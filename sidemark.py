@@ -11136,6 +11136,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.bindings = Bindings.load()
         self._bindings_list = None   # built with the pen popover
         self._tool_btns = None       # built with the header
+        self._tool_strips = {}       # tool -> the painted binding stripes
         self._borrow_key = None      # the key a hold-to-borrow is waiting on
         self._path = None
         self._notes_path = None   # set when a .md file is opened without an associated PDF
@@ -11677,6 +11678,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         for b, m in zip(self._tool_btns, self._TOOL_BAR_ORDER):
             b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
             self._attach_binding_click(b, m)
+            self._add_binding_strip(b, m)
             tools_box.append(b)
 
         # ── pen settings popover: width / colour / smoothing (mode is on bar) ──
@@ -11737,6 +11739,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         for b, m in zip(self._ptool_btns, self._TOOL_BAR_ORDER):
             b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
             self._attach_binding_click(b, m)
+            self._add_binding_strip(b, m)
             pmode_box.append(b)
         self._pen_modes_section.append(pmode_box)
         self._pen_modes_section.set_visible(False)
@@ -11859,7 +11862,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         popover_box.append(self._bindings_list)
 
         popover = Gtk.Popover()
-        popover.set_child(popover_box)
+        # The popover must be able to SHRINK. GTK4 does not open a popover it
+        # cannot fit on screen, so with the window low on the display this one
+        # simply refused to appear — silently, which reads as a broken button.
+        # A ScrolledWindow that propagates its natural size stays exactly this
+        # tall when there is room and scrolls when there isn't, so it always
+        # opens. (The Buttons list made a tight fit much tighter — row 132.)
+        pen_scroll = Gtk.ScrolledWindow()
+        pen_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        pen_scroll.set_propagate_natural_height(True)
+        pen_scroll.set_propagate_natural_width(True)
+        pen_scroll.set_max_content_height(560)
+        pen_scroll.set_child(popover_box)
+        popover.set_child(pen_scroll)
 
         # the settings button shows the active tool's colour as a swatch
         self._color_swatch = Gtk.DrawingArea()
@@ -14566,6 +14581,47 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     # ── the toolbar as a binding surface (row 132) ───────────────────────────
 
+    # one colour per mouse button, painted rather than themed
+    BUTTON_COLORS = {"left": None,                  # None = the theme accent
+                     "right": (0.83, 0.34, 0.17),
+                     "middle": (0.23, 0.60, 0.36),
+                     "thumb": (0.79, 0.60, 0.12)}
+
+    def _add_binding_strip(self, button, tool):
+        """Paint the binding stripe under a tool's glyph.
+
+        Drawn, not styled: a CSS border or box-shadow on a `.linked` toolbar
+        button loses to libadwaita's own linked-button rules and the badge
+        silently never appears — which is exactly how it shipped broken. A
+        DrawingArea overlay renders whatever the theme does. Untargetable, so
+        it never eats the click that binds."""
+        child = button.get_child()
+        overlay = Gtk.Overlay()
+        button.set_child(None)
+        overlay.set_child(child)
+        strip = Gtk.DrawingArea()
+        strip.set_content_height(3)
+        strip.set_valign(Gtk.Align.END)
+        strip.set_halign(Gtk.Align.FILL)
+        strip.set_can_target(False)
+        strip.set_draw_func(self._draw_binding_strip, tool)
+        overlay.add_overlay(strip)
+        button.set_child(overlay)
+        self._tool_strips.setdefault(tool, []).append(strip)
+
+    def _draw_binding_strip(self, _area, ctx, w, h, tool):
+        """A segment per UNMODIFIED button this tool owns, side by side — so a
+        tool on two buttons wears both colours and an unbound tool wears none."""
+        plain = self.bindings.plain_buttons_for(tool)
+        if not plain:
+            return
+        seg = w / len(plain)
+        for i, chord in enumerate(plain):
+            rgb = self.BUTTON_COLORS.get(chord) or self._theme_acc
+            ctx.set_source_rgb(*rgb)
+            ctx.rectangle(i * seg, 0, seg, h)
+            ctx.fill()
+
     def _attach_binding_click(self, button, tool):
         """Click a tool with the mouse button you want it on, and it goes
         there. Plain unmodified LEFT is the exception: it stays the ordinary
@@ -14661,12 +14717,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             else:
                 tip += " — not bound"
             for grp in (self._tool_btns, self._ptool_btns):
-                b = grp[self._TOOL_ORDER[tool]]
-                b.set_tooltip_text(tip)
-                for name in BUTTON_NAMES.values():
-                    b.remove_css_class(f"bound-{name}")
-                for chord in plain:
-                    b.add_css_class(f"bound-{chord}")
+                grp[self._TOOL_ORDER[tool]].set_tooltip_text(tip)
+            for strip in self._tool_strips.get(tool, ()):
+                strip.queue_draw()
         if self._bindings_list is not None:
             self._populate_bindings_list()
 
@@ -14815,6 +14868,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         self._syncing_mode = True
         try:
+            # the plain left-click path binds too — logged here so the stream
+            # shows every binding, not only the chord-clicks
+            log_press("bind", "left", mode,
+                      f"was {self.bindings.tool_for_chord('left')}")
             self.canvas.tool = mode
             if mode != "lasso":
                 self.canvas.clear_lasso_selection()

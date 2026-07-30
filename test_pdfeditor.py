@@ -6801,13 +6801,14 @@ class TestBindingToolbar(unittest.TestCase):
             win.bindings.replace(dict(sidemark.DEFAULT_BINDINGS))
             win._refresh_tool_bindings()
             eraser = win._tool_btns[win._TOOL_ORDER["eraser"]]
-            self.assertTrue(eraser.has_css_class("bound-right"))
             self.assertIn("right", eraser.get_tooltip_text())
-            # move it and both follow
+            # the stripe is PAINTED from the table, so what it shows is what
+            # the mouse does (a themed border silently never rendered)
+            self.assertEqual(win.bindings.plain_buttons_for("eraser"), ["right"])
             win._bind_chord("middle", "eraser")
-            self.assertTrue(eraser.has_css_class("bound-middle"))
-            pan = win._tool_btns[win._TOOL_ORDER["pan"]]
-            self.assertFalse(pan.has_css_class("bound-middle"))
+            self.assertEqual(sorted(win.bindings.plain_buttons_for("eraser")),
+                             ["middle", "right"])
+            self.assertEqual(win.bindings.plain_buttons_for("pan"), [])
             # a tool with nothing on it says so
             win._clear_binding("right")
             win._clear_binding("middle")
