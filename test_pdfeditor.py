@@ -5199,8 +5199,11 @@ class TestThumbnailSidebar(unittest.TestCase):
             def body(win):
                 win._do_open_file(pdf)
                 self.assertTrue(win._has_toc)
-                self.assertFalse(win._toc_thumbs)
+                # page previews are the default view, outline is one click away
+                self.assertTrue(win._toc_thumbs)
                 self.assertTrue(win._toc_switch.get_visible())
+                win._toc_seg_outline.set_active(True)
+                self.assertFalse(win._toc_thumbs)
                 self.assertEqual(win._toc_scroll.get_size_request()[0], 230)
                 win._toc_seg_pages.set_active(True)
                 self.assertTrue(win._toc_thumbs)
@@ -5230,7 +5233,7 @@ class TestThumbnailSidebar(unittest.TestCase):
 
             self._run_in_window(body)
 
-    def test_toc_takes_precedence_over_thumbnails(self):
+    def test_page_previews_open_by_default_with_or_without_a_toc(self):
         with tempfile.TemporaryDirectory() as d:
             plain = os.path.join(d, "plain.pdf")
             make_pdf(plain, n_pages=2)
@@ -5244,8 +5247,12 @@ class TestThumbnailSidebar(unittest.TestCase):
             def body(win):
                 win._do_open_file(plain)
                 self.assertTrue(win._toc_thumbs)
-                win._do_open_file(toc_pdf)   # switching docs must leave thumbs mode
-                self.assertFalse(win._toc_thumbs)
+                # a document WITH an outline still opens on the previews — the
+                # outline is offered by the switcher, not forced
+                win._do_open_file(toc_pdf)
+                self.assertTrue(win._toc_thumbs)
+                self.assertTrue(win._toc_switch.get_visible())
+                win._toc_seg_outline.set_active(True)
                 rows = self._rows(win)
                 self.assertEqual(len(rows), 2)
                 self.assertIsInstance(rows[0].get_child(), Gtk.Label)
@@ -11122,9 +11129,9 @@ class TestMergeImportInWindow(unittest.TestCase):
                 self.assertEqual(asked, [[a, b]])
             self._run_in_window(body)
 
-    def test_several_files_on_the_thumbnails_become_chapters(self):
-        """A single dropped PDF stays a plain page insert; several become
-        chapters at the drop gap."""
+    def test_files_dropped_on_the_sidebar_always_ask(self):
+        """One file takes the same path as many — a single import is still a
+        chapter, and one path is one thing to learn."""
         with tempfile.TemporaryDirectory() as d:
             host, a, b = (os.path.join(d, n)
                           for n in ("host.pdf", "a.pdf", "b.pdf"))
@@ -11136,14 +11143,88 @@ class TestMergeImportInWindow(unittest.TestCase):
                 asked = []
                 win._begin_merge_import = (
                     lambda paths, skipped, gap=None: asked.append((paths, gap)))
-                inserted = []
-                win._confirm_page_change = lambda _m, on_confirm: inserted.append(1)
 
                 win._insert_files_to_gap([a], [], 1)
-                self.assertEqual((asked, len(inserted)), ([], 1))
-
                 win._insert_files_to_gap([a, b], [], 1)
-                self.assertEqual(asked, [([a, b], 1)])
+                self.assertEqual(asked, [([a], 1), ([a, b], 1)])
+            self._run_in_window(body)
+
+    def test_the_outline_takes_a_file_drop_at_its_chapter(self):
+        """The outline had no file target of its own, so dropping documents on
+        it did nothing. Its rows are CHAPTERS, so the drop gap comes from the
+        entry's page, not from a row index."""
+        with tempfile.TemporaryDirectory() as d:
+            first, second = os.path.join(d, "1.pdf"), os.path.join(d, "2.pdf")
+            make_pdf(first, n_pages=2)
+            make_pdf(second, n_pages=3)
+            dest = os.path.join(d, "merged.pdf")
+            sidemark.merge_documents(
+                [sidemark.MergeSource(first), sidemark.MergeSource(second)],
+                dest)
+
+            def body(win):
+                win._do_open_file(dest)
+                win._toc_btn.set_active(True)      # reveal + populate the sidebar
+                win._toc_seg_outline.set_active(True)   # page previews open by default
+                win._populate_toc()
+                self.assertFalse(win._toc_thumbs, "the outline view is not up")
+                rows = [win._toc_list.get_row_at_index(i) for i in (0, 1)]
+                self.assertEqual([r.toc_page for r in rows], [0, 2])
+
+                # the row a drop points at is a lookup, not geometry (nothing is
+                # laid out headlessly), so drive the lookup directly
+                pointed = [rows[0]]
+                win._toc_list.get_row_at_y = lambda _y: pointed[0]
+                half = [0.0]        # 0 = top half of the row, 1 = bottom half
+                win._row_local_y = lambda row, _y: half[0] * 1000
+
+                # top half of chapter 1 → before it; bottom half → where
+                # chapter 2 starts; below every row → the end of the document
+                self.assertEqual(win._toc_drop_gap(0), 0)
+                half[0] = 1.0
+                self.assertEqual(win._toc_drop_gap(0), 2)
+                pointed[0] = None
+                self.assertEqual(win._toc_drop_gap(0), 5)
+            self._run_in_window(body)
+
+    def test_a_drop_on_the_editor_reaches_the_window_in_both_modes(self):
+        """A GtkTextView installs its own string DropTarget, and a file manager
+        offers text/plain beside the uris — so the editor swallowed every file
+        dropped on it and the window's target never ran. Both modes are the
+        same editor widget, so both broke and both are fixed by one target."""
+        with tempfile.TemporaryDirectory() as d:
+            md = os.path.join(d, "note.md")
+            with open(md, "w") as f:
+                f.write("# a text-first page\n")
+
+            def body(win):
+                win._do_open_file(md)
+                self.assertTrue(win._text_mode)
+                sheet = win._active_session._text_page.view
+                for view, label in ((sheet, "the text-first sheet"),
+                                    (win._notes_view, "the notes panel")):
+                    targets = []
+                    ctrls = view.observe_controllers()
+                    for i in range(ctrls.get_n_items()):
+                        c = ctrls.get_item(i)
+                        if isinstance(c, (Gtk.DropTarget, Gtk.DropTargetAsync)):
+                            targets.append(c)
+                    self.assertTrue(
+                        any(isinstance(c, Gtk.DropTargetAsync) for c in targets),
+                        f"{label} takes no file drop")
+                    self.assertFalse(
+                        [c for c in targets if isinstance(c, Gtk.DropTarget)],
+                        f"{label} still has the built-in target that swallows "
+                        f"the drop before ours")
+
+                # …and the drop itself behaves the same as in PDF mode
+                asked = []
+                win._ask_open_or_merge = lambda paths, sup: asked.append(sup)
+                a, b = os.path.join(d, "a.pdf"), os.path.join(d, "b.pdf")
+                make_pdf(a)
+                make_pdf(b)
+                win._open_dropped([a, b])
+                self.assertEqual(asked, [[a, b]])
             self._run_in_window(body)
 
     def test_the_import_dialog_builds(self):

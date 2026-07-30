@@ -77,7 +77,10 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   every pasted image renders twice forever (`take_source_images`). Chapters
   reorder by dragging an outline row: `chapter_spans` → `move_page_range` (one
   `select()`, one re-key) → `resort_toc` (`select()` re-pages the outline but
-  does not re-order it).
+  does not re-order it). A drop lands the same way wherever it falls: the
+  sidebar (outline rows, thumbnails, the empty space below either) imports at
+  that gap, everywhere else — including a text-first page — opens or merges
+  into a new file.
 - **`[[wiki links]]` (the linking workflow)** — this is the feature the project
   was designed around and it has shipped (ideas.csv row 99). In notes,
   `[[target]]` is a clickable link (Ctrl+click follows, hover shows a hand).
@@ -148,9 +151,21 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   returning an action, or the drop never fires (portal transfer).
 - **GTK4 popovers**: never popdown one popover and popup a sibling on the same
   widget synchronously — defer to the "closed" signal.
+- **Both modes, always.** Every feature is designed for PDF *and* text-first
+  pages unless there is a stated reason it cannot be — the two are one app to
+  the user, and a feature missing on one side reads as a bug, not a scope call.
+  This generalises the image contract and the chord grammar below; it is not
+  their private rule. Walk a new feature through both before calling it done,
+  and if one side genuinely can't have it, say so loudly in `ideas.csv`.
 - **Event reachability — a correct handler can still never run.** When a
   gesture "does nothing", test the PATH, not the handler (all of these tested
   fine in isolation while being unreachable in the app):
+  - **A `GtkTextView` installs its own `GtkDropTarget` for `gchararray`**, and
+    a file manager offers `text/plain` beside the uris — so the editor matched
+    first and every file dropped on the notes panel or the text sheet
+    disappeared, while the window's own target sat there working. Two targets
+    on one widget are tried in the order they were ADDED, so the built-in has
+    to be *replaced*, not supplemented (`attach_file_drop`).
   - `GtkScrolledWindow` installs its OWN capture-phase scroll controller and
     STOPS scroll it can use, so a Ctrl+scroll zoom must be captured on an
     ancestor **above** it (`MarkdownNotesView.attach_zoom_scroll`,

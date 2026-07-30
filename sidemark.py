@@ -4917,6 +4917,52 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
     return result
 
 
+def attach_file_drop(text_view):
+    """Let a file dropped on a text editor reach the window's open/import flow.
+
+    The window's own file target never sees it: a GtkTextView installs its own
+    GtkDropTarget for `gchararray`, and a file manager offers text/plain
+    alongside the uris — so the editor's target matches first, swallows the
+    drop, and the file "does nothing". That is the same reachability trap as
+    the scroll handlers, in DND form: the handler was fine, the PATH was not.
+
+    The built-in target is replaced rather than supplemented, because two
+    targets on one widget are tried in the order they were added and the
+    built-in was there first.
+
+    # ceiling: dropping selected TEXT into the editor goes away with it. If
+    # that is ever wanted back, add a second string target after this one and
+    # insert at the iter under the pointer.
+    """
+    stale = []
+    controllers = text_view.observe_controllers()
+    for i in range(controllers.get_n_items()):
+        c = controllers.get_item(i)
+        if isinstance(c, Gtk.DropTarget):
+            fmts = c.get_formats()
+            if fmts and not fmts.contain_gtype(Gdk.FileList.__gtype__):
+                stale.append(c)
+    for c in stale:
+        text_view.remove_controller(c)
+
+    target = Gtk.DropTargetAsync.new(
+        Gdk.ContentFormats.new_for_gtype(Gdk.FileList), Gdk.DragAction.COPY)
+
+    def window():
+        root = text_view.get_root()
+        return root if hasattr(root, "_on_drop_async") else None
+
+    # drag-enter/motion MUST return an action or the compositor rejects the
+    # drop on release (the same portal rule as the window's target)
+    target.connect("drag-enter", lambda *_a: Gdk.DragAction.COPY)
+    target.connect("drag-motion", lambda *_a: Gdk.DragAction.COPY)
+    target.connect(
+        "drop",
+        lambda _t, drop, x, y: bool(
+            (win := window()) and win._on_drop_async(_t, drop, x, y)))
+    text_view.add_controller(target)
+
+
 def classify_import_paths(paths):
     """Split a dropped file list into (mergeable, skipped) for the merge flow.
 
@@ -6160,6 +6206,11 @@ class MarkdownNotesView(GtkSource.View):
         self.set_top_margin(6)
         self.set_bottom_margin(10)
         self.add_css_class("notes-view")
+        # a document dropped ON the editor must open/import like one dropped
+        # anywhere else in the window — see attach_file_drop for why the window's
+        # own target never sees it. This is the notes panel AND the text-first
+        # sheet, which is one of these styled as paper.
+        attach_file_drop(self)
 
         buf.set_language(GtkSource.LanguageManager.get_default().get_language("markdown"))
         buf.set_style_scheme(GtkSource.StyleSchemeManager.get_default().get_scheme(scheme_id))
@@ -10605,6 +10656,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         toc_click = Gtk.GestureClick()
         toc_click.connect("pressed", lambda *a: s.win._on_toc_list_pressed(*a))
         s._toc_list.add_controller(toc_click)
+        # dropping documents anywhere in the sidebar imports them as chapters —
+        # on the OUTLINE (which has no per-row file target of its own) and on
+        # the empty space below the thumbnails alike. The per-thumbnail targets
+        # sit deeper in the widget tree, so a drop on a page still goes there.
+        toc_files = Gtk.DropTargetAsync.new(
+            Gdk.ContentFormats.new_for_gtype(Gdk.FileList), Gdk.DragAction.COPY)
+        toc_files.connect("accept", lambda *a: s.win._on_toc_file_accept(*a))
+        toc_files.connect("drag-enter", lambda *a: s.win._on_toc_file_motion(*a))
+        toc_files.connect("drag-motion", lambda *a: s.win._on_toc_file_motion(*a))
+        toc_files.connect("drag-leave",
+                          lambda *a: s.win._clear_drop_indicator())
+        toc_files.connect("drop", lambda *a: s.win._on_toc_file_drop(*a))
+        s._toc_list.add_controller(toc_files)
         s._toc_scroll = Gtk.ScrolledWindow()
         s._toc_scroll.set_child(s._toc_list)
         s._toc_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -10612,13 +10676,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._toc_scroll.set_vexpand(True)
         # Outline ⇄ Pages view switcher, shown only when the PDF has a TOC
         s._toc_seg_outline = Gtk.ToggleButton(label="Outline")
-        s._toc_seg_outline.set_active(True)
         s._toc_seg_outline.set_tooltip_text(
             "Show the document outline (Ctrl+T toggles this sidebar)")
         s._toc_seg_pages = Gtk.ToggleButton(label="Pages")
         s._toc_seg_pages.set_tooltip_text(
             "Show page thumbnails (Ctrl+T toggles this sidebar)")
         s._toc_seg_pages.set_group(s._toc_seg_outline)
+        # page previews are the default view even when the document HAS an
+        # outline: you recognise the slide you want faster than its title
+        s._toc_seg_pages.set_active(True)
         s._toc_seg_pages.connect("toggled", lambda *a: s.win._on_toc_view_toggled(*a))
         s._toc_switch = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         s._toc_switch.add_css_class("linked")
@@ -12235,6 +12301,66 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._on_thumb_file_read, (gdk_drop, gap))
         return True
 
+    # ── file drop on the sidebar as a whole (outline view, empty space) ───────
+
+    def _on_toc_file_accept(self, _target, gdk_drop):
+        fmts = gdk_drop.get_formats()
+        if not fmts:
+            return False
+        if fmts.contain_gtype(GObject.TYPE_INT):
+            return False        # one of our thumbnails being reordered
+        # A chapter drag of ours carries a bare string — but so does half of
+        # every real file drop (file managers offer text/plain beside the
+        # uris), so "is it a string?" is NOT the question. Files are.
+        return (fmts.contain_gtype(Gdk.FileList.__gtype__)
+                or fmts.contain_mime_type("text/uri-list"))
+
+    def _on_toc_file_motion(self, target, _drop, _x, y):
+        row = self._toc_list.get_row_at_y(int(y))
+        if row is not None:
+            self._show_drop_indicator(
+                row, self._row_local_y(row, y) > row.get_height() / 2)
+        else:
+            self._clear_drop_indicator()
+        return Gdk.DragAction.COPY
+
+    def _row_local_y(self, row, y):
+        """`y` (given in the list's coordinates, because this controller sits on
+        the LIST rather than on a row) rebased onto the row it points at."""
+        ok, bounds = row.compute_bounds(self._toc_list)
+        return y - bounds.origin.y if ok else y
+
+    def _on_toc_file_drop(self, _target, gdk_drop, _x, y):
+        self._clear_drop_indicator()
+        gdk_drop.read_value_async(
+            Gdk.FileList, GLib.PRIORITY_DEFAULT, None,
+            self._on_thumb_file_read, (gdk_drop, self._toc_drop_gap(y)))
+        return True
+
+    def _toc_drop_gap(self, y):
+        """Which page the sidebar drop at `y` lands before.
+
+        In the outline the rows are CHAPTERS, not pages, so the gap comes from
+        the entry's page: the top half of a row means "before this chapter",
+        the bottom half "after it" — which is the next entry's page, or the end
+        of the document for the last one."""
+        n_pages = self.canvas.n_pages if self.canvas.document else 0
+        row = self._toc_list.get_row_at_y(int(y))
+        if row is None:
+            return n_pages                      # empty space below: the end
+        if self._toc_thumbs:
+            return self._gap_for(row, row.get_index(),
+                                 self._row_local_y(row, y))
+        below = self._row_local_y(row, y) > row.get_height() / 2
+        if not below:
+            return max(0, min(getattr(row, "toc_page", 0), n_pages))
+        nxt = self._toc_list.get_row_at_index(row.get_index() + 1)
+        while nxt is not None and getattr(nxt, "toc_page", None) is None:
+            nxt = self._toc_list.get_row_at_index(nxt.get_index() + 1)
+        if nxt is None:
+            return n_pages
+        return max(0, min(nxt.toc_page, n_pages))
+
     def _on_thumb_file_read(self, _src, result, data):
         gdk_drop, gap = data
         try:
@@ -12254,24 +12380,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             gdk_drop.finish(0)
 
     def _insert_files_to_gap(self, paths, skipped, gap):
-        """Several documents dropped on the thumbnails become CHAPTERS inserted
-        at the gap; a single one stays a plain page insert (row 123).
+        """Documents dropped on the sidebar become CHAPTERS inserted at the gap.
 
-        The single-file case is deliberately unchanged: inserting a two-page
-        appendix into a document is not chapter work, and it has always been a
-        one-click confirm."""
+        One file goes through the same dialog as many: a single import is still
+        a chapter with a name and (optionally) its own sub-chapters, and one
+        path is one thing to learn rather than two."""
         if not self.canvas.document:
             return
-        # a .pptx has to be converted before its pages exist, which is the merge
-        # pipeline's job even for a single file
-        if len(paths) > 1 or paths[0].lower().endswith(".pptx"):
-            self._begin_merge_import(paths, skipped, gap=gap)
-            return
-        names = ", ".join(os.path.basename(p) for p in paths)
-        self._confirm_page_change(
-            f"Insert pages from {names} at position {gap + 1}?",
-            lambda: (self._do_insert_pdfs(paths, gap),
-                     self._report_import_skips(skipped)) and None)
+        self._begin_merge_import(paths, skipped, gap=gap)
 
     def _do_insert_pdfs(self, paths, gap):
         at = max(0, min(gap, self.canvas.n_pages))
@@ -12317,13 +12433,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     # window offers "open all / merge" and merges into a NEW file. Both end in
     # merge_documents(); only the destination differs.
 
-    # order choices, in dialog order. "As dropped" is honest about what it can
-    # deliver: the drop hands us an ORDERED file list, but most Linux file
-    # managers fill it in their view's display order, not the order you clicked
-    # (macOS Finder is the one usually claimed to preserve click order), so it
-    # is offered, not defaulted.
-    MERGE_ORDERS = ("Filename (1, 2, 10, 101 — numbers count as numbers)",
-                    "As dropped (the order the file manager sent)")
+    # order choices, in dialog order. The DEFAULT is the file manager's own
+    # order: it is what you were looking at when you dragged, so it is the
+    # order you meant. What it cannot promise is CLICK order — most Linux file
+    # managers fill the dropped list in their view's display order (macOS
+    # Finder is the one usually claimed to preserve click order), which is why
+    # the label says "file manager", not "selection".
+    MERGE_ORDERS = ("As dropped (the order the file manager sent)",
+                    "Filename (1, 2, 10, 101 — numbers count as numbers)")
+    MERGE_ORDER_DROPPED = 0
 
     def _begin_merge_import(self, paths, skipped=(), gap=None):
         """Ask how to merge `paths`, then do it. gap=None merges into a new
@@ -12335,10 +12453,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
 
         order_dd = Gtk.DropDown.new_from_strings(list(self.MERGE_ORDERS))
-        order_dd.set_selected(0)
+        order_dd.set_selected(self.MERGE_ORDER_DROPPED)
+        order_dd.set_visible(len(paths) > 1)   # nothing to order in a single file
         sub_check = Gtk.CheckButton(
             label="Keep each document's own chapters as sub-chapters")
-        sub_check.set_active(True)
+        sub_check.set_active(False)
         listbox = Gtk.ListBox()
         listbox.set_selection_mode(Gtk.SelectionMode.NONE)
         listbox.add_css_class("boxed-list")
@@ -12349,7 +12468,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         scroll.set_child(listbox)
 
         def ordered():
-            if order_dd.get_selected() == 1:
+            if order_dd.get_selected() == self.MERGE_ORDER_DROPPED:
                 return list(paths)
             return sorted(paths, key=natural_sort_key)
 
@@ -12382,14 +12501,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         where = ("into this document" if gap is not None else
                  "into a new document")
+        many = len(paths) != 1
         dialog = Adw.AlertDialog.new(
-            "Merge documents?",
-            f"{len(paths)} documents will be merged {where}, "
-            "one chapter each. Notes and pasted images that belong to them "
-            "come along, with their page numbers adjusted.")
+            "Merge documents?" if many else "Import as a chapter?",
+            f"{len(paths)} document{'s' if many else ''} will be "
+            f"{'merged' if many else 'imported'} {where}, "
+            f"{'one chapter each' if many else 'as a chapter'}. Notes and "
+            "pasted images that belong to "
+            f"{'them' if many else 'it'} come along, with their page numbers "
+            "adjusted.")
         dialog.set_extra_child(box)
         dialog.add_response("cancel", "Cancel")
-        dialog.add_response("merge", "Merge")
+        dialog.add_response("merge", "Merge" if many else "Import")
         dialog.set_response_appearance("merge", Adw.ResponseAppearance.SUGGESTED)
         dialog.set_default_response("merge")
         dialog.set_close_response("cancel")
