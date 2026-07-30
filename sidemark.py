@@ -20,6 +20,7 @@ import base64
 import struct
 import zlib
 import uuid
+from typing import NamedTuple
 
 RECENT_PATH = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
@@ -5498,34 +5499,57 @@ def chapter_spans(toc, n_pages):
     return spans
 
 
+class NoteSections(NamedTuple):
+    """What a notes sidecar says: per-page bodies, which pages CONTINUE their
+    predecessor (row 129), and whether the file carried page markers at all.
+
+    A named tuple rather than a plain 3-tuple because `sections, had = ...`
+    unpacking is spread across the merge import — growing a third field must
+    fail loudly at the call sites that need updating, not silently rebind
+    `had_markers` to the link set."""
+    sections: dict
+    linked: set
+    had_markers: bool
+
+
+# `<!-- page:12 -->` opens a page's notes; the ` continued` variant says the
+# page shares the run above it and so has no body of its own (row 129).
+_PAGE_MARKER_RE = r'<!--\s*page:(\d+)(\s+continued)?\s*-->'
+
+
 def parse_note_sections(raw):
-    """(sections, had_page_markers) for a notes file's text.
+    """NoteSections for a notes file's text.
 
     Split out of NotesModel.load because merging needs the distinction the
     loader hides: a file with no `<!-- page:N -->` markers is an externally
     authored note, and the loader's "keep it all as page 0" fallback would, in
     a merge, dump a whole hand-written file onto one page of a chapter."""
     raw = re.sub(r'^\s*!\[\[.*?\]\]\n+', '', raw)
-    parts = re.split(r'<!--\s*page:(\d+)\s*-->', raw)
+    parts = re.split(_PAGE_MARKER_RE, raw)
     if len(parts) == 1:
         text = raw.strip()
-        return ({0: text} if text else {}), False
-    sections = {}
-    for i in range(1, len(parts), 2):
-        content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        return NoteSections({0: text} if text else {}, set(), False)
+    sections, linked = {}, set()
+    # re.split yields [prefix, page, continued, body, page, continued, body...]
+    # — one group per marker capture, so the stride is 3, not 2.
+    for i in range(1, len(parts), 3):
+        idx = int(parts[i])
+        content = parts[i + 2].strip() if i + 2 < len(parts) else ""
+        if parts[i + 1]:
+            linked.add(idx)
         if content:
-            sections[int(parts[i])] = content
-    return sections, True
+            sections[idx] = content
+    return NoteSections(sections, linked, True)
 
 
 def read_note_sections(path):
-    """(sections, had_page_markers) for a notes sidecar on disk; ({}, False)
-    when there isn't one or it can't be read."""
+    """NoteSections for a notes sidecar on disk; empty when there isn't one or
+    it can't be read."""
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             raw = f.read()
     except OSError:
-        return {}, False
+        return NoteSections({}, set(), False)
     return parse_note_sections(raw)
 
 
@@ -5713,6 +5737,7 @@ class MergeResult:
         self.skipped = []       # (name, reason)
         self.toc = []           # the merged outline, 1-based pages
         self.notes = {}         # page idx → markdown
+        self.linked = set()     # page idxs that continue their predecessor
         self.images = {}        # "page idx" → sidecar image records
         self.error = None
 
@@ -5734,7 +5759,7 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
     notes/images into the live models at the insertion point."""
     out = fitz.open()
     result = MergeResult()
-    toc, notes, images = [], {}, {}
+    toc, notes, images, linked = [], {}, {}, set()
     offset = 0
     try:
         for src_info in sources:
@@ -5764,12 +5789,17 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
             toc.append([1, src_info.title, offset + 1])
             toc += shift_toc(sub, offset, base_level=2)
             if src_info.notes is not None:
-                sections = dict(src_info.notes)
+                sections, src_links = dict(src_info.notes), set()
             else:
-                sections, _had = read_note_sections(notes_path_for(src_info.origin))
+                parsed = read_note_sections(notes_path_for(src_info.origin))
+                sections, src_links = parsed.sections, parsed.linked
             for idx, text in sections.items():
                 if text.strip():
                     notes[idx + offset] = text
+            # a chapter lands contiguously, so a run inside it survives the
+            # shift; a source's page 0 can never be linked, which is what keeps
+            # one chapter's notes from reaching into the one before it
+            linked |= {idx + offset for idx in src_links if 0 < idx < n}
             for key, entries in page_images.items():
                 try:
                     images[str(int(key) + offset)] = entries
@@ -5779,6 +5809,7 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
             offset += n
         result.pages = offset
         result.toc, result.notes, result.images = toc, notes, images
+        result.linked = linked
         if not offset:
             return result
         out.set_toc(toc)
@@ -5789,11 +5820,12 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
         out.close()
     if not write_sidecars:
         return result
-    if notes:
+    if notes or linked:
         model = NotesModel()
         model.pdf_name = os.path.basename(dest_path)
         for idx, text in notes.items():
-            model.set(idx, text)
+            model.set(idx, text)     # links go on AFTER, or set() would
+        model.set_links(linked)      # route a run's pages onto its start
         model.save(notes_path_for(dest_path))
     if images:
         tmp = _ink_path_for(dest_path) + ".tmp"
@@ -6690,7 +6722,13 @@ def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty,
     With group=True, small notes from consecutive pages are packed onto shared
     notes pages, each section headed by the page it came from. With group=False
     each annotated page is followed by its own notes page (and include_empty adds
-    a notes page even for pages with nothing extra)."""
+    a notes page even for pages with nothing extra).
+
+    Reads `own_text`, never `get`: a linked run (row 129) prints ONCE, under the
+    page it is written on — `get` would repeat the same paragraph on all five
+    slides of a run.
+    # ceiling: a continued page prints nothing at all, not even a "continued
+    # from page N" line; add one to the notes page if anyone misses it."""
     src_doc = fitz.open(src_path)
     out_doc = fitz.open()
     anchor_color = accent
@@ -6715,7 +6753,7 @@ def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty,
             pending.clear()
 
         for page_idx in range(len(src_doc)):
-            notes_text = _symbolize(notes_model.get(page_idx))
+            notes_text = _symbolize(notes_model.own_text(page_idx))
             anchors = _parse_anchors(notes_text)
             out_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
             out_page = out_doc[-1]
@@ -6733,7 +6771,7 @@ def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty,
         _flush()
     else:
         for page_idx in range(len(src_doc)):
-            notes_text = _symbolize(notes_model.get(page_idx))
+            notes_text = _symbolize(notes_model.own_text(page_idx))
             anchors = _parse_anchors(notes_text)
             out_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
             out_page = out_doc[-1]
@@ -6995,28 +7033,126 @@ class _NotesWriter:
 
 
 class NotesModel:
-    """Per-page markdown notes, backed by a sidecar .md file."""
+    """Per-page markdown notes, backed by a sidecar .md file.
+
+    A page may CONTINUE the one before it (row 129): a run of linked pages
+    shares ONE body, stored once on the run's first page. That is what makes
+    duplication impossible rather than merely discouraged — but it means every
+    reader has to say which text it wants:
+
+      get(idx)       the RESOLVED body — what the editor shows on this page.
+      own_text(idx)  the text this page STORES, "" on a continued page — what
+                     export, share, page marks and search want, so a run
+                     prints once instead of once per page.
+
+    Reach for `get` only where a human is looking at that one page."""
 
     def __init__(self):
         self._notes = {}
+        self._links = set()   # pages that continue their predecessor
         self.pdf_name = None  # written as ![[name.pdf]] at top of the file
 
+    # ── runs ─────────────────────────────────────────────────────────────────
+
+    def is_linked(self, idx):
+        """True if idx continues the page before it."""
+        return idx in self._links
+
+    def run_start(self, idx):
+        """The page that holds the body idx displays — itself when unlinked."""
+        while idx in self._links:
+            idx -= 1
+        return idx
+
+    def run_pages(self, idx):
+        """Every page of idx's run, in order."""
+        start = self.run_start(idx)
+        pages, nxt = [start], start + 1
+        while nxt in self._links:
+            pages.append(nxt)
+            nxt += 1
+        return pages
+
+    def run_end(self, idx):
+        return self.run_pages(idx)[-1]
+
+    def link(self, idx):
+        """Continue idx's notes from the page before it. Any text idx had of
+        its own is APPENDED to the run's body — a link must never silently eat
+        what someone already wrote."""
+        if idx <= 0 or idx in self._links:
+            return False
+        mine = self._notes.pop(idx, "").strip()
+        self._links.add(idx)
+        if mine:
+            start = self.run_start(idx)
+            head = self._notes.get(start, "").strip()
+            self._notes[start] = f"{head}\n\n{mine}" if head else mine
+        return True
+
+    def unlink(self, idx):
+        """Split the run at idx. The text stays with the run's first page and
+        idx starts empty — deterministic beats guessing which half of a
+        paragraph belonged to which slide (the user's call; the UI says so)."""
+        if idx not in self._links:
+            return False
+        self._links.discard(idx)
+        return True
+
+    def set_links(self, pages):
+        """Replace the link flags wholesale (a merge, a re-key, an undo).
+        Texts must already be in place: `set` routes through a link, so
+        applying the flags first would write a page's notes onto its run."""
+        self._links = {i for i in pages if i > 0}
+        self._normalize()
+
+    def links(self):
+        """The link flags, as a plain set — for saving and re-keying."""
+        return set(self._links)
+
+    def _normalize(self):
+        """Restore the invariant a hand-edited sidecar can break: page 0 can
+        continue nothing, and a continued page holds no body of its own."""
+        self._links = {i for i in self._links if i > 0}
+        for idx in sorted(self._links):
+            body = self._notes.pop(idx, "").strip()
+            if body:
+                start = self.run_start(idx)
+                head = self._notes.get(start, "").strip()
+                self._notes[start] = f"{head}\n\n{body}" if head else body
+
+    # ── text ─────────────────────────────────────────────────────────────────
+
     def get(self, idx):
+        """The body shown on page idx — the run's, if it is part of one."""
+        return self._notes.get(self.run_start(idx), "")
+
+    def own_text(self, idx):
+        """What page idx stores; "" on a continued page."""
         return self._notes.get(idx, "")
 
     def has_content(self):
-        """True if any page has non-whitespace notes (drives lazy file creation)."""
-        return any(v.strip() for v in self._notes.values())
+        """True if anything is worth a sidecar (drives lazy file creation) —
+        a bare link flag counts: losing it would silently re-split a run."""
+        return bool(self._links) or any(v.strip() for v in self._notes.values())
 
     def set(self, idx, text):
-        self._notes[idx] = text
+        """Write page idx's notes — to the run's first page when it is linked,
+        so the shared body stays stored exactly once."""
+        self._notes[self.run_start(idx)] = text
 
     def load(self, path):
         # the parse lives at module level (parse_note_sections): merging notes
         # needs the "were there page markers?" answer this loader throws away —
         # without markers the whole file is page 0, which in a merge would dump
         # a hand-written note onto one page of a chapter (row 123)
-        self._notes, _had_markers = read_note_sections(path)
+        parsed = read_note_sections(path)
+        self._notes, self._links = parsed.sections, set(parsed.linked)
+        self._normalize()
+
+    # ── re-keying (every path that re-pages a document; see row 123) ─────────
+    # Rule: degrade to UNLINKED rather than silently re-link two unrelated
+    # slides. A wrong flag makes one page's notes vanish behind another's.
 
     def shift_for_insert(self, idx, count=1):
         """Re-key notes after count pages were inserted at idx."""
@@ -7024,29 +7160,54 @@ class NotesModel:
             (k + count if k >= idx else k): v
             for k, v in self._notes.items()
         }
+        self._links = {(k + count if k >= idx else k) for k in self._links}
+        # the new pages are blank and unlinked, so the run is broken anyway:
+        # cut the tail loose rather than let its text reach across the gap
+        self._links.discard(idx + count)
 
     def shift_for_delete(self, idx):
-        """Drop the note of deleted page idx; re-key later pages."""
+        """Drop the note of deleted page idx; re-key later pages.
+
+        Deleting a run's START must hand the body to the next page in the run
+        — otherwise the whole run's text goes with the one page."""
+        if idx not in self._links and idx + 1 in self._links:
+            self._links.discard(idx + 1)
+            if self._notes.get(idx, "").strip():
+                self._notes[idx + 1] = self._notes[idx]
         self._notes = {
             (k - 1 if k > idx else k): v
             for k, v in self._notes.items()
             if k != idx
         }
+        self._links = {(k - 1 if k > idx else k)
+                       for k in self._links if k != idx}
+        self._links.discard(0)
 
     def reorder(self, old_to_new):
         """Re-key notes after pages were reordered. old_to_new maps each old
-        page index to its new index."""
+        page index to its new index. A run that moved as a block keeps its
+        links; one that was torn apart becomes plain unlinked pages."""
         self._notes = {
             old_to_new.get(k, k): v
             for k, v in self._notes.items()
         }
+        kept = set()
+        for k in self._links:
+            new, prev = old_to_new.get(k, k), old_to_new.get(k - 1, k - 1)
+            if new == prev + 1:
+                kept.add(new)
+        self._links = {k for k in kept if k > 0}
+        self._normalize()   # a torn-off page may now own text behind a link
 
     def save(self, path):
-        sections = [
-            f"<!-- page:{idx} -->\n\n{self._notes[idx].strip()}"
-            for idx in sorted(self._notes)
-            if self._notes[idx].strip()
-        ]
+        sections = []
+        for idx in sorted(set(self._notes) | self._links):
+            if idx in self._links:
+                # marker only: the body lives on the run's first page. This is
+                # the one place an EMPTY page still has to be written out.
+                sections.append(f"<!-- page:{idx} continued -->")
+            elif self._notes.get(idx, "").strip():
+                sections.append(f"<!-- page:{idx} -->\n\n{self._notes[idx].strip()}")
         body = "\n\n".join(sections) + "\n" if sections else ""
         embed = f"![[{self.pdf_name}]]\n\n" if self.pdf_name else ""
         tmp = path + ".tmp"
@@ -10864,6 +11025,7 @@ class DocumentSession:
     )
     WIDGETS = (
         "canvas", "_notes_view", "_panel_notes_view", "_notes_box",
+        "_notes_link_check", "_notes_link_hint",
         "_search_revealer", "_search_entry", "_search_label", "_paned",
         "_toc_list", "_toc_scroll", "_toc_revealer", "_toc_switch",
         "_toc_seg_outline", "_toc_seg_pages", "content", "_text_page",
@@ -10917,6 +11079,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._sessions = [self._active_session]
         self._closed_tabs = []   # reopen stack for Ctrl+Shift+T (file paths)
         self._share_revision = 0  # bumps on every change; drives live phone share
+        self._notes_link_updating = False   # guards the row-129 checkbox
         self._path = None
         self._notes_path = None   # set when a .md file is opened without an associated PDF
         self._active_notes_path = None  # the .md a loaded PDF saves notes to (default sidecar, or a user-chosen file remembered per-PDF)
@@ -11861,13 +12024,38 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         # ── notes panel ───────────────────────────────────────────────────────
         s._notes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         notes_header = Gtk.Label(label="Notes")
         notes_header.add_css_class("dim-label")
         notes_header.set_xalign(0)
+        notes_header.set_hexpand(True)
         notes_header.set_margin_start(10)
         notes_header.set_margin_top(6)
         notes_header.set_margin_bottom(4)
-        s._notes_box.append(notes_header)
+        header_row.append(notes_header)
+
+        # row 129 lives in the header row and nowhere else: the checkbox IS the
+        # per-page boolean, and a continued page has to LOOK continued or you
+        # edit the run's shared text believing it belongs to this page alone.
+        # Everything here is caption-sized and margin-free so the row keeps the
+        # height the bare "Notes" label had.
+        s._notes_link_hint = Gtk.Label()
+        s._notes_link_hint.add_css_class("dim-label")
+        s._notes_link_hint.add_css_class("caption")
+        s._notes_link_hint.set_ellipsize(Pango.EllipsizeMode.END)
+        s._notes_link_hint.set_margin_end(8)
+        s._notes_link_hint.set_visible(False)
+        header_row.append(s._notes_link_hint)
+        s._notes_link_check = Gtk.CheckButton()
+        s._notes_link_check.add_css_class("caption")
+        s._notes_link_check.set_margin_end(10)
+        s._notes_link_check.set_valign(Gtk.Align.CENTER)
+        s._notes_link_check.set_visible(False)
+        s._notes_link_check.connect(
+            "toggled", lambda b: s.win._on_notes_link_toggled(b))
+        header_row.append(s._notes_link_check)
+        s._notes_box.append(header_row)
+
         notes_scroll = Gtk.ScrolledWindow()
         notes_scroll.set_vexpand(True)
         notes_scroll.set_hexpand(True)
@@ -12944,8 +13132,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _restore_note(self):
         self._suppress_dirty = True
         text = self.notes_model.get(self.canvas.current_page_idx)
-        self._last_anchor_mark = None   # set_text would strand the mark at offset 0
         buf = self._notes_view.get_buffer()
+        if buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True) == text:
+            # Turning the page INSIDE a linked run (row 129) shows the same body,
+            # so re-setting it would only throw the caret to offset 0 mid-sentence
+            # — the one thing that would make a run feel like separate pages.
+            self._suppress_dirty = False
+            self._notes_burst_open = False
+            self._burst_base = text
+            self._update_canvas_anchors()
+            self._update_notes_link_ui()
+            return
+        self._last_anchor_mark = None   # set_text would strand the mark at offset 0
         # Programmatic page loads must not enter the undo history — otherwise
         # Ctrl+Z in the notes view could resurrect another page's text here
         buf.begin_irreversible_action()
@@ -12957,6 +13155,108 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._notes_burst_open = False
         self._burst_base = text
         self._update_canvas_anchors()
+        self._update_notes_link_ui()
+
+    # ── linked page notes (row 129) ───────────────────────────────────────────
+
+    def _can_link_notes(self):
+        """Linking is a PDF-only verb: a text-first page has no page-to-page
+        structure to continue (the one feature that is genuinely one-sided —
+        see the parity rule in CLAUDE.md)."""
+        return (not self._text_mode and self.canvas.document is not None
+                and self.canvas.n_pages > 1)
+
+    def _link_notes_to_previous(self):
+        """Continue this page's notes from the page before it."""
+        idx = self.canvas.current_page_idx
+        if not self._can_link_notes() or idx <= 0:
+            return
+        self._commit_note()
+        if not self.notes_model.link(idx):
+            return
+        self._restore_note()
+        self._populate_toc()      # the page strip carries the run marker too
+        self._mark_dirty()
+        start = self.notes_model.run_start(idx)
+        self._toast(f"Notes continue from page {start + 1}")
+
+    def _unlink_notes_from_previous(self, idx=None):
+        """Split the run at this page. The body stays with the run's first page
+        — say which, and offer the way back, because the alternative is
+        guessing which half of a paragraph belonged to which slide."""
+        if idx is None:
+            idx = self.canvas.current_page_idx
+        if not self.notes_model.is_linked(idx):
+            return
+        self._commit_note()
+        start = self.notes_model.run_start(idx)
+        self.notes_model.unlink(idx)
+        self._restore_note()
+        self._populate_toc()
+        self._mark_dirty()
+        toast = Adw.Toast.new(f"Notes stayed with page {start + 1}")
+        toast.set_button_label("Undo")
+        toast.connect("button-clicked", lambda *_: self._relink_notes(idx))
+        toast.set_timeout(6)
+        self.toast_overlay.add_toast(toast)
+
+    def _relink_notes(self, idx):
+        """Undo an unlink. The page has been empty since the split, so this
+        cannot merge stray text back into the run."""
+        if self.notes_model.is_linked(idx):
+            return
+        self._commit_note()
+        self.notes_model.link(idx)
+        self._restore_note()
+        self._populate_toc()
+        self._mark_dirty()
+
+    def _on_notes_link_toggled(self, check):
+        """The checkbox IS the page's boolean — but it is also written to by
+        `_update_notes_link_ui` on every page turn, so ignore the toggle when
+        it merely reports the state we just put there."""
+        if self._notes_link_updating:
+            return
+        idx = self.canvas.current_page_idx
+        if check.get_active():
+            self._link_notes_to_previous()
+        else:
+            self._unlink_notes_from_previous(idx)
+        # a verb that declined (page 0, no document) must not leave the box
+        # showing a state the model doesn't have
+        self._update_notes_link_ui()
+
+    def _update_notes_link_ui(self):
+        """Show both ENDS of a run in the panel header: a continued page has
+        the box ticked and says where its text lives, the run's first page says
+        that it carries on. Learning about a link from one side only is how you
+        edit shared text thinking it is this page's own."""
+        check, hint = self._notes_link_check, self._notes_link_hint
+        if check is None:
+            return
+        idx = self.canvas.current_page_idx
+        if not self._can_link_notes():
+            check.set_visible(False)
+            hint.set_visible(False)
+            return
+        # page 0 continues nothing — but it can still BE the start of a run, so
+        # the hint is decided separately from the checkbox
+        linked = self.notes_model.is_linked(idx)
+        if idx > 0:
+            check.set_label(f"Continue from page {idx}")
+            start = self.notes_model.run_start(idx) + 1 if linked else idx
+            check.set_tooltip_text(
+                f"Write ONE set of notes across page {idx} and this page: the "
+                f"text lives on page {start} and both pages show and edit it.\n"
+                f"Clearing this leaves the text on page {start}; this page "
+                f"starts empty again.")
+            self._notes_link_updating = True
+            check.set_active(linked)
+            self._notes_link_updating = False
+        check.set_visible(idx > 0)
+        end = self.notes_model.run_end(idx)
+        hint.set_label(f"continues on page {idx + 2}" if end > idx else "")
+        hint.set_visible(end > idx)
 
     # ── global undo ───────────────────────────────────────────────────────────
 
@@ -13420,7 +13720,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             pic = Gtk.Picture()
             scale = self.THUMB_WIDTH / rect.width if rect.width else 0.2
             pic.set_size_request(self.THUMB_WIDTH, int(rect.height * scale))
-            num = Gtk.Label(label=str(i + 1))
+            # a continued page (row 129) is marked in the strip too — the panel
+            # only tells you once you are already on the page
+            linked = self.notes_model.is_linked(i)
+            num = Gtk.Label(label=f"{i + 1} ⤸" if linked else str(i + 1))
             num.add_css_class("dim-label")
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             box.set_margin_top(6)
@@ -13433,8 +13736,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             row.set_child(box)
             row.toc_page = i
             row.set_tooltip_text(
-                f"Page {i + 1} — click to open (PageUp/PageDown to flip), "
-                "Ctrl+click to select, drag to reorder or export")
+                (f"Page {i + 1} — notes continued from page "
+                 f"{self.notes_model.run_start(i) + 1}" if linked else
+                 f"Page {i + 1}")
+                + " — click to open (PageUp/PageDown to flip), "
+                  "Ctrl+click to select, drag to reorder or export")
             self._add_thumb_dnd(row, i)
             self._toc_list.append(row)
             pictures.append(pic)
@@ -13976,6 +14282,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         for idx, text in result.notes.items():
             self.notes_model.set(at + idx, text)
+        if result.linked:
+            # after the texts, or set() would route a run's page onto its start
+            self.notes_model.set_links(
+                self.notes_model.links() | {at + idx for idx in result.linked})
         for idx, images in images_from_sidecar(
                 {"version": 1, "images": result.images}).items():
             self.canvas.all_images.setdefault(at + idx, []).extend(images)
@@ -14093,12 +14403,21 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         # Re-key the dragged pages' notes to the exported page order; if any has
         # notes, bake them in (also renders anchors/callouts) via the export path.
+        # A linked run (row 129) survives only where the drag kept the pages
+        # adjacent; a continued page torn away from its run start takes the
+        # text it was SHOWING, or it would export blank.
         sub = NotesModel()
+        sub_links = set()
         has_notes = False
         for new_idx, orig in enumerate(indices):
+            if (new_idx and self.notes_model.is_linked(orig)
+                    and indices[new_idx - 1] == orig - 1):
+                sub_links.add(new_idx)
+                continue
             text = self.notes_model.get(orig)
             sub.set(new_idx, text)
             has_notes = has_notes or bool(text.strip())
+        sub.set_links(sub_links)
         if has_notes:
             _export_pdf_with_notes(pages_pdf, out_path, sub,
                                    include_empty=False,
@@ -15783,7 +16102,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             out.insert_pdf(canvas.document, from_page=idx, to_page=idx)
             canvas._settle_ocg_refs(out)
             page = out[0]
-            _draw_page_marks(page, _symbolize(notes_model.get(idx)), accent)
+            _draw_page_marks(page, _symbolize(notes_model.own_text(idx)), accent)
             zoom = 1500.0 / max(page.rect.width, 1)   # ~1500px is crisp on phones
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
             pix.save(path)

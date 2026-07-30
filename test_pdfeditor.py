@@ -1129,6 +1129,322 @@ class TestNotes(unittest.TestCase):
             os.unlink(path)
 
 
+# ── notes that run over several pages (row 129) ──────────────────────────────
+
+class TestLinkedPageNotes(unittest.TestCase):
+    """A run of linked pages shares ONE body, stored once on the run's first
+    page. The two things worth breaking a build over: `get` resolves through a
+    run while `own_text` does not (or an export prints the same paragraph on
+    every slide), and re-keying degrades to UNLINKED rather than silently
+    re-linking two unrelated slides."""
+
+    def _run(self):
+        """Pages 2–4 are one run whose body lives on page 2."""
+        m = NotesModel()
+        m.set(1, "own note on 1")
+        m.set(2, "the long thought")
+        m.set_links({3, 4})
+        return m
+
+    def test_a_run_resolves_to_one_body(self):
+        m = self._run()
+        for page in (2, 3, 4):
+            self.assertEqual(m.get(page), "the long thought")
+        self.assertEqual(m.run_start(4), 2)
+        self.assertEqual(m.run_pages(2), [2, 3, 4])
+        self.assertEqual(m.run_end(2), 4)
+
+    def test_own_text_is_empty_on_a_continued_page(self):
+        """What export, share and the page marks read — a run prints ONCE."""
+        m = self._run()
+        self.assertEqual(m.own_text(2), "the long thought")
+        self.assertEqual(m.own_text(3), "")
+        self.assertEqual(m.own_text(4), "")
+
+    def test_writing_on_a_continued_page_writes_to_the_run_start(self):
+        m = self._run()
+        m.set(4, "edited from the last page")
+        self.assertEqual(m.own_text(2), "edited from the last page")
+        self.assertEqual(m.own_text(4), "")
+        self.assertEqual(m.get(3), "edited from the last page")
+
+    def test_linking_a_page_keeps_the_text_it_already_had(self):
+        """A link must never silently eat what someone already wrote."""
+        m = NotesModel()
+        m.set(0, "start")
+        m.set(1, "continuation")
+        self.assertTrue(m.link(1))
+        self.assertEqual(m.own_text(0), "start\n\ncontinuation")
+        self.assertEqual(m.own_text(1), "")
+
+    def test_unlink_leaves_the_text_with_the_run_start(self):
+        m = self._run()
+        m.unlink(3)
+        self.assertEqual(m.own_text(2), "the long thought")
+        self.assertEqual(m.get(3), "")
+        self.assertEqual(m.get(4), "")     # 4 still continues 3, now empty
+        self.assertEqual(m.run_start(4), 3)
+
+    def test_page_zero_can_never_be_linked(self):
+        m = NotesModel()
+        self.assertFalse(m.link(0))
+        m.set_links({0, 1})
+        self.assertEqual(m.links(), {1})
+
+    def test_sidecar_roundtrip_keeps_the_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "n.md")
+            self._run().save(path)
+            raw = open(path).read()
+            self.assertIn("<!-- page:3 continued -->", raw)
+            self.assertIn("<!-- page:4 continued -->", raw)
+            back = NotesModel()
+            back.load(path)
+            self.assertEqual(back.links(), {3, 4})
+            self.assertEqual(back.get(4), "the long thought")
+            self.assertEqual(back.own_text(3), "")
+
+    def test_a_hand_edited_body_under_a_link_is_folded_into_the_run(self):
+        """A sidecar edited outside Sidemark can give a continued page a body;
+        keeping it would hide it behind the run's text forever."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "n.md")
+            with open(path, "w") as f:
+                f.write("<!-- page:0 -->\n\nhead\n\n"
+                        "<!-- page:1 continued -->\n\nstray\n")
+            m = NotesModel()
+            m.load(path)
+            self.assertEqual(m.own_text(1), "")
+            self.assertEqual(m.get(1), "head\n\nstray")
+
+    def test_a_link_alone_is_worth_a_sidecar(self):
+        """has_content drives lazy file creation; losing a bare flag would
+        silently re-split a run on the next open."""
+        m = NotesModel()
+        m.set_links({1})
+        self.assertTrue(m.has_content())
+
+    def test_insert_cuts_the_run_at_the_gap(self):
+        m = self._run()
+        m.shift_for_insert(3)            # a blank page lands mid-run
+        self.assertEqual(m.own_text(2), "the long thought")
+        self.assertEqual(m.get(3), "")   # the inserted page
+        self.assertEqual(m.get(4), "")   # the tail is cut loose, not reaching back
+        self.assertEqual(m.links(), {5})
+
+    def test_deleting_a_run_start_hands_the_body_on(self):
+        """The trap: dropping the deleted page's note would vaporise the whole
+        run's text, not one page's."""
+        m = self._run()
+        m.shift_for_delete(2)
+        self.assertEqual(m.own_text(2), "the long thought")   # was page 3
+        self.assertEqual(m.links(), {3})
+        self.assertEqual(m.get(3), "the long thought")
+
+    def test_deleting_a_middle_page_keeps_the_run(self):
+        m = self._run()
+        m.shift_for_delete(3)
+        self.assertEqual(m.links(), {3})
+        self.assertEqual(m.get(3), "the long thought")
+
+    def test_a_run_moved_as_a_block_survives_reorder(self):
+        m = self._run()
+        # pages 2,3,4 move to the front, keeping their order
+        m.reorder({2: 0, 3: 1, 4: 2, 0: 3, 1: 4})
+        self.assertEqual(m.links(), {1, 2})
+        self.assertEqual(m.get(2), "the long thought")
+
+    def test_merge_import_carries_a_run_into_its_chapter(self):
+        """A chapter lands contiguously, so a run inside a source survives the
+        page offset — and can never reach back into the chapter before it."""
+        with tempfile.TemporaryDirectory() as d:
+            a, b = os.path.join(d, "a.pdf"), os.path.join(d, "b.pdf")
+            make_pdf(a, n_pages=2)
+            make_pdf(b, n_pages=3)
+            m = NotesModel()
+            m.set(0, "b's shared thought")
+            m.set_links({1, 2})
+            m.save(notes_path_for(b))
+            dest = os.path.join(d, "merged.pdf")
+            result = sidemark.merge_documents(
+                [sidemark.MergeSource(a), sidemark.MergeSource(b)], dest)
+            self.assertEqual(result.linked, {3, 4})   # b starts at page 2
+            merged = NotesModel()
+            merged.load(notes_path_for(dest))
+            self.assertEqual(merged.links(), {3, 4})
+            self.assertEqual(merged.get(4), "b's shared thought")
+            self.assertEqual(merged.own_text(2), "b's shared thought")
+
+    def test_a_torn_run_degrades_to_unlinked_pages(self):
+        m = self._run()
+        m.reorder({2: 0, 3: 5, 4: 6})   # the start is pulled away from its tail
+        self.assertEqual(m.links(), {6})     # 5→6 is still adjacent, 0→5 is not
+        self.assertEqual(m.get(5), "")       # no text silently follows the tear
+        self.assertEqual(m.own_text(0), "the long thought")
+
+
+class TestLinkedNotesInWindow(unittest.TestCase):
+    """The verbs and the strip, driven through a real window."""
+
+    def _run_in_window(self, pdf_pages, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.linkednotes")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "deck.pdf")
+                    make_pdf(pdf, n_pages=pdf_pages)
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    @staticmethod
+    def _write_note(win, text):
+        """Type into the live buffer, not the model: turning the page commits
+        whatever the buffer holds, so a model-only note would be clobbered."""
+        win._notes_view.get_buffer().set_text(text)
+        win._commit_note()
+
+    def test_linking_shows_the_previous_page_text_and_both_ends_of_the_run(self):
+        def body(win):
+            self._write_note(win, "a thought that keeps going")
+            win._go_to_page(1)
+            win._link_notes_to_previous()
+            self.assertEqual(win._notes_view.get_source_text(),
+                             "a thought that keeps going")
+            # the checkbox is the page's boolean, ticked and naming its page
+            self.assertTrue(win._notes_link_check.get_visible())
+            self.assertTrue(win._notes_link_check.get_active())
+            self.assertEqual(win._notes_link_check.get_label(),
+                             "Continue from page 1")
+            # and the run's first page says the notes carry on
+            win._go_to_page(0)
+            self.assertFalse(win._notes_link_check.get_visible())  # page 0
+            self.assertTrue(win._notes_link_hint.get_visible())
+            self.assertIn("continues on page 2", win._notes_link_hint.get_label())
+
+        self._run_in_window(3, body)
+
+    def test_the_checkbox_links_and_unlinks(self):
+        """Ticking it is the whole verb — and the box must not fight the
+        programmatic set that follows every page turn."""
+        def body(win):
+            self._write_note(win, "shared")
+            win._go_to_page(1)
+            win._notes_link_check.set_active(True)
+            self.assertEqual(win.notes_model.links(), {1})
+            self.assertEqual(win._notes_view.get_source_text(), "shared")
+            win._notes_link_check.set_active(False)
+            self.assertEqual(win.notes_model.links(), set())
+            self.assertEqual(win._notes_view.get_source_text(), "")
+            # turning the page re-ticks it without re-running the verb
+            win._notes_link_check.set_active(True)
+            win._go_to_page(0)
+            win._go_to_page(1)
+            self.assertTrue(win._notes_link_check.get_active())
+            self.assertEqual(win.notes_model.links(), {1})
+
+        self._run_in_window(3, body)
+
+    def test_typing_on_a_continued_page_edits_the_run(self):
+        def body(win):
+            self._write_note(win, "start")
+            win._go_to_page(1)
+            win._link_notes_to_previous()
+            win._notes_view.get_buffer().set_text("start and more")
+            win._commit_note()
+            self.assertEqual(win.notes_model.own_text(0), "start and more")
+            self.assertEqual(win.notes_model.own_text(1), "")
+
+        self._run_in_window(3, body)
+
+    def test_turning_the_page_inside_a_run_keeps_the_caret(self):
+        """A run must feel like one page of notes: re-setting identical text
+        would throw the caret to offset 0 mid-sentence."""
+        def body(win):
+            self._write_note(win, "a long shared thought")
+            win._go_to_page(1)
+            win._link_notes_to_previous()
+            buf = win._notes_view.get_buffer()
+            buf.place_cursor(buf.get_iter_at_offset(7))
+            win._go_to_page(0)
+            self.assertEqual(
+                buf.get_iter_at_mark(buf.get_insert()).get_offset(), 7)
+
+        self._run_in_window(3, body)
+
+    def test_unlink_leaves_the_page_empty_and_says_where_the_text_went(self):
+        def body(win):
+            self._write_note(win, "shared")
+            win._go_to_page(1)
+            win._link_notes_to_previous()
+            win._unlink_notes_from_previous()
+            self.assertEqual(win._notes_view.get_source_text(), "")
+            self.assertEqual(win.notes_model.own_text(0), "shared")
+            self.assertFalse(win._notes_link_check.get_active())
+            # the toast's Undo re-links, with nothing lost either way
+            win._relink_notes(1)
+            self.assertEqual(win._notes_view.get_source_text(), "shared")
+
+        self._run_in_window(3, body)
+
+    def test_a_run_survives_save_and_reopen(self):
+        def body(win):
+            self._write_note(win, "written once")
+            win._go_to_page(1)
+            win._link_notes_to_previous()
+            win._on_save(None)
+            path = win._path
+            win._do_open_file(path)
+            self.assertEqual(win.notes_model.links(), {1})
+            self.assertEqual(win.notes_model.get(1), "written once")
+
+        self._run_in_window(3, body)
+
+    def test_linking_is_pdf_only(self):
+        """A text-first page has no page-to-page structure to continue — the
+        one feature that is genuinely one-sided (see the parity rule)."""
+        def body(win):
+            win._on_new_text_page()
+            self.assertFalse(win._can_link_notes())
+            win._link_notes_to_previous()          # must be a no-op, not a crash
+            self.assertEqual(win.notes_model.links(), set())
+
+        self._run_in_window(3, body)
+
+
+class TestLinkedNotesExport(unittest.TestCase):
+    def test_a_run_prints_once_not_once_per_page(self):
+        """`_export_pdf_with_notes` must read own_text: a resolving get() would
+        repeat the same paragraph on every slide of the run."""
+        with tempfile.TemporaryDirectory() as d:
+            src, out = os.path.join(d, "s.pdf"), os.path.join(d, "o.pdf")
+            make_pdf(src, n_pages=3)
+            m = NotesModel()
+            m.set(0, "the shared thought")
+            m.set_links({1, 2})
+            sidemark._export_pdf_with_notes(src, out, m, include_empty=False,
+                                            accent=(0.2, 0.4, 0.9))
+            doc = fitz.open(out)
+            try:
+                hits = sum("the shared thought" in doc[i].get_text()
+                           for i in range(len(doc)))
+            finally:
+                doc.close()
+            self.assertEqual(hits, 1)
+
+
 # ── view adjustment on canvas resize (sidebar toggle, window resize) ─────────
 
 class TestViewResize(unittest.TestCase):
@@ -12004,10 +12320,11 @@ class TestMergeImport(unittest.TestCase):
         """NotesModel.load() maps a marker-less file onto page 0. Merging must
         be able to SEE that fallback, or a hand-written note lands on one page
         of a chapter as if it had been written there."""
-        sections, had = sidemark.parse_note_sections("just some prose\n")
-        self.assertEqual((sections, had), ({0: "just some prose"}, False))
-        sections, had = sidemark.parse_note_sections("<!-- page:4 -->\n\nx\n")
-        self.assertEqual((sections, had), ({4: "x"}, True))
+        parsed = sidemark.parse_note_sections("just some prose\n")
+        self.assertEqual((parsed.sections, parsed.had_markers),
+                         ({0: "just some prose"}, False))
+        parsed = sidemark.parse_note_sections("<!-- page:4 -->\n\nx\n")
+        self.assertEqual((parsed.sections, parsed.had_markers), ({4: "x"}, True))
 
     def test_a_notes_file_is_claimed_by_its_document_and_reported_otherwise(self):
         with tempfile.TemporaryDirectory() as d:

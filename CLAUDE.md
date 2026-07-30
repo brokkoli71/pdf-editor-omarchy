@@ -92,6 +92,21 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   (`_MD_LINK_RE`, negative lookbehind so the `![[embed]]` line is left alone).
   When extending linking, keep link targets un-mangled and test both same-doc
   and cross-doc forms.
+- **Linked page notes (row 129)** — a page can CONTINUE the one before it, and
+  a run of linked pages shares ONE body stored once on the run's first page
+  (`NotesModel._links`, `run_start`/`run_pages`/`run_end`; the sidecar marker
+  is `<!-- page:13 continued -->` with an empty body, the one case where an
+  empty page is still written out). **The trap is which text you ask for**:
+  `get(idx)` RESOLVES through the run — for the human looking at that page —
+  while `own_text(idx)` is what the page stores and is `""` on a continued
+  page. Everything that walks all pages (export, share render, page marks,
+  search) must read `own_text`, or a run prints on every slide instead of
+  once. `set(idx)` writes to the run start, so undo, the merge import and the
+  drag-export need no special casing. Re-keying degrades to UNLINKED rather
+  than re-linking two unrelated slides; the load-bearing one is
+  `shift_for_delete`, where deleting a run's START hands the body to the next
+  page in the run instead of dropping the whole run's text. PDF-only, and the
+  UI is one checkbox in the notes header (`_update_notes_link_ui`).
 - Single-instance app (`Gio.Application`, `HANDLES_COMMAND_LINE`): a second
   launch forwards its argv to the primary, which opens the file as a tab in the
   last-used window (`_open_target`/`open_file_in_tab`). For manual testing
@@ -128,16 +143,23 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   property always, scroll only when the sheet actually laid out). The tell is
   a test that passes alone, fails only in a full run, and dies at a geometry
   precondition rather than at what it means to assert.
-- For visual verification, launch the app (standalone env var above) and
-  screenshot with `grim` (Hyprland); focus the window first via
-  `hyprctl dispatch focuswindow address:...`. Don't leave repeated windows
-  popping up on the user's screen, and don't close them with `hyprctl dispatch
-  closewindow` — it can raise an unsaved-changes dialog you then cannot dismiss.
+- **Whether it LOOKS right is the user's call, not yours.** Don't screenshot
+  the app to judge a layout, spacing or a new widget — build it, then hand over
+  a short numbered checklist and let them look. Agent screenshots are for
+  answering a *factual* question that has a yes/no answer ("does the strip
+  appear at all?", "is the ghost line gone?"), never for taste. Set up the
+  state the user needs to see (seed a file/sidecar so the thing is on screen
+  the moment the app opens) instead of asking them to reproduce it.
+  When you do launch: standalone env var above, focus via
+  `hyprctl dispatch focuswindow address:...`, screenshot with `grim`
+  (Hyprland). Don't leave repeated windows popping up on the user's screen, and
+  don't close them with `hyprctl dispatch closewindow` — it can raise an
+  unsaved-changes dialog you then cannot dismiss. Kill only the process you
+  started yourself; other Sidemark instances on screen may be theirs.
 - **There is no key-injection tool on this machine** (no `wtype`/`ydotool`), so
   an agent cannot drive gestures, Ctrl+Z or Ctrl+V. Script what you can against
-  the model, prefer setups where the bug shows up in a plain screenshot, and
-  hand the user a short numbered checklist for the rest. Anything gesture- or
-  undo-shaped is **not verified** until they run it.
+  the model, and hand the user a short numbered checklist for the rest.
+  Anything gesture- or undo-shaped is **not verified** until they run it.
 
 ## Feature acceptance checklist (every feature)
 
@@ -176,7 +198,9 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   the user, and a feature missing on one side reads as a bug, not a scope call.
   This generalises the image contract and the chord grammar below; it is not
   their private rule. Walk a new feature through both before calling it done,
-  and if one side genuinely can't have it, say so loudly in `ideas.csv`.
+  and if one side genuinely can't have it, say so loudly in `ideas.csv`. There
+  is exactly ONE stated exception today: linked page notes (row 129), because a
+  text-first page has no page-to-page structure to continue.
 - **Event reachability — a correct handler can still never run.** When a
   gesture "does nothing", test the PATH, not the handler (all of these tested
   fine in isolation while being unreachable in the app):
@@ -483,11 +507,6 @@ than writing a line about having finished it. The chronology lives in
 
 **Loose ends, roughly in order of how ready they are:**
 
-- **Row 129 (notes continued across pages)** — "link to previous page" /
-  "unlink", one boolean per page, no general linking graph (the user's scope
-  call). A linked run shares one note body; a split leaves the text with the
-  first page of the run. PDF-only by nature. The work is the re-keying: every
-  path in row 123 that re-pages notes must carry the flag.
 - **Row 130 (gestures between the modes)** — drag the notes panel to full
   width → text-first; drag in from the left edge → a blank PDF beside the text.
   Settle first whether it is a view state or a real file conversion (ink lives
