@@ -879,6 +879,204 @@ def _merge_selection(base, strokes, images):
             list(base_i) + [i for i in images if id(i) not in seen_i])
 
 
+# ── the tools, and which document modes have them ────────────────────────────
+# ONE table: the toolbar order, the _MODE_CHROME rows for the tool buttons and
+# the binding resolver all read it, so a tool cannot exist in the bar and be
+# missing from the grammar (or the reverse).
+#
+# "text" is the caret tool — selecting text on a PDF page and placing the caret
+# on a text page are the same tool wearing one I-beam button. "select" is its
+# old id, still accepted everywhere a tool is named (settings, saved chords).
+
+TOOL_BAR_ORDER = ("pen", "highlighter", "eraser", "lasso", "text",
+                  "pan", "zoom", "anchor")
+TOOL_MODES = {
+    "pen":         ("pdf", "text"),
+    "highlighter": ("pdf", "text"),
+    "eraser":      ("pdf", "text"),
+    "lasso":       ("pdf", "text"),
+    "text":        ("pdf", "text"),
+    # pan and zoom-to-region both get a toolbar tool in BOTH modes — the
+    # modifier-free twins of their Ctrl/middle-drag and Shift+drag gestures,
+    # so the text bar reads the same as the PDF bar.
+    "pan":         ("pdf", "text"),
+    "zoom":        ("pdf", "text"),
+    "anchor":      ("pdf",),        # the one genuinely PDF-only tool
+}
+TOOL_WIDGET = {"pen": "_mode_pen", "highlighter": "_mode_hl",
+               "eraser": "_mode_eraser", "lasso": "_mode_lasso",
+               "text": "_mode_text", "pan": "_mode_pan",
+               "zoom": "_mode_zoom", "anchor": "_mode_anchor"}
+TOOL_ALIASES = {"select": "text"}
+TOOL_INDEX = {t: i for i, t in enumerate(TOOL_BAR_ORDER)}
+TOOL_INDEX["select"] = TOOL_INDEX["text"]
+TOOL_LABELS = {"pen": "Pen", "highlighter": "Highlighter", "eraser": "Eraser",
+               "lasso": "Lasso", "text": "Text cursor", "pan": "Pan",
+               "zoom": "Zoom to region", "anchor": "Anchor / callout"}
+
+
+def canonical_tool(tool):
+    """The tool's real id — folds the "select" alias onto "text"."""
+    return TOOL_ALIASES.get(tool, tool)
+
+
+def tool_in_mode(tool, mode):
+    """Is this tool available in this document mode?"""
+    return mode in TOOL_MODES.get(canonical_tool(tool), ())
+
+
+# ── button bindings: THE table (row 132) ─────────────────────────────────────
+# There is no "active tool" any more. Every mouse button, alone or under
+# modifiers, HAS a tool, and pressing that button uses it — left draws, right
+# erases, middle pans, and that is true at the same time. Clicking a tool in
+# the toolbar with a mouse button binds the tool to THAT button.
+#
+# One table for both document modes: a chord means the same thing everywhere,
+# and where a mode lacks the tool (anchor on a text page) the chord is simply
+# absent. Everything that routes a press, paints a badge or writes a tooltip
+# reads this table — a second mapping is how the two sides drift apart.
+#
+# The thumb button ships UNBOUND on purpose: most mice do not have one, and a
+# tool nobody can reach is worse than an empty slot. Assign it if you have it.
+
+BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_THUMB = 1, 2, 3, 10
+BUTTON_NAMES = {BTN_LEFT: "left", BTN_MIDDLE: "middle",
+                BTN_RIGHT: "right", BTN_THUMB: "thumb"}
+BUTTON_LABELS = {"left": "Left", "middle": "Middle", "right": "Right",
+                 "thumb": "Thumb"}
+# order matters: it is the order modifiers are written in a chord id, so one
+# chord has exactly one spelling and settings.json stays diffable
+MOD_ORDER = ("ctrl", "shift", "alt")
+
+DEFAULT_BINDINGS = {
+    "left": "pen",
+    "ctrl+left": "pan",
+    "shift+left": "zoom",
+    "shift+alt+left": "zoom",       # the chord that also works under a caret
+    "ctrl+shift+left": "highlighter",
+    "ctrl+alt+left": "anchor",
+    "ctrl+shift+alt+left": "lasso",
+    "right": "eraser",
+    "middle": "pan",
+    "shift+middle": "zoom",
+}
+
+
+def chord_id(button, ctrl=False, shift=False, alt=False):
+    """The canonical id of a button+modifier chord, e.g. `ctrl+shift+left`."""
+    name = BUTTON_NAMES.get(button, str(button))
+    mods = [m for m, on in zip(MOD_ORDER, (ctrl, shift, alt)) if on]
+    return "+".join(mods + [name])
+
+
+def chord_label(chord):
+    """A chord id as a human reads it: `ctrl+shift+left` → `Ctrl+Shift+left`."""
+    parts = chord.split("+")
+    return "+".join([p.capitalize() for p in parts[:-1]] + [parts[-1]])
+
+
+class _SyntheticDrag:
+    """A GestureDrag stand-in for the thumb button.
+
+    Button 10 never reaches a GestureDrag — only EventControllerLegacy reports
+    it reliably (extras/probe_thumb.py) — so the thumb used to be hardwired to
+    pan/zoom. Feeding this object to the ordinary press router instead makes the
+    thumb a first-class button: whatever you bind to it is what it does."""
+
+    def __init__(self, x, y, button):
+        self._start = (x, y)
+        self._button = button
+
+    def get_start_point(self):
+        return (True, self._start[0], self._start[1])
+
+    def get_current_button(self):
+        return self._button
+
+    def get_current_event_state(self):
+        return Gdk.ModifierType(0)
+
+
+class Bindings:
+    """The mutable button table, persisted in settings.json under
+    `button_bindings`. Unknown tools are dropped on load rather than kept —
+    a binding nothing can execute would silently swallow the press."""
+
+    def __init__(self, table=None):
+        self._table = dict(DEFAULT_BINDINGS if table is None else table)
+
+    # ── reading ──────────────────────────────────────────────────────────────
+
+    def tool_for(self, button, ctrl=False, shift=False, alt=False, mode="pdf"):
+        """The tool this chord runs in this document mode, or None."""
+        tool = self._table.get(chord_id(button, ctrl, shift, alt))
+        if tool is None:
+            return None
+        tool = canonical_tool(tool)
+        return tool if tool_in_mode(tool, mode) else None
+
+    def chords_for(self, tool, mode=None):
+        """Every chord bound to a tool, in a stable order (plain buttons before
+        modified ones) — this is what the tooltips and the badges are built
+        from, so they can never disagree with what the mouse does."""
+        tool = canonical_tool(tool)
+        found = [c for c, t in self._table.items() if canonical_tool(t) == tool]
+        if mode is not None and not tool_in_mode(tool, mode):
+            return []
+        return sorted(found, key=lambda c: (c.count("+"), c))
+
+    def plain_buttons_for(self, tool):
+        """The UNMODIFIED buttons a tool owns — the ones that earn a badge.
+        Modified chords deliberately get none, or every button in the bar
+        wears a constellation; they live in the tooltip instead."""
+        return [c for c in self.chords_for(tool) if "+" not in c]
+
+    def items(self):
+        """(chord, tool) pairs, plain buttons first — the popover's list."""
+        return [(c, self._table[c])
+                for c in sorted(self._table, key=lambda c: (c.count("+"), c))]
+
+    # ── writing ──────────────────────────────────────────────────────────────
+
+    def bind(self, chord, tool):
+        """Bind a chord, returning the tool it took it from (None if free).
+        A chord maps to exactly ONE tool, so binding MOVES it — that is what
+        the toast reports, and why there is no silent double-binding."""
+        tool = canonical_tool(tool)
+        previous = self._table.get(chord)
+        self._table[chord] = tool
+        return canonical_tool(previous) if previous else None
+
+    def clear(self, chord):
+        return self._table.pop(chord, None)
+
+    def reset(self):
+        self._table = dict(DEFAULT_BINDINGS)
+
+    # ── persistence ──────────────────────────────────────────────────────────
+
+    def to_json(self):
+        return dict(self._table)
+
+    @classmethod
+    def from_json(cls, data):
+        if not isinstance(data, dict):
+            return cls()
+        table = {}
+        for chord, tool in data.items():
+            tool = canonical_tool(tool) if isinstance(tool, str) else None
+            if tool in TOOL_MODES and isinstance(chord, str):
+                table[chord] = tool
+        return cls(table)
+
+    @classmethod
+    def load(cls):
+        return cls.from_json(_load_settings().get("button_bindings"))
+
+    def save(self):
+        _save_setting("button_bindings", self.to_json())
+
+
 def chord_tool(ctrl, shift, alt, mode, ink_active=True):
     """THE modifier-chord grammar: which tool a held (Ctrl, Shift, Alt) set
     stands in for. One table for both document modes so a chord never means
@@ -910,7 +1108,7 @@ def chord_tool(ctrl, shift, alt, mode, ink_active=True):
         # Alt flips ink<->text: it escapes to the OTHER mode's home tool
         # (PDF's home tool is the pen, so Alt selects text; a text page's
         # home tool is the caret, so Alt draws — Alt+right erases in both).
-        return "select" if mode == "pdf" else "pen"
+        return "text" if mode == "pdf" else "pen"
     if shift:
         return "zoom" if (mode == "pdf" or ink_active) else None
     return None
@@ -1210,7 +1408,6 @@ class PDFCanvas(Gtk.DrawingArea):
         self._snap_label = None
         self._snap_at = (0.0, 0.0)   # PDF-unit anchor for that glyph
         # highlighter mode: wide translucent strokes (PDF CA key via annot.set_opacity)
-        self.highlighter = False
         self.hl_color = (1.0, 0.85, 0.0)
         self.hl_width = 12.0
         self.hl_opacity = 0.40
@@ -1380,19 +1577,17 @@ class PDFCanvas(Gtk.DrawingArea):
         self._post_pinch_anchor = None
         self._post_pinch_base = (0.0, 0.0)
 
-        self._thumb_panning = False
-        self._thumb_zooming = False    # Shift+thumb: zoom-to-region in flight
-        self._thumb_origin = (0.0, 0.0)
-        self._thumb_start_offset = (0.0, 0.0)
+        self._thumb_gesture = None     # a thumb-button press in flight
 
-        # active tool: one of pen / highlighter / select / pan / zoom / anchor.
-        # The tool decides what a *plain* (unmodified) drag does; the modifier
-        # gestures (Ctrl/Alt/Shift/Ctrl+Alt) always work regardless, and the
-        # selected tool is just the modifier-free shortcut for the same actions.
-        # ``highlighter`` and ``select_mode`` are kept in sync as the pen-attr /
-        # text-select flags the rest of the canvas already reads.
-        self.tool = "pen"
-        self.select_mode = False
+        # There is no single "active tool" — every mouse button has one (row
+        # 132). `bindings` is THE table and the window shares one instance
+        # across every canvas, so a rebinding is instantly true everywhere.
+        # `tool` below is the LEFT button's tool while nothing is pressed, and
+        # the pressed button's tool during a gesture, which is what the rest of
+        # the canvas (cursor, pen attrs, straight-snap) means when it asks.
+        self.bindings = Bindings()
+        self._press_tool = None       # the tool of the press in flight
+        self._borrowed_tool = None    # hold-to-borrow keyboard shortcut
         # set for the duration of a Ctrl+Shift+drag: a one-off highlighter stroke
         self._temp_highlighter = False
         # transient tool implied by the modifiers currently held down — surfaced
@@ -1581,6 +1776,53 @@ class PDFCanvas(Gtk.DrawingArea):
     @property
     def images(self):
         return self.all_images.setdefault(self.current_page_idx, [])
+
+    # ── which tool is "the" tool right now (row 132) ─────────────────────────
+    # Everything downstream of a press — pen attrs, the cursor, the snap timer —
+    # asks `self.tool`. During a gesture that is the tool of the button being
+    # held; the rest of the time it is what LEFT would do, which is what the
+    # cursor should promise. Assigning to it binds the left button, so older
+    # code and tests that say `canvas.tool = "lasso"` still mean what they meant.
+
+    @property
+    def tool(self):
+        if self._press_tool is not None:
+            return self._press_tool
+        if self._borrowed_tool is not None:
+            return self._borrowed_tool
+        return self.bindings.tool_for(BTN_LEFT, mode=self.doc_mode) or "pen"
+
+    @tool.setter
+    def tool(self, value):
+        self.bindings.bind("left", value)
+
+    @property
+    def doc_mode(self):
+        return "pdf"
+
+    @property
+    def highlighter(self):
+        return self.tool == "highlighter"
+
+    @highlighter.setter
+    def highlighter(self, on):
+        # kept so the pen popover can flip the left button to the highlighter
+        # and back without knowing about the table
+        if on:
+            self.bindings.bind("left", "highlighter")
+        elif self.tool == "highlighter":
+            self.bindings.bind("left", "pen")
+
+    @property
+    def select_mode(self):
+        return self.tool == "text"
+
+    @select_mode.setter
+    def select_mode(self, on):
+        if on:
+            self.bindings.bind("left", "text")
+        elif self.tool == "text":
+            self.bindings.bind("left", "pen")
 
     def _pen_attrs(self):
         """(color, width, opacity) of the active drawing tool. ``_temp_highlighter``
@@ -2391,46 +2633,32 @@ class PDFCanvas(Gtk.DrawingArea):
         if event is None:
             return False
         t = event.get_event_type()
-        if t == Gdk.EventType.BUTTON_PRESS and event.get_button() == 10:
-            # the thumb button mirrors the middle (navigation) button, as the
-            # more ergonomic reach: hold to pan, Shift+hold to zoom-to-region
-            # (scroll-while-held zooms — see _on_scroll)
-            if (self._shift_held
-                    or event.get_modifier_state() & Gdk.ModifierType.SHIFT_MASK):
-                logger.debug("thumb zoom-region start")
-                self._thumb_zooming = True
-                self._zoom_selecting = True
-                self._zoom_start = (self._mouse_x, self._mouse_y)
-                self._zoom_end = (self._mouse_x, self._mouse_y)
-                self._fire_gesture_tool("zoom")
-                self.queue_draw()
-                return False
-            logger.debug(f"thumb pan start ({self._mouse_x:.0f},{self._mouse_y:.0f})")
-            self._thumb_panning = True
-            self._is_fitted = False
-            self._thumb_origin = (self._mouse_x, self._mouse_y)
-            self._thumb_start_offset = (self.offset_x, self.offset_y)
-            self._fire_gesture_tool("pan")
-        elif t == Gdk.EventType.BUTTON_RELEASE and event.get_button() == 10:
-            if self._thumb_zooming:
-                logger.debug("thumb zoom-region end")
-                self._thumb_zooming = False
-                self._finish_zoom_region()
-                self._fire_gesture_tool(None)
-                return False
-            logger.debug("thumb pan end")
-            self._thumb_panning = False
-            self._fire_gesture_tool(None)
+        if t == Gdk.EventType.BUTTON_PRESS and event.get_button() == BTN_THUMB:
+            # the thumb runs whatever the table says (nothing, by default —
+            # most mice have no thumb button, and an unreachable tool is worse
+            # than an empty slot). Replayed through the one press router.
+            if event.get_modifier_state() & Gdk.ModifierType.SHIFT_MASK:
+                self._shift_held = True
+            self._thumb_gesture = _SyntheticDrag(
+                self._mouse_x, self._mouse_y, BTN_THUMB)
+            self._on_drag_begin(self._thumb_gesture, self._mouse_x, self._mouse_y)
+            if self._ignoring:
+                self._thumb_gesture = None
+            else:
+                logger.debug(f"thumb press -> {self._press_tool}")
+            self.queue_draw()
+        elif t == Gdk.EventType.BUTTON_RELEASE and event.get_button() == BTN_THUMB:
+            g, self._thumb_gesture = self._thumb_gesture, None
+            if g is not None:
+                sx, sy = g.get_start_point()[1], g.get_start_point()[2]
+                self._on_drag_end(g, self._mouse_x - sx, self._mouse_y - sy)
         return False
 
     def _on_motion(self, _ctrl, x, y):
-        if self._thumb_panning:
-            self.offset_x = self._thumb_start_offset[0] + (x - self._thumb_origin[0])
-            self.offset_y = self._thumb_start_offset[1] + (y - self._thumb_origin[1])
-            self.queue_draw()
-        elif self._thumb_zooming:
-            self._zoom_end = (x, y)
-            self.queue_draw()
+        if self._thumb_gesture is not None:
+            sx, sy = (self._thumb_gesture.get_start_point()[1],
+                      self._thumb_gesture.get_start_point()[2])
+            self._on_drag_update(self._thumb_gesture, x - sx, y - sy)
         self._mouse_x = x
         self._mouse_y = y
         self._pointer_in = True
@@ -2461,7 +2689,8 @@ class PDFCanvas(Gtk.DrawingArea):
         # and the page-flip resistance differ per source so both feel natural.
         smooth = ctrl.get_unit() == Gdk.ScrollUnit.SURFACE
         # zoom on Ctrl+scroll, or plain scroll while thumb pan mode is latched
-        if not (state & Gdk.ModifierType.CONTROL_MASK) and not self._thumb_panning:
+        if (not (state & Gdk.ModifierType.CONTROL_MASK)
+                and self._thumb_gesture is None):
             flip_threshold = (self.TOUCHPAD_FLIP_THRESHOLD if smooth
                               else self.SCROLL_FLIP_THRESHOLD)
             if self._handle_boundary_flip(dx, dy, flip_threshold):
@@ -2535,10 +2764,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self._is_fitted = False
         self.offset_x = cx - pdf_x * self.scale
         self.offset_y = cy - pdf_y * self.scale
-        if self._thumb_panning:
-            # rebase the pan origin so the next motion event doesn't jump
-            self._thumb_origin = (cx, cy)
-            self._thumb_start_offset = (self.offset_x, self.offset_y)
+        if self._thumb_gesture is not None and self._panning:
+            # rebase the pan so the next motion event doesn't jump
+            self._thumb_gesture._start = (cx, cy)
+            self._pan_start_offset = (self.offset_x, self.offset_y)
         self._schedule_rerender()
         self.queue_draw()
 
@@ -2711,7 +2940,7 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _default_cursor(self):
         """Cursor that matches the active tool while idle (no drag in flight)."""
-        name = {"select": "text", "pan": "grab", "lasso": "crosshair",
+        name = {"text": "text", "pan": "grab", "lasso": "crosshair",
                 "zoom": "crosshair", "anchor": "crosshair"}.get(self.tool)
         return Gdk.Cursor.new_from_name(name, None) if name else None
 
@@ -2750,32 +2979,19 @@ class PDFCanvas(Gtk.DrawingArea):
                 self.on_anchor_placed(self.current_page_idx, round(px), round(py))
 
     def _on_drag_begin(self, gesture, start_x, start_y):
+        """THE press router: resolve the button+modifiers through the binding
+        table (row 132) and hand the gesture to that tool. Nothing here decides
+        what a chord means — the table does, so the badge on a toolbar button,
+        its tooltip and this dispatch can never disagree."""
         self._post_pinch = False   # a fresh press starts a normal interaction
         self._dismissed_selection = False
         self._text_highlighting = False
-        if gesture.get_current_button() == 3:
-            state = self._chord_state(gesture)
-            if ((state & Gdk.ModifierType.CONTROL_MASK)
-                    and (state & Gdk.ModifierType.ALT_MASK)
-                    and not (state & Gdk.ModifierType.SHIFT_MASK)):
-                # Ctrl+Alt+right-click drops a standalone text box here (#56)
-                self._ignoring = True
-                if self.page is not None and self.on_textbox_placed:
-                    px, py = self._screen_to_pdf(start_x, start_y)
-                    self.on_textbox_placed(self.current_page_idx, round(px), round(py))
-                return
-            self._dismiss_selection_unless_lasso()
-            self._erasing = True
-            self._erase_group += 1
-            self._panning = False
-            self._text_selecting = False
-            self._zoom_selecting = False
-            self._selected_words = []
-            self._fire_gesture_tool("eraser")
-            self._erase_at(start_x, start_y)
-            return
         btn = gesture.get_current_button()
-        logger.debug(f"drag begin btn={btn}")
+        state = self._chord_state(gesture)
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        alt = bool(state & Gdk.ModifierType.ALT_MASK)
+        logger.debug(f"drag begin btn={btn} chord={chord_id(btn, ctrl, shift, alt)}")
         if btn in (8, 9):
             # Page navigation by the mouse side buttons is handled window-wide
             # (a capture-phase legacy controller), so it also works when the
@@ -2783,195 +2999,153 @@ class PDFCanvas(Gtk.DrawingArea):
             # doesn't turn the press into a stroke.
             self._ignoring = True
             return
-        if btn == 10:
-            # thumb-button pan is driven by _on_motion while held; ignore the
-            # drag gesture so it doesn't draw or pan on top of it
+        if btn == BTN_THUMB and not isinstance(gesture, _SyntheticDrag):
+            # a real button-10 press never gets here reliably; _on_thumb_event
+            # replays it through this router with a synthetic gesture, and the
+            # GestureDrag copy (if any) must not double-run it
             self._ignoring = True
             return
+        if btn == BTN_RIGHT and ctrl and alt and not shift:
+            # Ctrl+Alt+right-click drops a standalone text box here (#56). An
+            # ACTION rather than a tool, so it is deliberately not in the table.
+            self._ignoring = True
+            if self.page is not None and self.on_textbox_placed:
+                px, py = self._screen_to_pdf(start_x, start_y)
+                self.on_textbox_placed(self.current_page_idx, round(px), round(py))
+            return
+
+        tool = self.bindings.tool_for(btn, ctrl, shift, alt, mode="pdf")
+        # THE one exception, and it is not a fork of the table: with the LASSO
+        # on the plain button, Shift ADDS to the selection instead of running
+        # whatever Shift is bound to. Shift+lasso is still the lasso — Shift
+        # modifies it rather than replacing it (see CLAUDE.md).
+        plain = self.bindings.tool_for(btn, mode="pdf")
+        additive = False
+        if shift and not ctrl and not alt and plain == "lasso":
+            tool, additive = "lasso", True
+        if tool is None:
+            self._ignoring = True
+            return
+
         self._ignoring = False
         self._erasing = False
         self._temp_highlighter = False
-        if btn == 2:
-            # the middle button is the NAVIGATION button (chord grammar):
-            # plain middle-drag pans, Shift+middle-drag zooms to a region.
-            # Shift+middle is the portable zoom chord — unlike plain Shift it
-            # also works on text pages, where Shift belongs to text selection.
-            if self._chord_state(gesture) & Gdk.ModifierType.SHIFT_MASK:
-                self._zoom_selecting = True
-                self._zoom_start = (start_x, start_y)
-                self._zoom_end = (start_x, start_y)
-                self._text_selecting = False
-                self._panning = False
-                self._selected_words = []
-                self._fire_gesture_tool("zoom")
-                return
+        self._panning = False
+        self._text_selecting = False
+        self._zoom_selecting = False
+        self._selected_words = []
+        self._press_tool = tool
+        # a press that is not the plain button's own tool is a "gesture": the
+        # toolbar lights that tool up so the binding is discoverable
+        if tool != plain:
+            self._fire_gesture_tool(tool)
+        self._begin_tool(tool, start_x, start_y, chorded=(tool != plain),
+                         additive=additive)
+
+    def _begin_tool(self, tool, start_x, start_y, chorded, additive=False):
+        """Start `tool` at this point. Called only by the press router, so the
+        tool is already resolved — everything below is what that tool DOES."""
+        # A LIVE selection is grabbable with ANY tool in hand (see
+        # selection_grab_at): ahead of the tool dispatch, so a press on the
+        # selection edits it rather than drawing/erasing over it — but behind
+        # the chords, so an explicit bound pan still pans over a selection.
+        if not chorded and tool != "lasso" and self.selection_grab_at(start_x, start_y):
+            self._lasso_press(start_x, start_y)
+            return
+        if tool == "pan":
             self._panning = True
             self._is_fitted = False
             self._pan_start_offset = (self.offset_x, self.offset_y)
-            self._text_selecting = False
-            self._zoom_selecting = False
-            self._selected_words = []
-            self._fire_gesture_tool("pan")
             return
-        state = self._chord_state(gesture)
-        if ((state & Gdk.ModifierType.CONTROL_MASK)
-                and (state & Gdk.ModifierType.ALT_MASK)
-                and (state & Gdk.ModifierType.SHIFT_MASK)):
-            # Ctrl+Shift+Alt+drag: the lasso chord. Full stand-in for the tool
-            # (chord_tool grammar): a press on a handle scales, inside the
-            # selection moves, elsewhere starts a fresh loop.
-            self._panning = False
-            self._text_selecting = False
-            self._zoom_selecting = False
-            self._selected_words = []
-            self._lasso_press(start_x, start_y)
+        if tool == "zoom":
+            self._zoom_selecting = True
+            self._zoom_start = (start_x, start_y)
+            self._zoom_end = (start_x, start_y)
             return
-        if (state & Gdk.ModifierType.CONTROL_MASK) and (state & Gdk.ModifierType.ALT_MASK):
-            # anchor already placed at press by GestureClick; dragging on
-            # places a callout box at the release point
+        if tool == "anchor":
+            # the anchor itself is dropped at press by _on_click_pressed;
+            # dragging on places a callout box at the release point
             self._callout_dragging = True
             self._callout_start = (start_x, start_y)
             self._callout_cur = None
             return
-        if (state & Gdk.ModifierType.CONTROL_MASK) and (state & Gdk.ModifierType.SHIFT_MASK):
-            # Ctrl+Shift+drag: a one-off highlighter stroke regardless of the
-            # sticky tool (mirrors the Ctrl+H highlighter toggle as a gesture)
+        if tool == "eraser":
+            self._dismiss_selection_unless_lasso()
+            self._erasing = True
+            self._erase_group += 1
+            self._erase_at(start_x, start_y)
+            return
+        if tool == "lasso":
+            # a press on a handle scales, inside the selection moves,
+            # elsewhere starts a fresh loop
+            self._lasso_press(start_x, start_y, additive=additive)
+            return
+        if tool == "text" and chorded:
+            self._text_selecting = True
+            self._alt_start = (start_x, start_y)
+            self.grab_focus()
+            return
+        if tool == "highlighter" and chorded:
+            # a one-off highlighter stroke that ignores the sticky style
             self._temp_highlighter = True
             self._dismiss_selection_unless_lasso()
-            self._panning = False
-            self._text_selecting = False
-            self._zoom_selecting = False
-            self._selected_words = []
             self._cancel_straight_timer()
             self._straight_mode = False
             self._snap_kind = self._snap_label = None
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
             return
-        if state & Gdk.ModifierType.CONTROL_MASK:
-            self._panning = True
-            self._is_fitted = False
-            self._pan_start_offset = (self.offset_x, self.offset_y)
-            self._text_selecting = False
-            self._zoom_selecting = False
-            self._selected_words = []
-        elif (state & Gdk.ModifierType.ALT_MASK
-                and not state & Gdk.ModifierType.SHIFT_MASK):
+
+        # ── the plain press of a drawing / selecting tool ────────────────────
+        self._dismiss_selection_unless_lasso()
+        hit = self._anchor_hit_test(start_x, start_y)
+        if hit is not None:
+            # begin dragging the anchor; a release with no real movement is
+            # treated as a click that jumps the notes cursor (see drag-end)
+            self._anchor_dragging = hit
+            self._anchor_drag_moved = False
+            self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
+            return
+        chit = self._callout_hit_test(start_x, start_y)
+        if chit is not None:
+            # begin dragging a callout box; keep the grab point fixed within
+            # the box so it doesn't jump to the cursor
+            self._callout_moving = chit
+            self._callout_move_moved = False
+            cpx, cpy = self._anchors[self.current_page_idx][chit]["callout"]
+            px, py = self._screen_to_pdf(start_x, start_y)
+            self._callout_move_offset = (cpx - px, cpy - py)
+            self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
+            return
+        thit = self._textbox_hit_test(start_x, start_y)
+        if thit is not None:
+            # begin dragging a standalone text box (same feel as callouts)
+            self._textbox_moving = thit
+            self._textbox_move_moved = False
+            t = self._textboxes[self.current_page_idx][thit]
+            px, py = self._screen_to_pdf(start_x, start_y)
+            self._textbox_move_offset = (t["x"] - px, t["y"] - py)
+            self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
+            return
+        if self.select_mode:
+            # plain drag selects text instead of drawing
             self._text_selecting = True
             self._alt_start = (start_x, start_y)
-            self._selected_words = []
-            self._panning = False
-            self._zoom_selecting = False
             self.grab_focus()
-        elif state & Gdk.ModifierType.SHIFT_MASK and self.tool != "lasso":
-            # Shift, or Alt+Shift — the portable keyboard zoom chord, which
-            # means zoom in BOTH modes (chord_tool), so it does the same here
-            # as it does under the text caret.
-            #
-            # …except with the LASSO in hand, where Shift adds to the selection
-            # (the universal convention, and the whole point of a lasso is
-            # building a selection up). This does not fork chord_tool: that
-            # table answers "which TOOL does this chord stand in for", and
-            # Shift+lasso is still the lasso — Shift modifies it, it does not
-            # replace it. Nothing is lost, because Alt+Shift+drag remains THE
-            # portable zoom chord in both modes, which is exactly why the
-            # grammar says Shift-alone must never be load-bearing.
-            self._zoom_selecting = True
-            self._zoom_start = (start_x, start_y)
-            self._zoom_end = (start_x, start_y)
-            self._text_selecting = False
-            self._panning = False
+            return
+        if self.highlighter and self.highlight_style == "text":
+            # highlighter "text" style: drag selects words (reading order)
+            # and commits highlight ink over them on release
+            self._text_selecting = True
+            self._text_highlighting = True
+            self._alt_start = (start_x, start_y)
             self._selected_words = []
-        else:
-            self._zoom_selecting = False
-            self._text_selecting = False
-            self._panning = False
-            self._selected_words = []
-            # A LIVE selection is grabbable with any tool in hand — see
-            # selection_grab_at(). Ahead of the tool dispatch (a press on the
-            # selection edits it rather than drawing), behind the chords (an
-            # explicit Ctrl+drag still pans over a selection).
-            if self.selection_grab_at(start_x, start_y):
-                self._lasso_press(start_x, start_y)
-                return
-            self._dismiss_selection_unless_lasso()
-            # the active tool is the modifier-free shortcut for a gesture: pan
-            # mirrors Ctrl, zoom mirrors Shift, anchor mirrors Ctrl+Alt (the
-            # anchor itself is dropped at press by _on_click_pressed).
-            if self.tool == "pan":
-                self._panning = True
-                self._is_fitted = False
-                self._pan_start_offset = (self.offset_x, self.offset_y)
-                return
-            if self.tool == "zoom":
-                self._zoom_selecting = True
-                self._zoom_start = (start_x, start_y)
-                self._zoom_end = (start_x, start_y)
-                return
-            if self.tool == "anchor":
-                self._callout_dragging = True
-                self._callout_start = (start_x, start_y)
-                self._callout_cur = None
-                return
-            if self.tool == "eraser":
-                # left-drag erases, same as the always-on right-drag gesture
-                self._erasing = True
-                self._erase_group += 1
-                self._erase_at(start_x, start_y)
-                return
-            if self.tool == "lasso":
-                self._lasso_press(
-                    start_x, start_y,
-                    additive=bool(state & Gdk.ModifierType.SHIFT_MASK))
-                return
-            hit = self._anchor_hit_test(start_x, start_y)
-            if hit is not None:
-                # begin dragging the anchor; a release with no real movement is
-                # treated as a click that jumps the notes cursor (see drag-end)
-                self._anchor_dragging = hit
-                self._anchor_drag_moved = False
-                self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
-                return
-            chit = self._callout_hit_test(start_x, start_y)
-            if chit is not None:
-                # begin dragging a callout box; keep the grab point fixed within
-                # the box so it doesn't jump to the cursor
-                self._callout_moving = chit
-                self._callout_move_moved = False
-                cpx, cpy = self._anchors[self.current_page_idx][chit]["callout"]
-                px, py = self._screen_to_pdf(start_x, start_y)
-                self._callout_move_offset = (cpx - px, cpy - py)
-                self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
-                return
-            thit = self._textbox_hit_test(start_x, start_y)
-            if thit is not None:
-                # begin dragging a standalone text box (same feel as callouts)
-                self._textbox_moving = thit
-                self._textbox_move_moved = False
-                t = self._textboxes[self.current_page_idx][thit]
-                px, py = self._screen_to_pdf(start_x, start_y)
-                self._textbox_move_offset = (t["x"] - px, t["y"] - py)
-                self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
-                return
-            if self.select_mode:
-                # plain drag selects text instead of drawing
-                self._text_selecting = True
-                self._alt_start = (start_x, start_y)
-                self.grab_focus()
-                return
-            if self.highlighter and self.highlight_style == "text":
-                # highlighter "text" style: drag selects words (reading order)
-                # and commits highlight ink over them on release
-                self._text_selecting = True
-                self._text_highlighting = True
-                self._alt_start = (start_x, start_y)
-                self._selected_words = []
-                self.grab_focus()
-                return
-            self._cancel_straight_timer()
-            self._straight_mode = False
-            self._snap_kind = self._snap_label = None
-            self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
-            self._arm_circle_lasso(start_x, start_y)
+            self.grab_focus()
+            return
+        self._cancel_straight_timer()
+        self._straight_mode = False
+        self._snap_kind = self._snap_label = None
+        self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
+        self._arm_circle_lasso(start_x, start_y)
 
     # ── circle to lasso (row 126) ───────────────────────────────────────────
 
@@ -3375,6 +3549,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # a button gesture's transient toolbar highlight ends with the press
         # (no-op for plain tool drags — the window falls back to held chords)
         self._fire_gesture_tool(None)
+        self._press_tool = None      # `tool` goes back to meaning the left button
         self._cancel_straight_timer()
         self._cancel_circle_lasso()   # a lift ends the hold (row 126)
         was_straight = self._straight_mode
@@ -11561,21 +11736,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "Lasso ink (Ctrl+Shift+Alt+drag · drag a loop to select, then drag "
             "to move · Delete · change colour to recolour)")
         self._mode_lasso.set_group(self._mode_pen)
-        self._mode_select = Gtk.ToggleButton()
-        self._mode_select.set_child(_glyph(_draw_mode_sel))
-        self._mode_select.set_tooltip_text(
-            "Select text (Alt+drag · Ctrl+M · long-press for reading-order / rectangular)")
-        self._mode_select.set_group(self._mode_pen)
-        # text-first pages swap the PDF select tool for this caret tool: same
-        # "select" mode underneath, but visually an I-beam (the page is text)
+        # ONE caret button for both document modes (the I-beam the user
+        # picked): a PDF page selects its text with it, a text page places the
+        # caret with it. The tool id is "text"; "select" is kept as an alias
+        # because settings, chords and older code still say it.
         self._mode_text = Gtk.ToggleButton()
         self._mode_text.set_child(_glyph(_draw_mode_text))
         # the Alt-hold ink hint lives on the pen / eraser tooltips (the tools it
         # actually refers to), set per-mode in _update_header_for_mode
-        self._mode_text.set_tooltip_text(
-            "Text cursor — click to place the caret and type")
         self._mode_text.set_group(self._mode_pen)
-        self._mode_text.set_visible(False)
         self._mode_pan = Gtk.ToggleButton()
         self._mode_pan.set_child(_glyph(_draw_mode_pan, 20))
         self._mode_pan.set_tooltip_text(
@@ -11590,21 +11759,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._mode_anchor.set_child(_glyph(_draw_mode_anchor))
         self._mode_anchor.set_tooltip_text("Anchor / callout (Ctrl+Alt+click/drag)")
         self._mode_anchor.set_group(self._mode_pen)
-        for b, m in ((self._mode_pen, "pen"), (self._mode_hl, "highlighter"),
-                     (self._mode_eraser, "eraser"), (self._mode_lasso, "lasso"),
-                     (self._mode_select, "select"),
-                     (self._mode_pan, "pan"), (self._mode_zoom, "zoom"),
-                     (self._mode_anchor, "anchor"),
-                     (self._mode_text, "select")):
-            b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
-
         self._tools_box = tools_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         tools_box.add_css_class("linked")
         self._tool_btns = (self._mode_pen, self._mode_hl, self._mode_eraser,
-                           self._mode_lasso, self._mode_select, self._mode_pan,
+                           self._mode_lasso, self._mode_text, self._mode_pan,
                            self._mode_zoom, self._mode_anchor)
-        tools_box.append(self._mode_text)   # leftmost — first tool on a text page
-        for b in self._tool_btns:
+        for b, m in zip(self._tool_btns, self._TOOL_BAR_ORDER):
+            b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
             tools_box.append(b)
 
         # ── pen settings popover: width / colour / smoothing (mode is on bar) ──
@@ -11640,18 +11801,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "Lasso ink (Ctrl+Shift+Alt+drag · drag a loop to select, then drag "
             "to move · Delete · change colour to recolour)")
         self._pmode_lasso.set_group(self._pmode_pen)
-        self._pmode_select = Gtk.ToggleButton()
-        self._pmode_select.set_child(_glyph(_draw_mode_sel))
-        self._pmode_select.set_tooltip_text(
-            "Select text (Alt+drag · Ctrl+M · long-press for reading-order / rectangular)")
-        self._pmode_select.set_group(self._pmode_pen)
         self._pmode_text = Gtk.ToggleButton()
         self._pmode_text.set_child(_glyph(_draw_mode_text))
-        self._pmode_text.set_tooltip_text(
-            "Text cursor — click to place the caret and type "
-            "(Alt+drag draws with the pen)")
         self._pmode_text.set_group(self._pmode_pen)
-        self._pmode_text.set_visible(False)
         self._pmode_pan = Gtk.ToggleButton()
         self._pmode_pan.set_child(_glyph(_draw_mode_pan, 20))
         self._pmode_pan.set_tooltip_text(
@@ -11666,20 +11818,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._pmode_anchor.set_child(_glyph(_draw_mode_anchor))
         self._pmode_anchor.set_tooltip_text("Anchor / callout (Ctrl+Alt+click/drag)")
         self._pmode_anchor.set_group(self._pmode_pen)
-        for b, m in ((self._pmode_pen, "pen"), (self._pmode_hl, "highlighter"),
-                     (self._pmode_eraser, "eraser"), (self._pmode_lasso, "lasso"),
-                     (self._pmode_select, "select"),
-                     (self._pmode_pan, "pan"), (self._pmode_zoom, "zoom"),
-                     (self._pmode_anchor, "anchor"),
-                     (self._pmode_text, "select")):
-            b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
         pmode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         pmode_box.add_css_class("linked")
         self._ptool_btns = (self._pmode_pen, self._pmode_hl, self._pmode_eraser,
-                            self._pmode_lasso, self._pmode_select, self._pmode_pan,
+                            self._pmode_lasso, self._pmode_text, self._pmode_pan,
                             self._pmode_zoom, self._pmode_anchor)
-        pmode_box.append(self._pmode_text)
-        for b in self._ptool_btns:
+        for b, m in zip(self._ptool_btns, self._TOOL_BAR_ORDER):
+            b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
             pmode_box.append(b)
         self._pen_modes_section.append(pmode_box)
         self._pen_modes_section.set_visible(False)
@@ -11687,8 +11832,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         # long-press either select button → choose reading-order vs rectangular
         self._select_style_radios = []
-        self._attach_select_style_menu(self._mode_select)
-        self._attach_select_style_menu(self._pmode_select)
+        self._attach_select_style_menu(self._mode_text)
+        self._attach_select_style_menu(self._pmode_text)
         # long-press either highlighter button → free-hand vs text marking
         self._highlight_style_radios = []
         self._attach_highlight_style_menu(self._mode_hl)
@@ -14455,23 +14600,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         "_share_btn":    ("pdf",),
         "_notes_toggle": ("pdf",),
         "_present_btn":  ("pdf",),
-        "_mode_text":    ("text",),
-        "_mode_pen":     ("pdf", "text"),
-        "_mode_hl":      ("pdf", "text"),
-        "_mode_eraser":  ("pdf", "text"),
-        "_mode_lasso":   ("pdf", "text"),
-        "_mode_select":  ("pdf",),
-        # pan and zoom-to-region both get a toolbar tool in BOTH modes — the
-        # modifier-free twins of their Ctrl/middle-drag and Shift+drag gestures,
-        # so the text bar reads the same as the PDF bar.
-        "_mode_pan":     ("pdf", "text"),
-        "_mode_zoom":    ("pdf", "text"),
-        "_mode_anchor":  ("pdf",),
         "_pen_btn":      ("pdf", "text"),
+        # the tool buttons come from TOOL_MODES — one table for the bar, the
+        # bindings and the chrome, so a tool cannot be in the bar and missing
+        # from the grammar
+        **{TOOL_WIDGET[_t]: TOOL_MODES[_t] for _t in TOOL_BAR_ORDER},
     }
 
-    _TOOL_ORDER = {"pen": 0, "highlighter": 1, "eraser": 2, "lasso": 3,
-                   "select": 4, "pan": 5, "zoom": 6, "anchor": 7}
+    _TOOL_BAR_ORDER = TOOL_BAR_ORDER
+    _TOOL_ORDER = TOOL_INDEX
 
     def _attach_select_style_menu(self, button):
         """Long-press a select-tool button to pick reading-order vs rectangular."""
@@ -14548,37 +14685,30 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._syncing_highlight_style = False
 
     def _set_tool_mode(self, mode):
-        """mode in pen / highlighter / select / pan / zoom / anchor — the bar's
-        segmented switch. The tool is the modifier-free shortcut for the matching
-        drag gesture (pan↔Ctrl, zoom↔Shift, anchor↔Ctrl+Alt).
+        """Put `mode` on the LEFT mouse button (row 132) and mirror the choice
+        into both toggle groups.
 
-        Mirrored by a second toggle group inside the pen popover (shown when the
-        bar collapses); keep both in sync without re-entering on the echo.
+        `highlighter` / `select_mode` are derived from the left binding now, so
+        setting them here would fight it: `select_mode = False` while the caret
+        is on left hands the button straight back to the pen.
         """
+        mode = canonical_tool(mode)
         if self._syncing_mode:
             return
         self._syncing_mode = True
         try:
             self.canvas.tool = mode
-            self.canvas.highlighter = (mode == "highlighter")
-            self.canvas.select_mode = (mode == "select")
             if mode != "lasso":
                 self.canvas.clear_lasso_selection()
-            # cursor reflects the active tool (text/grab/crosshair, or default)
+            # cursor reflects what the left button would do right now
             self.canvas.set_cursor(self.canvas._default_cursor())
             # text-first page: pen/highlighter/eraser/lasso work the sheet's
             # ink, everything else falls back to the text caret
             if self._text_page is not None:
                 self._text_page.set_tool(mode)
-            # on a text page "select" is represented by the caret button
-            in_text = bool(self._active_session and self._active_session._text_mode)
-            if mode == "select" and in_text:
-                self._mode_text.set_active(True)
-                self._pmode_text.set_active(True)
-            else:
-                idx = self._TOOL_ORDER[mode]
-                for grp in (self._tool_btns, self._ptool_btns):
-                    grp[idx].set_active(True)
+            idx = self._TOOL_ORDER[mode]
+            for grp in (self._tool_btns, self._ptool_btns):
+                grp[idx].set_active(True)
         finally:
             self._syncing_mode = False
         self._sync_pen_popover()
@@ -14726,11 +14856,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._apply_collapse_level(level)
 
     def _toggle_select_mode(self):
-        """Ctrl+M: flip select-text on/off, falling back to pen."""
-        if self._mode_select.get_active():
+        """Ctrl+M: put the caret on the left button, or hand it back to the pen."""
+        if self._mode_text.get_active():
             self._mode_pen.set_active(True)
         else:
-            self._mode_select.set_active(True)
+            self._mode_text.set_active(True)
 
     # ── presentation control bar (timer + large prev/next) ───────────────────
     def _build_present_bar(self):

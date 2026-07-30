@@ -341,29 +341,30 @@ class TestZoomToRegion(unittest.TestCase):
                                      get_button=lambda: 10,
                                      get_modifier_state=lambda: mods)
 
-    def test_shift_thumb_zooms_to_region(self):
-        # the thumb button mirrors the middle button: Shift+hold rubber-bands
-        # a zoom region instead of panning
+    def test_a_bound_thumb_zooms_to_region(self):
+        # the thumb runs whatever the table says — bind zoom to Shift+thumb and
+        # holding it rubber-bands a region (row 132)
         c = self._canvas()
+        c.bindings.bind("shift+thumb", "zoom")
         c._shift_held = True
         c._mouse_x, c._mouse_y = 100, 100
         c._on_thumb_event(None, self._thumb_event(Gdk.EventType.BUTTON_PRESS))
-        self.assertTrue(c._thumb_zooming)
         self.assertTrue(c._zoom_selecting)
-        self.assertFalse(c._thumb_panning)
         c._on_motion(None, 300, 250)
         self.assertEqual(c._zoom_end, (300, 250))
         c._on_thumb_event(None, self._thumb_event(Gdk.EventType.BUTTON_RELEASE))
-        self.assertFalse(c._thumb_zooming)
         self.assertEqual(len(c._zoom_stack), 1)
         self.assertGreater(c.scale, 1.0)
 
-    def test_plain_thumb_still_pans(self):
+    def test_an_unbound_thumb_does_nothing(self):
+        """The thumb ships UNBOUND: most mice have no thumb button, and a tool
+        nobody can reach is worse than an empty slot."""
         c = self._canvas()
         c._mouse_x, c._mouse_y = 100, 100
         c._on_thumb_event(None, self._thumb_event(Gdk.EventType.BUTTON_PRESS))
-        self.assertTrue(c._thumb_panning)
-        self.assertFalse(c._thumb_zooming)
+        self.assertIsNone(c._thumb_gesture)
+        self.assertFalse(c._panning)
+        self.assertFalse(c._zoom_selecting)
         c._on_thumb_event(None, self._thumb_event(Gdk.EventType.BUTTON_RELEASE))
 
     def test_zoom_stack_is_lifo(self):
@@ -5990,8 +5991,8 @@ class TestResponsiveHeader(unittest.TestCase):
             win._mode_hl.set_active(True)
             if not win._pmode_hl.get_active():
                 raise AssertionError("popover mode did not mirror the bar")
-            win._pmode_select.set_active(True)
-            if not win._mode_select.get_active():
+            win._pmode_text.set_active(True)
+            if not win._mode_text.get_active():
                 raise AssertionError("bar mode did not mirror the popover")
             if not win.canvas.select_mode:
                 raise AssertionError("canvas not in select mode")
@@ -6777,7 +6778,7 @@ class TestToolModes(unittest.TestCase):
         self.assertEqual(ct(True, False, True, "pdf"), "anchor")
         self.assertEqual(ct(True, True, False, "pdf"), "highlighter")
         self.assertEqual(ct(False, True, False, "pdf"), "zoom")
-        self.assertEqual(ct(False, False, True, "pdf"), "select")
+        self.assertEqual(ct(False, False, True, "pdf"), "text")
         # Shift+Alt is the portable keyboard zoom chord — the same in both
         # modes, because it is the only one that reaches zoom under the caret
         self.assertEqual(ct(False, True, True, "pdf"), "zoom")
@@ -6829,7 +6830,7 @@ class TestToolModes(unittest.TestCase):
             if pdf is not None and txt is not None:
                 # Alt is the ink<->text flip: the one deliberate asymmetry
                 if mods == (0, 0, 1):
-                    self.assertEqual((pdf, txt), ("select", "pen"))
+                    self.assertEqual((pdf, txt), ("text", "pen"))
                 else:
                     self.assertEqual(pdf, txt, f"chord {mods} diverges")
         # text mode: no anchors, and Shift-alone belongs to text selection
@@ -7380,37 +7381,39 @@ class TestThumbHoldPan(unittest.TestCase):
         e.get_modifier_state.return_value = Gdk.ModifierType(0)
         return e
 
-    def test_press_starts_pan_release_ends_it(self):
+    def test_press_starts_the_bound_tool_release_ends_it(self):
         canvas = self._canvas()
+        canvas.bindings.bind("thumb", "pan")
         canvas._mouse_x, canvas._mouse_y = 200, 150
         ctrl = mock.Mock()
         canvas._on_thumb_event(ctrl, self._event(Gdk.EventType.BUTTON_PRESS, 10))
-        self.assertTrue(canvas._thumb_panning)
+        self.assertTrue(canvas._panning)
         self.assertFalse(canvas._is_fitted)
-        self.assertEqual(canvas._thumb_origin, (200, 150))
-        ox, oy = canvas._thumb_start_offset
+        ox, oy = canvas._pan_start_offset
         # motion while held pans relative to the press origin
         canvas._on_motion(None, 250, 130)
         self.assertEqual((canvas.offset_x, canvas.offset_y), (ox + 50, oy - 20))
         canvas._on_thumb_event(ctrl, self._event(Gdk.EventType.BUTTON_RELEASE, 10))
-        self.assertFalse(canvas._thumb_panning)
+        self.assertFalse(canvas._panning)
         # motion after release no longer pans
         canvas._on_motion(None, 400, 400)
         self.assertEqual((canvas.offset_x, canvas.offset_y), (ox + 50, oy - 20))
 
     def test_other_buttons_ignored(self):
         canvas = self._canvas()
+        canvas.bindings.bind("thumb", "pan")
         ctrl = mock.Mock()
         canvas._on_thumb_event(ctrl, self._event(Gdk.EventType.BUTTON_PRESS, 1))
-        self.assertFalse(canvas._thumb_panning)
+        self.assertFalse(canvas._panning)
 
     def test_marshals_event_from_controller_when_arg_none(self):
         canvas = self._canvas()
+        canvas.bindings.bind("thumb", "pan")
         ctrl = mock.Mock()
         ctrl.get_current_event.return_value = self._event(
             Gdk.EventType.BUTTON_PRESS, 10)
         canvas._on_thumb_event(ctrl, None)   # PyGObject quirk: arg is None
-        self.assertTrue(canvas._thumb_panning)
+        self.assertTrue(canvas._panning)
 
 
 class TestThumbScrollZoom(unittest.TestCase):
@@ -7422,7 +7425,9 @@ class TestThumbScrollZoom(unittest.TestCase):
             make_pdf(tmp, n_pages=2)
             canvas.load(tmp)
             canvas._fit_page(800, 600)
-            canvas._thumb_panning = True
+            canvas.bindings.bind("thumb", "pan")
+            canvas._thumb_gesture = sidemark._SyntheticDrag(300, 300, 10)
+            canvas._panning = True
             canvas._mouse_x = canvas._mouse_y = 300
             ctrl = mock.Mock()
             ctrl.get_current_event_state.return_value = Gdk.ModifierType(0)
@@ -7430,8 +7435,8 @@ class TestThumbScrollZoom(unittest.TestCase):
             canvas._on_scroll(ctrl, 0, -1)
             self.assertAlmostEqual(canvas.scale, scale * 1.1)
             # pan origin rebased so the next motion event doesn't jump
-            self.assertEqual(canvas._thumb_origin, (300, 300))
-            self.assertEqual(canvas._thumb_start_offset,
+            self.assertEqual(canvas._thumb_gesture.get_start_point()[1:], (300, 300))
+            self.assertEqual(canvas._pan_start_offset,
                              (canvas.offset_x, canvas.offset_y))
             canvas._on_scroll(ctrl, 0, 1)   # zoom back out, no page flip
             # in and out are exact inverses (shared zoom_factor_for_scroll), so
@@ -9604,16 +9609,13 @@ class TestTextFirstMode(unittest.TestCase):
             def body(win):
                 self._open_md(win, d)
                 for w in (win._notes_toggle, win._present_btn, win._toc_btn,
-                          win._nav_box, win._pages_box, win._mode_anchor,
-                          win._mode_select):
+                          win._nav_box, win._pages_box, win._mode_anchor):
                     self.assertFalse(w.get_visible(), w)
                 for w in (win._mode_pen, win._mode_hl, win._mode_eraser,
                           win._mode_lasso, win._mode_zoom,   # zoom tool: #106.5
                           win._mode_pan,                     # pan tool: #106.4
-                          win._mode_text):                   # lasso: #108
+                          win._mode_text):                   # one caret button
                     self.assertTrue(w.get_visible(), w)
-                # the caret tool leads the tool strip
-                self.assertIs(win._tools_box.get_first_child(), win._mode_text)
                 # the ☰ menu drops its PDF-only actions too
                 for item in win._pdf_menu_items:
                     self.assertFalse(item.get_visible(), item)
@@ -9634,10 +9636,10 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertFalse(s._text_page.get_visible())
                 self.assertIs(win._notes_view, s._panel_notes_view)
                 self.assertTrue(win._notes_toggle.get_visible())
-                # the caret tool hands "select" back to the PDF select button
-                self.assertFalse(win._mode_text.get_visible())
-                self.assertTrue(win._mode_select.get_visible())
-                self.assertTrue(win._mode_select.get_active())
+                # ONE caret button serves both modes, so it stays visible and
+                # keeps the caret it had (row 132)
+                self.assertTrue(win._mode_text.get_visible())
+                self.assertTrue(win._mode_text.get_active())
                 for item in win._pdf_menu_items:
                     self.assertTrue(item.get_visible(), item)
 
