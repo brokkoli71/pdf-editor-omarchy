@@ -5998,24 +5998,6 @@ class TestResponsiveHeader(unittest.TestCase):
                 raise AssertionError("canvas not in select mode")
         self._run_in_window(body)
 
-    def test_ctrl_m_borrows_the_caret_while_held(self):
-        """With no active tool to toggle, Ctrl+M LENDS the left button the
-        caret for as long as it is held (row 132) — it cannot strand you in a
-        mode you forgot about."""
-        def body(win):
-            win._borrow_tool("text", Gdk.KEY_m)
-            if not win.canvas.select_mode:
-                raise AssertionError("Ctrl+M did not borrow the caret")
-            win._on_borrow_release(None, Gdk.KEY_m, 0, Gdk.ModifierType(0))
-            if win.canvas.select_mode:
-                raise AssertionError("the caret was not given back on release")
-            # letting go of Ctrl ends it too
-            win._borrow_tool("text", Gdk.KEY_m)
-            win._on_borrow_release(None, Gdk.KEY_Control_L, 0, Gdk.ModifierType(0))
-            if win.canvas.select_mode:
-                raise AssertionError("releasing Ctrl did not end the borrow")
-        self._run_in_window(body)
-
     def test_tool_buttons_select_canvas_tool(self):
         def body(win):
             # the new modifier-shortcut tools select on the canvas and mirror
@@ -6688,12 +6670,11 @@ class TestButtonBindings(unittest.TestCase):
         self.assertEqual(b.tool_for(sidemark.BTN_RIGHT), "eraser")
         self.assertEqual(b.tool_for(sidemark.BTN_MIDDLE), "pan")
 
-    def test_the_thumb_ships_unbound(self):
-        """Most mice have no thumb button, and a tool nobody can reach is
-        worse than an empty slot."""
+    def test_the_thumb_pans(self):
+        """The ergonomic stand-in for the middle button, and nothing else."""
         b = Bindings()
-        self.assertIsNone(b.tool_for(sidemark.BTN_THUMB))
-        self.assertEqual(b.chords_for("pan"), ["middle", "ctrl+left"])
+        self.assertEqual(b.tool_for(sidemark.BTN_THUMB), "pan")
+        self.assertEqual(b.chords_for("pan"), ["middle", "thumb"])
 
     def test_a_chord_has_exactly_one_spelling(self):
         self.assertEqual(sidemark.chord_id(1, ctrl=True, alt=True),
@@ -6705,12 +6686,13 @@ class TestButtonBindings(unittest.TestCase):
 
     def test_binding_moves_a_chord_and_reports_what_it_took(self):
         b = Bindings()
-        self.assertEqual(b.bind("ctrl+left", "lasso"), "pan")
-        self.assertEqual(b.tool_for(1, ctrl=True), "lasso")
+        self.assertEqual(b.bind("middle", "lasso"), "pan")
+        self.assertEqual(b.tool_for(sidemark.BTN_MIDDLE), "lasso")
         self.assertIsNone(b.bind("ctrl+right", "lasso"))   # was free
 
     def test_a_tool_the_mode_lacks_resolves_to_nothing(self):
         b = Bindings()
+        b.bind("ctrl+alt+left", "anchor")
         self.assertEqual(b.tool_for(1, ctrl=True, alt=True, mode="pdf"),
                          "anchor")
         self.assertIsNone(b.tool_for(1, ctrl=True, alt=True, mode="text"))
@@ -6808,7 +6790,7 @@ class TestBindingToolbar(unittest.TestCase):
             win._bind_chord("middle", "eraser")
             self.assertEqual(sorted(win.bindings.plain_buttons_for("eraser")),
                              ["middle", "right"])
-            self.assertEqual(win.bindings.plain_buttons_for("pan"), [])
+            self.assertEqual(win.bindings.plain_buttons_for("pan"), ["thumb"])
             # a tool with nothing on it says so
             win._clear_binding("right")
             win._clear_binding("middle")
@@ -8275,13 +8257,7 @@ class TestHighlighter(unittest.TestCase):
                         raise AssertionError("pen segment did not disable highlighter")
                     if abs(win._width_scale.get_value() - pen_width) > 0.01:
                         raise AssertionError("scale did not return to pen width")
-                    # Ctrl+H lends the left button the highlighter while held
-                    win._borrow_tool("highlighter", Gdk.KEY_h)
-                    if not win.canvas.highlighter:
-                        raise AssertionError("Ctrl+H did not borrow the highlighter")
-                    win._on_borrow_release(None, Gdk.KEY_h, 0, Gdk.ModifierType(0))
-                    if win.canvas.highlighter:
-                        raise AssertionError("Ctrl+H did not return to pen")
+
                 except Exception as e:
                     errors.append(e)
                 finally:
@@ -9674,10 +9650,10 @@ class TestTextFirstMode(unittest.TestCase):
                 tp = win._active_session._text_page
                 win._set_tool_mode("text")
                 self.assertEqual(tp.tool, "text")
-                win._borrow_tool("highlighter", Gdk.KEY_h)   # Ctrl+H held
+                win._set_tool_mode("highlighter")
                 self.assertEqual(tp.tool, "highlighter")
-                win._on_borrow_release(None, Gdk.KEY_h, 0, Gdk.ModifierType(0))
-                self.assertEqual(tp.tool, "text")            # given back
+                win._set_tool_mode("text")
+                self.assertEqual(tp.tool, "text")
                 # lasso verbs: the window fallback targets the sheet in text mode
                 win._set_tool_mode("lasso")
                 tp._selected = [object()]             # pretend a selection

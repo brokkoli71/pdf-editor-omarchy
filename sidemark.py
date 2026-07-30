@@ -949,16 +949,16 @@ BUTTON_LABELS = {"left": "Left", "middle": "Middle", "right": "Right",
 MOD_ORDER = ("ctrl", "shift", "alt")
 
 DEFAULT_BINDINGS = {
+    # A CLEAN START (the user's call, 2026-07-31): three buttons, no modifier
+    # chords at all. The old grammar's chords were a fixed table nobody chose;
+    # now that every chord is bindable, shipping a pile of them only makes it
+    # unclear what is yours and what was ours. Bind what you want.
     "left": "pen",
-    "ctrl+left": "pan",
-    "shift+left": "zoom",
-    "shift+alt+left": "zoom",       # the chord that also works under a caret
-    "ctrl+shift+left": "highlighter",
-    "ctrl+alt+left": "anchor",
-    "ctrl+shift+alt+left": "lasso",
     "right": "eraser",
     "middle": "pan",
-    "shift+middle": "zoom",
+    # the thumb pans, full stop — it is the ergonomic stand-in for the middle
+    # button and nobody wants it doing anything else (the user's call)
+    "thumb": "pan",
 }
 
 
@@ -1620,7 +1620,6 @@ class PDFCanvas(Gtk.DrawingArea):
         # the canvas (cursor, pen attrs, straight-snap) means when it asks.
         self.bindings = Bindings()
         self._press_tool = None       # the tool of the press in flight
-        self._borrowed_tool = None    # hold-to-borrow keyboard shortcut
         # set for the duration of a Ctrl+Shift+drag: a one-off highlighter stroke
         self._temp_highlighter = False
         # transient tool implied by the modifiers currently held down — surfaced
@@ -1821,8 +1820,6 @@ class PDFCanvas(Gtk.DrawingArea):
     def tool(self):
         if self._press_tool is not None:
             return self._press_tool
-        if self._borrowed_tool is not None:
-            return self._borrowed_tool
         return self.bindings.tool_for(BTN_LEFT, mode=self.doc_mode) or "pen"
 
     @tool.setter
@@ -8379,7 +8376,6 @@ class TextPageView(Gtk.Overlay):
         # button — which is what the cursor and the ink handlers want to know
         self.bindings = Bindings()
         self._press_tool = None
-        self._borrowed_tool = None    # hold-to-borrow keyboard shortcut
         self._ink_additive = False
         self.zoom = 1.0           # sheet zoom: paper, text and ink together
         # per-document sheet width (the wrap column), persisted in the ink
@@ -8664,7 +8660,7 @@ class TextPageView(Gtk.Overlay):
         """The tool of the press in flight, else the LEFT button's — which is
         what the cursor should promise and what the ink handlers mean when they
         ask. Anything the sheet has no implementation for reads as "text"."""
-        tool = self._press_tool or self._borrowed_tool
+        tool = self._press_tool
         if tool is None:
             tool = self.bindings.tool_for(BTN_LEFT, mode="text")
         return tool if tool in ("pen", "highlighter", "eraser", "lasso",
@@ -11137,7 +11133,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._bindings_list = None   # built with the pen popover
         self._tool_btns = None       # built with the header
         self._tool_strips = {}       # tool -> the painted binding stripes
-        self._borrow_key = None      # the key a hold-to-borrow is waiting on
         self._path = None
         self._notes_path = None   # set when a .md file is opened without an associated PDF
         self._active_notes_path = None  # the .md a loaded PDF saves notes to (default sidecar, or a user-chosen file remembered per-PDF)
@@ -12068,9 +12063,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                          lambda c, kv, kc, st: self.canvas._on_modifier_key(c, kv, kc, st, True))
         mod_ctrl.connect("key-released",
                          lambda c, kv, kc, st: self.canvas._on_modifier_key(c, kv, kc, st, False))
-        # the same controller ends a hold-to-borrow (row 132): letting go of
-        # the letter OR the Ctrl gives the button back to its own tool
-        mod_ctrl.connect("key-released", self._on_borrow_release)
         self.add_controller(mod_ctrl)
 
         # A modifier released while another window has focus never sends us
@@ -15460,39 +15452,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if self._text_page is not None and self._text_page.has_lasso_selection():
             self._text_page.recolor_selected(color, width, opacity)
 
-    # ── hold-to-borrow (row 132) ─────────────────────────────────────────────
-    # With no active tool to toggle, a tool shortcut LENDS the left button its
-    # tool for as long as you hold the keys — the keyboard twin of a modifier
-    # chord, and it cannot strand you in a mode you forgot you were in.
-
-    def _borrow_tool(self, tool, keyval):
-        tool = canonical_tool(tool)
-        if not tool_in_mode(tool, self._active_session.doc_mode
-                            if self._active_session else "pdf"):
-            return
-        self._borrow_key = keyval
-        for surface in (self.canvas, self._text_page):
-            if surface is not None:
-                surface._borrowed_tool = tool
-        self._apply_transient_highlight(tool)
-        if self.canvas is not None:
-            self.canvas.set_cursor(self.canvas._default_cursor())
-
-    def _on_borrow_release(self, _ctrl, keyval, _keycode, _state):
-        if self._borrow_key is None:
-            return False
-        if keyval not in (self._borrow_key, Gdk.KEY_Control_L,
-                          Gdk.KEY_Control_R):
-            return False
-        self._borrow_key = None
-        for surface in (self.canvas, self._text_page):
-            if surface is not None:
-                surface._borrowed_tool = None
-        self._apply_transient_highlight(self._chord_highlight_tool())
-        if self.canvas is not None:
-            self.canvas.set_cursor(self.canvas._default_cursor())
-        return False
-
     def _sync_pen_popover(self):
         """Point the width scale and color button at the active tool."""
         self._syncing_pen = True
@@ -16721,12 +16680,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 return True
             if keyval == Gdk.KEY_f:
                 self._show_search()
-                return True
-            if keyval == Gdk.KEY_h:
-                self._borrow_tool("highlighter", keyval)
-                return True
-            if keyval == Gdk.KEY_m:
-                self._borrow_tool("text", keyval)
                 return True
             if keyval == Gdk.KEY_e:
                 self._on_export()
