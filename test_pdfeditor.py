@@ -650,11 +650,13 @@ class TestStraightLineSnap(unittest.TestCase):
 
     def test_snap_collapses_squiggle_to_line(self):
         c = self._canvas()
-        c.current_stroke = [(0, 0), (5, 3), (8, 1), (12, 9)]
+        # a bowed, near-straight stroke: the classic snap's own case, and the
+        # one a multi-segment PATH must never steal (row 127)
+        c.current_stroke = [(0, 0), (25, 2), (50, 3), (75, 2), (100, 0)]
         c._snap_to_shape()
         self.assertTrue(c._straight_mode)
         self.assertEqual(c._snap_kind, "line")
-        self.assertEqual(c.current_stroke, [(0, 0), (12, 9)])
+        self.assertEqual(c.current_stroke, [(0, 0), (100, 0)])
 
     def test_snap_noop_for_single_point(self):
         c = self._canvas()
@@ -695,11 +697,39 @@ class TestStraightLineSnap(unittest.TestCase):
 # ── shape & grid recognition (the extended dwell) ──────────────────────────────
 
 class TestShapeRecognition(unittest.TestCase):
-    def test_open_squiggle_stays_line(self):
-        pts = [(0, 0), (5, 3), (8, 1), (12, 9)]
+    def test_a_nearly_straight_stroke_stays_one_line(self):
+        """The single line is the fallback and has to be BEATEN by a clear
+        margin, or every slightly bowed stroke becomes a two-segment path and
+        the classic straight snap is gone."""
+        pts = [(0, 0), (25, 2), (50, 3), (75, 2), (100, 0)]
         kind, new = sidemark.recognize_shape(pts)
         self.assertEqual(kind, "line")
-        self.assertEqual(new, [(0, 0), (12, 9)])
+        self.assertEqual(new, [(0, 0), (100, 0)])
+
+    def test_an_open_run_of_segments_becomes_a_path(self):
+        """A path of lines: straightened, but NOT closed up — the ends did not
+        meet, and only meeting ends make a shape."""
+        pts = ([(0, 0 + i) for i in range(0, 60, 6)]          # down
+               + [(0 + i, 60) for i in range(0, 80, 8)]       # right
+               + [(80, 60 - i) for i in range(0, 40, 5)])     # up again
+        kind, new = sidemark.recognize_shape(pts)
+        self.assertEqual(kind, "path")
+        self.assertEqual(len(new), 4)             # 3 segments
+        self.assertNotEqual(new[0], new[-1])      # emphatically open
+
+    def test_a_run_of_segments_that_returns_home_closes_into_a_polygon(self):
+        """"Close to the start" is what snaps it together — the same test the
+        rectangle and ellipse snaps use (polyline_is_closed)."""
+        corners = [(0, 0), (90, 10), (60, 80)]
+        pts = []
+        ring = corners + [corners[0]]
+        for i in range(len(ring) - 1):
+            ax, ay = ring[i]
+            bx, by = ring[i + 1]
+            pts += [(ax + (bx - ax) * k / 10, ay + (by - ay) * k / 10)
+                    for k in range(10)]
+        pts.append(ring[0])
+        self.assertEqual(sidemark.recognize_shape(pts)[0], "polygon")
 
     def test_closed_box_becomes_rectangle(self):
         # a wobbly loop hugging a rectangle perimeter
@@ -3604,6 +3634,67 @@ class TestLassoSelect(unittest.TestCase):
         canvas._lasso_path = [(280, 280), (330, 280), (330, 330), (280, 330)]
         canvas._on_drag_end(_FakeDrag(280, 280, state=shift), 50, 50)
         self.assertEqual(canvas._selected_strokes, [a, b])
+
+    # ── row 127: a snapped shape comes back selected, in box mode ───────────
+
+    def _snap_a_rect(self, canvas):
+        """Drive a real dwell-snap of a rectangle and return the stroke."""
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(0, 0), 0, 0)
+        canvas.current_stroke = [(0, 0), (40, 1), (81, 0), (80, 30), (79, 61),
+                                 (40, 60), (1, 59), (0, 30), (0, 0)]
+        canvas._snap_to_shape()
+        self.assertEqual(canvas._snap_kind, "rect")
+        canvas._on_drag_end(_FakeDrag(0, 0), 0, 0)
+        return canvas.all_strokes[0][-1]
+
+    def test_a_snapped_shape_comes_back_selected_and_boxed(self):
+        canvas = self._canvas()
+        shape = self._snap_a_rect(canvas)
+        self.assertEqual(canvas._selected_strokes, [shape])
+        self.assertTrue(canvas._selection_is_boxed())   # handles, not the loop
+        bbox = canvas._selection_bbox()
+        x0, y0 = canvas._pdf_to_screen(bbox[0], bbox[1])
+        self.assertEqual(canvas._lasso_handle_at(x0 - 5.0, y0 - 5.0), 0)
+
+    def test_the_auto_selection_does_not_claim_its_interior(self):
+        """Drawing INSIDE a box you just drew is the common diagram case, so a
+        selection you did not ask for must not swallow that press."""
+        canvas = self._canvas()
+        self._snap_a_rect(canvas)
+        self.assertFalse(canvas.selection_grab_at(40, 30))   # dead centre
+        n_before = len(canvas.all_strokes[0])
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(40, 30), 40, 30)
+        self.assertFalse(canvas._lasso_moving)
+        self.assertFalse(canvas.has_lasso_selection())   # and it is dismissed
+        canvas._on_drag_update(_FakeDrag(40, 30), 10, 10)
+        canvas._on_drag_end(_FakeDrag(40, 30), 10, 10)
+        self.assertEqual(len(canvas.all_strokes[0]), n_before + 1)
+
+    def test_dismissing_an_auto_selection_still_leaves_its_dot(self):
+        """The dot is only swallowed for a selection you actually made — you
+        never asked for this one, so the press is entirely yours."""
+        canvas = self._canvas()
+        self._snap_a_rect(canvas)
+        n_before = len(canvas.all_strokes[0])
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(300, 400), 300, 400)
+        canvas._on_drag_end(_FakeDrag(300, 400), 0, 0)
+        self.assertEqual(len(canvas.all_strokes[0]), n_before + 1)
+
+    def test_grabbing_a_handle_makes_it_an_ordinary_selection(self):
+        canvas = self._canvas()
+        self._snap_a_rect(canvas)
+        bbox = canvas._selection_bbox()
+        hx, hy = canvas._pdf_to_screen(bbox[0], bbox[1])
+        canvas._on_drag_begin(_FakeDrag(hx - 5, hy - 5), hx - 5, hy - 5)
+        self.assertTrue(canvas._lasso_scaling)
+        self.assertFalse(canvas._selection_auto)
+        canvas._on_drag_end(_FakeDrag(hx - 5, hy - 5), -20, -20)
+        # now it behaves like any selection: the interior grabs
+        self.assertTrue(canvas.selection_grab_at(
+            *canvas._pdf_to_screen(40, 30)))
 
     # ── row 126: circle to lasso (press and hold the stroke you just drew) ──
 

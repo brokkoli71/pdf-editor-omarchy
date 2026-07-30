@@ -312,6 +312,41 @@ def simplify_polyline(pts, tol):
             + simplify_polyline(pts[at:], tol))
 
 
+def polyline_residual(pts, verts):
+    """Total distance from every point to the nearest segment of `verts` — the
+    one residual all the candidates are scored with, so their totals compare
+    directly."""
+    return sum(
+        min(_point_segment_distance(x, y, verts[i][0], verts[i][1],
+                                    verts[i + 1][0], verts[i + 1][1])
+            for i in range(len(verts) - 1))
+        for x, y in pts)
+
+
+def open_path_corners(pts, tol_frac=0.045, gain=2.5):
+    """The corners of an OPEN stroke drawn as a run of straight segments — a
+    "path of lines" (row 127). Empty when the stroke reads as one line.
+
+    The single straight line stays the fallback and has to be BEATEN by a clear
+    margin (`gain`), or every slightly bowed stroke turns into a two-segment
+    path and the classic straight snap is gone."""
+    if len(pts) < 3:
+        return []
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+    if diag < 1e-6:
+        return []
+    simple = simplify_polyline(pts, tol_frac * diag)
+    # at least two segments, and no more corners than a polygon may have
+    if not (3 <= len(simple) <= POLYGON_MAX_CORNERS + 1):
+        return []
+    line_err = polyline_residual(pts, [pts[0], pts[-1]])
+    if polyline_residual(pts, simple) * gain > line_err:
+        return []
+    return simple
+
+
 def polygon_corners(pts, tol_frac=0.045):
     """The corner vertices of a closed freehand loop, as an OPEN list (no
     repeated closing point). Empty when the loop does not read as a polygon.
@@ -365,7 +400,8 @@ CIRCLE_TOLERANCE = 0.12   # |rx-ry| within this fraction reads as a circle
 # missing entry here is a KeyError mid-gesture, so a new kind must land in
 # both places at once.
 SNAP_LABELS = {"line": "line", "rect": "rectangle", "ellipse": "ellipse",
-               "polygon": "polygon", "vdiv": "grid", "hdiv": "grid"}
+               "polygon": "polygon", "path": "path", "vdiv": "grid",
+               "hdiv": "grid"}
 
 
 def recognize_shape(pts):
@@ -381,7 +417,11 @@ def recognize_shape(pts):
     w, h = maxx - minx, maxy - miny
     start, end = pts[0], pts[-1]
     if not polyline_is_closed(pts):
-        return "line", [start, end]
+        # an open stroke is either a run of straight segments or one line; the
+        # loop tests above have already ruled out "the ends met", which is the
+        # only thing that makes a shape closed
+        path = open_path_corners(pts)
+        return ("path", path) if path else ("line", [start, end])
     cx, cy = (minx + maxx) / 2, (miny + maxy) / 2
     rx, ry = max(w / 2, 1e-6), max(h / 2, 1e-6)
     # Fit the candidates and keep the smallest residual, all as a total over
@@ -397,14 +437,8 @@ def recognize_shape(pts):
                         abs(y - miny), abs(y - maxy))
         ell_err += abs(math.hypot((x - cx) / rx, (y - cy) / ry) - 1.0) * (rx + ry) / 2
     corners = polygon_corners(pts)
-    poly_err = math.inf
-    if corners:
-        ring = corners + [corners[0]]
-        poly_err = sum(
-            min(_point_segment_distance(x, y, ring[i][0], ring[i][1],
-                                        ring[i + 1][0], ring[i + 1][1])
-                for i in range(len(ring) - 1))
-            for x, y in pts)
+    poly_err = (polyline_residual(pts, corners + [corners[0]])
+                if corners else math.inf)
     # RECT stays its own kind and wins its own case outright: rect_bbox_of
     # re-derives rectangles geometrically for the grid dividers, and a
     # hand-drawn box is ALSO a good 4-corner polygon — a slightly tilted quad
@@ -1097,6 +1131,11 @@ class PDFCanvas(Gtk.DrawingArea):
         self._circle_timer = None       # press-and-hold → circle to lasso (row 126)
         self._circle_start = None       # screen point the hold is measured from
         self._dismissed_selection = False   # this press ended a selection
+        # A selection the user did not ask for: what the dwell hands back so a
+        # snapped shape is adjustable straight away (row 127). It shows the box
+        # and its handles, but it does NOT claim its interior — see
+        # _point_in_selection.
+        self._selection_auto = False
         self._selected_strokes = []    # references into self.strokes, selected
         self._lasso_moving = False
         self._lasso_move_start = None
@@ -2820,7 +2859,10 @@ class PDFCanvas(Gtk.DrawingArea):
         The lasso tool is excluded because its own press router owns the rule
         there: Shift ADDS to the selection, and a fresh loop replaces it."""
         if self.tool != "lasso" and self.has_lasso_selection():
+            auto = self._selection_auto
             self.clear_lasso_selection()
+            if auto:
+                return   # you never asked for it, so it does not eat the press
             # A TAP that only dismissed the selection must not also leave a
             # dot: that press meant "done with this", not "draw here". A press
             # that goes on to DRAG still draws, from where it landed — only the
@@ -2863,6 +2905,7 @@ class PDFCanvas(Gtk.DrawingArea):
             # corner); a side handle stretches one axis (anchored on the
             # opposite edge), changing the aspect ratio
             self._lasso_scaling = True
+            self._selection_auto = False   # you have taken hold of it now
             self._lasso_scale_mode, self._lasso_scale_anchor = \
                 lasso_handle_anchor(handle, self._selection_bbox())
             self._lasso_scale_start = (px, py)
@@ -3246,6 +3289,13 @@ class PDFCanvas(Gtk.DrawingArea):
                     self.strokes.append(stroke)
                     self._undo_stack.append(
                         ("draw", self.current_page_idx, stroke))
+                    if was_straight:
+                        # the dwell recognised it: hand it back selected and
+                        # BOXED, so it can be adjusted with the pen still in
+                        # hand (row 127)
+                        self._set_selected([stroke])
+                        self._selection_boxed = True
+                        self._selection_auto = True
                 self._redo_stack.clear()
                 if self.on_change:
                     self.on_change()
@@ -3846,7 +3896,14 @@ class PDFCanvas(Gtk.DrawingArea):
         """Is the PDF point inside the selection — its loop in loop mode, its
         (padded) bounding box otherwise? This is the GRAB region, so it has to
         match what is painted: with the loop on screen, a press in the corner
-        of the box but outside the loop is not a grab, it is a new lasso."""
+        of the box but outside the loop is not a grab, it is a new lasso.
+
+        An AUTO selection (the dwell handing a snapped shape back, row 127)
+        claims its handles but never its interior. Drawing inside a box you
+        just drew is the common case in a diagram, and a selection you did not
+        ask for must not swallow that press."""
+        if self._selection_auto:
+            return False
         if not self._selection_is_boxed():
             return self._point_in_polygon(px, py, self._selection_loop)
         bbox = self._selection_bbox()
@@ -3949,6 +4006,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._selected_images = list(images)
         self._selection_loop = []
         self._selection_boxed = False
+        self._selection_auto = False
         if self.on_lasso_selection:
             self.on_lasso_selection(bool(strokes or images))
 
@@ -7558,6 +7616,9 @@ class TextPageView(Gtk.Overlay):
         # the rest of a drag whose meaning was consumed mid-gesture (the
         # circle-to-lasso hold); PDFCanvas._ignoring is the same idea
         self._ink_ignoring = False
+        # a selection the user did not ask for — the dwell handing a snapped
+        # shape back (row 127); PDFCanvas._selection_auto's twin
+        self._selection_auto = False
         self._lasso_moving = False
         self._lasso_moved = False
         self._lasso_drag = (0.0, 0.0)  # live move offset while dragging
@@ -8810,6 +8871,12 @@ class TextPageView(Gtk.Overlay):
                 self._finish_grid_divider(pts)
             else:
                 self._commit_stroke(pts)
+                if was_straight and self.strokes:
+                    # the dwell recognised it: hand it back selected and BOXED,
+                    # adjustable with the pen still in hand (row 127)
+                    self._set_selected([self.strokes[-1]])
+                    self._selection_boxed = True
+                    self._selection_auto = True
             self.current_stroke = []
             self._snap_kind = self._snap_label = None
         elif self._erased_now:
@@ -9121,6 +9188,7 @@ class TextPageView(Gtk.Overlay):
             # a corner scales uniformly; a side handle stretches one axis (see
             # PDFCanvas — same shared handle policy)
             self._lasso_scaling = True
+            self._selection_auto = False   # you have taken hold of it now
             self._lasso_scale_mode, self._lasso_scale_anchor = \
                 lasso_handle_anchor(handle, self._selection_bbox())
             self._lasso_scale_start = (x, y)
@@ -9227,6 +9295,7 @@ class TextPageView(Gtk.Overlay):
         self._selected_images = list(images or [])
         self._selection_loop = None
         self._selection_boxed = False
+        self._selection_auto = False
         self._images_changed()   # the glow is drawn with the image, under text
 
     def _selection_is_boxed(self):
@@ -9285,7 +9354,10 @@ class TextPageView(Gtk.Overlay):
 
     def _point_in_selection(self, x, y):
         """The GRAB region: the loop in loop mode, the padded box otherwise —
-        see PDFCanvas._point_in_selection, it must match what is painted."""
+        see PDFCanvas._point_in_selection, it must match what is painted, and
+        for why an AUTO selection claims its handles but not its interior."""
+        if self._selection_auto:
+            return False
         if not self._selection_is_boxed():
             return PDFCanvas._point_in_polygon(x, y,
                                                self._selection_loop_overlay())
