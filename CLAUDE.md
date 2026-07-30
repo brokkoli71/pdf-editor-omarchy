@@ -321,15 +321,27 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     a selection — and `circle_lasso_target` is that decision for both canvases.
     Not gated on `shape_snap` (that setting governs the dwell). The **tool does
     not change**: the pen stays in your hand, which is the entire point.
-  - **Control points** (row 127): a selection of ONE corner polyline — a line,
-    path, polygon or rectangle — grows round vertex handles in BOX mode;
-    dragging one moves both edges meeting there. `shape_vertices` re-derives
-    them from the geometry each time (nothing stored, the `rect_bbox_of`
-    pattern), excludes sampled curves (an ellipse is 24+ points) and drops a
-    closed ring's repeated last point — moving vertex 0 must move both ends.
-    A control point sits inside the box on top of a resize handle and **wins**
-    there; both press routers test it first, and `selection_grab_at` includes
-    it. One `("reshape", …)` undo entry per drag.
+  - **Control points** (row 127): EVERY selected corner polyline — line, path,
+    polygon, rectangle — grows round vertex handles in BOX mode; dragging one
+    moves both edges meeting there. `shape_vertices` re-derives them from the
+    geometry each time (nothing stored, the `rect_bbox_of` pattern), excludes
+    sampled curves (an ellipse is 24+ points) and drops a closed ring's
+    repeated last point — moving vertex 0 must move both ends. Capped at
+    `MAX_VISIBLE_VERTICES`, same hedgehog argument. A control point sits inside
+    the box on top of a resize handle and **wins** there; both press routers
+    test it first, and `selection_grab_at` includes it. One `("reshape", …)`
+    undo entry per drag.
+  - **Welding** (row 127): a dragged control point snaps onto the nearest other
+    one within `vertex_snap_radius` (a fraction of the VIEWPORT — a reach on
+    screen must not shrink as you zoom in), visually first, so pulling away
+    before release lets go. Release leaves them sharing a coordinate, and
+    `welded_vertices()` re-derives the join at every grab so they drag as one.
+    **Nothing is stored** — that is what makes a weld survive a reload, a
+    sidecar round-trip and undo. Binding a vertex to a point ON an edge cannot
+    work this way and needs stable per-stroke ids; read row 129 before trying.
+    After the dwell fires, the pen keeps hold of the last control point of a
+    `line`/`path`/`polygon` (index 0 for a closed ring), so a recognised shape
+    is adjustable without lifting.
   - **Lasso verbs**: select / move / resize / rotate / `Ctrl+D` duplicate /
     `Del`. Rotation is a knob on a stalk above the box; Shift snaps to
     `ROTATE_SNAP_DEG`. A tilt is stored as an ANGLE and applied at render — it
@@ -421,9 +433,13 @@ than writing a line about having finished it. The chronology lives in
   at `get_end_iter()`, making the click merely the other end of the span; check
   `buffer.get_selection_bounds()` after the switch alone, before any click.
 
-- **Endpoint snapping between strokes** (row 127's last item) — draw a line
-  and have its end snap to a nearby stroke's end. Independent of everything
-  else in that row, which has shipped.
+- **Row 129 (a vertex bound to a point ON another edge)** — the one thing the
+  derive-at-drag-time model genuinely cannot do; it needs stored constraints
+  and therefore stable per-stroke ids in both persistence paths. Decide the
+  identity question before the geometry.
+- **Endpoint snapping while DRAWING** (row 127's last item) — a new line's end
+  snapping to a nearby stroke's end, as opposed to welding two control points
+  after the fact, which has shipped.
 
 - **Row 129 (notes continued across pages)** — "link to previous page" /
   "unlink", one boolean per page, no general linking graph (the user's scope

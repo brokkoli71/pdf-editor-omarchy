@@ -3721,9 +3721,10 @@ class TestLassoSelect(unittest.TestCase):
         shape = self._snap_a_rect(canvas)          # comes back selected + boxed
         before = list(shape["pts"])
         corner = canvas._pdf_to_screen(*shape["pts"][1])
-        self.assertEqual(canvas._shape_vertex_at(*corner), 1)
+        self.assertEqual(canvas._shape_vertex_at(*corner), (shape, 1))
         canvas._on_drag_begin(_FakeDrag(*corner), *corner)
-        self.assertEqual(canvas._vertex_dragging, 1)
+        self.assertEqual([(s, i) for s, i, _o in canvas._vertex_drag],
+                         [(shape, 1)])
         canvas._on_drag_update(_FakeDrag(*corner), 20, 30)
         canvas._on_drag_end(_FakeDrag(*corner), 20, 30)
         self.assertNotEqual(shape["pts"][1], before[1])
@@ -3740,30 +3741,103 @@ class TestLassoSelect(unittest.TestCase):
         shape = self._snap_a_rect(canvas)
         corner = canvas._pdf_to_screen(*shape["pts"][0])
         canvas._on_drag_begin(_FakeDrag(*corner), *corner)
-        self.assertIsNotNone(canvas._vertex_dragging)
+        self.assertTrue(canvas._vertex_drag)
         self.assertFalse(canvas._lasso_scaling)
 
-    def test_control_points_need_exactly_one_shape(self):
-        """With two selected there is no single geometry to edit, and the box
-        is the right tool for a group."""
+    def test_every_selected_shape_shows_its_control_points(self):
+        """Merging two drawings means seeing BOTH sets at once and dragging one
+        onto the other."""
         canvas = self._canvas()
         a, b = self._two_strokes(canvas)
         canvas._set_selected([a, b])
         canvas._selection_boxed = True
-        self.assertIsNone(canvas._selected_shape())
-        self.assertEqual(canvas._shape_vertices_screen(), [])
-        canvas._set_selected([a])
+        shapes = canvas._selected_shapes()
+        self.assertEqual([st for st, _v in shapes], [a, b])
+        self.assertEqual([len(v) for _s, v in shapes], [2, 2])
+
+    def test_too_many_control_points_are_no_control_points(self):
+        """A hedgehog is not editable — the same reason a sampled curve gets
+        none applies to thirty selected strokes."""
+        canvas = self._canvas()
+        many = [self._stroke([(i * 3, 0), (i * 3, 20)]) for i in range(30)]
+        canvas.all_strokes[0] = many
+        canvas._set_selected(many)
         canvas._selection_boxed = True
-        self.assertIsNotNone(canvas._selected_shape())
+        self.assertEqual(canvas._selected_shapes(), [])
 
     def test_control_points_are_hidden_in_loop_mode(self):
         canvas = self._canvas()
         a, _b = self._two_strokes(canvas)
         self._loop_select(canvas)
         self.assertEqual(canvas._selected_strokes, [a])
-        self.assertEqual(canvas._shape_vertices_screen(), [])
+        self.assertEqual(canvas._selected_shapes(), [])
         canvas.toggle_selection_box()
-        self.assertEqual(len(canvas._shape_vertices_screen()), 2)
+        self.assertEqual(len(canvas._selected_shapes()[0][1]), 2)
+
+    def _two_lines_meeting_near(self, canvas):
+        """Two 2-point strokes whose ends are close but not touching."""
+        a = self._stroke([(100, 100), (200, 100)])
+        b = self._stroke([(206, 104), (300, 200)])
+        canvas.all_strokes[0] = [a, b]
+        canvas._set_selected([a, b])
+        canvas._selection_boxed = True
+        return a, b
+
+    def test_a_dragged_control_point_snaps_onto_a_neighbour(self):
+        canvas = self._canvas()
+        a, b = self._two_lines_meeting_near(canvas)
+        grab = canvas._pdf_to_screen(200, 100)      # A's free end
+        canvas._on_drag_begin(_FakeDrag(*grab), *grab)
+        self.assertTrue(canvas._vertex_drag)
+        # nudge it a little way towards B's end — inside the snap reach
+        canvas._on_drag_update(_FakeDrag(*grab), 3, 2)
+        self.assertIsNotNone(canvas._vertex_snap_at)
+        self.assertEqual(a["pts"][1], b["pts"][0])   # visually together
+        # …and pulling far away lets go again, without releasing
+        canvas._on_drag_update(_FakeDrag(*grab), 250, 250)
+        self.assertIsNone(canvas._vertex_snap_at)
+        self.assertNotEqual(a["pts"][1], b["pts"][0])
+
+    def test_released_on_a_neighbour_they_drag_as_one(self):
+        canvas = self._canvas()
+        a, b = self._two_lines_meeting_near(canvas)
+        grab = canvas._pdf_to_screen(200, 100)
+        canvas._on_drag_begin(_FakeDrag(*grab), *grab)
+        canvas._on_drag_update(_FakeDrag(*grab), 3, 2)
+        canvas._on_drag_end(_FakeDrag(*grab), 3, 2)
+        joined = a["pts"][1]
+        self.assertEqual(joined, b["pts"][0])
+        # grabbing the merged point now takes BOTH strokes with it
+        g2 = canvas._pdf_to_screen(*joined)
+        canvas._on_drag_begin(_FakeDrag(*g2), *g2)
+        self.assertEqual(len(canvas._vertex_drag), 2)
+        canvas._on_drag_update(_FakeDrag(*g2), 30, 40)
+        canvas._on_drag_end(_FakeDrag(*g2), 30, 40)
+        self.assertEqual(a["pts"][1], b["pts"][0])   # still one point
+        self.assertNotEqual(a["pts"][1], joined)     # and it moved
+        canvas.undo_last()                           # ONE undo for both
+        self.assertEqual(a["pts"][1], joined)
+        self.assertEqual(b["pts"][0], joined)
+
+    def test_the_snap_reach_follows_the_viewport_not_the_zoom(self):
+        """It is a reach on SCREEN, so it must not shrink when you zoom in to
+        work on a detail."""
+        small = sidemark.vertex_snap_radius(400, 300)
+        big = sidemark.vertex_snap_radius(1600, 1200)
+        self.assertLess(small, big)
+        self.assertGreaterEqual(sidemark.vertex_snap_radius(10, 10),
+                                sidemark.VERTEX_SNAP_MIN)
+        self.assertLessEqual(sidemark.vertex_snap_radius(9000, 9000),
+                             sidemark.VERTEX_SNAP_MAX)
+
+    def test_welded_vertices_finds_every_point_at_a_coordinate(self):
+        a = {"pts": [(0, 0), (10, 10)]}
+        b = {"pts": [(10, 10), (20, 0)]}
+        c = {"pts": [(50, 50), (60, 60)]}
+        shapes = [(a, a["pts"]), (b, b["pts"]), (c, c["pts"])]
+        self.assertEqual(sidemark.welded_vertices(shapes, 10, 10),
+                         [(a, 1), (b, 0)])
+        self.assertEqual(sidemark.welded_vertices(shapes, 99, 99), [])
 
     # ── row 126: circle to lasso (press and hold the stroke you just drew) ──
 
@@ -9649,7 +9723,7 @@ class TestTextPageLasso(unittest.TestCase):
                 st = tp.strokes[0]
                 tp._set_selected([st])
                 tp._selection_boxed = True
-                verts = tp._shape_vertices_overlay()
+                verts = tp._selected_shapes()[0][1]
                 self.assertEqual(len(verts), 4)   # closing point dropped
                 before = list(st["pts"])
                 vx, vy = verts[1]
@@ -9660,7 +9734,8 @@ class TestTextPageLasso(unittest.TestCase):
                 win._set_tool_mode("lasso")
                 g = self._gesture(vx, vy)
                 tp._on_ink_begin(g, vx, vy)
-                self.assertEqual(tp._vertex_dragging, 1)
+                self.assertEqual([(a, i) for a, i, _o in tp._vertex_drag],
+                                 [(st, 1)])
                 tp._on_ink_update(g, 40.0, 25.0)
                 tp._on_ink_end(g, 40.0, 25.0)
                 after = tp._stroke_overlay_pts(st)
