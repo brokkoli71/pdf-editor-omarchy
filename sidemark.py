@@ -11882,6 +11882,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         pen_scroll.set_max_content_height(560)
         pen_scroll.set_child(popover_box)
         popover.set_child(pen_scroll)
+        # The pen button sits at the BOTTOM of the window, so this popover
+        # always opens upwards. Say so, or GTK keeps the "below" arrow while
+        # placing the popover above and the tail points away from its button.
+        popover.set_position(Gtk.PositionType.TOP)
 
         # the settings button shows the active tool's colour as a swatch
         self._color_swatch = Gtk.DrawingArea()
