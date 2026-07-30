@@ -395,6 +395,69 @@ def quad_is_axis_aligned(corners, tol_deg=12.0):
 POLYGON_MAX_CORNERS = 8
 CIRCLE_TOLERANCE = 0.12   # |rx-ry| within this fraction reads as a circle
 
+VERTEX_HIT_PX = 7.0       # grab radius for a control point
+VERTEX_DRAW_R = 4.0       # and the radius it is drawn at
+
+
+def shape_vertices(pts):
+    """The draggable CONTROL POINTS of a stroke, or [] when it has none.
+
+    Re-derived from the geometry every time, with nothing stored and no tag on
+    the stroke — the `rect_bbox_of` pattern — so control points survive a
+    reload and a round-trip through the sidecar for free.
+
+    A stroke qualifies when it is a CORNER polyline: a line (2), a path, a
+    polygon, a rectangle. A sampled curve (an ellipse is 24+ points) and
+    freehand ink do not — twenty-five handles on one wobble is not editing, it
+    is a hedgehog. For a closed shape the repeated last point is dropped and
+    the first vertex moves both ends, or the ring tears open."""
+    if len(pts) < 2:
+        return []
+    closed = (abs(pts[0][0] - pts[-1][0]) < 1e-9
+              and abs(pts[0][1] - pts[-1][1]) < 1e-9)
+    core = pts[:-1] if closed else pts
+    if not (2 <= len(core) <= POLYGON_MAX_CORNERS + 1):
+        return []
+    return list(core)
+
+
+def move_shape_vertex(pts, index, x, y):
+    """A stroke's points with vertex `index` moved to (x, y), keeping a closed
+    ring closed."""
+    out = list(pts)
+    closed = (abs(out[0][0] - out[-1][0]) < 1e-9
+              and abs(out[0][1] - out[-1][1]) < 1e-9)
+    out[index] = (x, y)
+    if closed and index == 0:
+        out[-1] = (x, y)
+    return out
+
+
+def nearest_vertex(verts, x, y, hit):
+    """Index of the control point within `hit` of (x, y), or None."""
+    best, at = hit, None
+    for i, (vx, vy) in enumerate(verts):
+        d = math.hypot(vx - x, vy - y)
+        if d <= best:
+            best, at = d, i
+    return at
+
+
+def draw_shape_vertices(ctx, verts, accent):
+    """Paint the control points — round, so they never read as the square
+    resize handles they sit inside."""
+    ar, ag, ab = accent
+    ctx.set_line_width(1.0)
+    ctx.set_dash([])
+    for vx, vy in verts:
+        ctx.new_sub_path()
+        ctx.arc(vx, vy, VERTEX_DRAW_R, 0, 2 * math.pi)
+        ctx.set_source_rgba(1, 1, 1, 0.95)
+        ctx.fill_preserve()
+        ctx.set_source_rgba(ar, ag, ab, 0.9)
+        ctx.stroke()
+
+
 # What the dwell says it recognised. One table, because the label is a
 # DECISION about what the user is told, not a per-canvas mechanic — and a
 # missing entry here is a KeyError mid-gesture, so a new kind must land in
@@ -1136,6 +1199,8 @@ class PDFCanvas(Gtk.DrawingArea):
         # and its handles, but it does NOT claim its interior — see
         # _point_in_selection.
         self._selection_auto = False
+        self._vertex_dragging = None    # index of the control point in hand
+        self._vertex_orig = None        # (stroke, pts) at drag begin
         self._selected_strokes = []    # references into self.strokes, selected
         self._lasso_moving = False
         self._lasso_move_start = None
@@ -2847,6 +2912,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # that gating on self._selected fell into (row 118).
         if (self._lasso_rotate_handle_at(sx, sy)
                 or self._lasso_chip_at(sx, sy)
+                or self._shape_vertex_at(sx, sy) is not None
                 or self._lasso_handle_at(sx, sy) is not None):
             return True
         return self._point_in_selection(*self._screen_to_pdf(sx, sy))
@@ -2882,6 +2948,17 @@ class PDFCanvas(Gtk.DrawingArea):
         # self._selected_strokes — that list is STROKES, and reading it as
         # "the selection" is what made an images-only selection unpickable on
         # the sheet (row 118).
+        vertex = (self._shape_vertex_at(start_x, start_y)
+                  if self.has_lasso_selection() else None)
+        if vertex is not None:
+            # ahead of the resize handles: a control point sits INSIDE the box
+            # and is the finer verb, so it must win where the two overlap
+            self._vertex_dragging = vertex
+            st = self._selected_shape()
+            self._vertex_orig = (st, list(st["pts"]))
+            self._selection_auto = False
+            self.set_cursor(Gdk.Cursor.new_from_name("crosshair", None))
+            return
         if self._lasso_chip_at(start_x, start_y):
             # the chip swaps the loop for the resize box and back; it claims
             # the press so nothing else reads it as a grab or a fresh loop
@@ -3012,6 +3089,12 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         if self._erasing:
             self._erase_at(sx + offset_x, sy + offset_y)
+            return
+        if self._vertex_dragging is not None:
+            st, orig = self._vertex_orig
+            px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
+            st["pts"] = move_shape_vertex(orig, self._vertex_dragging, px, py)
+            self.queue_draw()
             return
         if self._lasso_scaling:
             px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
@@ -3191,6 +3274,18 @@ class PDFCanvas(Gtk.DrawingArea):
                     and self._undo_stack[-1][4] == self._erase_group
                     and self.on_user_action):
                 self.on_user_action()
+            return
+        if self._vertex_dragging is not None:
+            self._vertex_dragging = None
+            self.set_cursor(self._default_cursor())
+            st, orig = self._vertex_orig
+            self._vertex_orig = None
+            if st["pts"] != orig:
+                # one undo entry for the drag, like every other lasso verb
+                self._undo_stack.append(("reshape", self.current_page_idx,
+                                         [(st, orig, list(st["pts"]))]))
+                self._end_lasso_edit()
+            self.queue_draw()
             return
         if self._lasso_scaling:
             self._lasso_scaling = False
@@ -4019,6 +4114,27 @@ class PDFCanvas(Gtk.DrawingArea):
     def _selection_loop_screen(self):
         return [self._pdf_to_screen(x, y) for x, y in self._selection_loop]
 
+    def _selected_shape(self):
+        """The ONE stroke whose control points are on show, or None.
+
+        One shape only: with two selected there is no single geometry to edit,
+        and the box is the right tool for a group anyway — the same call
+        GoodNotes makes by putting control points on a single tapped shape."""
+        if self._selected_images or len(self._selected_strokes) != 1:
+            return None
+        st = self._selected_strokes[0]
+        return st if shape_vertices(st["pts"]) else None
+
+    def _shape_vertices_screen(self):
+        st = self._selected_shape()
+        if st is None or not self._selection_is_boxed():
+            return []
+        return [self._pdf_to_screen(x, y) for x, y in shape_vertices(st["pts"])]
+
+    def _shape_vertex_at(self, sx, sy):
+        return nearest_vertex(self._shape_vertices_screen(), sx, sy,
+                              VERTEX_HIT_PX)
+
     def _lasso_chip_at(self, sx, sy):
         """Is the screen point on the loop⇄box chip? Only a selection that HAS
         a loop gets a chip — with nothing to switch to it would be a dead
@@ -4181,6 +4297,9 @@ class PDFCanvas(Gtk.DrawingArea):
                     ctx.fill_preserve()
                     ctx.set_source_rgba(ar, ag, ab, 0.9)
                     ctx.stroke()
+                if boxed:
+                    draw_shape_vertices(ctx, self._shape_vertices_screen(),
+                                        self.zoom_accent)
                 if self._selection_loop:
                     cx, cy = lasso_chip_centre(x0, y0, pad)
                     draw_lasso_chip(ctx, cx, cy, boxed, self.zoom_accent)
@@ -4352,6 +4471,9 @@ class PDFCanvas(Gtk.DrawingArea):
         elif op[0] == "recolor":
             for s, oc, ow, oo in op[2]:
                 s["color"], s["width"], s["opacity"] = oc, ow, oo
+        elif op[0] == "reshape":
+            for st, old_pts, _new in op[2]:
+                st["pts"] = list(old_pts)
         elif op[0] == "grid":
             _, _, new_stroke, entries = op
             if new_stroke in strokes:
@@ -4386,6 +4508,9 @@ class PDFCanvas(Gtk.DrawingArea):
             # re-add in chronological order (reverse of the pop order)
             for op in reversed(ops):
                 self._redo_add_op(page, op)
+        elif ops[0][0] == "reshape":
+            for st, _old, new_pts in ops[0][2]:
+                st["pts"] = list(new_pts)
         elif ops[0][0] == "lasso_move":
             _, _, refs, imgs, dx, dy = ops[0]
             for s in refs:
@@ -7619,6 +7744,8 @@ class TextPageView(Gtk.Overlay):
         # a selection the user did not ask for — the dwell handing a snapped
         # shape back (row 127); PDFCanvas._selection_auto's twin
         self._selection_auto = False
+        self._vertex_dragging = None    # index of the control point in hand
+        self._vertex_orig = None        # (stroke, stored pts) at drag begin
         self._lasso_moving = False
         self._lasso_moved = False
         self._lasso_drag = (0.0, 0.0)  # live move offset while dragging
@@ -8596,6 +8723,7 @@ class TextPageView(Gtk.Overlay):
         # `is not None`: handle 0 is a real corner and falsy (row 118's trap).
         if (self._lasso_rotate_handle_at(x, y)
                 or self._lasso_chip_at(x, y)
+                or self._shape_vertex_at(x, y) is not None
                 or self._lasso_handle_at(x, y) is not None):
             return True
         return self._point_in_selection(x, y)
@@ -8766,7 +8894,12 @@ class TextPageView(Gtk.Overlay):
             self._zoom_end = (x, y)
             self.ink.queue_draw()
             return
-        if self._lassoing:
+        if self._vertex_dragging is not None:
+            st, _orig = self._vertex_orig
+            moved = move_shape_vertex(self._stroke_overlay_pts(st),
+                                      self._vertex_dragging, x, y)
+            st["pts"] = self._overlay_to_stroke_pts(st, moved)
+        elif self._lassoing:
             self._lasso_path.append((x, y))
         elif self._lasso_rotating:
             cx, cy = self._lasso_rotate_centre
@@ -8821,6 +8954,22 @@ class TextPageView(Gtk.Overlay):
             return
         was_straight = self._straight_mode
         self._straight_mode = False
+        if self._vertex_dragging is not None:
+            self._vertex_dragging = None
+            self.ink.set_cursor(None)
+            st, orig = self._vertex_orig
+            self._vertex_orig = None
+            if st["pts"] != orig:
+                # one undo entry for the drag, like every other lasso verb
+                self._undo_ops.append(
+                    ("reshape", [(st, orig, list(st["pts"]))]))
+                self._redo_ops.clear()
+                if self.on_ink_action:
+                    self.on_ink_action()
+                if self.on_ink_changed:
+                    self.on_ink_changed()
+            self.ink.queue_draw()
+            return
         if self._lassoing:
             self._lassoing = False
             self._finish_lasso()
@@ -9164,6 +9313,17 @@ class TextPageView(Gtk.Overlay):
         # images-only selection has no strokes, and gating on strokes made a
         # lone photo impossible to grab or resize (it started a new loop
         # instead).
+        vertex = (self._shape_vertex_at(x, y)
+                  if self.has_lasso_selection() else None)
+        if vertex is not None:
+            # ahead of the resize handles — the finer verb wins where they
+            # overlap (PDFCanvas parity)
+            self._vertex_dragging = vertex
+            st = self._selected_shape()
+            self._vertex_orig = (st, list(st["pts"]))
+            self._selection_auto = False
+            self.ink.set_cursor(Gdk.Cursor.new_from_name("crosshair"))
+            return
         if self._lasso_chip_at(x, y):
             # the chip swaps the loop for the resize box and back, claiming the
             # press so nothing reads it as a grab or a fresh loop
@@ -9311,6 +9471,39 @@ class TextPageView(Gtk.Overlay):
         pts = self._stroke_overlay_pts(self._selection_loop)
         fn = self._lasso_transform()
         return [fn(p) for p in pts] if fn else pts
+
+    def _selected_shape(self):
+        """The ONE stroke whose control points are on show — see
+        PDFCanvas._selected_shape."""
+        if self._selected_images or len(self._selected) != 1:
+            return None
+        st = self._selected[0]
+        return st if shape_vertices(self._stroke_overlay_pts(st)) else None
+
+    def _shape_vertices_overlay(self):
+        st = self._selected_shape()
+        if st is None or not self._selection_is_boxed():
+            return []
+        return shape_vertices(self._stroke_overlay_pts(st))
+
+    def _shape_vertex_at(self, x, y):
+        return nearest_vertex(self._shape_vertices_overlay(), x, y,
+                              VERTEX_HIT_PX)
+
+    def _overlay_to_stroke_pts(self, st, overlay_pts):
+        """The exact inverse of _stroke_overlay_pts: overlay points back into
+        the offsets a stroke stores. Goes through the FLOAT converter, because
+        these are STORED — truncating each point is what made a rotated stroke
+        go lumpy."""
+        buf = self.view.get_buffer()
+        it = buf.get_iter_at_mark(st["mark"])
+        r = self.view.get_iter_location(it)
+        f = self.font_px / max(st["font_px"], 1)
+        out = []
+        for px, py in overlay_pts:
+            bx, by = self._overlay_to_buffer_f(px, py)
+            out.append(((bx - r.x) / f, (by - r.y) / f))
+        return out
 
     def _lasso_chip_at(self, x, y):
         """Is the overlay point on the loop⇄box chip? Only a selection that HAS
@@ -10033,6 +10226,9 @@ class TextPageView(Gtk.Overlay):
                 ctx.fill_preserve()
                 ctx.set_source_rgba(ar, ag, ab, 0.9)
                 ctx.stroke()
+            if boxed:
+                draw_shape_vertices(ctx, self._shape_vertices_overlay(),
+                                    self.accent())
             if self._selection_loop is not None:
                 cx, cy = lasso_chip_centre(x0, y0, pad)
                 draw_lasso_chip(ctx, cx, cy, boxed, self.accent())

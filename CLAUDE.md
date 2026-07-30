@@ -321,6 +321,15 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     a selection — and `circle_lasso_target` is that decision for both canvases.
     Not gated on `shape_snap` (that setting governs the dwell). The **tool does
     not change**: the pen stays in your hand, which is the entire point.
+  - **Control points** (row 127): a selection of ONE corner polyline — a line,
+    path, polygon or rectangle — grows round vertex handles in BOX mode;
+    dragging one moves both edges meeting there. `shape_vertices` re-derives
+    them from the geometry each time (nothing stored, the `rect_bbox_of`
+    pattern), excludes sampled curves (an ellipse is 24+ points) and drops a
+    closed ring's repeated last point — moving vertex 0 must move both ends.
+    A control point sits inside the box on top of a resize handle and **wins**
+    there; both press routers test it first, and `selection_grab_at` includes
+    it. One `("reshape", …)` undo entry per drag.
   - **Lasso verbs**: select / move / resize / rotate / `Ctrl+D` duplicate /
     `Del`. Rotation is a knob on a stalk above the box; Shift snaps to
     `ROTATE_SNAP_DEG`. A tilt is stored as an ANGLE and applied at render — it
@@ -384,12 +393,13 @@ than writing a line about having finished it. The chronology lives in
 
 **In flight — all three are code-verified and need a pass in the real app:**
 
-- **Rows 125 + 126 (the lasso keeps its loop; circle to lasso).** Unit-tested
-  on both canvases (`TestLassoSelect`'s row-125/126 blocks,
-  `TestTextPageLasso`). What needs hands: whether the chip is big enough to hit
-  with a pen first time, whether loop mode ever feels like the handles went
-  missing, and whether the 500 ms hold is right — every one of those is a
-  gesture, so none of it is verified.
+- **Rows 125–127 (the lasso keeps its loop; circle to lasso; shape
+  recognition and control points).** Unit-tested on both canvases
+  (`TestLassoSelect`'s row-125/126/127 blocks, `TestShapeRecognition`,
+  `TestTextPageLasso`). The 500 ms hold is confirmed by hand; everything else
+  is a gesture and so unverified — whether the chip and the control points are
+  big enough to hit with a pen first time, and whether an auto-selected shape
+  ever gets in the way.
 
 - **Row 123 (merge import).** What needs real hardware: the drops themselves
   (several PDFs on the window → "Merge…"; several on the page thumbnails →
@@ -411,13 +421,19 @@ than writing a line about having finished it. The chronology lives in
   at `get_end_iter()`, making the click merely the other end of the span; check
   `buffer.get_selection_bounds()` after the switch alone, before any click.
 
-- **Row 127 (vertex editing)** — the classifier half has shipped (polygons,
-  true circles). What is left: vertex handles on a single-shape lasso
-  selection (drag a corner, both adjacent edges follow) and endpoint snapping
-  between strokes. *Do not* revive "auto-select the shape after it snaps" — a
-  live selection owns its interior as the grab region, so it would block
-  drawing inside a box you just drew (see row 127's notes).
+- **Endpoint snapping between strokes** (row 127's last item) — draw a line
+  and have its end snap to a nearby stroke's end. Independent of everything
+  else in that row, which has shipped.
 
+- **Row 129 (notes continued across pages)** — "link to previous page" /
+  "unlink", one boolean per page, no general linking graph (the user's scope
+  call). A linked run shares one note body; a split leaves the text with the
+  first page of the run. PDF-only by nature. The work is the re-keying: every
+  path in row 123 that re-pages notes must carry the flag.
+- **Row 130 (gestures between the modes)** — drag the notes panel to full
+  width → text-first; drag in from the left edge → a blank PDF beside the text.
+  Settle first whether it is a view state or a real file conversion (ink lives
+  in different substrates), and make an accidental drag leave no trace.
 - **Row 119 (crop)** — the last piece of the image feature. Its design is
   settled in row 118 and must not be re-litigated: a field on the model applied
   at render, never a destructive re-encode, landing ONCE for both modes.

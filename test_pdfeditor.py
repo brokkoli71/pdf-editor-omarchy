@@ -3258,14 +3258,16 @@ class TestLassoSelect(unittest.TestCase):
 
     def test_move_translates_points_with_undo_redo(self):
         canvas = self._canvas()
-        a, _ = self._two_strokes(canvas)
+        a = self._stroke([(100, 100), (300, 300)])
+        canvas.all_strokes[0] = [a]
         orig = list(a["pts"])
         canvas._set_selected([a])
-        # grab inside A's bbox, drag by (30, 40)
-        canvas._on_drag_begin(_FakeDrag(50, 50), 50, 50)
+        # grab the MIDDLE of A's bbox — its ends are control points now (row
+        # 127), and those are the finer verb where the two overlap
+        canvas._on_drag_begin(_FakeDrag(200, 200), 200, 200)
         self.assertTrue(canvas._lasso_moving)
-        canvas._on_drag_update(_FakeDrag(50, 50), 30, 40)
-        canvas._on_drag_end(_FakeDrag(50, 50), 30, 40)
+        canvas._on_drag_update(_FakeDrag(200, 200), 30, 40)
+        canvas._on_drag_end(_FakeDrag(200, 200), 30, 40)
         self.assertEqual(a["pts"], [(x + 30, y + 40) for x, y in orig])
         canvas.undo_last()
         self.assertEqual(a["pts"], orig)
@@ -3695,6 +3697,73 @@ class TestLassoSelect(unittest.TestCase):
         # now it behaves like any selection: the interior grabs
         self.assertTrue(canvas.selection_grab_at(
             *canvas._pdf_to_screen(40, 30)))
+
+    # ── row 127: control points on a single selected shape ──────────────────
+
+    def test_shape_vertices_are_only_for_corner_shapes(self):
+        V = sidemark.shape_vertices
+        self.assertEqual(V([(0, 0), (10, 0)]), [(0, 0), (10, 0)])   # a line
+        rect = [(0, 0), (10, 0), (10, 5), (0, 5), (0, 0)]
+        self.assertEqual(len(V(rect)), 4)      # the closing point is dropped
+        curve = [(math.cos(t / 6), math.sin(t / 6)) for t in range(40)]
+        self.assertEqual(V(curve), [])         # 25+ handles is a hedgehog
+        self.assertEqual(V([(1, 1)]), [])
+
+    def test_moving_a_closed_shapes_first_vertex_keeps_it_closed(self):
+        rect = [(0, 0), (10, 0), (10, 5), (0, 5), (0, 0)]
+        moved = sidemark.move_shape_vertex(rect, 0, -3, -4)
+        self.assertEqual(moved[0], (-3, -4))
+        self.assertEqual(moved[-1], (-3, -4))   # or the ring tears open
+        self.assertEqual(moved[1], (10, 0))
+
+    def test_dragging_a_control_point_moves_two_edges_with_undo_redo(self):
+        canvas = self._canvas()
+        shape = self._snap_a_rect(canvas)          # comes back selected + boxed
+        before = list(shape["pts"])
+        corner = canvas._pdf_to_screen(*shape["pts"][1])
+        self.assertEqual(canvas._shape_vertex_at(*corner), 1)
+        canvas._on_drag_begin(_FakeDrag(*corner), *corner)
+        self.assertEqual(canvas._vertex_dragging, 1)
+        canvas._on_drag_update(_FakeDrag(*corner), 20, 30)
+        canvas._on_drag_end(_FakeDrag(*corner), 20, 30)
+        self.assertNotEqual(shape["pts"][1], before[1])
+        # only that corner moved — its two edges followed, nothing else did
+        for i in (0, 2, 3, 4):
+            self.assertEqual(shape["pts"][i], before[i])
+        canvas.undo_last()
+        self.assertEqual(shape["pts"], before)
+        canvas.redo_last()
+        self.assertNotEqual(shape["pts"][1], before[1])
+
+    def test_a_control_point_wins_over_the_resize_handle_it_sits_inside(self):
+        canvas = self._canvas()
+        shape = self._snap_a_rect(canvas)
+        corner = canvas._pdf_to_screen(*shape["pts"][0])
+        canvas._on_drag_begin(_FakeDrag(*corner), *corner)
+        self.assertIsNotNone(canvas._vertex_dragging)
+        self.assertFalse(canvas._lasso_scaling)
+
+    def test_control_points_need_exactly_one_shape(self):
+        """With two selected there is no single geometry to edit, and the box
+        is the right tool for a group."""
+        canvas = self._canvas()
+        a, b = self._two_strokes(canvas)
+        canvas._set_selected([a, b])
+        canvas._selection_boxed = True
+        self.assertIsNone(canvas._selected_shape())
+        self.assertEqual(canvas._shape_vertices_screen(), [])
+        canvas._set_selected([a])
+        canvas._selection_boxed = True
+        self.assertIsNotNone(canvas._selected_shape())
+
+    def test_control_points_are_hidden_in_loop_mode(self):
+        canvas = self._canvas()
+        a, _b = self._two_strokes(canvas)
+        self._loop_select(canvas)
+        self.assertEqual(canvas._selected_strokes, [a])
+        self.assertEqual(canvas._shape_vertices_screen(), [])
+        canvas.toggle_selection_box()
+        self.assertEqual(len(canvas._shape_vertices_screen()), 2)
 
     # ── row 126: circle to lasso (press and hold the stroke you just drew) ──
 
@@ -9562,6 +9631,44 @@ class TestTextPageLasso(unittest.TestCase):
                 self.assertTrue(tp._selection_is_boxed())
                 self.assertEqual(tp._lasso_handle_at(bbox[0] - 5.0,
                                                      bbox[1] - 5.0), 0)
+
+            self._run_in_window(body)
+
+    def test_control_points_on_the_sheet(self):
+        """Row 127's twin: drag a control point of a snapped shape, and the
+        stored geometry follows through the FLOAT converter — these offsets are
+        persisted, and truncating each point is what makes a shape degrade."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                win._set_tool_mode("pen")
+                tp._commit_stroke([(200.0, 200.0), (400.0, 200.0),
+                                   (400.0, 320.0), (200.0, 320.0),
+                                   (200.0, 200.0)])
+                st = tp.strokes[0]
+                tp._set_selected([st])
+                tp._selection_boxed = True
+                verts = tp._shape_vertices_overlay()
+                self.assertEqual(len(verts), 4)   # closing point dropped
+                before = list(st["pts"])
+                vx, vy = verts[1]
+                # a control point is grabbable with ANY tool: the capture-phase
+                # chord gesture claims it and borrows the lasso, exactly as it
+                # does for a pasted image
+                self.assertTrue(tp.selection_grab_at(vx, vy))
+                win._set_tool_mode("lasso")
+                g = self._gesture(vx, vy)
+                tp._on_ink_begin(g, vx, vy)
+                self.assertEqual(tp._vertex_dragging, 1)
+                tp._on_ink_update(g, 40.0, 25.0)
+                tp._on_ink_end(g, 40.0, 25.0)
+                after = tp._stroke_overlay_pts(st)
+                self.assertAlmostEqual(after[1][0], vx + 40.0, delta=1.5)
+                self.assertAlmostEqual(after[1][1], vy + 25.0, delta=1.5)
+                self.assertNotEqual(st["pts"], before)
+                tp.undo_ink()
+                self.assertEqual(st["pts"], before)
 
             self._run_in_window(body)
 
