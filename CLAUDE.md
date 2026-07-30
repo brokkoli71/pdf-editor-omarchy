@@ -113,6 +113,21 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 - Tests set `SIDEMARK_TEST=1` and use the system `/usr/bin/python3` (not venv
   shims). Window tests build a real `PDFEditorWindow` inside a throwaway
   `Adw.Application` and pump the main loop (`_settle()` pattern — copy it).
+- **Layout needs a live frame clock, and a full run does not have one.**
+  Allocation happens in the frame clock's layout phase, which is driven by the
+  compositor's frame callbacks — and by late in a full suite Weston has taken
+  the surface away (`VK_ERROR_SURFACE_LOST_KHR` in the captured stderr). After
+  that NOTHING re-allocates: `_settle()` pumps idles all it likes, a widget
+  keeps whatever size it last had, and even an explicit `set_size_request` is
+  never honoured. So a `GtkTextView` never grows to its content height, and
+  anything downstream of that (an adjustment's `upper`, a scroll position, a
+  `translate_coordinates` result) is stale. **Test the property or the model,
+  not the pixels** — and where a gesture-level assertion really is the point,
+  make it `skipTest` on the unmet precondition instead of failing for the
+  environment (`test_focusing_the_sheet_does_not_scroll_it` is the pattern:
+  property always, scroll only when the sheet actually laid out). The tell is
+  a test that passes alone, fails only in a full run, and dies at a geometry
+  precondition rather than at what it means to assert.
 - For visual verification, launch the app (standalone env var above) and
   screenshot with `grim` (Hyprland); focus the window first via
   `hyprctl dispatch focuswindow address:...`. Don't leave repeated windows
@@ -371,7 +386,7 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     on an EDGE when no vertex is in reach (a vertex must win, or you land
     beside the corner you aimed at); that snap is **positional only** — the
     point lands there and does not follow the edge afterwards, which is what
-    keeps row 129's false-positive problem out, since nothing is persisted.
+    keeps row 131's false-positive problem out, since nothing is persisted.
     After the dwell fires the pen keeps hold of the last control point of a
     `line`/`path`/`polygon` (index 0 for a closed ring), and every corner
     polyline on the PAGE becomes a live magnet for it (`_live_snap_shapes`,
@@ -489,17 +504,12 @@ than writing a line about having finished it. The chronology lives in
 - **Row 111** — duplicate-download dialog.
 - **Row 117** — the suite is flaky under full-run load: one test fails per full
   run while passing in isolation and on a clean tree. Wants its own session.
-  **Left failing on purpose (2026-07-30):**
-  `TestTextFirstMode::test_focusing_the_sheet_does_not_scroll_it` (row 128)
-  passes alone and fails in the full run. The fix it guards is confirmed by
-  hand in the app, so this is the test, not the code. What is known: it fails
-  at its precondition — the sheet is never taller than its viewport, so there
-  is nothing to scroll — and waiting on layout (3 s of pumped loop) does NOT
-  fix it, so the sheet seems not to reach full height at all under full-run
-  load. Start row 117 here: it is the freshest and smallest case.
+  One cause is now known and written up under "layout needs a live frame clock"
+  above — that is the shape to check any new full-run-only failure against
+  before assuming a race, since a stalled clock reads exactly like one.
 - **Rows 26/27/64** — older, unranked.
 
 **Won't do:** presenter/share for text mode (row 106 item 7); a vertex truly
-BOUND to a point on another edge (row 129) — the positional edge snap gives the
+BOUND to a point on another edge (row 131) — the positional edge snap gives the
 useful half without needing stored constraints and stable per-stroke ids. Both
 the user's call.

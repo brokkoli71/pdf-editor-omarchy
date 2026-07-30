@@ -8779,21 +8779,39 @@ class TestTextFirstMode(unittest.TestCase):
         fire, which is exactly what picking a tool from the toolbar sets up:
         the first thing GTK does on the next press is grab_focus() on the
         view, so the sheet moved out from under the click and the caret landed
-        pages away from the pointer."""
-        long_md = self.MD + "".join(f"line {i}: text\n" for i in range(200))
+        pages away from the pointer.
+
+        The test comes in two halves because only one of them survives a full
+        run. **The property is the guard**; the gesture is the demonstration.
+        Scrolling anything needs a laid-out tree, and layout happens in the
+        frame clock's layout phase — which stops under full-suite load, once
+        the headless compositor has taken the surface away
+        (`VK_ERROR_SURFACE_LOST_KHR` in the captured stderr). Then nothing
+        re-allocates however long the loop is pumped: even a forced 3000 px
+        size request leaves the adjustment at one screen, so the child is never
+        taller than the viewport and scroll-to-focus has nothing to reveal. The
+        height is forced rather than filled with 200 lines of text for the same
+        reason at one remove — a GtkTextView only reaches its content height
+        once its layout has been incrementally validated, which needs that same
+        clock. So the gesture half SKIPS when the sheet did not lay out, rather
+        than failing for the environment (row 117)."""
+        never_laid_out = []
         with tempfile.TemporaryDirectory() as d:
             def body(win):
-                self._open_md(win, d, long_md)
+                self._open_md(win, d)
                 tp = win._active_session._text_page
                 vadj = tp.scroll.get_vadjustment()
-                # the sheet has to be laid out before it can scroll at all,
-                # and under full-suite load that takes longer than one settle
+                # the fix itself — load-independent, so this half always runs
+                self.assertFalse(tp.scroll.get_child().get_scroll_to_focus())
+                tp.view.set_size_request(-1, 3000)
                 for _ in range(20):
                     if vadj.get_upper() - vadj.get_page_size() > 700:
                         break
                     self._settle(150)
-                self.assertGreater(vadj.get_upper() - vadj.get_page_size(), 700,
-                                   "sheet must be taller than the viewport")
+                else:
+                    never_laid_out.append(
+                        f"upper={vadj.get_upper()} page={vadj.get_page_size()}")
+                    return
                 # the tool switch parks focus on a toolbar button
                 win._set_tool_mode("pen")
                 win._mode_pen.grab_focus()
@@ -8809,6 +8827,10 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertAlmostEqual(vadj.get_value(), was, delta=1)
 
             self._run_in_window(body)
+        if never_laid_out:
+            self.skipTest("no live frame clock, so the sheet never got taller "
+                          f"than its viewport ({never_laid_out[0]}) — the "
+                          "scroll-to-focus property was still checked")
 
     def _assert_chrome_matches(self, win, mode):
         """Every widget in _MODE_CHROME (and its popover twin) is visible
