@@ -559,6 +559,7 @@ def draw_vertex_snap_ring(ctx, pt, accent):
     ctx.set_dash([])
     ctx.set_line_width(2.0)
     ctx.set_source_rgba(ar, ag, ab, 0.9)
+    ctx.new_sub_path()   # or a stray current point becomes a line into the arc
     ctx.arc(pt[0], pt[1], VERTEX_DRAW_R + 4.0, 0, 2 * math.pi)
     ctx.stroke()
     ctx.restore()
@@ -1128,6 +1129,12 @@ def draw_snap_label(ctx, sx, sy, text, accent):
     ctx.set_source_rgb(1, 1, 1)
     ctx.move_to(bx + pad - ext.x_bearing, by + pad - ext.y_bearing)
     ctx.show_text(text)
+    # show_text leaves a CURRENT POINT at the end of the text, and ctx.restore()
+    # does not clear the path — it is not part of the saved state. Whatever
+    # draws next then joins onto it: an arc() with a current point starts with a
+    # straight line to the arc, which drew a ghost line from this label to the
+    # snap ring at the cursor. Leave the path empty for the next painter.
+    ctx.new_path()
     ctx.restore()
 
 

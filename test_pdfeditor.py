@@ -813,6 +813,20 @@ class TestShapeRecognition(unittest.TestCase):
         ys = [p[1] for p in new]
         self.assertGreater(max(xs) - min(xs), 2 * (max(ys) - min(ys)))
 
+    def test_the_snap_label_leaves_no_current_point(self):
+        """REGRESSION: show_text leaves a current point and ctx.restore() does
+        NOT clear the path — it is not part of the saved state. The next
+        painter's arc() then began with a straight line to it, drawing a ghost
+        line from this label to the snap ring at the cursor."""
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 200, 100)
+        ctx = cairo.Context(surf)
+        sidemark.draw_snap_label(ctx, 20, 60, "path", (0.2, 0.4, 0.9))
+        self.assertFalse(ctx.has_current_point())
+        # and the ring is safe even if some other painter left one behind
+        ctx.move_to(5, 5)
+        sidemark.draw_vertex_snap_ring(ctx, (120, 50), (0.2, 0.4, 0.9))
+        self.assertFalse(ctx.has_current_point())
+
     def test_every_recognised_kind_has_a_label(self):
         """A missing entry is a KeyError mid-gesture, and both canvases read
         this one table."""

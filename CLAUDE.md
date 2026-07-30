@@ -151,6 +151,11 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   returning an action, or the drop never fires (portal transfer).
 - **GTK4 popovers**: never popdown one popover and popup a sibling on the same
   widget synchronously — defer to the "closed" signal.
+- **cairo's `save()`/`restore()` does not save the PATH.** A painter that ends
+  with `show_text()` leaves a current point behind, and the next `arc()` joins
+  onto it with a straight line — which is how a ghost line appeared from the
+  snap label to the snap ring. End a shared painter with `new_path()`, and
+  start an arc with `new_sub_path()`.
 - **Both modes, always.** Every feature is designed for PDF *and* text-first
   pages unless there is a stated reason it cannot be — the two are one app to
   the user, and a feature missing on one side reads as a bug, not a scope call.
@@ -444,10 +449,6 @@ than writing a line about having finished it. The chronology lives in
   at `get_end_iter()`, making the click merely the other end of the span; check
   `buffer.get_selection_bounds()` after the switch alone, before any click.
 
-- **Row 129 (a vertex bound to a point ON another edge)** — the one thing the
-  derive-at-drag-time model genuinely cannot do; it needs stored constraints
-  and therefore stable per-stroke ids in both persistence paths. Decide the
-  identity question before the geometry.
 
 - **Row 129 (notes continued across pages)** — "link to previous page" /
   "unlink", one boolean per page, no general linking graph (the user's scope
@@ -472,4 +473,7 @@ than writing a line about having finished it. The chronology lives in
   run while passing in isolation and on a clean tree. Wants its own session.
 - **Rows 26/27/64** — older, unranked.
 
-**Won't do:** presenter/share for text mode (row 106 item 7) — the user's call.
+**Won't do:** presenter/share for text mode (row 106 item 7); a vertex truly
+BOUND to a point on another edge (row 129) — the positional edge snap gives the
+useful half without needing stored constraints and stable per-stroke ids. Both
+the user's call.
