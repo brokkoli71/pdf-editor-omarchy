@@ -2239,6 +2239,73 @@ class TestLatexFormatting(unittest.TestCase):
         self.assertFalse(v._line_originals)
         self.assertEqual(v.get_source_text(), 'brand new')
 
+    # ── row 128: re-rendering a line must not move the caret or the bound ─────
+
+    def test_restoring_cursor_line_keeps_the_caret(self):
+        """Clicking onto a rendered line un-renders it (α → \\alpha), which
+        deletes and re-inserts the whole line. Both marks live inside that
+        range, so without care they ride the insert's right gravity to the line
+        END — the caret jumps and the selection bound is left parked there."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('other\n' + r'a \alpha b tail')
+        buf.place_cursor(buf.get_iter_at_line(0)[1])   # line 1 renders to α
+        v._rehighlight()
+        # a click lands after the (now one-character) glyph, on "b"
+        buf.place_cursor(buf.get_iter_at_line_offset(1, 4)[1])
+        v._rehighlight()                               # un-renders line 1
+        it = buf.get_iter_at_mark(buf.get_insert())
+        self.assertEqual(it.get_line(), 1)
+        # the caret stays on the same character, now past the restored \alpha
+        self.assertEqual(it.get_line_offset(), 9)
+        self.assertFalse(buf.get_has_selection())
+
+    def test_rerender_leaves_no_selection_bound_behind(self):
+        """The bug's signature. A pen press always jitters, so GTK follows the
+        press with a drag-update, which moves `insert` ALONE back to the
+        pointer (move_mark_to_pointer_and_scroll). If the re-render parked the
+        bound at the line end, that innocent motion becomes a selection."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('other\n' + r'a \alpha b tail')
+        buf.place_cursor(buf.get_iter_at_line(0)[1])
+        v._rehighlight()
+        click = buf.get_iter_at_line_offset(1, 4)[1]
+        buf.place_cursor(click)                    # the press
+        v._rehighlight()                           # un-renders the line
+        # GTK's drag-update: the insert mark alone follows the pointer, which
+        # after the restore is one column further along (\alpha is 6 chars)
+        buf.move_mark(buf.get_insert(), buf.get_iter_at_line_offset(1, 9)[1])
+        self.assertFalse(buf.get_has_selection())
+
+    def test_rerender_keeps_a_live_selection(self):
+        """A selection whose BOUND sits on a line that gets rendered keeps that
+        end where the user put it — the bound is carried across the replace
+        just like the caret, and it is on a non-cursor line that renders."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('plain\n' + r'\alpha tail')
+        # caret on line 0 (so line 1 renders), selection running back to
+        # just after the symbol on line 1
+        buf.select_range(buf.get_iter_at_line_offset(0, 0)[1],
+                         buf.get_iter_at_line_offset(1, 7)[1])
+        v._rehighlight()
+        bounds = buf.get_selection_bounds()
+        self.assertTrue(bounds)
+        # line 1 now reads "α tail"; the bound stays after "α ", not at the end
+        self.assertEqual(buf.get_text(bounds[0], bounds[1], False),
+                         'plain\nα ')
+
+    def test_remap_column_maps_around_the_changed_span(self):
+        v = self._view()
+        old, new = 'a α b', r'a \alpha b'
+        self.assertEqual(v._remap_column(0, old, new), 0)    # before the span
+        self.assertEqual(v._remap_column(2, old, new), 2)    # at the span start
+        self.assertEqual(v._remap_column(3, old, new), 8)    # after it
+        self.assertEqual(v._remap_column(5, old, new), 10)   # line end
+        # shrinking (render) is the same map run the other way
+        self.assertEqual(v._remap_column(8, new, old), 3)
+
     # ── `code` spans render verbatim (no symbols/scripts/bold inside) ──────────
     def _render_line0(self, text):
         """Render `text` as line 0 with the cursor parked on a second line, so

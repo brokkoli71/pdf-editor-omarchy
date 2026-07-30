@@ -7768,6 +7768,28 @@ class MarkdownNotesView(GtkSource.View):
                 shifted[ln - n] = orig
         self._line_originals = shifted
 
+    @staticmethod
+    def _remap_column(col, old, new):
+        """Where column `col` of `old` lands once the line reads `new`.
+
+        Rendering and un-rendering a line only ever swaps one span for another
+        (`\\alpha` ↔ α), so the common prefix and suffix are what a caret is
+        really anchored to: a column inside the prefix keeps its number, one
+        inside the suffix keeps its distance from the line end, and only a
+        column inside the changed span itself has to be clamped."""
+        p = 0
+        while p < len(old) and p < len(new) and old[p] == new[p]:
+            p += 1
+        s = 0
+        while (s < len(old) - p and s < len(new) - p
+               and old[len(old) - 1 - s] == new[len(new) - 1 - s]):
+            s += 1
+        if col <= p:
+            return col
+        if col >= len(old) - s:
+            return col + len(new) - len(old)
+        return min(col, len(new))
+
     def _buf_replace_line(self, buf, ln, new_text):
         ok, ls = buf.get_iter_at_line(ln)
         if not ok:
@@ -7775,11 +7797,34 @@ class MarkdownNotesView(GtkSource.View):
         le = ls.copy()
         if not le.ends_line():
             le.forward_to_line_end()
+        old_text = buf.get_text(ls, le, True)
+        # Whenever the caret is on this line BOTH marks sit inside the range
+        # about to be deleted: the delete collapses them onto the line start
+        # and the re-insert then drags them to the line END on their right
+        # gravity. That silently parks the selection bound away from the caret,
+        # and the next pointer motion (a pen press always jitters, so GTK's
+        # drag-update runs) moves `insert` alone — which is how a plain click
+        # turned into a selection spanning the rest of the line. Carry both
+        # marks across by hand; a mark on any other line rides the edit fine.
+        cols = []
+        for mark in (buf.get_insert(), buf.get_selection_bound()):
+            it = buf.get_iter_at_mark(mark)
+            cols.append(self._remap_column(it.get_line_offset(),
+                                           old_text, new_text)
+                        if it.get_line() == ln else None)
         self._in_highlight = True
         try:
             buf.delete(ls, le)
             ins = buf.get_iter_at_line(ln)[1]
             buf.insert(ins, new_text)
+            if cols[0] is not None or cols[1] is not None:
+                its = [buf.get_iter_at_mark(buf.get_insert()),
+                       buf.get_iter_at_mark(buf.get_selection_bound())]
+                for i, col in enumerate(cols):
+                    if col is not None:
+                        its[i] = buf.get_iter_at_line_offset(
+                            ln, max(0, min(col, len(new_text))))[1]
+                buf.select_range(its[0], its[1])
         finally:
             self._in_highlight = False
 

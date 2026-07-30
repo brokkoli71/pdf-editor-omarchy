@@ -191,6 +191,20 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     belong on the WINDOW's capture controller, which fires whatever has focus;
     let it ask the surface (`wants_paste()`, `has_lasso_selection()`) instead
     of the surface owning the key.
+- **A GtkTextMark displaced by an EDIT moves without a `mark-set` signal.**
+  Rewriting a line under the caret (`_buf_replace_line`, how the live-Markdown
+  renderer un-renders `α`→`\alpha`) deletes and re-inserts it, and `insert` +
+  `selection_bound` sit inside that range: the delete collapses them onto the
+  line start and the re-insert drags them to the line END on their right
+  gravity. Any such rewrite must carry both marks across by hand — save
+  COLUMNS (ints) before, re-derive iters after, since the edit invalidates
+  every iter. Row 128 is what this costs when you don't: the caret jumped, and
+  because a pen press always jitters, GTK's follow-up drag-update moved
+  `insert` alone (`move_mark_to_pointer_and_scroll`) and a plain click became a
+  selection running to the end of the text. Two lessons for debugging it: a
+  mark that moves with no `mark-set` is riding an edit, and instrumenting the
+  real app was the only thing that showed it — every static reading of the
+  handlers tested clean.
 - **`save()` rebinds `self.document` — anything holding the OLD one is stale.**
   `save()` reopens the file, so every cached PyMuPDF object from before it
   belongs to an orphaned document. `self.page` is the one that bites: the page
@@ -442,13 +456,6 @@ than writing a line about having finished it. The chronology lives in
   checklist.
 
 **Loose ends, roughly in order of how ready they are:**
-
-- **Row 128 (BUG, reported 2026-07-30)** — on a text page, switching TO the
-  text/cursor tool and then clicking selects from the click to the end of the
-  document and scrolls there. Suspect the tool switch parks the selection bound
-  at `get_end_iter()`, making the click merely the other end of the span; check
-  `buffer.get_selection_bounds()` after the switch alone, before any click.
-
 
 - **Row 129 (notes continued across pages)** — "link to previous page" /
   "unlink", one boolean per page, no general linking graph (the user's scope
