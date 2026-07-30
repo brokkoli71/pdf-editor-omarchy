@@ -291,6 +291,21 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     `COPY_RENDER_SCALE`× supersampled PNG. In-app paste is lossless — ink
     comes back as editable INK, an image as an image — every other app gets a
     picture. This is a hard user requirement, not a nicety.
+  - **A selection wears the LOOP it was drawn with** (row 125), not a box: it
+    is stored in document coords (`_selection_loop`), it is the GRAB region
+    (`_point_in_selection` → point-in-polygon), and a chip diagonally outside
+    the box's top-left corner switches to the 8-handle resize box and back
+    (`lasso_chip_centre`/`lasso_chip_hit`/`draw_lasso_chip`, one policy for
+    both canvases). **Handles and the rotate knob hit-test to nothing in loop
+    mode** — a hit-test that outlives its painter is exactly how a frame drifts
+    from what a grab catches. A click / paste / duplicate / additive selection
+    has no loop and so shows the box; `_set_selected` clears the loop and
+    `_finish_lasso` puts it back, never the other way round. Transforms carry
+    the loop along (PDF: the drag snapshot; sheet: `_reanchor_selected`), and a
+    stale loop after an undone move is impossible only because undo already
+    calls `clear_lasso_selection()` — don't remove that. On the sheet the loop
+    is anchored **like a stroke** (mark + buffer offsets + `font_px`) so it
+    reflows; overlay coords would drift on the first edit.
   - **Lasso verbs**: select / move / resize / rotate / `Ctrl+D` duplicate /
     `Del`. Rotation is a knob on a stalk above the box; Shift snaps to
     `ROTATE_SNAP_DEG`. A tilt is stored as an ANGLE and applied at render — it
@@ -352,7 +367,12 @@ when something lands, fold its invariants upward and delete it from here rather
 than writing a line about having finished it. The chronology lives in
 `ideas.csv` and git.
 
-**In flight — both are code-verified and need a pass in the real app:**
+**In flight — all three are code-verified and need a pass in the real app:**
+
+- **Row 125 (the lasso keeps its loop).** Unit-tested on both canvases
+  (`TestLassoSelect`'s row-125 block, `TestTextPageLasso`). What needs hands:
+  whether the chip is big enough to hit with a pen first time, and whether
+  loop mode ever feels like the handles went missing.
 
 - **Row 123 (merge import).** What needs real hardware: the drops themselves
   (several PDFs on the window → "Merge…"; several on the page thumbnails →
@@ -367,6 +387,20 @@ than writing a line about having finished it. The chronology lives in
   checklist.
 
 **Loose ends, roughly in order of how ready they are:**
+
+- **Row 128 (BUG, reported 2026-07-30)** — on a text page, switching TO the
+  text/cursor tool and then clicking selects from the click to the end of the
+  document and scrolls there. Suspect the tool switch parks the selection bound
+  at `get_end_iter()`, making the click merely the other end of the span; check
+  `buffer.get_selection_bounds()` after the switch alone, before any click.
+
+- **Row 126 (circle to lasso)** — designed, not built, and next after row 125
+  (the loop IS its visual half). The insight not to lose: it does not collide
+  with the dwell shape-snap because the two are separated by the **pen lift**,
+  not by the shape.
+- **Row 127 (polygon recognition + vertex editing)** — designed, not built.
+  Start with "select the shape right after it snaps": nearly free, and nothing
+  else in the row is reachable without it.
 
 - **Row 119 (crop)** — the last piece of the image feature. Its design is
   settled in row 118 and must not be re-litigated: a field on the model applied

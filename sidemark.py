@@ -400,6 +400,77 @@ def lasso_handle_cursor(handle):
             "ns-resize", "ew-resize", "ns-resize", "ew-resize")[handle]
 
 
+# ── the loop ⇄ box mode chip (row 125) ──────────────────────────────────────
+# A lasso selection normally keeps the LOOP you drew — you grab anywhere inside
+# it — and the chip is how you get to the resize box, which is the only way to
+# scale or rotate. One geometry and one painter for both canvases, like the
+# handle policy above: the chip must be grabbed exactly where it is drawn, and
+# it must read identically on a PDF page and on a text sheet.
+
+LASSO_CHIP_SIZE = 16.0    # the chip's side, in screen px
+LASSO_CHIP_GAP = 6.0      # clearance from the box, so it misses the TL handle
+
+
+def lasso_chip_centre(x0, y0, pad):
+    """Centre of the mode chip for a selection box whose top-left corner is
+    (x0, y0), drawn with `pad` slack.
+
+    Diagonally OUTSIDE that corner: the top edge's centre belongs to the rotate
+    knob and the corner itself to a resize handle, and the gap is what keeps
+    the chip clear of that handle's 8×8 hit box."""
+    off = pad + LASSO_CHIP_GAP + LASSO_CHIP_SIZE / 2.0
+    return (x0 - off, y0 - off)
+
+
+def lasso_chip_hit(cx, cy, px, py, slop=3.0):
+    """Is (px, py) on the chip centred at (cx, cy)? The slop is generous — it
+    is a 16 px target that a pen has to hit on the first try."""
+    r = LASSO_CHIP_SIZE / 2.0 + slop
+    return abs(px - cx) <= r and abs(py - cy) <= r
+
+
+def draw_lasso_chip(ctx, cx, cy, boxed, accent):
+    """Paint the mode chip. It shows WHAT YOU WILL GET, not what you have: in
+    loop mode a resize box with corner ticks, in box mode a dashed loop. A
+    toggle that pictures its own current state reads as a status light and
+    leaves you guessing what tapping it does."""
+    ar, ag, ab = accent
+    s = LASSO_CHIP_SIZE
+    ctx.save()
+    ctx.set_line_width(1.0)
+    ctx.set_dash([])
+    r = 3.0
+    x, y = cx - s / 2.0, cy - s / 2.0
+    ctx.new_sub_path()
+    ctx.arc(x + s - r, y + r, r, -math.pi / 2, 0)
+    ctx.arc(x + s - r, y + s - r, r, 0, math.pi / 2)
+    ctx.arc(x + r, y + s - r, r, math.pi / 2, math.pi)
+    ctx.arc(x + r, y + r, r, math.pi, 1.5 * math.pi)
+    ctx.close_path()
+    ctx.set_source_rgba(1, 1, 1, 0.95)
+    ctx.fill_preserve()
+    ctx.set_source_rgba(ar, ag, ab, 0.9)
+    ctx.stroke()
+    ctx.set_source_rgba(ar, ag, ab, 0.95)
+    if boxed:
+        # currently boxed → the chip offers the loop back: a dashed circle
+        ctx.set_dash([1.8, 1.8])
+        ctx.arc(cx, cy, s * 0.28, 0, 2 * math.pi)
+        ctx.stroke()
+        ctx.set_dash([])
+    else:
+        # currently looped → the chip offers the box: a square with its
+        # corner handles marked, the same picture as the real selection frame
+        h = s * 0.26
+        ctx.rectangle(cx - h, cy - h, 2 * h, 2 * h)
+        ctx.stroke()
+        for hx, hy in ((cx - h, cy - h), (cx + h, cy - h),
+                       (cx + h, cy + h), (cx - h, cy + h)):
+            ctx.rectangle(hx - 1.5, hy - 1.5, 3, 3)
+            ctx.fill()
+    ctx.restore()
+
+
 def _merge_selection(base, strokes, images):
     """Add a lasso's catch to the selection it started from — Shift+lasso, in
     both modes.
@@ -854,6 +925,12 @@ class PDFCanvas(Gtk.DrawingArea):
         self._lasso_additive = False   # Shift: add this loop's catch to the selection
         self._lasso_base = ([], [])    # the selection an additive loop started from
         self._lasso_path = []          # screen-space points of the loop in progress
+        # The loop a selection was made with, kept in PDF coords so it rides the
+        # zoom (row 125). Empty when the selection has no loop to show — a
+        # click, a paste, a duplicate — and then the box is all there is.
+        self._selection_loop = []
+        self._selection_boxed = False   # the chip flipped this selection to the box
+        self._loop_orig = []            # loop snapshot at drag begin
         self._selected_strokes = []    # references into self.strokes, selected
         self._lasso_moving = False
         self._lasso_move_start = None
@@ -2492,6 +2569,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # `is not None` — handle 0 is a real corner and falsy, the same trap
         # that gating on self._selected fell into (row 118).
         if (self._lasso_rotate_handle_at(sx, sy)
+                or self._lasso_chip_at(sx, sy)
                 or self._lasso_handle_at(sx, sy) is not None):
             return True
         return self._point_in_selection(*self._screen_to_pdf(sx, sy))
@@ -2509,6 +2587,11 @@ class PDFCanvas(Gtk.DrawingArea):
         # self._selected_strokes — that list is STROKES, and reading it as
         # "the selection" is what made an images-only selection unpickable on
         # the sheet (row 118).
+        if self._lasso_chip_at(start_x, start_y):
+            # the chip swaps the loop for the resize box and back; it claims
+            # the press so nothing else reads it as a grab or a fresh loop
+            self.toggle_selection_box()
+            return
         if (self.has_lasso_selection()
                 and self._lasso_rotate_handle_at(start_x, start_y)):
             # the knob above the box spins the whole selection about its centre
@@ -2571,11 +2654,13 @@ class PDFCanvas(Gtk.DrawingArea):
     def _snapshot_selection(self):
         """Freeze the selection's geometry at drag begin — ONE snapshot pair
         for move, resize and rotate alike, so strokes and images can never
-        drift apart mid-drag."""
+        drift apart mid-drag. The loop is snapshotted with them and transformed
+        alongside, or the outline drifts off the ink it belongs to."""
         self._lasso_scale_orig = [(s, list(s["pts"]), s["width"])
                                   for s in self._selected_strokes]
         self._lasso_image_orig = [(im, tuple(im["rect"]))
                                   for im in self._selected_images]
+        self._loop_orig = list(self._selection_loop)
 
     def _on_drag_update(self, gesture, offset_x, offset_y):
         if self._post_pinch:
@@ -2649,6 +2734,8 @@ class PDFCanvas(Gtk.DrawingArea):
             for im, (x, y, w, h) in self._lasso_image_orig:
                 im["rect"] = (ax + (x - ax) * fx, ay + (y - ay) * fy,
                               w * fx, h * fy)
+            self._selection_loop = [(ax + (x - ax) * fx, ay + (y - ay) * fy)
+                                    for x, y in self._loop_orig]
             self.queue_draw()
             return
         if self._lasso_rotating:
@@ -2676,6 +2763,7 @@ class PDFCanvas(Gtk.DrawingArea):
             for im, (x, y, w, h) in self._lasso_image_orig:
                 ncx, ncy = spin(x + w / 2.0, y + h / 2.0)
                 im["rect"] = (ncx - w / 2.0, ncy - h / 2.0, w, h)
+            self._selection_loop = [spin(x, y) for x, y in self._loop_orig]
             self.queue_draw()
             return
         if self._lasso_moving:
@@ -2686,6 +2774,8 @@ class PDFCanvas(Gtk.DrawingArea):
                 s["pts"] = [(x + dx, y + dy) for x, y in orig]
             for im, (x, y, w, h) in self._lasso_image_orig:
                 im["rect"] = (x + dx, y + dy, w, h)
+            self._selection_loop = [(x + dx, y + dy)
+                                    for x, y in self._loop_orig]
             self.queue_draw()
             return
         if self._lassoing:
@@ -3457,6 +3547,14 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._lasso_additive:
             sel, images = _merge_selection(self._lasso_base, sel, images)
         self._set_selected(sel, images)
+        # Keep the loop as the selection's outline (row 125) — but only when
+        # there is one loop that means something. A CLICK has no loop, and an
+        # additive selection has two or more.
+        # ceiling: additive falls back to the box rather than unioning the
+        # polygons — if that ever matters, keep a LIST of loops and draw and
+        # hit-test each one.
+        if not self._lasso_was_click(path) and not self._lasso_additive:
+            self._selection_loop = [self._screen_to_pdf(x, y) for x, y in path]
 
     def _selection_bbox(self):
         """PDF-space (x0, y0, x1, y1) bounding box of the selection, or None.
@@ -3482,7 +3580,12 @@ class PDFCanvas(Gtk.DrawingArea):
         return ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
 
     def _point_in_selection(self, px, py):
-        """Is the PDF point inside the selection's (padded) bounding box?"""
+        """Is the PDF point inside the selection — its loop in loop mode, its
+        (padded) bounding box otherwise? This is the GRAB region, so it has to
+        match what is painted: with the loop on screen, a press in the corner
+        of the box but outside the loop is not a grab, it is a new lasso."""
+        if not self._selection_is_boxed():
+            return self._point_in_polygon(px, py, self._selection_loop)
         bbox = self._selection_bbox()
         if bbox is None:
             return False
@@ -3502,7 +3605,13 @@ class PDFCanvas(Gtk.DrawingArea):
         point, or None — 0-3 corners (uniform), 4-7 side midpoints (one-axis
         stretch). Handles carry the same 5 px pad the dashed box is drawn with,
         so they sit exactly where they are painted; the hit box matches the
-        drawn 8×8 handle so a grab just inside the box still means move."""
+        drawn 8×8 handle so a grab just inside the box still means move.
+
+        None in loop mode: no handles are drawn there, and a hit-test that
+        outlives its painter is exactly how a frame drifts from what a grab
+        actually catches."""
+        if not self._selection_is_boxed():
+            return None
         bbox = self._selection_bbox()
         if bbox is None:
             return None
@@ -3518,7 +3627,10 @@ class PDFCanvas(Gtk.DrawingArea):
     ROTATE_SNAP_DEG = 15.0     # Shift snaps to this, like the straight-line snap
 
     def _lasso_rotate_handle_at(self, sx, sy, hit=8.0):
-        """Is the screen point on the rotate knob above the selection?"""
+        """Is the screen point on the rotate knob above the selection? Only in
+        box mode, where the knob is drawn (see _lasso_handle_at)."""
+        if not self._selection_is_boxed():
+            return False
         bbox = self._selection_bbox()
         if bbox is None:
             return False
@@ -3566,10 +3678,42 @@ class PDFCanvas(Gtk.DrawingArea):
         self.queue_draw()
 
     def _set_selected(self, strokes, images=()):
+        # Every new selection starts loop-less and un-boxed; _finish_lasso puts
+        # a loop back afterwards when it has one. Doing it the other way round
+        # would leave a paste or a duplicate wearing the outline of whatever
+        # was selected before it.
         self._selected_strokes = strokes
         self._selected_images = list(images)
+        self._selection_loop = []
+        self._selection_boxed = False
         if self.on_lasso_selection:
             self.on_lasso_selection(bool(strokes or images))
+
+    def _selection_is_boxed(self):
+        """Does this selection show the resize box rather than its loop? With
+        no loop to show there is nothing to choose — the box is the only
+        presentation that exists."""
+        return self._selection_boxed or not self._selection_loop
+
+    def _selection_loop_screen(self):
+        return [self._pdf_to_screen(x, y) for x, y in self._selection_loop]
+
+    def _lasso_chip_at(self, sx, sy):
+        """Is the screen point on the loop⇄box chip? Only a selection that HAS
+        a loop gets a chip — with nothing to switch to it would be a dead
+        button."""
+        if not self.has_lasso_selection() or not self._selection_loop:
+            return False
+        bbox = self._selection_bbox()
+        if bbox is None:
+            return False
+        x0, y0 = self._pdf_to_screen(bbox[0], bbox[1])
+        cx, cy = lasso_chip_centre(x0, y0, 5.0)
+        return lasso_chip_hit(cx, cy, sx, sy)
+
+    def toggle_selection_box(self):
+        self._selection_boxed = not self._selection_boxed
+        self.queue_draw()
 
     def has_lasso_selection(self):
         return bool(self._selected_strokes or self._selected_images)
@@ -3678,34 +3822,47 @@ class PDFCanvas(Gtk.DrawingArea):
                 x0, y0 = self._pdf_to_screen(bbox[0], bbox[1])
                 x1, y1 = self._pdf_to_screen(bbox[2], bbox[3])
                 pad = 5.0
+                boxed = self._selection_is_boxed()
                 ctx.set_source_rgba(ar, ag, ab, 0.85)
                 ctx.set_line_width(1.0)
                 ctx.set_dash([4.0, 3.0])
-                ctx.rectangle(x0 - pad, y0 - pad,
-                              (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad)
+                if boxed:
+                    ctx.rectangle(x0 - pad, y0 - pad,
+                                  (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad)
+                else:
+                    # the loop the selection was drawn with, kept as its outline
+                    loop = self._selection_loop_screen()
+                    ctx.move_to(*loop[0])
+                    for pt in loop[1:]:
+                        ctx.line_to(*pt)
+                    ctx.close_path()
                 ctx.stroke()
                 ctx.set_dash([])
-                # resize handles: 4 corners (uniform) + 4 side midpoints
-                # (one-axis stretch, so the aspect ratio can change)
-                for hx, hy in lasso_handle_points(x0, y0, x1, y1, pad):
-                    ctx.rectangle(hx - 4, hy - 4, 8, 8)
+                if boxed:
+                    # resize handles: 4 corners (uniform) + 4 side midpoints
+                    # (one-axis stretch, so the aspect ratio can change)
+                    for hx, hy in lasso_handle_points(x0, y0, x1, y1, pad):
+                        ctx.rectangle(hx - 4, hy - 4, 8, 8)
+                        ctx.set_source_rgba(1, 1, 1, 0.95)
+                        ctx.fill_preserve()
+                        ctx.set_source_rgba(ar, ag, ab, 0.9)
+                        ctx.stroke()
+                    # rotate handle: a knob on a stalk above the box (the usual
+                    # place, and the same knob the sheet grew in row 118)
+                    hx, hy = (x0 + x1) / 2.0, y0 - pad - self.ROTATE_HANDLE_GAP
+                    ctx.set_source_rgba(ar, ag, ab, 0.85)
+                    ctx.set_line_width(1.0)
+                    ctx.move_to(hx, y0 - pad)
+                    ctx.line_to(hx, hy)
+                    ctx.stroke()
+                    ctx.arc(hx, hy, 5, 0, 2 * math.pi)
                     ctx.set_source_rgba(1, 1, 1, 0.95)
                     ctx.fill_preserve()
                     ctx.set_source_rgba(ar, ag, ab, 0.9)
                     ctx.stroke()
-                # rotate handle: a knob on a stalk above the box (the usual
-                # place, and the same knob the sheet grew in row 118)
-                hx, hy = (x0 + x1) / 2.0, y0 - pad - self.ROTATE_HANDLE_GAP
-                ctx.set_source_rgba(ar, ag, ab, 0.85)
-                ctx.set_line_width(1.0)
-                ctx.move_to(hx, y0 - pad)
-                ctx.line_to(hx, hy)
-                ctx.stroke()
-                ctx.arc(hx, hy, 5, 0, 2 * math.pi)
-                ctx.set_source_rgba(1, 1, 1, 0.95)
-                ctx.fill_preserve()
-                ctx.set_source_rgba(ar, ag, ab, 0.9)
-                ctx.stroke()
+                if self._selection_loop:
+                    cx, cy = lasso_chip_centre(x0, y0, pad)
+                    draw_lasso_chip(ctx, cx, cy, boxed, self.zoom_accent)
         # the loop being drawn
         if self._lassoing and len(self._lasso_path) >= 2:
             ctx.set_source_rgba(ar, ag, ab, 0.9)
@@ -7128,6 +7285,12 @@ class TextPageView(Gtk.Overlay):
         self._lasso_base = ([], [])    # the selection an additive loop started from
         self._zoom_stack = []          # [(zoom, scroll_h, scroll_v), ...] for Escape
         self._lasso_path = []          # overlay coords of the loop in progress
+        # The loop a selection was made with (row 125), stored the way a STROKE
+        # is — mark + buffer offsets + font_px — so it reflows with the
+        # paragraph and rides the zoom instead of drifting the moment the sheet
+        # scrolls. None when the selection has no loop to show.
+        self._selection_loop = None
+        self._selection_boxed = False   # the chip flipped this selection to the box
         self._lasso_moving = False
         self._lasso_moved = False
         self._lasso_drag = (0.0, 0.0)  # live move offset while dragging
@@ -8104,6 +8267,7 @@ class TextPageView(Gtk.Overlay):
             return False
         # `is not None`: handle 0 is a real corner and falsy (row 118's trap).
         if (self._lasso_rotate_handle_at(x, y)
+                or self._lasso_chip_at(x, y)
                 or self._lasso_handle_at(x, y) is not None):
             return True
         return self._point_in_selection(x, y)
@@ -8591,6 +8755,11 @@ class TextPageView(Gtk.Overlay):
         # images-only selection has no strokes, and gating on strokes made a
         # lone photo impossible to grab or resize (it started a new loop
         # instead).
+        if self._lasso_chip_at(x, y):
+            # the chip swaps the loop for the resize box and back, claiming the
+            # press so nothing reads it as a grab or a fresh loop
+            self.toggle_selection_box()
+            return
         if self.has_lasso_selection() and self._lasso_rotate_handle_at(x, y):
             # the knob above the box spins the whole selection about its centre
             cx, cy = self._selection_centre()
@@ -8696,11 +8865,56 @@ class TextPageView(Gtk.Overlay):
         if self._lasso_additive:
             sel, images = _merge_selection(self._lasso_base, sel, images)
         self._set_selected(sel, images)
+        # keep the loop as the selection's outline — see PDFCanvas._finish_lasso
+        # for why a click and an additive selection get no loop
+        if not self._lasso_additive:
+            self._set_selection_loop(path)
+
+    def _set_selection_loop(self, overlay_pts):
+        """Anchor a lasso path as the selection's outline, exactly the way a
+        stroke is anchored — so it reflows with its paragraph."""
+        mark, pts = self._anchor_stroke_at(overlay_pts)
+        self._selection_loop = {"mark": mark, "pts": pts,
+                                "font_px": self.font_px}
 
     def _set_selected(self, strokes, images=None):
+        # loop-less and un-boxed by default, like the PDF canvas: _finish_lasso
+        # puts a loop back when it has one, so a paste or a duplicate can never
+        # inherit the outline of whatever was selected before it.
         self._selected = strokes
         self._selected_images = list(images or [])
+        self._selection_loop = None
+        self._selection_boxed = False
         self._images_changed()   # the glow is drawn with the image, under text
+
+    def _selection_is_boxed(self):
+        """Does this selection show the resize box rather than its loop?
+        PDFCanvas._selection_is_boxed's twin."""
+        return self._selection_boxed or self._selection_loop is None
+
+    def _selection_loop_overlay(self):
+        """The loop in overlay coords — read back through the ordinary stroke
+        path, so it follows its paragraph and the zoom for free."""
+        if self._selection_loop is None:
+            return []
+        pts = self._stroke_overlay_pts(self._selection_loop)
+        fn = self._lasso_transform()
+        return [fn(p) for p in pts] if fn else pts
+
+    def _lasso_chip_at(self, x, y):
+        """Is the overlay point on the loop⇄box chip? Only a selection that HAS
+        a loop gets a chip (PDFCanvas._lasso_chip_at's twin)."""
+        if not self.has_lasso_selection() or self._selection_loop is None:
+            return False
+        bbox = self._selection_bbox()
+        if bbox is None:
+            return False
+        cx, cy = lasso_chip_centre(bbox[0], bbox[1], 5.0)
+        return lasso_chip_hit(cx, cy, x, y)
+
+    def toggle_selection_box(self):
+        self._selection_boxed = not self._selection_boxed
+        self.ink.queue_draw()
 
     def has_lasso_selection(self):
         return bool(self._selected or self._selected_images)
@@ -8728,6 +8942,11 @@ class TextPageView(Gtk.Overlay):
         return (min(xs), min(ys), max(xs), max(ys))
 
     def _point_in_selection(self, x, y):
+        """The GRAB region: the loop in loop mode, the padded box otherwise —
+        see PDFCanvas._point_in_selection, it must match what is painted."""
+        if not self._selection_is_boxed():
+            return PDFCanvas._point_in_polygon(x, y,
+                                               self._selection_loop_overlay())
         bbox = self._selection_bbox()
         if bbox is None:
             return False
@@ -8746,7 +8965,10 @@ class TextPageView(Gtk.Overlay):
         return ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
 
     def _lasso_rotate_handle_at(self, x, y, hit=8.0):
-        """Is the overlay point on the rotate knob above the selection?"""
+        """Is the overlay point on the rotate knob above the selection? Only in
+        box mode, where the knob is drawn."""
+        if not self._selection_is_boxed():
+            return False
         bbox = self._selection_bbox()
         if bbox is None:
             return False
@@ -8758,7 +8980,10 @@ class TextPageView(Gtk.Overlay):
     def _lasso_handle_at(self, x, y, hit=4.0):
         """Index (0–7) of the resize handle under the overlay point, or None —
         4 corners + 4 side midpoints, same pad/hit-box compromise as the PDF
-        canvas (a grab just inside the box still means move)."""
+        canvas (a grab just inside the box still means move). None in loop
+        mode, where no handles are drawn."""
+        if not self._selection_is_boxed():
+            return None
         bbox = self._selection_bbox()
         if bbox is None:
             return None
@@ -8837,6 +9062,14 @@ class TextPageView(Gtk.Overlay):
             img_entries.append((im, before,
                                 (mark, im["dx"], im["dy"], im["w"], im["h"],
                                  im["font_px"], im.get("rotate", 0.0))))
+        # The outline rides along, re-anchored at its new home. Its geometry is
+        # untouched by the drag (the live preview transforms it at DRAW time),
+        # so reading it back now gives the drag-begin points the transform
+        # expects — the same thing _lasso_orig holds for the strokes.
+        if self._selection_loop is not None:
+            self._set_selection_loop(
+                [transform(p)
+                 for p in self._stroke_overlay_pts(self._selection_loop)])
         # ONE undo entry for the whole drag, whatever it grabbed — a move that
         # took ink and a photo together must come back in one Ctrl+Z
         if img_entries:
@@ -9350,32 +9583,45 @@ class TextPageView(Gtk.Overlay):
         if bbox:
             x0, y0, x1, y1 = bbox
             pad = 5.0
+            boxed = self._selection_is_boxed()
             ctx.set_source_rgba(ar, ag, ab, 0.85)
             ctx.set_line_width(1.0)
             ctx.set_dash([4.0, 3.0])
-            ctx.rectangle(x0 - pad, y0 - pad,
-                          (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad)
+            if boxed:
+                ctx.rectangle(x0 - pad, y0 - pad,
+                              (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad)
+            else:
+                # the loop the selection was drawn with, kept as its outline
+                loop = self._selection_loop_overlay()
+                ctx.move_to(*loop[0])
+                for pt in loop[1:]:
+                    ctx.line_to(*pt)
+                ctx.close_path()
             ctx.stroke()
             ctx.set_dash([])
-            # 4 corners (uniform) + 4 side midpoints (one-axis stretch)
-            for hx, hy in lasso_handle_points(x0, y0, x1, y1, pad):
-                ctx.rectangle(hx - 4, hy - 4, 8, 8)
+            if boxed:
+                # 4 corners (uniform) + 4 side midpoints (one-axis stretch)
+                for hx, hy in lasso_handle_points(x0, y0, x1, y1, pad):
+                    ctx.rectangle(hx - 4, hy - 4, 8, 8)
+                    ctx.set_source_rgba(1, 1, 1, 0.95)
+                    ctx.fill_preserve()
+                    ctx.set_source_rgba(ar, ag, ab, 0.9)
+                    ctx.stroke()
+                # rotate handle: a knob on a stalk above the box (usual place)
+                hx, hy = (x0 + x1) / 2.0, y0 - pad - self.ROTATE_HANDLE_GAP
+                ctx.set_source_rgba(ar, ag, ab, 0.85)
+                ctx.set_line_width(1.0)
+                ctx.move_to(hx, y0 - pad)
+                ctx.line_to(hx, hy)
+                ctx.stroke()
+                ctx.arc(hx, hy, 5, 0, 2 * math.pi)
                 ctx.set_source_rgba(1, 1, 1, 0.95)
                 ctx.fill_preserve()
                 ctx.set_source_rgba(ar, ag, ab, 0.9)
                 ctx.stroke()
-            # rotate handle: a knob on a stalk above the box (the usual place)
-            hx, hy = (x0 + x1) / 2.0, y0 - pad - self.ROTATE_HANDLE_GAP
-            ctx.set_source_rgba(ar, ag, ab, 0.85)
-            ctx.set_line_width(1.0)
-            ctx.move_to(hx, y0 - pad)
-            ctx.line_to(hx, hy)
-            ctx.stroke()
-            ctx.arc(hx, hy, 5, 0, 2 * math.pi)
-            ctx.set_source_rgba(1, 1, 1, 0.95)
-            ctx.fill_preserve()
-            ctx.set_source_rgba(ar, ag, ab, 0.9)
-            ctx.stroke()
+            if self._selection_loop is not None:
+                cx, cy = lasso_chip_centre(x0, y0, pad)
+                draw_lasso_chip(ctx, cx, cy, boxed, self.accent())
         if self._lassoing and len(self._lasso_path) >= 2:
             ctx.set_source_rgba(ar, ag, ab, 0.9)
             ctx.set_line_width(1.5)
@@ -9956,45 +10202,35 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                         (h - ext.height) / 2 - ext.y_bearing)
             ctx.show_text("A")
 
-        # the classic pointing-hand ("link") mouse cursor, the conventional
-        # drag/grab affordance, as pixel-faithful polygons from the public-domain
-        # Wikimedia cursor (commons "Mouse-cursor-hand-pointer", right glyph). The
-        # outer silhouette is filled in the theme foreground and the inner region
-        # cut out in the background, so the cursor adapts to light/dark like a
-        # symbolic icon. Source bbox is x14..31, y1..23.
-        _PAN_OUTLINE = ((19, 1), (21, 1), (21, 2), (22, 2), (22, 6), (24, 6),
-                        (24, 7), (27, 7), (27, 8), (29, 8), (29, 9), (30, 9),
-                        (30, 10), (31, 10), (31, 17), (30, 17), (30, 20), (29, 20),
-                        (29, 23), (19, 23), (19, 20), (18, 20), (18, 18), (17, 18),
-                        (17, 16), (16, 16), (16, 14), (15, 14), (15, 13), (14, 13),
-                        (14, 10), (17, 10), (17, 11), (18, 11), (18, 2), (19, 2))
-        _PAN_INNER = ((21, 2), (21, 11), (22, 11), (22, 7), (24, 7), (24, 11),
-                      (25, 11), (25, 8), (27, 8), (27, 12), (28, 12), (28, 9),
-                      (29, 9), (29, 10), (30, 10), (30, 17), (29, 17), (29, 20),
-                      (28, 20), (28, 22), (20, 22), (20, 20), (19, 20), (19, 18),
-                      (18, 18), (18, 16), (17, 16), (17, 14), (16, 14), (16, 13),
-                      (15, 13), (15, 11), (17, 11), (17, 12), (18, 12), (18, 13),
-                      (19, 13), (19, 2))
-        pan_bg = _hex_to_rgb(theme["background"])
-
         def _draw_mode_pan(_a, ctx, w, h):
-            # fit the source bbox (17×22) into the allocation, centred, with a
-            # small margin — so the cursor scales with the drawing area and stays
-            # centred in the button at any size.
-            src_w, src_h = 17.0, 22.0
-            m = 0.5 * (w / 16.0)
-            sc = min((w - 2 * m) / src_w, (h - 2 * m) / src_h)
-            offx = (w - src_w * sc) / 2
-            offy = (h - src_h * sc) / 2
-
-            def trace(pts):
-                for i, (x, y) in enumerate(pts):
-                    X, Y = (x - 14) * sc + offx, (y - 1) * sc + offy
-                    ctx.line_to(X, Y) if i else ctx.move_to(X, Y)
-                ctx.close_path()
-
-            ctx.set_source_rgb(*fg);     trace(_PAN_OUTLINE); ctx.fill()
-            ctx.set_source_rgb(*pan_bg); trace(_PAN_INNER);   ctx.fill()
+            # the four-way arrow cross, the conventional "move/pan the surface"
+            # glyph. GTK ships no such icon (Adwaita's pan-* are directional
+            # chevrons, and `tool-move-symbolic` belongs to whatever paint
+            # program happens to be installed), so it is two strokes plus four
+            # chevron heads on the same 16-unit grid and at the same hairline
+            # weight as the eraser/lasso glyphs — a filled arrow reads far too
+            # heavy next to them.
+            # Head width and length must stay under the arm: at ~2.6 the four
+            # heads meet and the glyph reads as a diamond, not as arrows.
+            s = min(w, h) / 16.0
+            arm, head, tip = 5.9, 2.2, 2.2
+            ctx.translate((w - 16 * s) / 2, (h - 16 * s) / 2)
+            ctx.set_source_rgb(*fg)
+            ctx.set_line_width(1.2 * s)
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+            ctx.move_to(8 * s, (8 - arm) * s); ctx.line_to(8 * s, (8 + arm) * s)
+            ctx.move_to((8 - arm) * s, 8 * s); ctx.line_to((8 + arm) * s, 8 * s)
+            ctx.stroke()
+            for deg in (0, 90, 180, 270):
+                ctx.save()
+                ctx.translate(8 * s, 8 * s)
+                ctx.rotate(math.radians(deg))
+                ctx.move_to(-head * s, (tip - arm) * s)
+                ctx.line_to(0, -arm * s)
+                ctx.line_to(head * s, (tip - arm) * s)
+                ctx.stroke()
+                ctx.restore()
 
         def _draw_mode_anchor(_a, ctx, w, h):
             cx, cy = w / 2, h / 2

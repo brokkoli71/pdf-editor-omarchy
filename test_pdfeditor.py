@@ -3303,6 +3303,152 @@ class TestLassoSelect(unittest.TestCase):
         self.assertEqual(sidemark.chord_tool(True, True, True, "pdf"), "lasso")
         self.assertEqual(sidemark.chord_tool(True, False, True, "pdf"), "anchor")
 
+    # ── row 125: the selection keeps the loop; a chip switches to the box ────
+
+    LOOP = [(30, 30), (90, 30), (90, 90), (30, 90)]   # encloses stroke A
+
+    def _loop_select(self, canvas, loop=None):
+        canvas._lasso_path = list(loop or self.LOOP)
+        canvas._finish_lasso()
+
+    def _chip_point(self, canvas):
+        bbox = canvas._selection_bbox()
+        x0, y0 = canvas._pdf_to_screen(bbox[0], bbox[1])
+        return sidemark.lasso_chip_centre(x0, y0, 5.0)
+
+    def _corner_handle_point(self, canvas):
+        """Screen point of the top-left resize handle (5 px pad)."""
+        bbox = canvas._selection_bbox()
+        x0, y0 = canvas._pdf_to_screen(bbox[0], bbox[1])
+        return (x0 - 5.0, y0 - 5.0)
+
+    def test_a_lassoed_selection_keeps_its_loop_and_hides_the_handles(self):
+        """The loop you drew stays as the outline; the resize box and its
+        handles are what the chip switches to, so they are not hit-testable
+        until it does — a hit-test that outlives its painter is how the frame
+        drifts from what a grab catches."""
+        canvas = self._canvas()
+        a, _b = self._two_strokes(canvas)
+        self._loop_select(canvas)
+        self.assertEqual(canvas._selected_strokes, [a])
+        self.assertTrue(canvas._selection_loop)
+        self.assertFalse(canvas._selection_is_boxed())
+        self.assertIsNone(canvas._lasso_handle_at(*self._corner_handle_point(canvas)))
+        bbox = canvas._selection_bbox()
+        kx, ky = canvas._pdf_to_screen((bbox[0] + bbox[2]) / 2.0, bbox[1])
+        self.assertFalse(
+            canvas._lasso_rotate_handle_at(kx, ky - 5.0 - canvas.ROTATE_HANDLE_GAP))
+
+    def test_a_click_selection_has_no_loop_so_it_shows_the_box(self):
+        """There is no outline to keep when you never drew one — the box is
+        the only presentation that exists, handles and all."""
+        canvas = self._canvas()
+        a, _b = self._two_strokes(canvas)
+        canvas._lasso_path = [(55, 55)]      # a click, not a loop
+        canvas._finish_lasso()
+        self.assertEqual(canvas._selected_strokes, [a])
+        self.assertEqual(canvas._selection_loop, [])
+        self.assertTrue(canvas._selection_is_boxed())
+        self.assertEqual(canvas._lasso_handle_at(*self._corner_handle_point(canvas)), 0)
+
+    def test_the_chip_toggles_loop_and_box_both_ways(self):
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._loop_select(canvas)
+        cx, cy = self._chip_point(canvas)
+        self.assertTrue(canvas._lasso_chip_at(cx, cy))
+        # the chip claims the press: it must not start a loop or a move
+        canvas._lasso_press(cx, cy)
+        self.assertFalse(canvas._lassoing)
+        self.assertFalse(canvas._lasso_moving)
+        self.assertTrue(canvas._selection_is_boxed())
+        self.assertEqual(canvas._lasso_handle_at(*self._corner_handle_point(canvas)), 0)
+        # and back again
+        canvas._lasso_press(*self._chip_point(canvas))
+        self.assertFalse(canvas._selection_is_boxed())
+
+    def test_the_chip_misses_the_top_left_resize_handle(self):
+        """The chip sits diagonally outside the corner precisely so it cannot
+        swallow the handle next to it — LASSO_CHIP_GAP is what buys that."""
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._loop_select(canvas)
+        canvas.toggle_selection_box()
+        hx, hy = self._corner_handle_point(canvas)
+        self.assertFalse(canvas._lasso_chip_at(hx, hy))
+        cx, cy = self._chip_point(canvas)
+        self.assertIsNone(canvas._lasso_handle_at(cx, cy))
+
+    def test_the_grab_region_is_the_loop_not_its_bounding_box(self):
+        """A press inside the box but OUTSIDE the loop is a new lasso, not a
+        grab: the grab region has to match what is painted."""
+        canvas = self._canvas()
+        # an L-shaped loop: a top bar and a left leg, with the bottom-right
+        # quarter of its bbox outside the loop
+        loop = [(0, 0), (100, 0), (100, 40), (40, 40), (40, 100), (0, 100)]
+        bar = self._stroke([(10, 10), (90, 20)])
+        leg = self._stroke([(10, 80), (20, 90)])
+        canvas.all_strokes[0] = [bar, leg]
+        self._loop_select(canvas, loop)
+        self.assertEqual(canvas._selected_strokes, [bar, leg])
+        # (80, 80) is well inside the selection's bbox, but in the L's notch
+        self.assertFalse(canvas._point_in_selection(80, 80))
+        self.assertTrue(canvas._point_in_selection(20, 20))
+        canvas.toggle_selection_box()
+        self.assertTrue(canvas._point_in_selection(80, 80))
+
+    def test_a_move_carries_the_loop_with_the_ink(self):
+        canvas = self._canvas()
+        a, _b = self._two_strokes(canvas)
+        orig_pts = list(a["pts"])
+        self._loop_select(canvas)
+        loop_before = list(canvas._selection_loop)
+        canvas._on_drag_begin(_FakeDrag(55, 55), 55, 55)
+        self.assertTrue(canvas._lasso_moving)
+        canvas._on_drag_update(_FakeDrag(55, 55), 30, 40)
+        canvas._on_drag_end(_FakeDrag(55, 55), 30, 40)
+        self.assertEqual(a["pts"], [(x + 30, y + 40) for x, y in orig_pts])
+        for (bx, by), (nx, ny) in zip(loop_before, canvas._selection_loop):
+            self.assertAlmostEqual(nx, bx + 30, places=6)
+            self.assertAlmostEqual(ny, by + 40, places=6)
+
+    def test_undo_drops_the_selection_so_no_stale_loop_survives(self):
+        """undo_last already clears the selection, which is what makes an
+        undone move unable to strand the outline on top of moved-back ink.
+        Do not remove that call thinking it is unrelated."""
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._loop_select(canvas)
+        canvas._on_drag_begin(_FakeDrag(55, 55), 55, 55)
+        canvas._on_drag_update(_FakeDrag(55, 55), 30, 40)
+        canvas._on_drag_end(_FakeDrag(55, 55), 30, 40)
+        canvas.undo_last()
+        self.assertFalse(canvas.has_lasso_selection())
+        self.assertEqual(canvas._selection_loop, [])
+
+    def test_an_additive_selection_falls_back_to_the_box(self):
+        """ceiling: Shift-adding gives two loops and we do not union polygons —
+        the box is a perfectly good answer for a selection built in pieces."""
+        canvas = self._canvas()
+        a, b = self._two_strokes(canvas)
+        self._loop_select(canvas)
+        canvas._lasso_additive = True
+        canvas._lasso_base = ([a], [])
+        canvas._lasso_path = [(280, 280), (330, 280), (330, 330), (280, 330)]
+        canvas._finish_lasso()
+        self.assertEqual(canvas._selected_strokes, [a, b])
+        self.assertEqual(canvas._selection_loop, [])
+        self.assertTrue(canvas._selection_is_boxed())
+
+    def test_a_duplicate_does_not_inherit_the_loop(self):
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._loop_select(canvas)
+        canvas.duplicate_selected()
+        self.assertTrue(canvas.has_lasso_selection())
+        self.assertEqual(canvas._selection_loop, [])
+        self.assertTrue(canvas._selection_is_boxed())
+
 
 class TestThumbSelectionClearing(unittest.TestCase):
     """A plain (no Ctrl/Shift) click on a thumbnail collapses the multi-page
@@ -9006,6 +9152,61 @@ class TestTextPageLasso(unittest.TestCase):
 
             self._run_in_window(body)
 
+    # ── row 125: the sheet's half of the loop/box contract ──────────────────
+
+    def test_lasso_keeps_its_loop_and_the_chip_toggles_the_box(self):
+        """The text sheet's twin of the PDF canvas' loop⇄box chip — one
+        contract, two substrates."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(
+                    win, [(300.0, 100.0 + i * 3) for i in range(5)])
+                st = tp.strokes[0]
+                self._lasso_around(win, tp, self._bbox(
+                    tp._stroke_overlay_pts(st)))
+                self.assertEqual(tp._selected, [st])
+                self.assertIsNotNone(tp._selection_loop)
+                self.assertFalse(tp._selection_is_boxed())
+                bbox = tp._selection_bbox()
+                # no handles while the loop is showing
+                self.assertIsNone(tp._lasso_handle_at(bbox[0] - 5.0,
+                                                      bbox[1] - 5.0))
+                cx, cy = sidemark.lasso_chip_centre(bbox[0], bbox[1], 5.0)
+                self.assertTrue(tp._lasso_chip_at(cx, cy))
+                # the chip claims the press rather than starting a loop
+                tp._lasso_begin(cx, cy)
+                self.assertFalse(tp._lassoing)
+                self.assertTrue(tp._selection_is_boxed())
+                self.assertEqual(tp._lasso_handle_at(bbox[0] - 5.0,
+                                                     bbox[1] - 5.0), 0)
+
+            self._run_in_window(body)
+
+    def test_the_loop_reflows_with_its_paragraph(self):
+        """The outline is anchored the way a STROKE is (mark + buffer offsets),
+        so text inserted above carries it down with the ink it belongs to. Held
+        in overlay coords it would sit still and drift off on the first edit."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(
+                    win, [(300.0, 200.0 + i * 3) for i in range(5)])
+                st = tp.strokes[0]
+                self._lasso_around(win, tp, self._bbox(
+                    tp._stroke_overlay_pts(st)))
+                ink_before = tp._stroke_overlay_pts(st)[0]
+                loop_before = tp._selection_loop_overlay()[0]
+                buf = tp.view.get_buffer()
+                buf.insert(buf.get_start_iter(), "extra\n" * 6)
+                self._settle()
+                ink_shift = tp._stroke_overlay_pts(st)[0][1] - ink_before[1]
+                loop_shift = tp._selection_loop_overlay()[0][1] - loop_before[1]
+                self.assertGreater(ink_shift, 5.0)   # the edit really moved it
+                self.assertAlmostEqual(loop_shift, ink_shift, delta=1.0)
+
+            self._run_in_window(body)
+
     def test_lasso_move_reanchors_and_undoes(self):
         with tempfile.TemporaryDirectory() as d:
             def body(win):
@@ -9052,6 +9253,8 @@ class TestTextPageLasso(unittest.TestCase):
                 drawn_before = st["width"] * tp.font_px / st["font_px"]
                 self._lasso_around(
                     win, tp, self._bbox(tp._stroke_overlay_pts(st)))
+                # the loop is the selection's outline; handles are box mode
+                tp.toggle_selection_box()
                 bbox = tp._selection_bbox()
                 pad = 5.0
                 # grab the top-left handle; anchor is the bottom-right corner
@@ -10138,6 +10341,9 @@ class TestPDFImages(unittest.TestCase):
         canvas = self._canvas()
         im = self._image(canvas, at=(100, 100), w=100, h=100)
         self._select_around(canvas, im)
+        # a lasso selection wears its LOOP (row 125); the resize handles live
+        # in box mode, which the chip switches to
+        canvas.toggle_selection_box()
         x0, y0, x1, y1 = canvas._selection_bbox()
         # grab the bottom-right handle (5 px pad outside the box)
         canvas._on_drag_begin(_FakeDrag(x1 + 5, y1 + 5), x1 + 5, y1 + 5)
@@ -10160,6 +10366,7 @@ class TestPDFImages(unittest.TestCase):
         im = self._image(canvas, at=(200, 200), w=80, h=40)
         png_before = im["data"]
         self._select_around(canvas, im)
+        canvas.toggle_selection_box()   # the rotate knob is a box-mode handle
         bx0, by0, bx1, by1 = canvas._selection_bbox()
         knob = ((bx0 + bx1) / 2.0, by0 - 5.0 - canvas.ROTATE_HANDLE_GAP)
         self.assertTrue(canvas._lasso_rotate_handle_at(*knob))
