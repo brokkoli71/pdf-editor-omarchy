@@ -306,6 +306,16 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     calls `clear_lasso_selection()` — don't remove that. On the sheet the loop
     is anchored **like a stroke** (mark + buffer offsets + `font_px`) so it
     reflows; overlay coords would drift on the first edit.
+  - **Circle to lasso** (row 126): draw a loop with the pen, lift, then
+    press-and-hold on it — or anywhere inside it — and it becomes the lasso
+    path. It does NOT collide with the dwell shape-snap, and the reason is the
+    thing to keep: the two are separated by the **pen lift**, not by the shape
+    (hold *without* lifting = snap; hold on a *finished* stroke = lasso), so a
+    stroke available to convert was by construction never snapped. Only the
+    **last** stroke converts — anything else means a resting hand eats ink into
+    a selection — and `circle_lasso_target` is that decision for both canvases.
+    Not gated on `shape_snap` (that setting governs the dwell). The **tool does
+    not change**: the pen stays in your hand, which is the entire point.
   - **Lasso verbs**: select / move / resize / rotate / `Ctrl+D` duplicate /
     `Del`. Rotation is a knob on a stalk above the box; Shift snaps to
     `ROTATE_SNAP_DEG`. A tilt is stored as an ANGLE and applied at render — it
@@ -369,10 +379,12 @@ than writing a line about having finished it. The chronology lives in
 
 **In flight — all three are code-verified and need a pass in the real app:**
 
-- **Row 125 (the lasso keeps its loop).** Unit-tested on both canvases
-  (`TestLassoSelect`'s row-125 block, `TestTextPageLasso`). What needs hands:
-  whether the chip is big enough to hit with a pen first time, and whether
-  loop mode ever feels like the handles went missing.
+- **Rows 125 + 126 (the lasso keeps its loop; circle to lasso).** Unit-tested
+  on both canvases (`TestLassoSelect`'s row-125/126 blocks,
+  `TestTextPageLasso`). What needs hands: whether the chip is big enough to hit
+  with a pen first time, whether loop mode ever feels like the handles went
+  missing, and whether the 500 ms hold is right — every one of those is a
+  gesture, so none of it is verified.
 
 - **Row 123 (merge import).** What needs real hardware: the drops themselves
   (several PDFs on the window → "Merge…"; several on the page thumbnails →
@@ -394,10 +406,6 @@ than writing a line about having finished it. The chronology lives in
   at `get_end_iter()`, making the click merely the other end of the span; check
   `buffer.get_selection_bounds()` after the switch alone, before any click.
 
-- **Row 126 (circle to lasso)** — designed, not built, and next after row 125
-  (the loop IS its visual half). The insight not to lose: it does not collide
-  with the dwell shape-snap because the two are separated by the **pen lift**,
-  not by the shape.
 - **Row 127 (polygon recognition + vertex editing)** — designed, not built.
   Start with "select the shape right after it snaps": nearly free, and nothing
   else in the row is reachable without it.

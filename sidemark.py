@@ -263,6 +263,26 @@ def erase_radius(width):
 # fallback — an open or ambiguous stroke stays exactly the old dwell line, so
 # turning recognition off (which forces "line") can never regress.
 
+def polyline_is_closed(pts):
+    """Is this freehand polyline a LOOP? Its ends meet, relative to its own
+    size, AND the pen travelled much further than the straight-line distance —
+    the second half is what tells a loop from a near-straight scribble that
+    merely wandered back near where it started.
+
+    One definition, because two things ask it: the shape snap (a loop becomes a
+    rectangle or an ellipse, a line is the fallback) and circle-to-lasso (only
+    a loop can be pressed INSIDE)."""
+    if len(pts) < 2:
+        return False
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+    gap = math.hypot(pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1])
+    plen = sum(math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+               for i in range(1, len(pts)))
+    return diag > 1e-6 and gap < 0.30 * diag and plen > 1.4 * diag
+
+
 def recognize_shape(pts):
     """Classify a freehand polyline into a clean primitive. Returns
     (kind, new_pts) with kind "line" | "rect" | "ellipse" and new_pts the
@@ -274,16 +294,8 @@ def recognize_shape(pts):
     minx, maxx = min(xs), max(xs)
     miny, maxy = min(ys), max(ys)
     w, h = maxx - minx, maxy - miny
-    diag = math.hypot(w, h)
     start, end = pts[0], pts[-1]
-    gap = math.hypot(end[0] - start[0], end[1] - start[1])
-    plen = sum(math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
-               for i in range(1, len(pts)))
-    # A shape is "closed" when the ends meet (relative to its size) AND the pen
-    # travelled much further than the straight-line distance — a loop, not a
-    # near-straight scribble that merely wandered back near its start.
-    closed = diag > 1e-6 and gap < 0.30 * diag and plen > 1.4 * diag
-    if not closed:
+    if not polyline_is_closed(pts):
         return "line", [start, end]
     cx, cy = (minx + maxx) / 2, (miny + maxy) / 2
     rx, ry = max(w / 2, 1e-6), max(h / 2, 1e-6)
@@ -469,6 +481,47 @@ def draw_lasso_chip(ctx, cx, cy, boxed, accent):
             ctx.rectangle(hx - 1.5, hy - 1.5, 3, 3)
             ctx.fill()
     ctx.restore()
+
+
+# ── circle to lasso (row 126) ───────────────────────────────────────────────
+# Draw a loop with the PEN, lift, then press and hold on that stroke: it turns
+# into the lasso path. The point is that you never leave the pen — the same
+# reason the shape snap is a dwell and not a shape tool.
+#
+# This does NOT collide with the loop→ellipse dwell snap, and the reason is
+# worth keeping: the two are separated by the pen LIFT, not by the shape. Hold
+# at the end of a stroke WITHOUT lifting = snap to a clean shape; lift, then
+# press and hold ON the finished stroke = turn it into a lasso. A stroke that
+# is available to convert was by construction never snapped.
+
+CIRCLE_LASSO_HOLD_MS = 500     # the shape snap's dwell, so one hold time to learn
+CIRCLE_LASSO_SLOP_PX = 6.0     # move further than this and it was a real stroke
+
+
+def circle_lasso_target(strokes, hits, inside=None):
+    """Which stroke a press-and-hold converts into a lasso path — THE decision,
+    shared by both canvases.
+
+    Only the MOST RECENT stroke. Converting any ink under the pen would mean a
+    hand resting mid-page silently eats a stroke into a selection; "the one you
+    just drew" is both the safe rule and the one that matches what the gesture
+    means.
+
+    The press counts if it landed ON the stroke (`hits` — the eraser's
+    question, so it gets the eraser's answer) or ANYWHERE INSIDE it when it is
+    a closed loop (`inside`). GoodNotes wants the stroke itself; the whole
+    interior is more forgiving, and it is the region you are pointing at
+    anyway, so there is nothing to be precise about. The cost is that a hold
+    inside your last closed shape converts it — bounded by the last-stroke
+    rule, and one Ctrl+Z away."""
+    if not strokes:
+        return None
+    last = strokes[-1]
+    if hits(last):
+        return last
+    if inside is not None and inside(last):
+        return last
+    return None
 
 
 def _merge_selection(base, strokes, images):
@@ -931,6 +984,8 @@ class PDFCanvas(Gtk.DrawingArea):
         self._selection_loop = []
         self._selection_boxed = False   # the chip flipped this selection to the box
         self._loop_orig = []            # loop snapshot at drag begin
+        self._circle_timer = None       # press-and-hold → circle to lasso (row 126)
+        self._circle_start = None       # screen point the hold is measured from
         self._selected_strokes = []    # references into self.strokes, selected
         self._lasso_moving = False
         self._lasso_move_start = None
@@ -2551,6 +2606,74 @@ class PDFCanvas(Gtk.DrawingArea):
             self._straight_mode = False
             self._snap_kind = self._snap_label = None
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
+            self._arm_circle_lasso(start_x, start_y)
+
+    # ── circle to lasso (row 126) ───────────────────────────────────────────
+
+    def _arm_circle_lasso(self, sx, sy):
+        """A press that landed on the stroke you just drew starts a hold timer
+        alongside the new stroke: move the pen and this was an ordinary stroke
+        (the timer dies in _on_drag_update), hold still and the nascent stroke
+        is dropped and the previous one becomes the lasso.
+
+        Deliberately NOT gated on `shape_snap`: that setting governs the dwell,
+        and this is an independent mechanism that must keep working with the
+        snap off."""
+        self._cancel_circle_lasso()
+        px, py = self._screen_to_pdf(sx, sy)
+        target = circle_lasso_target(
+            self.strokes,
+            lambda s: self._stroke_hits(s["pts"], px, py,
+                                        erase_radius(s["width"])),
+            lambda s: (polyline_is_closed(s["pts"])
+                       and self._point_in_polygon(px, py, s["pts"])))
+        if target is None:
+            return
+        self._circle_start = (sx, sy)
+        self._circle_timer = GLib.timeout_add(CIRCLE_LASSO_HOLD_MS,
+                                              self._circle_lasso_fire)
+
+    def _cancel_circle_lasso(self):
+        if self._circle_timer is not None:
+            GLib.source_remove(self._circle_timer)
+            self._circle_timer = None
+
+    def _circle_lasso_fire(self):
+        """The hold landed: the stroke under the pen becomes the lasso path.
+
+        Removing it and selecting its catch is ONE undo entry (a shared erase
+        group), so a mis-fire costs exactly one Ctrl+Z. The rest of the still-
+        held drag is ignored — the gesture stopped being a stroke the moment
+        this fired."""
+        self._circle_timer = None
+        if not self.strokes:
+            return False
+        loop = self.strokes[-1]
+        self.current_stroke = []
+        self._ignoring = True
+        self._cancel_straight_timer()
+        self._straight_mode = False
+        self._snap_kind = self._snap_label = None
+        page = self.current_page_idx
+        self._erase_group += 1
+        self.all_strokes[page] = [s for s in self.strokes if s is not loop]
+        self._undo_stack.append(("erase", page, len(self.all_strokes[page]),
+                                 loop, self._erase_group))
+        self._redo_stack.clear()
+        # feed the loop through the ordinary lasso close, so a converted circle
+        # and a drawn one select identically (and both keep their outline)
+        self._lasso_additive = False
+        self._lasso_path = [self._pdf_to_screen(x, y) for x, y in loop["pts"]]
+        self._finish_lasso()
+        # The TOOL does not change: the pen stays in your hand, which is the
+        # entire point of the gesture, and a live selection is editable with
+        # any tool anyway (selection_grab_at).
+        if self.on_change:
+            self.on_change()
+        if self.on_user_action:
+            self.on_user_action()
+        self.queue_draw()
+        return False
 
     def selection_grab_at(self, sx, sy):
         """Would a press at (sx, sy) grab the LIVE selection — its rotate knob,
@@ -2803,6 +2926,9 @@ class PDFCanvas(Gtk.DrawingArea):
             # fits whatever region you draw, no forced canvas aspect ratio
             self._zoom_end = (sx + offset_x, sy + offset_y)
         else:
+            # past the slop this press is a real stroke, not a hold (row 126)
+            if math.hypot(offset_x, offset_y) > CIRCLE_LASSO_SLOP_PX:
+                self._cancel_circle_lasso()
             pt = self._screen_to_pdf(sx + offset_x, sy + offset_y)
             if self._straight_mode:
                 if self._snap_kind == "line":
@@ -2825,6 +2951,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # (no-op for plain tool drags — the window falls back to held chords)
         self._fire_gesture_tool(None)
         self._cancel_straight_timer()
+        self._cancel_circle_lasso()   # a lift ends the hold (row 126)
         was_straight = self._straight_mode
         self._straight_mode = False
         if self._post_pinch:
@@ -7291,6 +7418,7 @@ class TextPageView(Gtk.Overlay):
         # scrolls. None when the selection has no loop to show.
         self._selection_loop = None
         self._selection_boxed = False   # the chip flipped this selection to the box
+        self._circle_timer = None       # press-and-hold → circle to lasso (row 126)
         self._lasso_moving = False
         self._lasso_moved = False
         self._lasso_drag = (0.0, 0.0)  # live move offset while dragging
@@ -8392,6 +8520,7 @@ class TextPageView(Gtk.Overlay):
             self._straight_mode = False
             self._snap_kind = self._snap_label = None
             self.current_stroke = [(x, y)]
+            self._arm_circle_lasso(x, y)
         self.ink.queue_draw()
 
     def _finish_zoom_region(self):
@@ -8442,6 +8571,9 @@ class TextPageView(Gtk.Overlay):
             if abs(dx) + abs(dy) > 1:
                 self._lasso_moved = True
         elif self.current_stroke:
+            # past the slop this press is a real stroke, not a hold (row 126)
+            if math.hypot(dx, dy) > CIRCLE_LASSO_SLOP_PX:
+                self._cancel_circle_lasso()
             if self._straight_mode:
                 if self._snap_kind == "line":
                     # locked to a line: only the endpoint follows the cursor
@@ -8467,6 +8599,7 @@ class TextPageView(Gtk.Overlay):
             self._finish_zoom_region()
             return
         self._cancel_straight_timer()
+        self._cancel_circle_lasso()   # a lift ends the hold (row 126)
         was_straight = self._straight_mode
         self._straight_mode = False
         if self._lassoing:
@@ -8719,6 +8852,58 @@ class TextPageView(Gtk.Overlay):
             self.on_ink_action()
         if self.on_ink_changed:
             self.on_ink_changed()
+
+    # ── circle to lasso (row 126) ───────────────────────────────────────────
+    # PDFCanvas._arm_circle_lasso's twin — see it for the contract and for why
+    # the pen lift, not the shape, is what keeps this clear of the dwell snap.
+
+    def _arm_circle_lasso(self, x, y):
+        self._cancel_circle_lasso()
+        target = circle_lasso_target(
+            self.strokes,
+            lambda st: PDFCanvas._stroke_hits(self._stroke_overlay_pts(st),
+                                              x, y, self._erase_radius(st)),
+            lambda st: (polyline_is_closed(self._stroke_overlay_pts(st))
+                        and PDFCanvas._point_in_polygon(
+                            x, y, self._stroke_overlay_pts(st))))
+        if target is None:
+            return
+        self._circle_timer = GLib.timeout_add(CIRCLE_LASSO_HOLD_MS,
+                                              self._circle_lasso_fire)
+
+    def _cancel_circle_lasso(self):
+        if self._circle_timer is not None:
+            GLib.source_remove(self._circle_timer)
+            self._circle_timer = None
+
+    def _circle_lasso_fire(self):
+        """The hold landed: the stroke under the pen becomes the lasso path,
+        removed in ONE undo entry so a mis-fire costs one Ctrl+Z. The tool does
+        not change — the pen stays in your hand, which is the whole point."""
+        self._circle_timer = None
+        if not self.strokes:
+            return False
+        loop = self.strokes[-1]
+        path = self._stroke_overlay_pts(loop)
+        self.current_stroke = []
+        self._cancel_straight_timer()
+        self._straight_mode = False
+        self._snap_kind = self._snap_label = None
+        self.strokes.remove(loop)      # mark kept, so undo can restore it
+        self._undo_ops.append(("erase", [loop]))
+        self._redo_ops.clear()
+        # through the ordinary lasso close, so a converted loop and a drawn one
+        # select identically and both keep their outline
+        self._lasso_additive = False
+        self._lasso_path = list(path)
+        self._lassoing = False
+        self._finish_lasso()
+        if self.on_ink_action:
+            self.on_ink_action()
+        if self.on_ink_changed:
+            self.on_ink_changed()
+        self.ink.queue_draw()
+        return False
 
     def _erase_radius(self, st):
         """Overlay-space hit radius for `st`, from the shared erase_radius()

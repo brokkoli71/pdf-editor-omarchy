@@ -3440,6 +3440,115 @@ class TestLassoSelect(unittest.TestCase):
         self.assertEqual(canvas._selection_loop, [])
         self.assertTrue(canvas._selection_is_boxed())
 
+    # ── row 126: circle to lasso (press and hold the stroke you just drew) ──
+
+    def _hold_on(self, canvas, sx, sy):
+        """Press with the pen at (sx, sy) and let the hold timer fire."""
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(sx, sy), sx, sy)
+        fired = canvas._circle_timer is not None
+        if fired:
+            canvas._circle_lasso_fire()
+            canvas._cancel_circle_lasso()
+        return fired
+
+    def _circle(self, canvas):
+        """A loop stroke around stroke A, drawn as ink (the last stroke)."""
+        loop = self._stroke([(30, 30), (90, 30), (90, 90), (30, 90), (30, 30)])
+        canvas.all_strokes[0].append(loop)
+        return loop
+
+    def test_holding_on_the_last_stroke_turns_it_into_a_lasso(self):
+        canvas = self._canvas()
+        a, b = self._two_strokes(canvas)
+        loop = self._circle(canvas)
+        self.assertTrue(self._hold_on(canvas, 30, 30))   # on the loop's corner
+        # the loop stroke is gone and its catch is selected — with its outline
+        self.assertNotIn(loop, canvas.all_strokes[0])
+        self.assertEqual(canvas._selected_strokes, [a])
+        self.assertNotIn(b, canvas._selected_strokes)
+        self.assertTrue(canvas._selection_loop)
+        self.assertFalse(canvas._selection_is_boxed())
+        # the pen stays in your hand — that is the whole point of the gesture
+        self.assertEqual(canvas.tool, "pen")
+
+    def test_one_undo_puts_the_circle_back(self):
+        """A mis-fire must cost exactly one Ctrl+Z."""
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        loop = self._circle(canvas)
+        self._hold_on(canvas, 30, 30)
+        canvas.undo_last()
+        self.assertIn(loop, canvas.all_strokes[0])
+        self.assertFalse(canvas.has_lasso_selection())
+
+    def test_only_the_most_recent_stroke_converts(self):
+        """Holding over arbitrary old ink would mean a resting hand silently
+        eats a stroke into a selection. B is well clear of the loop, so this
+        is a press on ink that is simply not the last stroke."""
+        canvas = self._canvas()
+        _a, b = self._two_strokes(canvas)
+        self._circle(canvas)          # B is no longer the last stroke
+        self.assertFalse(self._hold_on(canvas, *b["pts"][0]))
+        self.assertFalse(canvas.has_lasso_selection())
+
+    def test_holding_anywhere_inside_the_circle_converts_it(self):
+        """You should not have to hit the line. The interior of a closed loop
+        is the region you are pointing at anyway, so the whole thing is the
+        target — more forgiving than GoodNotes, which wants the stroke."""
+        canvas = self._canvas()
+        a, _b = self._two_strokes(canvas)
+        self._circle(canvas)
+        self.assertTrue(self._hold_on(canvas, 60, 60))   # dead centre, no ink
+        self.assertEqual(canvas._selected_strokes, [a])
+
+    def test_an_open_stroke_only_converts_by_touching_it(self):
+        """An interior is only meaningful for a LOOP: an open squiggle would
+        otherwise claim the whole area its ends happen to span."""
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        arc = self._stroke([(30, 30), (90, 30), (90, 90)])   # ends far apart
+        canvas.all_strokes[0].append(arc)
+        self.assertFalse(sidemark.polyline_is_closed(arc["pts"]))
+        self.assertFalse(self._hold_on(canvas, 45, 70))   # inside its span
+        self.assertTrue(self._hold_on(canvas, 90, 60))    # on the ink itself
+
+    def test_a_press_off_the_last_stroke_does_not_arm(self):
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._circle(canvas)
+        self.assertFalse(self._hold_on(canvas, 200, 200))   # empty page
+
+    def test_moving_past_the_slop_makes_it_an_ordinary_stroke(self):
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._circle(canvas)
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(30, 30), 30, 30)
+        self.assertIsNotNone(canvas._circle_timer)
+        canvas._on_drag_update(
+            _FakeDrag(30, 30), sidemark.CIRCLE_LASSO_SLOP_PX + 5, 0)
+        self.assertIsNone(canvas._circle_timer)   # it is a stroke, not a hold
+        canvas._cancel_circle_lasso()
+
+    def test_conversion_is_independent_of_the_shape_snap_setting(self):
+        """shape_snap governs the DWELL; circle-to-lasso is a separate
+        mechanism and must keep working with the snap switched off."""
+        canvas = self._canvas()
+        a, _b = self._two_strokes(canvas)
+        self._circle(canvas)
+        canvas.shape_snap = "off"
+        self.assertTrue(self._hold_on(canvas, 30, 30))
+        self.assertEqual(canvas._selected_strokes, [a])
+
+    def test_circle_lasso_target_is_the_shared_decision(self):
+        yes = lambda _s: True
+        no = lambda _s: False
+        self.assertIsNone(sidemark.circle_lasso_target([], yes))
+        self.assertIsNone(sidemark.circle_lasso_target([{"n": 1}], no))
+        first, last = {"n": 1}, {"n": 2}
+        self.assertIs(sidemark.circle_lasso_target([first, last], yes), last)
+
     def test_a_duplicate_does_not_inherit_the_loop(self):
         canvas = self._canvas()
         self._two_strokes(canvas)
@@ -9180,6 +9289,38 @@ class TestTextPageLasso(unittest.TestCase):
                 self.assertTrue(tp._selection_is_boxed())
                 self.assertEqual(tp._lasso_handle_at(bbox[0] - 5.0,
                                                      bbox[1] - 5.0), 0)
+
+            self._run_in_window(body)
+
+    def test_circle_to_lasso_on_the_sheet(self):
+        """Row 126's twin on the text page: draw a loop with the pen, then
+        press and hold on it and it becomes the selection — pen still in hand,
+        and one Ctrl+Z puts the circle back."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(
+                    win, [(300.0, 200.0 + i * 2) for i in range(5)])
+                ink = tp.strokes[0]
+                bx = self._bbox(tp._stroke_overlay_pts(ink))
+                m = 14.0
+                self._draw_stroke(win, [(bx[0] - m, bx[1] - m),
+                                        (bx[2] + m, bx[1] - m),
+                                        (bx[2] + m, bx[3] + m),
+                                        (bx[0] - m, bx[3] + m),
+                                        (bx[0] - m, bx[1] - m)])
+                loop = tp.strokes[-1]
+                hx, hy = tp._stroke_overlay_pts(loop)[0]
+                g = self._gesture(hx, hy)
+                tp._on_ink_begin(g, hx, hy)
+                self.assertIsNotNone(tp._circle_timer)
+                tp._circle_lasso_fire()
+                self.assertNotIn(loop, tp.strokes)
+                self.assertEqual(tp._selected, [ink])
+                self.assertIsNotNone(tp._selection_loop)
+                self.assertEqual(tp.tool, "pen")   # the pen stays in your hand
+                tp.undo_ink()
+                self.assertIn(loop, tp.strokes)
 
             self._run_in_window(body)
 
