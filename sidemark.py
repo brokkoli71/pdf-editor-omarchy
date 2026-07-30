@@ -986,6 +986,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._loop_orig = []            # loop snapshot at drag begin
         self._circle_timer = None       # press-and-hold → circle to lasso (row 126)
         self._circle_start = None       # screen point the hold is measured from
+        self._dismissed_selection = False   # this press ended a selection
         self._selected_strokes = []    # references into self.strokes, selected
         self._lasso_moving = False
         self._lasso_move_start = None
@@ -2390,6 +2391,7 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _on_drag_begin(self, gesture, start_x, start_y):
         self._post_pinch = False   # a fresh press starts a normal interaction
+        self._dismissed_selection = False
         self._text_highlighting = False
         if gesture.get_current_button() == 3:
             state = self._chord_state(gesture)
@@ -2709,6 +2711,11 @@ class PDFCanvas(Gtk.DrawingArea):
         there: Shift ADDS to the selection, and a fresh loop replaces it."""
         if self.tool != "lasso" and self.has_lasso_selection():
             self.clear_lasso_selection()
+            # A TAP that only dismissed the selection must not also leave a
+            # dot: that press meant "done with this", not "draw here". A press
+            # that goes on to DRAG still draws, from where it landed — only the
+            # dot is swallowed (see _on_drag_end).
+            self._dismissed_selection = True
 
     def _lasso_press(self, start_x, start_y, additive=False):
         """A lasso press — shared by the lasso tool, its Ctrl+Shift+Alt chord
@@ -3100,6 +3107,14 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._zoom_selecting:
             self._finish_zoom_region()
         else:
+            if self.current_stroke and self._dismissed_selection:
+                # current_stroke is in PDF units, so the screen-px click slop
+                # has to come back through the zoom to mean the same thing
+                xs = [p[0] for p in self.current_stroke]
+                ys = [p[1] for p in self.current_stroke]
+                slop = LASSO_CLICK_SLOP_PX / max(self.scale, 1e-6)
+                if (max(xs) - min(xs) < slop and max(ys) - min(ys) < slop):
+                    self.current_stroke = []   # a tap that only dismissed
             if self.current_stroke:
                 pts = self.current_stroke
                 # smooth freehand ink on commit; a snapped straight line/shape

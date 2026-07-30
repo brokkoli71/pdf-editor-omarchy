@@ -3454,6 +3454,44 @@ class TestLassoSelect(unittest.TestCase):
         self.assertFalse(canvas.has_lasso_selection())
         self.assertEqual(canvas._selection_loop, [])
 
+    def test_the_dismissing_tap_leaves_no_dot(self):
+        """A tap that only ended a selection meant "done with this", not "draw
+        here" — and the PDF canvas commits tiny strokes as dots on purpose, so
+        without this it left one behind every time."""
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._loop_select(canvas)
+        n_before = len(canvas.all_strokes[0])
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(300, 400), 300, 400)
+        canvas._on_drag_end(_FakeDrag(300, 400), 0, 0)
+        self.assertFalse(canvas.has_lasso_selection())
+        self.assertEqual(len(canvas.all_strokes[0]), n_before)
+
+    def test_a_dismissing_press_that_drags_still_draws(self):
+        """Only the DOT is swallowed: a press that goes on to draw must draw,
+        from where it landed."""
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._loop_select(canvas)
+        n_before = len(canvas.all_strokes[0])
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(300, 400), 300, 400)
+        canvas._on_drag_update(_FakeDrag(300, 400), 40, 40)
+        canvas._on_drag_end(_FakeDrag(300, 400), 40, 40)
+        self.assertEqual(len(canvas.all_strokes[0]), n_before + 1)
+
+    def test_a_plain_tap_with_no_selection_still_dots(self):
+        """The dot is only swallowed when the tap dismissed something — tapping
+        a dot on an empty page is still a dot."""
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        n_before = len(canvas.all_strokes[0])
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(300, 400), 300, 400)
+        canvas._on_drag_end(_FakeDrag(300, 400), 0, 0)
+        self.assertEqual(len(canvas.all_strokes[0]), n_before + 1)
+
     def test_a_grab_inside_the_loop_still_moves_it(self):
         """The dismissal must sit BEHIND the grab test, or a selection could
         never be picked up with the pen in hand."""
