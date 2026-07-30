@@ -5992,8 +5992,8 @@ class TestResponsiveHeader(unittest.TestCase):
             if not win._pmode_hl.get_active():
                 raise AssertionError("popover mode did not mirror the bar")
             win._pmode_text.set_active(True)
-            if not win._mode_text.get_active():
-                raise AssertionError("bar mode did not mirror the popover")
+            if win.bindings.tool_for_chord("left") != "text":
+                raise AssertionError("the popover did not bind the left button")
             if not win.canvas.select_mode:
                 raise AssertionError("canvas not in select mode")
         self._run_in_window(body)
@@ -9798,10 +9798,11 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertFalse(s._text_page.get_visible())
                 self.assertIs(win._notes_view, s._panel_notes_view)
                 self.assertTrue(win._notes_toggle.get_visible())
-                # ONE caret button serves both modes, so it stays visible and
-                # keeps the caret it had (row 132)
+                # ONE caret button serves both modes, so it stays visible; no
+                # button wears an "active" look any more — the stripe is the
+                # only signal (row 132)
                 self.assertTrue(win._mode_text.get_visible())
-                self.assertTrue(win._mode_text.get_active())
+                self.assertEqual(win.bindings.tool_for_chord("left"), "text")
                 for item in win._pdf_menu_items:
                     self.assertTrue(item.get_visible(), item)
 

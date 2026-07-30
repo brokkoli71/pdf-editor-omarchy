@@ -11246,6 +11246,16 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 border: 1px solid shade({bg_hex}, 0.75);
             }}
             .pen-swatch:hover {{ border: 2px solid {fg_hex}; }}
+            /* row 132: there is no active tool to show, so a checked tool
+               button must not look pressed — the painted stripe is the only
+               signal. Scoped to the tool buttons, so every other toggle in
+               the app keeps its normal checked state. */
+            .tool-btn:checked {{
+                background: none;
+                background-image: none;
+                box-shadow: none;
+                border-color: transparent;
+            }}
             .tool-transient {{
                 background-color: alpha({acc_hex}, 0.30);
                 box-shadow: inset 0 0 0 1px {acc_hex};
@@ -11677,6 +11687,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                            self._mode_zoom, self._mode_anchor)
         for b, m in zip(self._tool_btns, self._TOOL_BAR_ORDER):
             b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
+            b.add_css_class("tool-btn")
             self._attach_binding_click(b, m)
             self._add_binding_strip(b, m)
             tools_box.append(b)
@@ -11738,6 +11749,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                             self._pmode_zoom, self._pmode_anchor)
         for b, m in zip(self._ptool_btns, self._TOOL_BAR_ORDER):
             b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
+            b.add_css_class("tool-btn")
             self._attach_binding_click(b, m)
             self._add_binding_strip(b, m)
             pmode_box.append(b)
@@ -14889,11 +14901,20 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # ink, everything else falls back to the text caret
             if self._text_page is not None:
                 self._text_page.set_tool(mode)
+            # The buttons stay a radio group internally — GTK fights an
+            # attempt to leave a grouped toggle unchecked, and every caller and
+            # test flips them through `set_active`. What goes away is the LOOK:
+            # `.tool-btn` neutralises the checked styling, so the painted
+            # stripe is the only signal. A checked toggle would say "this is
+            # the mode you are in", which is the model this replaced.
             idx = self._TOOL_ORDER[mode]
             for grp in (self._tool_btns, self._ptool_btns):
                 grp[idx].set_active(True)
         finally:
             self._syncing_mode = False
+        # the left button just changed hands — repaint the stripes, which
+        # otherwise only followed the chord-click path
+        self._refresh_tool_bindings()
         self._sync_pen_popover()
         self._color_swatch.queue_draw()
 
