@@ -14707,6 +14707,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         the bar cannot claim one thing while the mouse does another."""
         if getattr(self, "_tool_btns", None) is None:
             return          # called while the header is still being built
+        # what each tool believes it owns, next to what the table says — the
+        # two disagreeing is the whole class of "the stripe is on the wrong
+        # button", and it is invisible without printing both
+        log_press("bar", "table",
+                  " ".join(f"{c}={t}" for c, t in self.bindings.items()))
+        log_press("bar", "stripes",
+                  " ".join(f"{t}:{'+'.join(self.bindings.plain_buttons_for(t)) or '-'}"
+                           for t in TOOL_BAR_ORDER))
         mode = (self._active_session.doc_mode if self._active_session else "pdf")
         for tool in TOOL_BAR_ORDER:
             plain = self.bindings.plain_buttons_for(tool)
