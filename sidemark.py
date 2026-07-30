@@ -983,9 +983,11 @@ class _SyntheticDrag:
     pan/zoom. Feeding this object to the ordinary press router instead makes the
     thumb a first-class button: whatever you bind to it is what it does."""
 
-    def __init__(self, x, y, button):
+    def __init__(self, x, y, button, shift=False):
         self._start = (x, y)
         self._button = button
+        self._state = (Gdk.ModifierType.SHIFT_MASK if shift
+                       else Gdk.ModifierType(0))
 
     def get_start_point(self):
         return (True, self._start[0], self._start[1])
@@ -994,7 +996,10 @@ class _SyntheticDrag:
         return self._button
 
     def get_current_event_state(self):
-        return Gdk.ModifierType(0)
+        return self._state
+
+    def set_state(self, _state):
+        pass          # nothing to claim: there is no real event sequence
 
 
 class Bindings:
@@ -8329,7 +8334,12 @@ class TextPageView(Gtk.Overlay):
 
     def __init__(self, font_px=13):
         super().__init__()
-        self.tool = "text"        # text | pen | highlighter | eraser
+        # no active tool: `bindings` says what each button does (row 132) and
+        # `tool` below means "the press in flight", falling back to the left
+        # button — which is what the cursor and the ink handlers want to know
+        self.bindings = Bindings()
+        self._press_tool = None
+        self._ink_additive = False
         self.zoom = 1.0           # sheet zoom: paper, text and ink together
         # per-document sheet width (the wrap column), persisted in the ink
         # sidecar; distinct from zoom, which scales everything together
@@ -8484,73 +8494,30 @@ class TextPageView(Gtk.Overlay):
         self.ink.set_can_target(False)   # clicks reach the text until a pen tool
         self.add_overlay(self.ink)
 
-        drag = Gtk.GestureDrag()
-        drag.set_button(0)               # pen draws, right button erases
-        drag.connect("drag-begin", self._on_ink_begin)
-        drag.connect("drag-update", self._on_ink_update)
-        drag.connect("drag-end", self._on_ink_end)
-        self.ink.add_controller(drag)
-        self._drag = drag
+        # No gesture of its own: the press router below drives _on_ink_*, so
+        # there is exactly one path from a press to a tool.
+        self._drag = None
 
-        # Alt+drag is the "quick ink" escape while the text caret is active —
-        # a fast annotation without switching tools: Alt+left draws with the
-        # pen, Alt+right erases (mirroring the ink tools' left-draw/right-erase
-        # pairing). Capture phase on the overlay sees the press before the
-        # TextView; without Alt (or on the middle button) the gesture denies
-        # itself so clicking, selecting text and the right-click menu stay put.
-        self._alt_saved_tool = None
-        alt = Gtk.GestureDrag()
-        alt.set_button(0)
-        alt.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        alt.connect("drag-begin", self._on_alt_begin)
-        alt.connect("drag-update", self._on_alt_update)
-        alt.connect("drag-end", self._on_alt_end)
-        self.add_controller(alt)
-        self._alt_drag = alt
-
-        # Ctrl+Shift+drag lays down a one-off HIGHLIGHTER stroke regardless of
-        # the active tool (PDF-canvas parity, #106 item 6 — the gesture twin of
-        # the Ctrl+H toggle). Same capture-phase escape pattern as Alt+drag.
-        self._temp_hl_saved_tool = None
-        thl = Gtk.GestureDrag()
-        thl.set_button(Gdk.BUTTON_PRIMARY)
-        thl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        thl.connect("drag-begin", self._on_temp_hl_begin)
-        thl.connect("drag-update", self._on_temp_hl_update)
-        thl.connect("drag-end", self._on_temp_hl_end)
-        self.add_controller(thl)
-        self._temp_hl_drag = thl
-
-        # Ctrl+Shift+Alt+drag is the lasso chord (chord_tool grammar, PDF-canvas
-        # parity): select/move/scale marks without switching tools. Same
-        # capture-phase escape pattern; the guards on the three chord gestures
-        # are mutually exclusive so their in-tree order doesn't matter.
-        self._chord_lasso_saved_tool = None
-        classo = Gtk.GestureDrag()
-        classo.set_button(Gdk.BUTTON_PRIMARY)
-        classo.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        classo.connect("drag-begin", self._on_chord_lasso_begin)
-        classo.connect("drag-update", self._on_chord_lasso_update)
-        classo.connect("drag-end", self._on_chord_lasso_end)
-        self.add_controller(classo)
-        self._chord_lasso_drag = classo
-
-        # Plain right-DRAG erases even while the caret is active (chord
-        # grammar: the right button is the eraser everywhere). The press must
-        # be claimed up front — the TextView opens its context menu on the
-        # press, so a deferred claim would race the popup — which means a
-        # clean right-CLICK has to re-open that menu itself on release (see
-        # _on_rerase_end).
-        self._rerase_press = None
+        # ONE press router for the sheet (row 132). Capture phase on the
+        # Overlay so it sees every press before both the ink overlay and the
+        # TextView, `set_button(0)` so every button reaches it: it resolves the
+        # chord through the binding table and either claims the press for that
+        # tool, or DENIES so the caret keeps it (text selection, the context
+        # menu, clicking to type). One router is what keeps a chord from
+        # meaning one thing here and another on a PDF page.
+        router = Gtk.GestureDrag()
+        router.set_button(0)
+        router.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        router.connect("drag-begin", self._on_press_begin)
+        router.connect("drag-update", self._on_press_update)
+        router.connect("drag-end", self._on_press_end)
+        self.add_controller(router)
+        self._router = router
+        self._press_tool = None      # the tool of the press in flight
+        self._panning = False
+        self._pan_start = (0.0, 0.0)
+        self._rerase_press = None    # a right-press that may still be a click
         self._rerase_started = False
-        rerase = Gtk.GestureDrag()
-        rerase.set_button(Gdk.BUTTON_SECONDARY)
-        rerase.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        rerase.connect("drag-begin", self._on_rerase_begin)
-        rerase.connect("drag-update", self._on_rerase_update)
-        rerase.connect("drag-end", self._on_rerase_end)
-        self.add_controller(rerase)
-        self._rerase_drag = rerase
 
         # Escape steps back out of a zoom-to-region: each one pushes the view
         # it came from, exactly like PDFCanvas._zoom_stack. The sheet's view is
@@ -8568,31 +8535,12 @@ class TextPageView(Gtk.Overlay):
         pinch.connect("scale-changed", self._on_sheet_pinch_scale)
         self.add_controller(pinch)
 
-        # Ctrl+drag or middle-drag grab-pans the sheet (PDF-canvas parity —
-        # #106 item 4). Capture phase on the overlay so it wins over both the
-        # text caret and an active drawing tool; button 0 catches every button
-        # and the begin handler claims only the two pan chords, denying itself
-        # otherwise so ordinary clicks / drawing / text selection are untouched.
-        self._panning = False
-        self._pan_start = (0.0, 0.0)
-        self._mzoom = False   # Shift+middle-drag zoom-to-region in flight
-        pan = Gtk.GestureDrag()
-        pan.set_button(0)
-        pan.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        pan.connect("drag-begin", self._on_pan_begin)
-        pan.connect("drag-update", self._on_pan_update)
-        pan.connect("drag-end", self._on_pan_end)
-        self.add_controller(pan)
-        self._pan_drag = pan
 
         # MX Master thumb button (btn 10): hold to grab-pan the sheet, same as
         # the PDF canvas. A motion controller tracks the pointer; a legacy
         # controller catches the thumb button press/release (GestureClick's high
         # buttons are unreliable — the PDF canvas uses the same legacy route).
-        self._thumb_panning = False
-        self._thumb_zooming = False    # Shift+thumb: zoom-to-region in flight
-        self._thumb_origin = (0.0, 0.0)
-        self._thumb_start = (0.0, 0.0)
+        self._thumb_gesture = None     # a thumb-button press in flight
         self._mouse_xy = (0.0, 0.0)
         self._pointer_in = False   # is the pointer over the sheet? (paste target)
         motion = Gtk.EventControllerMotion()
@@ -8670,21 +8618,27 @@ class TextPageView(Gtk.Overlay):
 
     # ── tool routing ─────────────────────────────────────────────────────────
 
+    @property
+    def tool(self):
+        """The tool of the press in flight, else the LEFT button's — which is
+        what the cursor should promise and what the ink handlers mean when they
+        ask. Anything the sheet has no implementation for reads as "text"."""
+        tool = self._press_tool
+        if tool is None:
+            tool = self.bindings.tool_for(BTN_LEFT, mode="text")
+        return tool if tool in ("pen", "highlighter", "eraser", "lasso",
+                                "zoom", "pan") else "text"
+
     def set_tool(self, tool):
-        """Anything that isn't a drawing / zoom / pan tool falls back to text
-        editing. zoom and pan are the modifier-free twins of the Shift+drag and
-        Ctrl/middle-drag gestures (PDF-canvas parity). The ink-drawing tools and
-        zoom claim the overlay; pan rides its capture-phase gesture (see
-        _pan_chord) so it needs no overlay target — just a grab cursor."""
-        self.tool = (tool
-                     if tool in ("pen", "highlighter", "eraser", "lasso",
-                                 "zoom", "pan")
-                     else "text")
-        targeting = self.tool in ("pen", "highlighter", "eraser", "lasso", "zoom")
-        self.ink.set_can_target(targeting)
+        """Put `tool` on the left button and follow it with the cursors.
+
+        The ink overlay is NOT made targetable any more: the capture-phase
+        press router sees every press above it, so targeting would only take
+        the caret's clicks away from the TextView for no gain."""
+        self.bindings.bind("left", canonical_tool(tool))
+        drawing = self.tool in ("pen", "highlighter", "eraser", "zoom")
         self.ink.set_cursor(
-            Gdk.Cursor.new_from_name("crosshair")
-            if targeting and self.tool != "lasso" else None)
+            Gdk.Cursor.new_from_name("crosshair") if drawing else None)
         self.set_cursor(Gdk.Cursor.new_from_name("grab")
                         if self.tool == "pan" else None)
         if self.tool != "lasso":
@@ -8931,74 +8885,21 @@ class TextPageView(Gtk.Overlay):
                 state |= Gdk.ModifierType.ALT_MASK
         return state
 
-    def _pan_chord(self, gesture):
-        """True when the drag should pan: middle-drag, Ctrl+left-drag (the two
-        chords the PDF canvas pans on), or a plain left-drag while the pan tool
-        is active (its modifier-free twin). Ctrl+SHIFT is reserved for the
-        temp-highlighter, so it never pans."""
-        state = self._chord_state(gesture)
-        button = gesture.get_current_button()
-        if button == Gdk.BUTTON_MIDDLE:
-            return True
-        if button != Gdk.BUTTON_PRIMARY:
-            return False
-        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
-        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
-        if ctrl and shift:
-            return False                     # Ctrl+Shift+drag → temp-highlighter
-        return self.tool == "pan" or ctrl
-
-    def _on_pan_begin(self, gesture, x, y):
-        state = self._chord_state(gesture)
-        if (gesture.get_current_button() == Gdk.BUTTON_MIDDLE
-                and state & Gdk.ModifierType.SHIFT_MASK):
-            # Shift+middle-drag zooms to a region: the middle button is the
-            # NAVIGATION button (chord grammar), and Shift+middle is the
-            # portable zoom chord — plain Shift belongs to text selection
-            # while the caret is active, so it can't carry zoom here.
-            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-            self._mzoom = True
-            self._zoom_selecting = True
-            self._zoom_start = (x, y)
-            self._zoom_end = (x, y)
-            self._fire_gesture_tool("zoom")
-            self.ink.queue_draw()
-            return
-        if not self._pan_chord(gesture):
-            gesture.set_state(Gtk.EventSequenceState.DENIED)
-            return
-        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+    def _begin_pan(self):
+        """Grab-pan the sheet: the content follows the pointer, so the scroll
+        offset moves opposite the drag delta (see _pan_update)."""
         self._panning = True
         ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
         self._pan_start = (ha.get_value(), va.get_value())
-        self._fire_gesture_tool("pan")
         self.set_cursor(Gdk.Cursor.new_from_name("grabbing"))
 
-    def _on_pan_update(self, gesture, dx, dy):
-        if self._mzoom:
-            ok, sx, sy = gesture.get_start_point()
-            if ok:
-                self._zoom_end = (sx + dx, sy + dy)
-                self.ink.queue_draw()
-            return
-        if not self._panning:
-            return
-        # drag the paper under the cursor: content follows the pointer, so the
-        # scroll offset moves opposite the drag delta
+    def _pan_update(self, dx, dy):
         ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
         ha.set_value(self._pan_start[0] - dx)
         va.set_value(self._pan_start[1] - dy)
 
-    def _on_pan_end(self, gesture, dx, dy):
-        if self._mzoom:
-            self._mzoom = False
-            self._fire_gesture_tool(None)
-            self._finish_zoom_region()
-            return
-        if not self._panning:
-            return
+    def _pan_end(self):
         self._panning = False
-        self._fire_gesture_tool(None)
         # the pan tool keeps its open-hand cursor between drags
         self.set_cursor(Gdk.Cursor.new_from_name("grab")
                         if self.tool == "pan" else None)
@@ -9013,14 +8914,10 @@ class TextPageView(Gtk.Overlay):
     def _on_sheet_motion(self, _ctrl, x, y):
         self._mouse_xy = (x, y)
         self._pointer_in = True
-        if self._thumb_panning:
-            ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
-            ha.set_value(self._thumb_start[0] - (x - self._thumb_origin[0]))
-            va.set_value(self._thumb_start[1] - (y - self._thumb_origin[1]))
-            return
-        if self._thumb_zooming:
-            self._zoom_end = (x, y)
-            self.ink.queue_draw()
+        if self._thumb_gesture is not None:
+            sx, sy = (self._thumb_gesture.get_start_point()[1],
+                      self._thumb_gesture.get_start_point()[2])
+            self._on_press_update(self._thumb_gesture, x - sx, y - sy)
             return
         # hint that the paper edge is draggable (caret tool only, matching where
         # _on_width_begin claims); leave other tools' cursors alone
@@ -9034,38 +8931,26 @@ class TextPageView(Gtk.Overlay):
         if event is None:
             return False
         t = event.get_event_type()
-        if t == Gdk.EventType.BUTTON_PRESS and event.get_button() == 10:
-            # thumb mirrors the middle (navigation) button, as the more
-            # ergonomic reach: hold to pan, Shift+hold to zoom-to-region,
-            # scroll-while-held to zoom (see _on_sheet_scroll)
+        if t == Gdk.EventType.BUTTON_PRESS and event.get_button() == BTN_THUMB:
+            # the thumb runs whatever the table says — nothing, by default.
+            # Replayed through the one press router with a synthetic drag, the
+            # same trick the PDF canvas uses (button 10 never reaches a
+            # GestureDrag).
             shift = bool(event.get_modifier_state()
                          & Gdk.ModifierType.SHIFT_MASK)
             if not shift and self.get_held_mods is not None:
                 shift = self.get_held_mods()[1]
-            if shift:
-                self._thumb_zooming = True
-                self._zoom_selecting = True
-                self._zoom_start = self._mouse_xy
-                self._zoom_end = self._mouse_xy
-                self._fire_gesture_tool("zoom")
-                self.ink.queue_draw()
-                return False
-            self._thumb_panning = True
-            self._thumb_origin = self._mouse_xy
-            ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
-            self._thumb_start = (ha.get_value(), va.get_value())
-            self._fire_gesture_tool("pan")
-            self.set_cursor(Gdk.Cursor.new_from_name("grabbing"))
-        elif t == Gdk.EventType.BUTTON_RELEASE and event.get_button() == 10:
-            if self._thumb_zooming:
-                self._thumb_zooming = False
-                self._fire_gesture_tool(None)
-                self._finish_zoom_region()
-                return False
-            self._thumb_panning = False
-            self._fire_gesture_tool(None)
-            self.set_cursor(Gdk.Cursor.new_from_name("grab")
-                            if self.tool == "pan" else None)
+            self._thumb_gesture = _SyntheticDrag(
+                *self._mouse_xy, BTN_THUMB, shift=shift)
+            self._on_press_begin(self._thumb_gesture, *self._mouse_xy)
+            if self._press_tool is None and not self._panning:
+                self._thumb_gesture = None
+        elif t == Gdk.EventType.BUTTON_RELEASE and event.get_button() == BTN_THUMB:
+            g, self._thumb_gesture = self._thumb_gesture, None
+            if g is not None:
+                sx, sy = g.get_start_point()[1], g.get_start_point()[2]
+                self._on_press_end(g, self._mouse_xy[0] - sx,
+                                   self._mouse_xy[1] - sy)
         return False
 
     def _on_sheet_scroll(self, ctrl, dx, dy):
@@ -9092,12 +8977,13 @@ class TextPageView(Gtk.Overlay):
         if not ctrl_held and self.get_held_mods is not None:
             ctrl_held = self.get_held_mods()[0]   # (ctrl, shift, alt)
         smooth = ctrl.get_unit() == Gdk.ScrollUnit.SURFACE
-        if ctrl_held or self._thumb_panning:
+        if ctrl_held or self._thumb_gesture is not None:
             new_scroll = self.zoom_by_at(zoom_factor_for_scroll(smooth, dy),
                                          *self._mouse_xy)
-            if self._thumb_panning:
-                self._thumb_start = new_scroll
-                self._thumb_origin = self._mouse_xy
+            if self._panning:
+                # rebase the pan so the next motion event doesn't jump
+                self._pan_start = new_scroll
+                self._thumb_gesture._start = self._mouse_xy
             return True
         # plain scroll → pan. Touchpad deltas are ~1px each; a wheel notch is
         # ±1 and needs the same step the PDF canvas pans by, so the two modes
@@ -9328,72 +9214,6 @@ class TextPageView(Gtk.Overlay):
 
     # ── drawing gestures ─────────────────────────────────────────────────────
 
-    def _on_alt_begin(self, gesture, x, y):
-        """The caret's escape into the ink chords. The ink overlay is not
-        targetable while the caret owns the sheet, so _on_ink_begin can never
-        see these drags — this capture gesture is the only route to them.
-        Alt+left = pen, Alt+right = eraser, Alt+Shift+left = zoom-to-region
-        (chord_tool: Alt flips to ink, Shift over ink zooms — and it is the
-        only zoom chord available here, since Shift alone is text selection)."""
-        state = self._chord_state(gesture)
-        button = gesture.get_current_button()
-        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
-        if (self.tool != "text" or not state & Gdk.ModifierType.ALT_MASK
-                or state & Gdk.ModifierType.CONTROL_MASK
-                or button not in (Gdk.BUTTON_PRIMARY, Gdk.BUTTON_SECONDARY)
-                or (shift and button != Gdk.BUTTON_PRIMARY)):
-            # Ctrl combos belong to other chords; middle (pan) and the
-            # unmodified caret keep their meaning
-            gesture.set_state(Gtk.EventSequenceState.DENIED)
-            return
-        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-        self._alt_saved_tool = self.tool
-        # borrow the tool the chord names; _on_ink_begin does the rest, and
-        # reads self.tool for the zoom branch as well as the ink ones
-        self.tool = ("zoom" if shift else
-                     "eraser" if button == Gdk.BUTTON_SECONDARY else "pen")
-        self._on_ink_begin(gesture, x, y)
-
-    def _on_alt_update(self, gesture, dx, dy):
-        if self._alt_saved_tool is not None:
-            self._on_ink_update(gesture, dx, dy)
-
-    def _on_alt_end(self, gesture, dx, dy):
-        if self._alt_saved_tool is None:
-            return
-        self._on_ink_end(gesture, dx, dy)
-        self.tool = self._alt_saved_tool
-        self._alt_saved_tool = None
-
-    # ── temp-highlighter (Ctrl+Shift+drag, PDF-canvas parity) ────────────────
-
-    def _on_temp_hl_begin(self, gesture, x, y):
-        state = self._chord_state(gesture)
-        need = Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
-        if (state & need) != need or state & Gdk.ModifierType.ALT_MASK:
-            # Ctrl+Shift only — with Alt on top it's the lasso chord
-            gesture.set_state(Gtk.EventSequenceState.DENIED)
-            return
-        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-        # borrow the highlighter for this one stroke (pen_style + _commit_stroke
-        # read self.tool); restored on release
-        self._temp_hl_saved_tool = self.tool
-        self.tool = "highlighter"
-        self._on_ink_begin(gesture, x, y)
-
-    def _on_temp_hl_update(self, gesture, dx, dy):
-        if self._temp_hl_saved_tool is not None:
-            self._on_ink_update(gesture, dx, dy)
-
-    def _on_temp_hl_end(self, gesture, dx, dy):
-        if self._temp_hl_saved_tool is None:
-            return
-        self._on_ink_end(gesture, dx, dy)
-        self.tool = self._temp_hl_saved_tool
-        self._temp_hl_saved_tool = None
-
-    # ── lasso chord (Ctrl+Shift+Alt+drag, PDF-canvas parity) ─────────────────
-
     def selection_grab_at(self, x, y):
         """Would a press at (x, y) (overlay coords) grab the LIVE selection?
         The PDF canvas's twin — see PDFCanvas.selection_grab_at for the
@@ -9409,92 +9229,110 @@ class TextPageView(Gtk.Overlay):
             return True
         return self._point_in_selection(x, y)
 
-    def _on_chord_lasso_begin(self, gesture, x, y):
+    # ── the press router (row 132) ───────────────────────────────────────────
+
+    def _on_press_begin(self, gesture, x, y):
+        """Resolve this press through the binding table and give it to that
+        tool — or DENY, and the caret below keeps it.
+
+        Capture phase above both the ink overlay and the TextView, which is
+        what makes it the only path: with the caret in hand the overlay is not
+        even targetable, so a handler down there would never see the press."""
         state = self._chord_state(gesture)
-        need = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
-                | Gdk.ModifierType.ALT_MASK)
-        # Two ways in: the chord, or a press that grabs a live selection with
-        # ANY tool. The latter MUST be claimed here rather than in
-        # _on_ink_begin: with the caret the ink overlay is not targetable
-        # (set_tool -> ink.set_can_target), so _on_ink_begin never fires and a
-        # pasted image was unmovable until you fetched the lasso. This gesture
-        # is on the TextPageView in the CAPTURE phase, above both the overlay
-        # and the TextView, so it fires whatever owns the press — and it claims
-        # ONLY on the selection, so plain typing and clicking are untouched.
-        if (state & need) != need and not self.selection_grab_at(x, y):
-            # Not a grab and not the chord: this press is happening somewhere
-            # else, so the selection is over (PDFCanvas parity). Done HERE
-            # because this gesture is the only one that sees every press —
-            # with the caret in hand the ink overlay is not even targetable.
-            # The lasso tool is excluded: _lasso_begin owns the rule there
-            # (Shift adds, a fresh loop replaces).
-            if self.tool != "lasso":
+        btn = gesture.get_current_button()
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        alt = bool(state & Gdk.ModifierType.ALT_MASK)
+        self._press_tool = None
+        self._rerase_press = None
+        self._rerase_started = False
+
+        tool = self.bindings.tool_for(btn, ctrl, shift, alt, mode="text")
+        plain = self.bindings.tool_for(btn, mode="text")
+        additive = False
+        # THE exception (PDF-canvas parity): with the lasso on the plain button
+        # Shift ADDS to the selection rather than running what Shift is bound
+        # to — Shift+lasso is still the lasso.
+        if shift and not ctrl and not alt and plain == "lasso":
+            tool, additive = "lasso", True
+
+        # A live selection is grabbable with ANY tool, and it MUST be claimed
+        # here: a pasted image would otherwise be unmovable until you fetched
+        # the lasso (row 125).
+        grab = self.selection_grab_at(x, y)
+        if grab and tool != "lasso":
+            tool, additive = "lasso", False
+
+        if tool is None or tool == "text":
+            # The press belongs to the caret (click, text selection, the
+            # context menu). It also ends any live selection, exactly as a
+            # press elsewhere does on a PDF page — done here because this is
+            # the only handler that sees every press.
+            if plain != "lasso":
                 self.clear_lasso_selection()
                 self.ink.queue_draw()
             gesture.set_state(Gtk.EventSequenceState.DENIED)
             return
+
+        if btn == BTN_RIGHT and tool == "eraser":
+            # A right press is ambiguous until it moves: erase on a drag, the
+            # context menu on a clean click. Claim it up front anyway — the
+            # TextView opens its menu on the PRESS, so a deferred claim would
+            # race the popup — and re-open the menu ourselves on release.
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            self._rerase_press = (x, y)
+            return
+
         gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-        # borrow the lasso for this drag (the routing in _on_ink_begin reads
-        # self.tool); restored RAW on release — set_tool() would clear the
-        # selection the chord just made. Handle-scale / inside-move / fresh
-        # loop all come from _lasso_begin, same as the toolbar tool.
-        self._chord_lasso_saved_tool = self.tool
-        self.tool = "lasso"
+        self._press_tool = tool
+        if tool != plain:
+            self._fire_gesture_tool(tool)
+        if tool == "pan":
+            self._begin_pan()
+            return
+        self._ink_additive = additive
         self._on_ink_begin(gesture, x, y)
 
-    def _on_chord_lasso_update(self, gesture, dx, dy):
-        if self._chord_lasso_saved_tool is not None:
+    def _on_press_update(self, gesture, dx, dy):
+        if self._rerase_press is not None:
+            if not self._rerase_started:
+                if math.hypot(dx, dy) < 6:
+                    return              # still a click; menu on release
+                self._rerase_started = True
+                self._press_tool = "eraser"
+                self._fire_gesture_tool("eraser")
+                self._on_ink_begin(gesture, *self._rerase_press)
+            self._on_ink_update(gesture, dx, dy)
+            return
+        if self._panning:
+            self._pan_update(dx, dy)
+            return
+        if self._press_tool is not None:
             self._on_ink_update(gesture, dx, dy)
 
-    def _on_chord_lasso_end(self, gesture, dx, dy):
-        if self._chord_lasso_saved_tool is None:
+    def _on_press_end(self, gesture, dx, dy):
+        if self._rerase_press is not None:
+            x, y = self._rerase_press
+            self._rerase_press = None
+            if self._rerase_started:
+                self._rerase_started = False
+                self._fire_gesture_tool(None)
+                self._on_ink_end(gesture, dx, dy)
+                self._press_tool = None
+                return
+            self._reopen_context_menu(x, y)
             return
-        self._on_ink_end(gesture, dx, dy)
-        self.tool = self._chord_lasso_saved_tool
-        self._chord_lasso_saved_tool = None
-
-    # ── right-drag erase with the caret (chord grammar: right = eraser) ─────
-
-    def _on_rerase_begin(self, gesture, x, y):
-        state = self._chord_state(gesture)
-        mods = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
-                | Gdk.ModifierType.ALT_MASK)
-        if self.tool != "text" or state & mods:
-            # Alt+right is the alt gesture's eraser; the ink tools already
-            # erase on right-drag via the overlay's own drag
-            gesture.set_state(Gtk.EventSequenceState.DENIED)
-            return
-        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-        self._rerase_started = False
-        self._rerase_press = (x, y)
-
-    def _on_rerase_update(self, gesture, dx, dy):
-        if self._rerase_press is None:
-            return
-        if not self._rerase_started:
-            if math.hypot(dx, dy) < 6:
-                return              # still a click; menu on release
-            self._rerase_started = True
-            # button 3 routes to _erase_at inside the ink handlers, no tool
-            # borrow needed (mirrors the PDF canvas' always-on right-erase)
-            self._fire_gesture_tool("eraser")
-            self._on_ink_begin(gesture, *self._rerase_press)
-        self._on_ink_update(gesture, dx, dy)
-
-    def _on_rerase_end(self, gesture, dx, dy):
-        if self._rerase_press is None:
-            return
-        x, y = self._rerase_press
-        self._rerase_press = None
-        if self._rerase_started:
-            self._rerase_started = False
-            self._fire_gesture_tool(None)
+        if self._panning:
+            self._pan_end()
+        elif self._press_tool is not None:
             self._on_ink_end(gesture, dx, dy)
-            return
-        # a clean right-CLICK: our up-front claim swallowed the press the
-        # TextView would have opened its context menu on — re-open it here.
-        # Mirror GTK's own behaviour: move the caret to the click point unless
-        # it landed inside the existing selection.
+        self._fire_gesture_tool(None)
+        self._press_tool = None
+
+    def _reopen_context_menu(self, x, y):
+        """A clean right-CLICK: our up-front claim swallowed the press the
+        TextView would have opened its menu on. Mirror GTK's own behaviour —
+        move the caret to the click point unless it landed in the selection."""
         bx, by = self._overlay_to_buffer(x, y)
         _over, it = self.view.get_iter_at_location(bx, by)
         buf = self.view.get_buffer()
@@ -9505,22 +9343,11 @@ class TextPageView(Gtk.Overlay):
         self.view.activate_action("menu.popup", None)
 
     def _on_ink_begin(self, gesture, x, y):
-        state = self._chord_state(gesture)
         self._zoom_cancelled = False
         self._ink_ignoring = False
-        # Shift alone (or the zoom tool) zooms to a region; Ctrl+Shift is the
-        # temp-highlighter (handled by its own capture gesture) so it is NOT a
-        # zoom here.
-        shift_only = (state & Gdk.ModifierType.SHIFT_MASK
-                      and not state & Gdk.ModifierType.CONTROL_MASK)
-        # …but with the LASSO in hand Shift adds to the selection instead of
-        # zooming (PDF-canvas parity — see PDFCanvas._on_drag_begin for why
-        # this does not fork chord_tool: Shift+lasso is still the lasso, and
-        # Alt+Shift+drag remains the portable zoom chord in both modes).
-        if (shift_only and self.tool != "lasso") or self.tool == "zoom":
-            # Shift (or the modifier-free zoom tool) starts a zoom-to-region
-            # rubber-band (PDF-canvas parity); a click that never grows into a
-            # rect falls back to fit-width on end
+        if self.tool == "zoom":
+            # a zoom-to-region rubber-band; a drag that never grows into a rect
+            # falls back to fit-width on release
             self._zoom_selecting = True
             self._zoom_start = (x, y)
             self._zoom_end = (x, y)
@@ -9530,8 +9357,7 @@ class TextPageView(Gtk.Overlay):
         button = gesture.get_current_button()
         self._erased_now = []
         if self.tool == "lasso" and button != 3:
-            self._lasso_begin(
-                x, y, additive=bool(state & Gdk.ModifierType.SHIFT_MASK))
+            self._lasso_begin(x, y, additive=self._ink_additive)
         elif self.tool == "eraser" or button == 3:
             self._erase_at(x, y)
         else:
@@ -12385,7 +12211,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         tp.set_visible(True)
         if s is self._active_session:
             self._update_header_for_mode()
-            self._set_tool_mode("select")   # text editing first; pen on demand
+            # deliberately NOT rebinding the left button to the caret: the
+            # table is shared with PDF pages (row 132), and silently rewriting
+            # it whenever a text page opens would undo the user's own binding.
+            # Typing works regardless — keys go to the focused view; it is
+            # CLICKING to move the caret that wants the caret tool.
             tp.view.grab_focus()
 
     def _leave_text_mode(self, s=None):

@@ -9220,9 +9220,9 @@ class TestTextFirstMode(unittest.TestCase):
                 tp.set_zoom(2.0)
                 gesture = _FakeDrag(100, 100,
                                     state=Gdk.ModifierType.SHIFT_MASK)
-                tp._on_ink_begin(gesture, 100, 100)
-                tp._on_ink_update(gesture, 3, 3)
-                tp._on_ink_end(gesture, 3, 3)
+                tp._on_press_begin(gesture, 100, 100)
+                tp._on_press_update(gesture, 3, 3)
+                tp._on_press_end(gesture, 3, 3)
                 vw = tp.scroll.get_width()
                 want = (vw - 2 * tp.PAGE_GAP) / tp.PAGE_WIDTH
                 want = max(tp.ZOOM_MIN, min(tp.ZOOM_MAX, want))
@@ -9240,12 +9240,12 @@ class TestTextFirstMode(unittest.TestCase):
                 tp = win._active_session._text_page
                 win._set_tool_mode("pen")
                 g = _FakeDrag(100, 100, state=Gdk.ModifierType.SHIFT_MASK)
-                tp._on_ink_begin(g, 100, 100)
+                tp._on_press_begin(g, 100, 100)
                 self.assertTrue(tp._zoom_selecting)
                 # drag out a 200×150 rectangle
-                tp._on_ink_update(g, 200, 150)
+                tp._on_press_update(g, 200, 150)
                 self.assertEqual(tp._zoom_end, (300, 250))
-                tp._on_ink_end(g, 200, 150)
+                tp._on_press_end(g, 200, 150)
                 vw, vh = tp.scroll.get_width(), tp.scroll.get_height()
                 want = min(vw / 200.0, vh / 150.0) * 0.97
                 want = max(tp.ZOOM_MIN, min(tp.ZOOM_MAX, want))
@@ -9272,10 +9272,10 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertTrue(tp.ink.get_can_target())   # grabs the drag
                 self.assertTrue(win._mode_zoom.get_visible())
                 g = _FakeDrag(100, 100)                    # NO Shift modifier
-                tp._on_ink_begin(g, 100, 100)
+                tp._on_press_begin(g, 100, 100)
                 self.assertTrue(tp._zoom_selecting)
-                tp._on_ink_update(g, 200, 150)
-                tp._on_ink_end(g, 200, 150)
+                tp._on_press_update(g, 200, 150)
+                tp._on_press_end(g, 200, 150)
                 vw, vh = tp.scroll.get_width(), tp.scroll.get_height()
                 want = min(vw / 200.0, vh / 150.0) * 0.97
                 want = max(tp.ZOOM_MIN, min(tp.ZOOM_MAX, want))
@@ -9302,8 +9302,8 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertTrue(secondary, "right-click cancel not wired to ink")
                 z0 = tp.zoom
                 g = _FakeDrag(100, 100)
-                tp._on_ink_begin(g, 100, 100)
-                tp._on_ink_update(g, 200, 150)
+                tp._on_press_begin(g, 100, 100)
+                tp._on_press_update(g, 200, 150)
                 self.assertTrue(tp._zoom_selecting)
                 # right-click cancels
                 tp._on_secondary_pressed(
@@ -9311,8 +9311,8 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertFalse(tp._zoom_selecting)
                 self.assertTrue(tp._zoom_cancelled)
                 # leftover drag motion + release do nothing
-                tp._on_ink_update(g, 260, 200)
-                tp._on_ink_end(g, 260, 200)
+                tp._on_press_update(g, 260, 200)
+                tp._on_press_end(g, 260, 200)
                 self.assertAlmostEqual(tp.zoom, z0, places=6)   # unchanged
                 self.assertEqual(tp.strokes, [])                # nothing drawn
                 self.assertFalse(tp._zoom_cancelled)            # reset for next
@@ -9338,28 +9338,28 @@ class TestTextFirstMode(unittest.TestCase):
                 va.set_value(200.0)
                 g = _FakeDrag(50, 50, button=1,
                               state=Gdk.ModifierType.CONTROL_MASK)
-                tp._on_pan_begin(g, 50, 50)
+                tp._on_press_begin(g, 50, 50)
                 self.assertTrue(tp._panning)
                 self.assertEqual(g.claimed, Gtk.EventSequenceState.CLAIMED)
-                tp._on_pan_update(g, 0, -60)
+                tp._on_press_update(g, 0, -60)
                 self.assertAlmostEqual(va.get_value(), 260.0, places=3)
-                tp._on_pan_end(g, 0, -60)
+                tp._on_press_end(g, 0, -60)
                 self.assertFalse(tp._panning)
 
                 # middle-drag pans too (no modifier needed)
                 va.set_value(100.0)
                 ha.set_value(0.0)
                 g2 = _FakeDrag(50, 50, button=2)
-                tp._on_pan_begin(g2, 50, 50)
+                tp._on_press_begin(g2, 50, 50)
                 self.assertTrue(tp._panning)
-                tp._on_pan_update(g2, 0, 40)
+                tp._on_press_update(g2, 0, 40)
                 self.assertAlmostEqual(va.get_value(), 60.0, places=3)
-                tp._on_pan_end(g2, 0, 40)
+                tp._on_press_end(g2, 0, 40)
 
                 # a plain left-drag is NOT a pan — the gesture denies itself so
                 # drawing / text selection keep the sequence
                 g3 = _FakeDrag(50, 50, button=1)
-                tp._on_pan_begin(g3, 50, 50)
+                tp._on_press_begin(g3, 50, 50)
                 self.assertFalse(tp._panning)
                 self.assertEqual(g3.claimed, Gtk.EventSequenceState.DENIED)
 
@@ -9369,12 +9369,12 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertFalse(tp.ink.get_can_target())   # pan rides capture
                 va.set_value(300.0)
                 g4 = _FakeDrag(50, 50, button=1)            # no modifier
-                tp._on_pan_begin(g4, 50, 50)
+                tp._on_press_begin(g4, 50, 50)
                 self.assertTrue(tp._panning)
                 self.assertEqual(g4.claimed, Gtk.EventSequenceState.CLAIMED)
-                tp._on_pan_update(g4, 0, -40)
+                tp._on_press_update(g4, 0, -40)
                 self.assertAlmostEqual(va.get_value(), 340.0, places=3)
-                tp._on_pan_end(g4, 0, -40)
+                tp._on_press_end(g4, 0, -40)
 
             self._run_in_window(body)
 
@@ -9399,13 +9399,14 @@ class TestTextFirstMode(unittest.TestCase):
                     get_event_type=lambda: Gdk.EventType.BUTTON_RELEASE,
                     get_button=lambda: 10,
                     get_modifier_state=lambda: Gdk.ModifierType(0))
+                tp.bindings.bind("thumb", "pan")
                 tp._on_sheet_motion(None, 100.0, 100.0)   # pointer at origin
                 tp._on_thumb_event(None, press)
-                self.assertTrue(tp._thumb_panning)
+                self.assertTrue(tp._panning)
                 tp._on_sheet_motion(None, 100.0, 60.0)    # move up 40px
                 self.assertAlmostEqual(va.get_value(), 240.0, places=3)
                 tp._on_thumb_event(None, release)
-                self.assertFalse(tp._thumb_panning)
+                self.assertFalse(tp._panning)
                 # a later move no longer pans
                 tp._on_sheet_motion(None, 100.0, 0.0)
                 self.assertAlmostEqual(va.get_value(), 240.0, places=3)
@@ -9467,11 +9468,15 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertAlmostEqual(ha.get_value(), new[0], places=3)
                 self.assertAlmostEqual(va.get_value(), new[1], places=3)
                 # a live thumb-pan rebases off the returned scroll
-                tp._thumb_panning = True
+                tp._thumb_gesture = sidemark._SyntheticDrag(0.0, 0.0, 10)
+                tp._panning = True
                 tp._mouse_xy = (300.0, 200.0)
                 tp._on_sheet_scroll(_scroll_ctrl(), 0, -1)
-                self.assertEqual(tp._thumb_origin, (300.0, 200.0))
-                self.assertEqual(tp._thumb_start, (ha.get_value(), va.get_value()))
+                self.assertEqual(tp._thumb_gesture.get_start_point()[1:],
+                                 (300.0, 200.0))
+                self.assertEqual(tp._pan_start, (ha.get_value(), va.get_value()))
+                tp._thumb_gesture = None
+                tp._panning = False
 
             self._run_in_window(body)
 
@@ -9488,17 +9493,17 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertLess(hl_opacity, 1.0)           # highlighter is translucent
                 g = _FakeDrag(120, 120, state=(Gdk.ModifierType.CONTROL_MASK
                                                | Gdk.ModifierType.SHIFT_MASK))
-                tp._on_temp_hl_begin(g, 120, 120)
+                tp._on_press_begin(g, 120, 120)
                 self.assertEqual(tp.tool, "highlighter")   # borrowed mid-gesture
                 for i in range(1, 5):
-                    tp._on_temp_hl_update(g, 0, i * 3)
-                tp._on_temp_hl_end(g, 0, 12)
+                    tp._on_press_update(g, 0, i * 3)
+                tp._on_press_end(g, 0, 12)
                 self.assertEqual(tp.tool, "text")          # restored after release
                 self.assertEqual(len(tp.strokes), 1)
                 self.assertAlmostEqual(tp.strokes[0]["opacity"], hl_opacity, places=5)
                 # without Ctrl+Shift the gesture denies itself (no stroke)
                 g2 = _FakeDrag(120, 120)
-                tp._on_temp_hl_begin(g2, 120, 120)
+                tp._on_press_begin(g2, 120, 120)
                 self.assertIsNone(tp._temp_hl_saved_tool)
                 self.assertEqual(g2.claimed, Gtk.EventSequenceState.DENIED)
 
@@ -9720,8 +9725,8 @@ class TestTextFirstMode(unittest.TestCase):
                 fake = types.SimpleNamespace(
                     get_current_button=lambda: 1,
                     get_current_event_state=lambda: Gdk.ModifierType(0))
-                tp._on_ink_begin(fake, px, py)
-                tp._on_ink_end(fake, 0, 0)
+                tp._on_press_begin(fake, px, py)
+                tp._on_press_end(fake, 0, 0)
                 self.assertEqual(len(tp.strokes), 0)
                 win._global_undo()
                 self.assertEqual(len(tp.strokes), 1)
@@ -9878,13 +9883,13 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertEqual(tp.tool, "text")        # caret owns the sheet
                 g = _FakeDrag(60, 60, state=(Gdk.ModifierType.ALT_MASK
                                              | Gdk.ModifierType.SHIFT_MASK))
-                tp._on_alt_begin(g, 60.0, 60.0)
+                tp._on_press_begin(g, 60.0, 60.0)
                 self.assertEqual(g.claimed, Gtk.EventSequenceState.CLAIMED)
                 self.assertTrue(tp._zoom_selecting)      # rubber-band, not ink
                 self.assertEqual(tp.strokes, [])         # and it did NOT draw
-                tp._on_alt_update(g, 120.0, 90.0)
+                tp._on_press_update(g, 120.0, 90.0)
                 z0 = tp.zoom
-                tp._on_alt_end(g, 120.0, 90.0)
+                tp._on_press_end(g, 120.0, 90.0)
                 self.assertFalse(tp._zoom_selecting)
                 self.assertNotAlmostEqual(tp.zoom, z0)   # zoomed to the region
                 self.assertEqual(tp.tool, "text")        # caret restored
@@ -9892,10 +9897,10 @@ class TestTextFirstMode(unittest.TestCase):
 
                 # plain Alt still draws — the escape it always was
                 g2 = _FakeDrag(60, 60, state=Gdk.ModifierType.ALT_MASK)
-                tp._on_alt_begin(g2, 60.0, 60.0)
+                tp._on_press_begin(g2, 60.0, 60.0)
                 self.assertFalse(tp._zoom_selecting)
                 self.assertEqual(tp.tool, "pen")
-                tp._on_alt_end(g2, 10.0, 10.0)
+                tp._on_press_end(g2, 10.0, 10.0)
                 self.assertEqual(tp.tool, "text")
 
             self._run_in_window(body)
@@ -10107,17 +10112,17 @@ class TestTextFirstMode(unittest.TestCase):
                 tp = win._active_session._text_page
                 self.assertEqual(tp.tool, "text")
                 g = self._fake_drag(alt=True)
-                tp._on_alt_begin(g, 300.0, 100.0)
+                tp._on_press_begin(g, 300.0, 100.0)
                 for i in range(1, 5):
-                    tp._on_alt_update(g, 0.0, i * 3.0)
-                tp._on_alt_end(g, 0.0, 12.0)
+                    tp._on_press_update(g, 0.0, i * 3.0)
+                tp._on_press_end(g, 0.0, 12.0)
                 self.assertEqual(len(tp.strokes), 1)
                 self.assertEqual(tp.tool, "text")   # pen only while held
                 # without Alt the gesture denies itself — no stroke
                 g = self._fake_drag(alt=False)
-                tp._on_alt_begin(g, 300.0, 100.0)
-                tp._on_alt_update(g, 0.0, 3.0)
-                tp._on_alt_end(g, 0.0, 6.0)
+                tp._on_press_begin(g, 300.0, 100.0)
+                tp._on_press_update(g, 0.0, 3.0)
+                tp._on_press_end(g, 0.0, 6.0)
                 self.assertEqual(len(tp.strokes), 1)
 
             self._run_in_window(body)
@@ -10133,23 +10138,23 @@ class TestTextFirstMode(unittest.TestCase):
                 tp = win._active_session._text_page
                 # draw a stroke with the Alt+left quick-pen
                 g = self._fake_drag(alt=True, button=1)
-                tp._on_alt_begin(g, 300.0, 100.0)
+                tp._on_press_begin(g, 300.0, 100.0)
                 for i in range(1, 5):
-                    tp._on_alt_update(g, 0.0, i * 3.0)
-                tp._on_alt_end(g, 0.0, 12.0)
+                    tp._on_press_update(g, 0.0, i * 3.0)
+                tp._on_press_end(g, 0.0, 12.0)
                 self.assertEqual(len(tp.strokes), 1)
                 # Alt+right over its first point erases it
                 sx, sy = tp._stroke_overlay_pts(tp.strokes[0])[0]
                 e = self._fake_drag(alt=True, button=3, start=(sx, sy))
-                tp._on_alt_begin(e, sx, sy)
+                tp._on_press_begin(e, sx, sy)
                 self.assertEqual(tp.tool, "eraser")   # switched mid-gesture
-                tp._on_alt_update(e, 0.0, 2.0)
-                tp._on_alt_end(e, 0.0, 2.0)
+                tp._on_press_update(e, 0.0, 2.0)
+                tp._on_press_end(e, 0.0, 2.0)
                 self.assertEqual(len(tp.strokes), 0)  # erased
                 self.assertEqual(tp.tool, "text")     # caret restored
                 # Alt+MIDDLE is left for panning — the quick-ink gesture denies
                 m = self._fake_drag(alt=True, button=2)
-                tp._on_alt_begin(m, 300.0, 100.0)
+                tp._on_press_begin(m, 300.0, 100.0)
                 self.assertIsNone(tp._alt_saved_tool)  # not claimed as ink
 
             self._run_in_window(body)
@@ -10265,10 +10270,10 @@ class TestTextPageLasso(unittest.TestCase):
         x0, y0, x1, y1 = (bbox[0] - margin, bbox[1] - margin,
                           bbox[2] + margin, bbox[3] + margin)
         g = self._gesture(x0, y0)
-        tp._on_ink_begin(g, x0, y0)
+        tp._on_press_begin(g, x0, y0)
         for px, py in ((x1, y0), (x1, y1), (x0, y1), (x0, y0)):
-            tp._on_ink_update(g, px - x0, py - y0)
-        tp._on_ink_end(g, 0.0, 0.0)
+            tp._on_press_update(g, px - x0, py - y0)
+        tp._on_press_end(g, 0.0, 0.0)
 
     @staticmethod
     def _bbox(pts):
@@ -10356,11 +10361,11 @@ class TestTextPageLasso(unittest.TestCase):
                 self.assertTrue(tp.selection_grab_at(vx, vy))
                 win._set_tool_mode("lasso")
                 g = self._gesture(vx, vy)
-                tp._on_ink_begin(g, vx, vy)
+                tp._on_press_begin(g, vx, vy)
                 self.assertEqual([(a, i) for a, i, _o in tp._vertex_drag],
                                  [(st, 1)])
-                tp._on_ink_update(g, 40.0, 25.0)
-                tp._on_ink_end(g, 40.0, 25.0)
+                tp._on_press_update(g, 40.0, 25.0)
+                tp._on_press_end(g, 40.0, 25.0)
                 after = tp._stroke_overlay_pts(st)
                 self.assertAlmostEqual(after[1][0], vx + 40.0, delta=1.5)
                 self.assertAlmostEqual(after[1][1], vy + 25.0, delta=1.5)
@@ -10390,15 +10395,15 @@ class TestTextPageLasso(unittest.TestCase):
                 loop = tp.strokes[-1]
                 hx, hy = tp._stroke_overlay_pts(loop)[0]
                 g = self._gesture(hx, hy)
-                tp._on_ink_begin(g, hx, hy)
+                tp._on_press_begin(g, hx, hy)
                 self.assertIsNotNone(tp._circle_timer)
                 tp._circle_lasso_fire()
                 self.assertNotIn(loop, tp.strokes)
                 self.assertEqual(tp._selected, [ink])
                 # REGRESSION: the pen is still down. Dragging on used to fall
                 # through to the erase branch and rub out everything it passed.
-                tp._on_ink_update(g, 120.0, 120.0)
-                tp._on_ink_end(g, 120.0, 120.0)
+                tp._on_press_update(g, 120.0, 120.0)
+                tp._on_press_end(g, 120.0, 120.0)
                 self.assertIn(ink, tp.strokes)
                 self.assertEqual(tp._selected, [ink])
                 self.assertIsNotNone(tp._selection_loop)
@@ -10447,10 +10452,10 @@ class TestTextPageLasso(unittest.TestCase):
                 bx = self._bbox(before_pts)
                 cx, cy = (bx[0] + bx[2]) / 2, (bx[1] + bx[3]) / 2
                 g = self._gesture(cx, cy)
-                tp._on_ink_begin(g, cx, cy)
+                tp._on_press_begin(g, cx, cy)
                 self.assertTrue(tp._lasso_moving)
-                tp._on_ink_update(g, 60.0, 90.0)
-                tp._on_ink_end(g, 60.0, 90.0)
+                tp._on_press_update(g, 60.0, 90.0)
+                tp._on_press_end(g, 60.0, 90.0)
                 after_pts = tp._stroke_overlay_pts(st)
                 for (ax, ay), (bx_, by) in zip(after_pts, before_pts):
                     self.assertAlmostEqual(ax, bx_ + 60.0, delta=2.0)
@@ -10486,14 +10491,14 @@ class TestTextPageLasso(unittest.TestCase):
                 hx, hy = bbox[0] - pad, bbox[1] - pad
                 ax, ay = bbox[2], bbox[3]
                 g = self._gesture(hx, hy)
-                tp._on_ink_begin(g, hx, hy)
+                tp._on_press_begin(g, hx, hy)
                 self.assertTrue(tp._lasso_scaling)
                 # drag the handle to double its distance from the anchor
                 dx, dy = (hx - ax), (hy - ay)
-                tp._on_ink_update(g, dx, dy)
+                tp._on_press_update(g, dx, dy)
                 self.assertAlmostEqual(tp._lasso_scale_fx, 2.0, delta=0.01)
                 self.assertAlmostEqual(tp._lasso_scale_fy, 2.0, delta=0.01)
-                tp._on_ink_end(g, dx, dy)
+                tp._on_press_end(g, dx, dy)
                 span = tp._stroke_overlay_pts(st)
                 w = abs(span[1][0] - span[0][0])
                 self.assertAlmostEqual(w, 80.0, delta=3.0)   # 40 × 2
@@ -10566,7 +10571,6 @@ class TestTextPageLasso(unittest.TestCase):
                 self._lasso_around(
                     win, tp, self._bbox(tp._stroke_overlay_pts(tp.strokes[0])))
                 self.assertTrue(tp.has_lasso_selection())
-                self.assertTrue(tp.ink.get_can_target())   # lasso is an ink tool
                 win._set_tool_mode("pen")
                 self.assertFalse(tp.has_lasso_selection())
 
@@ -10579,9 +10583,9 @@ class TestTextPageLasso(unittest.TestCase):
                 tp = win._active_session._text_page
                 win._set_tool_mode("pen")
                 g = self._gesture(300.0, 100.0)
-                tp._on_ink_begin(g, 300.0, 100.0)
+                tp._on_press_begin(g, 300.0, 100.0)
                 for i in range(1, 6):
-                    tp._on_ink_update(g, i * 10.0, i * 7.0)
+                    tp._on_press_update(g, i * 10.0, i * 7.0)
                 self.assertIsNotNone(tp._straight_timer)
                 tp._cancel_straight_timer()
                 tp._snap_to_shape()   # the rest timer firing
@@ -10590,10 +10594,10 @@ class TestTextPageLasso(unittest.TestCase):
                 self.assertEqual(tp.current_stroke,
                                  [(300.0, 100.0), (350.0, 135.0)])
                 # locked to a line: only the endpoint follows further motion
-                tp._on_ink_update(g, 80.0, 20.0)
+                tp._on_press_update(g, 80.0, 20.0)
                 self.assertEqual(tp.current_stroke,
                                  [(300.0, 100.0), (380.0, 120.0)])
-                tp._on_ink_end(g, 80.0, 20.0)
+                tp._on_press_end(g, 80.0, 20.0)
                 # committed exactly as the 2-point line, no smoothing applied
                 self.assertEqual(len(tp.strokes[0]["pts"]), 2)
 
@@ -10609,11 +10613,11 @@ class TestTextPageLasso(unittest.TestCase):
                 raw = [(300.0, 100.0), (310.0, 130.0), (320.0, 100.0),
                        (330.0, 130.0), (340.0, 100.0)]
                 g = self._gesture(*raw[0])
-                tp._on_ink_begin(g, *raw[0])
+                tp._on_press_begin(g, *raw[0])
                 for px, py in raw[1:]:
-                    tp._on_ink_update(g, px - raw[0][0], py - raw[0][1])
+                    tp._on_press_update(g, px - raw[0][0], py - raw[0][1])
                 tp._cancel_straight_timer()   # the cursor never rested
-                tp._on_ink_end(g, 40.0, 0.0)
+                tp._on_press_end(g, 40.0, 0.0)
                 st = tp.strokes[0]
                 expect = PDFCanvas._smooth_points(raw, tp.get_smoothing())
                 got = tp._stroke_overlay_pts(st)
@@ -10652,36 +10656,51 @@ class TestTextPageLasso(unittest.TestCase):
                     tp._stroke_overlay_pts(tp.strokes[0]))
                 x0 -= 12; y0 -= 12; x1 += 12; y1 += 12
                 g = self._chord_gesture(mods, sx=x0, sy=y0)
-                tp._on_chord_lasso_begin(g, x0, y0)
+                tp._on_press_begin(g, x0, y0)
                 for px, py in ((x1, y0), (x1, y1), (x0, y1), (x0, y0)):
-                    tp._on_chord_lasso_update(g, px - x0, py - y0)
-                tp._on_chord_lasso_end(g, 0.0, 0.0)
+                    tp._on_press_update(g, px - x0, py - y0)
+                tp._on_press_end(g, 0.0, 0.0)
                 self.assertEqual(tp._selected, tp.strokes)
                 self.assertEqual(tp.tool, "text")   # tool restored, not reset
 
             self._run_in_window(body)
 
-    def test_chord_gesture_guards_are_mutually_exclusive(self):
-        # Ctrl+Shift+Alt must be claimed by the lasso chord ONLY: the
-        # temp-highlighter (Ctrl+Shift) and Alt-ink gestures both stand down
-        mods = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
-                | Gdk.ModifierType.ALT_MASK)
+    def test_one_router_claims_a_bound_chord_and_stands_down_otherwise(self):
+        """There are no competing chord gestures left to keep exclusive (row
+        132): ONE capture-phase router resolves every press through the table.
+        A bound chord is claimed for its tool; an unbound one is denied so the
+        caret below keeps the press."""
         with tempfile.TemporaryDirectory() as d:
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
-                denied = []
-                g = types.SimpleNamespace(
-                    get_current_event_state=lambda: mods,
-                    set_state=lambda s: denied.append(s),
-                    get_current_button=lambda: 1,
-                    get_start_point=lambda: (True, 300.0, 100.0))
-                tp._on_temp_hl_begin(g, 300.0, 100.0)
-                tp._on_alt_begin(g, 300.0, 100.0)
-                self.assertEqual(denied,
-                                 [Gtk.EventSequenceState.DENIED] * 2)
-                self.assertIsNone(tp._temp_hl_saved_tool)
-                self.assertIsNone(tp._alt_saved_tool)
+
+                def press(mods, button=1):
+                    seen = []
+                    g = types.SimpleNamespace(
+                        get_current_event_state=lambda: mods,
+                        set_state=lambda s: seen.append(s),
+                        get_current_button=lambda: button,
+                        get_start_point=lambda: (True, 300.0, 100.0))
+                    tp._on_press_begin(g, 300.0, 100.0)
+                    tp._on_press_end(g, 0.0, 0.0)
+                    return seen[-1] if seen else None
+
+                lasso_chord = (Gdk.ModifierType.CONTROL_MASK
+                               | Gdk.ModifierType.SHIFT_MASK
+                               | Gdk.ModifierType.ALT_MASK)
+                self.assertEqual(press(lasso_chord),
+                                 Gtk.EventSequenceState.CLAIMED)
+                # plain left is the pen by default — also claimed
+                self.assertEqual(press(Gdk.ModifierType(0)),
+                                 Gtk.EventSequenceState.CLAIMED)
+                # …but put the caret on left and the press goes to the TextView
+                tp.set_tool("text")
+                self.assertEqual(press(Gdk.ModifierType(0)),
+                                 Gtk.EventSequenceState.DENIED)
+                # an unbound chord is nobody's: denied, never swallowed
+                self.assertEqual(press(Gdk.ModifierType.ALT_MASK),
+                                 Gtk.EventSequenceState.DENIED)
 
             self._run_in_window(body)
 
@@ -10692,15 +10711,14 @@ class TestTextPageLasso(unittest.TestCase):
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
-                self.assertEqual(tp.tool, "text")
                 z0 = tp.zoom
                 g = self._chord_gesture(Gdk.ModifierType.SHIFT_MASK, button=2,
                                         sx=100.0, sy=100.0)
-                tp._on_pan_begin(g, 100.0, 100.0)
-                self.assertTrue(tp._mzoom)
+                tp._on_press_begin(g, 100.0, 100.0)
+                self.assertEqual(tp._press_tool, "zoom")
                 self.assertFalse(tp._panning)
-                tp._on_pan_update(g, 150.0, 120.0)
-                tp._on_pan_end(g, 150.0, 120.0)
+                tp._on_press_update(g, 150.0, 120.0)
+                tp._on_press_end(g, 150.0, 120.0)
                 self.assertGreater(tp.zoom, z0)
 
             self._run_in_window(body)
@@ -10719,16 +10737,17 @@ class TestTextPageLasso(unittest.TestCase):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
                 z0 = tp.zoom
+                tp.bindings.bind("shift+thumb", "zoom")
                 tp._mouse_xy = (100.0, 100.0)
                 tp._on_thumb_event(None, self._thumb_event(
                     Gdk.EventType.BUTTON_PRESS, Gdk.ModifierType.SHIFT_MASK))
-                self.assertTrue(tp._thumb_zooming)
-                self.assertFalse(tp._thumb_panning)
+                self.assertEqual(tp._press_tool, "zoom")
+                self.assertFalse(tp._panning)
                 tp._on_sheet_motion(None, 260.0, 220.0)
                 self.assertEqual(tp._zoom_end, (260.0, 220.0))
                 tp._on_thumb_event(None, self._thumb_event(
                     Gdk.EventType.BUTTON_RELEASE))
-                self.assertFalse(tp._thumb_zooming)
+                self.assertIsNone(tp._thumb_gesture)
                 self.assertGreater(tp.zoom, z0)
 
             self._run_in_window(body)
@@ -10739,10 +10758,11 @@ class TestTextPageLasso(unittest.TestCase):
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
+                tp.bindings.bind("thumb", "pan")
                 tp._mouse_xy = (100.0, 100.0)
                 tp._on_thumb_event(None, self._thumb_event(
                     Gdk.EventType.BUTTON_PRESS))
-                self.assertTrue(tp._thumb_panning)
+                self.assertTrue(tp._panning)
                 z0 = tp.zoom
                 self.assertTrue(tp._on_sheet_scroll(_scroll_ctrl(), 0.0, -1.0))
                 self.assertGreater(tp.zoom, z0)      # scroll up → zoom in
@@ -10772,7 +10792,7 @@ class TestTextPageLasso(unittest.TestCase):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
                 tp._mouse_xy = (100.0, 100.0)
-                self.assertFalse(tp._thumb_panning)   # no thumb button involved
+                self.assertIsNone(tp._thumb_gesture)  # no thumb button involved
 
                 z0 = tp.zoom
                 self.assertTrue(tp._on_sheet_scroll(_scroll_ctrl(True), 0.0, -1.0))
@@ -10802,9 +10822,9 @@ class TestTextPageLasso(unittest.TestCase):
                 x, y = tp._stroke_overlay_pts(tp.strokes[0])[0]
                 g = self._chord_gesture(Gdk.ModifierType(0), button=3,
                                         sx=x, sy=y)
-                tp._on_rerase_begin(g, x, y)
-                tp._on_rerase_update(g, 8.0, 0.0)   # past the click threshold
-                tp._on_rerase_end(g, 8.0, 0.0)
+                tp._on_press_begin(g, x, y)
+                tp._on_press_update(g, 8.0, 0.0)   # past the click threshold
+                tp._on_press_end(g, 8.0, 0.0)
                 self.assertEqual(tp.strokes, [])
                 # and the erase is one undoable op
                 self.assertEqual(tp._undo_ops[-1][0], "erase")
@@ -11117,7 +11137,7 @@ class TestTextPageImages(unittest.TestCase):
         self.assertTrue(tp.selection_grab_at((x0 + x1) / 2, (y0 + y1) / 2))
 
         g = _FakeDrag((x0 + x1) / 2, (y0 + y1) / 2)
-        tp._on_chord_lasso_begin(g, (x0 + x1) / 2, (y0 + y1) / 2)
+        tp._on_press_begin(g, (x0 + x1) / 2, (y0 + y1) / 2)
         self.assertEqual(g.claimed, Gtk.EventSequenceState.CLAIMED)
         self.assertTrue(tp._lasso_moving, "the caret did not grab the paste")
 
@@ -11129,8 +11149,8 @@ class TestTextPageImages(unittest.TestCase):
         tp.clear_lasso_selection()
         x, y, w, h = tp._image_overlay_rect(im)
         cx, cy = x + w / 2, y + h / 2
-        tp._on_ink_begin(_FakeDrag(cx, cy), cx, cy)
-        tp._on_ink_end(_FakeDrag(cx, cy), 0, 0)
+        tp._on_press_begin(_FakeDrag(cx, cy), cx, cy)
+        tp._on_press_end(_FakeDrag(cx, cy), 0, 0)
         self.assertEqual(tp._selected_images, [im])
 
     def test_shift_click_adds_to_the_selection_on_the_sheet(self):
@@ -11143,8 +11163,8 @@ class TestTextPageImages(unittest.TestCase):
             x, y, w, h = tp._image_overlay_rect(im)
             cx, cy = x + w / 2, y + h / 2
             g = _FakeDrag(cx, cy, state=Gdk.ModifierType.SHIFT_MASK)
-            tp._on_ink_begin(g, cx, cy)
-            tp._on_ink_end(g, 0, 0)
+            tp._on_press_begin(g, cx, cy)
+            tp._on_press_end(g, 0, 0)
         self.assertEqual(len(tp._selected_images), 2)
 
     def test_a_press_off_the_selection_is_left_to_the_text(self):
@@ -11155,7 +11175,7 @@ class TestTextPageImages(unittest.TestCase):
         tp.add_image(self._png(), at=(300, 200))
         x0, y0, _x1, _y1 = tp._selection_bbox()
         g = _FakeDrag(x0 - 200, y0 - 150)
-        tp._on_chord_lasso_begin(g, x0 - 200, y0 - 150)
+        tp._on_press_begin(g, x0 - 200, y0 - 150)
         self.assertEqual(g.claimed, Gtk.EventSequenceState.DENIED)
 
     def test_sidecar_round_trip_keeps_the_image(self):

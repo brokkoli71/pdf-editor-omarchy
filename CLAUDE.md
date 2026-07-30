@@ -124,7 +124,18 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 - **Iterate with `./run_tests.sh --fast`** (~3 s): it skips the `window`-marked
   tier (classes that build real windows; auto-marked by `conftest.py` from the
   class source — a misclassified test still *passes*, it just lands in the
-  wrong speed tier). Run the full suite once before committing.
+  wrong speed tier).
+- **Run the NARROWEST thing that could tell you something.** `-k <the classes
+  you touched>` after each behavioural edit, `--fast` at milestones, the full
+  suite once before committing, and nothing at all after a mechanical rename.
+  A full run is ~3–5 min: during a refactor it is the difference between a
+  tight loop and a crawl, and it almost never finds what a targeted run
+  didn't. Note `-k` matching a window-tier class is as slow as a full run, so
+  keep the selector tight.
+  Two traps that waste more time than the tests do: a run over 120 s is
+  backgrounded, so start it, do other work, and read the output file **once**
+  — polling it with short sleeps buys nothing; and never re-run a suite on an
+  unchanged tree because the output was hard to read (fix the grep instead).
 - Tests set `SIDEMARK_TEST=1` and use the system `/usr/bin/python3` (not venv
   shims). Window tests build a real `PDFEditorWindow` inside a throwaway
   `Adw.Application` and pump the main loop (`_settle()` pattern — copy it).
