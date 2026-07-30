@@ -3440,6 +3440,53 @@ class TestLassoSelect(unittest.TestCase):
         self.assertEqual(canvas._selection_loop, [])
         self.assertTrue(canvas._selection_is_boxed())
 
+    # ── a press that is not a grab finishes the selection ───────────────────
+
+    def test_drawing_elsewhere_finishes_the_selection(self):
+        """Ink left glowing while you draw somewhere else reads as stuck, not
+        as selected."""
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._loop_select(canvas)
+        self.assertTrue(canvas.has_lasso_selection())
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(300, 400), 300, 400)   # empty page
+        self.assertFalse(canvas.has_lasso_selection())
+        self.assertEqual(canvas._selection_loop, [])
+
+    def test_a_grab_inside_the_loop_still_moves_it(self):
+        """The dismissal must sit BEHIND the grab test, or a selection could
+        never be picked up with the pen in hand."""
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._loop_select(canvas)
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(55, 55), 55, 55)   # inside the loop
+        self.assertTrue(canvas.has_lasso_selection())
+        self.assertTrue(canvas._lasso_moving)
+
+    def test_erasing_elsewhere_finishes_the_selection(self):
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._loop_select(canvas)
+        canvas.tool = "eraser"
+        canvas._on_drag_begin(_FakeDrag(300, 400), 300, 400)
+        self.assertFalse(canvas.has_lasso_selection())
+
+    def test_shift_lasso_still_adds_rather_than_dismissing(self):
+        """The lasso tool owns the rule: Shift ADDS, so the dismissal must not
+        reach it."""
+        canvas = self._canvas()
+        a, b = self._two_strokes(canvas)
+        self._loop_select(canvas)
+        canvas.tool = "lasso"
+        shift = Gdk.ModifierType.SHIFT_MASK
+        canvas._on_drag_begin(_FakeDrag(280, 280, state=shift), 280, 280)
+        self.assertTrue(canvas._lasso_additive)
+        canvas._lasso_path = [(280, 280), (330, 280), (330, 330), (280, 330)]
+        canvas._on_drag_end(_FakeDrag(280, 280, state=shift), 50, 50)
+        self.assertEqual(canvas._selected_strokes, [a, b])
+
     # ── row 126: circle to lasso (press and hold the stroke you just drew) ──
 
     def _hold_on(self, canvas, sx, sy):
@@ -3530,6 +3577,23 @@ class TestLassoSelect(unittest.TestCase):
             _FakeDrag(30, 30), sidemark.CIRCLE_LASSO_SLOP_PX + 5, 0)
         self.assertIsNone(canvas._circle_timer)   # it is a stroke, not a hold
         canvas._cancel_circle_lasso()
+
+    def test_moving_after_the_conversion_neither_draws_nor_erases(self):
+        """REGRESSION: the pen is still down when the hold fires. On the sheet
+        the leftover drag fell through to "no stroke in flight, so this is an
+        erase" and rubbed out everything it passed over; the rest of the
+        gesture has to mean nothing at all."""
+        canvas = self._canvas()
+        a, b = self._two_strokes(canvas)
+        self._circle(canvas)
+        self._hold_on(canvas, 60, 60)
+        before = list(canvas.all_strokes[0])
+        canvas._on_drag_update(_FakeDrag(60, 60), 200, 200)
+        canvas._on_drag_end(_FakeDrag(60, 60), 200, 200)
+        self.assertEqual(canvas.all_strokes[0], before)   # nothing rubbed out
+        self.assertEqual(canvas.current_stroke, [])       # and nothing drawn
+        self.assertIn(a, canvas.all_strokes[0])
+        self.assertIn(b, canvas.all_strokes[0])
 
     def test_conversion_is_independent_of_the_shape_snap_setting(self):
         """shape_snap governs the DWELL; circle-to-lasso is a separate
@@ -9316,6 +9380,12 @@ class TestTextPageLasso(unittest.TestCase):
                 self.assertIsNotNone(tp._circle_timer)
                 tp._circle_lasso_fire()
                 self.assertNotIn(loop, tp.strokes)
+                self.assertEqual(tp._selected, [ink])
+                # REGRESSION: the pen is still down. Dragging on used to fall
+                # through to the erase branch and rub out everything it passed.
+                tp._on_ink_update(g, 120.0, 120.0)
+                tp._on_ink_end(g, 120.0, 120.0)
+                self.assertIn(ink, tp.strokes)
                 self.assertEqual(tp._selected, [ink])
                 self.assertIsNotNone(tp._selection_loop)
                 self.assertEqual(tp.tool, "pen")   # the pen stays in your hand

@@ -2402,6 +2402,7 @@ class PDFCanvas(Gtk.DrawingArea):
                     px, py = self._screen_to_pdf(start_x, start_y)
                     self.on_textbox_placed(self.current_page_idx, round(px), round(py))
                 return
+            self._dismiss_selection_unless_lasso()
             self._erasing = True
             self._erase_group += 1
             self._panning = False
@@ -2474,6 +2475,7 @@ class PDFCanvas(Gtk.DrawingArea):
             # Ctrl+Shift+drag: a one-off highlighter stroke regardless of the
             # sticky tool (mirrors the Ctrl+H highlighter toggle as a gesture)
             self._temp_highlighter = True
+            self._dismiss_selection_unless_lasso()
             self._panning = False
             self._text_selecting = False
             self._zoom_selecting = False
@@ -2529,6 +2531,7 @@ class PDFCanvas(Gtk.DrawingArea):
             if self.selection_grab_at(start_x, start_y):
                 self._lasso_press(start_x, start_y)
                 return
+            self._dismiss_selection_unless_lasso()
             # the active tool is the modifier-free shortcut for a gesture: pan
             # mirrors Ctrl, zoom mirrors Shift, anchor mirrors Ctrl+Alt (the
             # anchor itself is dropped at press by _on_click_pressed).
@@ -2696,6 +2699,16 @@ class PDFCanvas(Gtk.DrawingArea):
                 or self._lasso_handle_at(sx, sy) is not None):
             return True
         return self._point_in_selection(*self._screen_to_pdf(sx, sy))
+
+    def _dismiss_selection_unless_lasso(self):
+        """A press that is NOT a grab finishes the selection — you have started
+        doing something else, and ink left glowing while you draw somewhere
+        else reads as stuck, not as selected.
+
+        The lasso tool is excluded because its own press router owns the rule
+        there: Shift ADDS to the selection, and a fresh loop replaces it."""
+        if self.tool != "lasso" and self.has_lasso_selection():
+            self.clear_lasso_selection()
 
     def _lasso_press(self, start_x, start_y, additive=False):
         """A lasso press — shared by the lasso tool, its Ctrl+Shift+Alt chord
@@ -7419,6 +7432,9 @@ class TextPageView(Gtk.Overlay):
         self._selection_loop = None
         self._selection_boxed = False   # the chip flipped this selection to the box
         self._circle_timer = None       # press-and-hold → circle to lasso (row 126)
+        # the rest of a drag whose meaning was consumed mid-gesture (the
+        # circle-to-lasso hold); PDFCanvas._ignoring is the same idea
+        self._ink_ignoring = False
         self._lasso_moving = False
         self._lasso_moved = False
         self._lasso_drag = (0.0, 0.0)  # live move offset while dragging
@@ -8413,6 +8429,15 @@ class TextPageView(Gtk.Overlay):
         # and the TextView, so it fires whatever owns the press — and it claims
         # ONLY on the selection, so plain typing and clicking are untouched.
         if (state & need) != need and not self.selection_grab_at(x, y):
+            # Not a grab and not the chord: this press is happening somewhere
+            # else, so the selection is over (PDFCanvas parity). Done HERE
+            # because this gesture is the only one that sees every press —
+            # with the caret in hand the ink overlay is not even targetable.
+            # The lasso tool is excluded: _lasso_begin owns the rule there
+            # (Shift adds, a fresh loop replaces).
+            if self.tool != "lasso":
+                self.clear_lasso_selection()
+                self.ink.queue_draw()
             gesture.set_state(Gtk.EventSequenceState.DENIED)
             return
         gesture.set_state(Gtk.EventSequenceState.CLAIMED)
@@ -8489,6 +8514,7 @@ class TextPageView(Gtk.Overlay):
     def _on_ink_begin(self, gesture, x, y):
         state = self._chord_state(gesture)
         self._zoom_cancelled = False
+        self._ink_ignoring = False
         # Shift alone (or the zoom tool) zooms to a region; Ctrl+Shift is the
         # temp-highlighter (handled by its own capture gesture) so it is NOT a
         # zoom here.
@@ -8541,6 +8567,12 @@ class TextPageView(Gtk.Overlay):
 
     def _on_ink_update(self, gesture, dx, dy):
         if self._zoom_cancelled:   # right-click aborted this drag
+            return
+        if self._ink_ignoring:
+            # The hold already turned this press into a selection. Without
+            # this the drag falls through to the ELSE below, whose meaning is
+            # "no stroke in flight, so this is an erase drag" — and moving the
+            # pen after a conversion rubbed out everything it passed over.
             return
         ok, sx, sy = gesture.get_start_point()
         if not ok:
@@ -8600,6 +8632,9 @@ class TextPageView(Gtk.Overlay):
             return
         self._cancel_straight_timer()
         self._cancel_circle_lasso()   # a lift ends the hold (row 126)
+        if self._ink_ignoring:
+            self._ink_ignoring = False
+            return
         was_straight = self._straight_mode
         self._straight_mode = False
         if self._lassoing:
@@ -8886,6 +8921,7 @@ class TextPageView(Gtk.Overlay):
         loop = self.strokes[-1]
         path = self._stroke_overlay_pts(loop)
         self.current_stroke = []
+        self._ink_ignoring = True   # the rest of this drag means nothing now
         self._cancel_straight_timer()
         self._straight_mode = False
         self._snap_kind = self._snap_label = None
