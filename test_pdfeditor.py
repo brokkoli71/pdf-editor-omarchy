@@ -8771,6 +8771,45 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_focusing_the_sheet_does_not_scroll_it(self):
+        """Row 128. The sheet's Box wrapper makes GtkScrolledWindow insert a
+        GtkViewport, which scrolls to its focus widget by default — and the
+        only focusable child is the full-height text view, so revealing it
+        means jumping to the top of the paper. It needs a focus CHANGE to
+        fire, which is exactly what picking a tool from the toolbar sets up:
+        the first thing GTK does on the next press is grab_focus() on the
+        view, so the sheet moved out from under the click and the caret landed
+        pages away from the pointer."""
+        long_md = self.MD + "".join(f"line {i}: text\n" for i in range(200))
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d, long_md)
+                tp = win._active_session._text_page
+                vadj = tp.scroll.get_vadjustment()
+                # the sheet has to be laid out before it can scroll at all,
+                # and under full-suite load that takes longer than one settle
+                for _ in range(20):
+                    if vadj.get_upper() - vadj.get_page_size() > 700:
+                        break
+                    self._settle(150)
+                self.assertGreater(vadj.get_upper() - vadj.get_page_size(), 700,
+                                   "sheet must be taller than the viewport")
+                # the tool switch parks focus on a toolbar button
+                win._set_tool_mode("pen")
+                win._mode_pen.grab_focus()
+                self._settle(150)
+                vadj.set_value(600)
+                self._settle(150)
+                was = vadj.get_value()
+                self.assertAlmostEqual(was, 600, delta=1)
+                # ...and the press hands focus back to the sheet
+                win._set_tool_mode("select")
+                tp.view.grab_focus()
+                self._settle(250)
+                self.assertAlmostEqual(vadj.get_value(), was, delta=1)
+
+            self._run_in_window(body)
+
     def _assert_chrome_matches(self, win, mode):
         """Every widget in _MODE_CHROME (and its popover twin) is visible
         exactly when the table names the active mode."""

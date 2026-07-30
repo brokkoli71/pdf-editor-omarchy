@@ -191,6 +191,17 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     belong on the WINDOW's capture controller, which fires whatever has focus;
     let it ask the surface (`wants_paste()`, `has_lasso_selection()`) instead
     of the surface owning the key.
+- **A viewport SCROLLS TO ITS FOCUS WIDGET, and the sheet's is the whole
+  paper.** `TextPageView`'s Box wrapper makes the text view a non-scrollable
+  child, so `GtkScrolledWindow` wraps it in a `GtkViewport` — whose
+  `scroll-to-focus` defaults to TRUE. The only focusable child is the
+  full-height view, never fully visible, so revealing it means jumping to the
+  top of the paper. It fires on a focus CHANGE, which is why it hid behind the
+  tool switch (picking a tool focuses the button; GTK's press handler then
+  calls `grab_focus()` on the view) and why the tool code looked innocent. The
+  sheet moved mid-press and GTK resolved the pointer against the moved view,
+  landing the caret pages from the click. Turned off in `__init__` — if you
+  ever re-wrap the sheet, turn it off again.
 - **A GtkTextMark displaced by an EDIT moves without a `mark-set` signal.**
   Rewriting a line under the caret (`_buf_replace_line`, how the live-Markdown
   renderer un-renders `α`→`\alpha`) deletes and re-inserts it, and `insert` +
@@ -478,6 +489,14 @@ than writing a line about having finished it. The chronology lives in
 - **Row 111** — duplicate-download dialog.
 - **Row 117** — the suite is flaky under full-run load: one test fails per full
   run while passing in isolation and on a clean tree. Wants its own session.
+  **Left failing on purpose (2026-07-30):**
+  `TestTextFirstMode::test_focusing_the_sheet_does_not_scroll_it` (row 128)
+  passes alone and fails in the full run. The fix it guards is confirmed by
+  hand in the app, so this is the test, not the code. What is known: it fails
+  at its precondition — the sheet is never taller than its viewport, so there
+  is nothing to scroll — and waiting on layout (3 s of pumped loop) does NOT
+  fix it, so the sheet seems not to reach full height at all under full-run
+  load. Start row 117 here: it is the freshest and smallest case.
 - **Rows 26/27/64** — older, unranked.
 
 **Won't do:** presenter/share for text mode (row 106 item 7); a vertex truly

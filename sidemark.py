@@ -8127,6 +8127,20 @@ class TextPageView(Gtk.Overlay):
         self.scroll.set_vexpand(True)
         self.scroll.add_css_class("text-surround")
         self.scroll.set_child(wrapper)
+        # ...but a non-scrollable child means GtkScrolledWindow wraps it in a
+        # GtkViewport, and a viewport SCROLLS TO ITS FOCUS WIDGET by default.
+        # The sheet's only focusable child is the full-height text view, which
+        # is never fully visible, so "reveal the focus widget" can only ever
+        # mean "jump to the top of the paper". It fires on a focus CHANGE, so
+        # it stays invisible until something else takes focus first — picking a
+        # tool from the toolbar focuses the button, and the very first thing
+        # GTK does on the next press is grab_focus() on the text view. The
+        # sheet jumped to the top mid-press, and GTK then resolved the pointer
+        # against the moved view: the caret landed pages from the click and the
+        # drag-update dragged a selection out to it (row 128).
+        _viewport = wrapper.get_parent()
+        if isinstance(_viewport, Gtk.Viewport):
+            _viewport.set_scroll_to_focus(False)
         self.set_child(self.scroll)
 
         self.ink = Gtk.DrawingArea()
