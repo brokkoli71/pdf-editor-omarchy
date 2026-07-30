@@ -3831,6 +3831,50 @@ class TestLassoSelect(unittest.TestCase):
         self.assertEqual(canvas.all_strokes[0][-1]["pts"][-1], (300, 100))
         self.assertEqual(canvas._live_snap_shapes, [])   # and disarmed
 
+    def test_the_live_shape_snaps_to_its_own_start(self):
+        """Closing a path onto its own start without lifting — its own control
+        points are targets too, not just the page's."""
+        canvas = self._canvas()
+        canvas.all_strokes[0] = []
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(0, 0), 0, 0)
+        canvas.current_stroke = [(100, 100), (150, 100), (200, 100),
+                                 (200, 150), (200, 200)]
+        canvas._snap_to_shape()
+        self.assertEqual(canvas._snap_kind, "path")
+        self.assertEqual(canvas._live_snap_shapes, [])   # nothing else drawn
+        # bring the held end back to just shy of the path's own start
+        canvas._on_drag_update(_FakeDrag(0, 0), 96, 103)
+        self.assertIsNotNone(canvas._live_snap_at)
+        self.assertEqual(canvas.current_stroke[-1], (100, 100))
+
+    def test_the_live_point_never_snaps_to_itself_or_its_own_edge(self):
+        """It always lies on its own two edges, so without the exclusions it
+        would lock in place and never move."""
+        canvas = self._canvas()
+        canvas.all_strokes[0] = []
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(0, 0), 0, 0)
+        canvas.current_stroke = [(100, 100), (200, 100), (200, 200)]
+        canvas._snap_to_shape()
+        # the drag start is (0, 0), so the offsets ARE the target point
+        canvas._on_drag_update(_FakeDrag(0, 0), 205, 215)
+        self.assertIsNone(canvas._live_snap_at)
+        self.assertEqual(canvas.current_stroke[-1], (205, 215))
+
+    def test_the_live_shape_snaps_onto_its_own_earlier_edge(self):
+        canvas = self._canvas()
+        canvas.all_strokes[0] = []
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(0, 0), 0, 0)
+        canvas.current_stroke = [(100, 100), (300, 100), (300, 300),
+                                 (200, 300)]
+        canvas._snap_to_shape()
+        self.assertEqual(canvas._snap_kind, "path")
+        # up towards the middle of the FIRST edge, which is not adjacent
+        canvas._on_drag_update(_FakeDrag(0, 0), 200, 108)
+        self.assertEqual(canvas.current_stroke[-1], (200, 100))
+
     def test_a_frozen_shape_arms_no_live_magnets(self):
         """A rectangle/ellipse is settled by the dwell — the pen is not holding
         one of its control points, so there is nothing to snap."""
