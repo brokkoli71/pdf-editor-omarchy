@@ -669,6 +669,13 @@ def draw_snap_label(ctx, sx, sy, text, accent):
     ctx.restore()
 
 
+# The optional content group our pasted images are placed in. /OC ownership is
+# the ONLY marker that survives a PDF round-trip (row 118), and the merge import
+# has to read it without a canvas — so the name lives here, at module level, and
+# PDFCanvas picks it up as a class attribute.
+IMAGE_OCG_NAME = "Sidemark images"
+
+
 class PDFCanvas(Gtk.DrawingArea):
     SCALE_MIN, SCALE_MAX = 0.1, 20.0   # zoom range of the PDF page canvas
     SCROLL_FLIP_THRESHOLD = 3.0   # mouse-wheel notches past the page edge before flipping
@@ -1594,38 +1601,16 @@ class PDFCanvas(Gtk.DrawingArea):
         ocg = self._image_ocg()
         if ocg is None:
             return
-        for i in range(self.n_pages):
-            page = self.document[i]
-            content = page.read_contents()
-            names = {n: x for n, x in self._our_placements(page, ocg)}
-            found = []
-            # our own placements, in the shape we write them: "q w 0 0 h x y cm
-            # /Name Do Q". The cm matrix is ground truth — get_image_rects()
-            # resolves by visual match and lies when two images look alike.
-            for m in re.finditer(
-                    rb"q\s+([-\d.]+)\s+0\s+0\s+([-\d.]+)\s+([-\d.]+)\s+"
-                    rb"([-\d.]+)\s+cm\s*/([^\s/]+)\s+Do\s*Q", content):
-                w, h, x, y, name = m.groups()
-                xref = names.get(name.decode("latin-1"))
-                if xref is None:
-                    continue
-                try:
-                    png = self.document.extract_image(xref)["image"]
-                except (RuntimeError, KeyError, TypeError):
-                    continue
-                texture = _texture_from_png(png)
-                if texture is None:
-                    continue
-                w, h = float(w), float(h)
-                # PDF places from the BOTTOM-left, our rects are top-left down
-                top = page.rect.height - float(y) - h
-                found.append({"data": png, "texture": texture,
-                              "rect": (float(x), top, w, h), "rotate": 0.0,
-                              "_xref": xref})
-            if found:
-                self.all_images[i] = found
-                logger.info(f"images: adopted {len(found)} from the layer on "
-                            f"page {i + 1} (no sidecar)")
+        # reading the layer back is the same job the merge import does on a
+        # source document, so it is the same function (row 123). The xrefs it
+        # doesn't return are handed out by _detach_image_layer immediately
+        # after, which is where the next save gets its re-place-by-reference.
+        pages = layer_images_as_sidecar(self.document, ocg)
+        if not pages:
+            return
+        self.load_images({"version": 1, "images": pages})
+        logger.info(f"images: adopted {sum(len(v) for v in pages.values())} "
+                    f"from the layer on {len(pages)} page(s) (no sidecar)")
 
     def _detach_image_layer(self):
         """Take our placements out of the IN-MEMORY document, remembering each
@@ -1648,28 +1633,7 @@ class PDFCanvas(Gtk.DrawingArea):
         """Restore the image sidecar written by images_to_json()."""
         self.all_images = {}
         self._selected_images = []
-        for key, records in (data.get("images") or {}).items():
-            try:
-                idx = int(key)
-            except (TypeError, ValueError):
-                continue
-            images = []
-            for rec in records:
-                try:
-                    png = base64.b64decode(rec.get("png", ""))
-                except (ValueError, TypeError):
-                    continue
-                texture = _texture_from_png(png)
-                if texture is None:
-                    continue   # unreadable bytes: skip the image, keep the doc
-                rect = rec.get("rect") or [0, 0, texture.get_width(),
-                                           texture.get_height()]
-                images.append({
-                    "data": png,
-                    "texture": texture,
-                    "rect": tuple(float(v) for v in rect[:4]),
-                    "rotate": float(rec.get("rotate", 0.0)),
-                })
+        for idx, images in images_from_sidecar(data).items():
             if images:
                 self.all_images[idx] = images
         self.queue_draw()
@@ -4029,62 +3993,22 @@ class PDFCanvas(Gtk.DrawingArea):
     # placements by VISUAL match and report the same xref for two look-alike
     # images. The content stream plus the Resources dict are the ground truth.
 
-    IMAGE_OCG_NAME = "Sidemark images"
+    # the layer's name lives at module level (the merge import needs it without
+    # a canvas); kept here too because it reads as canvas vocabulary
+    IMAGE_OCG_NAME = globals()["IMAGE_OCG_NAME"]
+
+    # The three below are thin wrappers on the module-level functions of the
+    # same name: the merge import (row 123) works on documents no canvas has
+    # opened, and "which images are OURS" must be decided in exactly one place.
 
     def _image_ocg(self, create=False):
-        """Our optional content group's xref — reused if the document already
-        carries it, so re-saving never piles up layers."""
-        for xref, info in self.document.get_ocgs().items():
-            if info.get("name") == self.IMAGE_OCG_NAME:
-                return xref
-        if not create:
-            return None
-        return self.document.add_ocg(self.IMAGE_OCG_NAME, on=True)
+        return image_ocg_xref(self.document, create)
 
     def _our_placements(self, page, ocg):
-        """[(resource name, xref)] of the page's images that are OURS, in
-        content-stream order — read from the Resources dict and the stream,
-        the only things that don't lie about which xref a name means."""
-        key = self.document.xref_get_key(page.xref, "Resources/XObject")
-        if key[0] != "dict":
-            return []
-        # the Resources dict is cheap; settle "are any of these ours?" on it
-        # before reading the content stream, so a save walking a 500-page
-        # document only pays for the handful of pages that hold our images
-        mine = {n: int(x) for n, x in
-                re.findall(r"/([^\s/]+)\s+(\d+) 0 R", key[1])
-                if self.document.xref_get_key(int(x), "OC")[1] == f"{ocg} 0 R"}
-        if not mine:
-            return []
-        out = []
-        for name in re.findall(rb"/([^\s/]+)\s+Do\b", page.read_contents()):
-            name = name.decode("latin-1")
-            if name in mine and (name, mine[name]) not in out:
-                out.append((name, mine[name]))
-        return out
+        return our_placements(self.document, page, ocg)
 
     def _strip_image_layer(self, page, ocg):
-        """Remove our placements from the page, leaving the document's own
-        images strictly alone. Returns our xrefs, in order, for reuse."""
-        if not self._our_placements(page, ocg):
-            return []           # nothing of ours here: don't rewrite the page
-        page.clean_contents()   # one normalised stream; re-read names after it
-        mine = self._our_placements(page, ocg)
-        if not mine:
-            return []
-        content = page.read_contents()
-        for name, _xref in mine:
-            # our own insert_image blocks, and only ours: "q <matrix> cm
-            # /Name Do Q". Anchored on a name we have already proved is /OC-ours
-            content = re.sub(
-                (r"q\s+[-\d.\s]+cm\s*/%s\s+Do\s*Q\s*" % re.escape(name)).encode(),
-                b"", content)
-            self.document.xref_set_key(page.xref,
-                                       f"Resources/XObject/{name}", "null")
-        streams = page.get_contents()
-        if streams:
-            self.document.update_stream(streams[0], content)
-        return [xref for _name, xref in mine]
+        return strip_image_layer(self.document, page, ocg)
 
     def _layer_bytes_for(self, im):
         """(PNG bytes, rect) to place for `im` — the rotation applied.
@@ -4353,6 +4277,18 @@ class PDFCanvas(Gtk.DrawingArea):
         order.insert(dst, order.pop(src))
         return order
 
+    @staticmethod
+    def _move_range_order(n, src, count, dst):
+        """Permutation for moving the `count` pages starting at src so the
+        block lands at index dst — dst counted in the document WITHOUT the
+        block, which is how a drop gap between two pages reads."""
+        order = list(range(n))
+        block = order[src:src + count]
+        del order[src:src + count]
+        dst = max(0, min(dst, len(order)))
+        order[dst:dst] = block
+        return order
+
     def move_page(self, src, dst):
         """Move the page at index src to index dst, re-keying strokes/anchors
         and the undo/redo stacks. Returns the old→new index map (or None)."""
@@ -4361,7 +4297,29 @@ class PDFCanvas(Gtk.DrawingArea):
         n = self.n_pages
         if not (0 <= src < n and 0 <= dst < n):
             return None
-        order = self._move_order(n, src, dst)
+        return self._apply_page_order(self._move_order(n, src, dst))
+
+    def move_page_range(self, src, count, dst):
+        """Move `count` consecutive pages as one block (a chapter, row 123).
+
+        One select() and one re-key for the whole range: doing it page by page
+        would re-key every model and re-render the page `count` times, which a
+        40-page chapter feels. `dst` is the gap index in the document with the
+        block taken out; a no-op move returns None."""
+        if not self.document or count <= 0:
+            return None
+        n = self.n_pages
+        if not (0 <= src < n and src + count <= n):
+            return None
+        order = self._move_range_order(n, src, count, dst)
+        if order == list(range(n)):
+            return None
+        return self._apply_page_order(order)
+
+    def _apply_page_order(self, order):
+        """Re-order the document's pages to `order` (old indices in new order),
+        re-keying strokes, images, anchors, the undo/redo stacks and the
+        outline. Returns the old→new index map."""
         self.document.select(order)        # reorder underlying pages
         old_to_new = {old: new for new, old in enumerate(order)}
         self.all_strokes = {old_to_new[k]: v for k, v in self.all_strokes.items()}
@@ -4372,9 +4330,41 @@ class PDFCanvas(Gtk.DrawingArea):
         self._redo_stack = [
             [(op[0], old_to_new[op[1]]) + op[2:] for op in ops]
             for ops in self._redo_stack]
+        # select() renumbers the pages the outline POINTS AT, but leaves the
+        # entries in their old sequence — so without this a moved chapter is
+        # listed first while sitting at page 30 (row 123). Pre-dates chapters:
+        # every page reorder has been leaving the outline out of order.
+        self.resort_toc()
         self.n_pages = len(self.document)
         self._load_page(old_to_new[self.current_page_idx])
         return old_to_new
+
+    def get_toc(self):
+        """The document's outline, or [] — never raises (a malformed outline
+        must not stop the sidebar from drawing)."""
+        if not self.document:
+            return []
+        try:
+            return self.document.get_toc(simple=True)
+        except Exception:
+            return []
+
+    def set_toc(self, toc):
+        try:
+            self.document.set_toc(normalize_toc(toc))
+            return True
+        except Exception:
+            logger.warning("toc: could not write outline\n%s", traceback.format_exc())
+            return False
+
+    def resort_toc(self):
+        """Put the outline back in page order (see _apply_page_order)."""
+        toc = self.get_toc()
+        if not toc:
+            return
+        ordered = sort_toc_chapters(normalize_toc(toc))
+        if ordered != normalize_toc(toc):
+            self.set_toc(ordered)
 
 
 def _load_theme():
@@ -4504,6 +4494,453 @@ def _themed_icon(*candidates):
 
 def notes_path_for(pdf_path):
     return os.path.splitext(pdf_path)[0] + "-notes.md"
+
+
+# ── merge import: several documents → one, a chapter each (row 123) ───────────
+#
+# Dropping a pile of PDFs (a semester of lecture slides) makes ONE document
+# with a level-1 outline entry per file. Everything Sidemark keeps beside a PDF
+# comes along: the `-notes.md` sidecar's per-page notes and the `-ink.json`
+# sidecar's pasted images are re-keyed by the chapter's page offset, and ink
+# rides along on its own because strokes ARE native PDF ink annotations, which
+# insert_pdf copies and load() reads back as editable strokes.
+#
+# Traps this section exists to handle, all of them verified against the
+# installed PyMuPDF rather than assumed:
+#   * insert_pdf does NOT carry the source outline — only the destination's
+#     survives. The merged TOC is ours to build, which is what we want anyway.
+#   * set_toc() wants a well-formed tree (starts at level 1, never skips a
+#     level), and a source outline may start deeper or jump; normalize_toc()
+#     repairs it before it is hung under a chapter.
+#   * an image layer of ours inside a source is a RENDER TARGET, not state
+#     (row 118). insert_pdf copies its placements and their /OC marks but not
+#     the catalog's OCProperties, so in the merged file those marks dangle and
+#     nothing can ever strip them again: the images would be frozen into the
+#     page AND redrawn from the merged sidecar on top. So the layer is taken
+#     out of each source copy before it is inserted, and its images enter the
+#     merged sidecar as objects (from the source's own sidecar when there is
+#     one — that keeps rotation and crop, which the PDF cannot express).
+
+
+def natural_sort_key(path):
+    """Sort key ordering embedded numbers numerically: 1-a, 2-b, 10-c, 101-d
+    (plain string sort gives 1, 10, 101, 2 — the lecture-slides worst case).
+
+    Digit runs compare as integers, everything else case-insensitively. The
+    leading 0/1 tag keeps a number and a word from ever being compared to each
+    other, which would raise on Python 3."""
+    name = os.path.basename(path)
+    return [(0, int(part), "") if part.isdigit() else (1, 0, part.casefold())
+            for part in re.split(r"(\d+)", name) if part]
+
+
+def chapter_title_for(path):
+    """A chapter's title: the file's stem, kept verbatim. A numeric prefix is
+    NOT stripped — "01-intro" is how the user named and orders the lecture, and
+    a title is the one place that ordering stays visible after the merge."""
+    return os.path.splitext(os.path.basename(path))[0] or "Untitled"
+
+
+def normalize_toc(toc):
+    """Repair an outline so set_toc() will accept it: levels start at 1 and
+    never jump by more than one. Documents in the wild do both."""
+    out, prev = [], 0
+    for entry in toc:
+        level, title, page = entry[0], entry[1], entry[2]
+        level = max(1, min(int(level), prev + 1))
+        out.append([level, str(title), int(page)])
+        prev = level
+    return out
+
+
+def shift_toc(toc, page_offset, base_level=1):
+    """A normalized outline re-based: pages moved by page_offset, levels sunk
+    so its top level becomes base_level (2 to hang under a chapter entry)."""
+    return [[entry[0] + base_level - 1, entry[1], entry[2] + page_offset]
+            for entry in toc]
+
+
+def shift_toc_for_insert(toc, at_page, count):
+    """Re-page an outline after count pages were inserted at index at_page
+    (0-based). TOC pages are 1-based."""
+    return [[lvl, title, page + count if page - 1 >= at_page else page]
+            for lvl, title, page in toc]
+
+
+def toc_blocks(toc):
+    """Split an outline into top-level blocks: [[chapter entry, children…], …].
+
+    Anything before the first level-1 entry forms a leading block of its own,
+    so no entry is ever silently dropped."""
+    blocks, current = [], []
+    for entry in toc:
+        if entry[0] <= 1 and current:
+            blocks.append(current)
+            current = []
+        current.append(entry)
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def sort_toc_chapters(toc):
+    """Put the outline back in page order after pages moved underneath it.
+
+    document.select() renumbers the pages an outline entry points at (verified),
+    but it does NOT reorder the entries — so after moving a chapter the sidebar
+    would list it first while it sits at page 30. Blocks are re-sorted by their
+    chapter's page; a block's own entries keep their relative order, which a
+    range move preserves."""
+    blocks = toc_blocks(toc)
+    blocks.sort(key=lambda b: b[0][2])   # stable: equal pages keep their order
+    return [entry for block in blocks for entry in block]
+
+
+def chapter_spans(toc, n_pages):
+    """[(title, start_idx, count)] for the outline's level-1 entries — the page
+    RANGE each chapter owns, which is what a chapter drag moves. A chapter runs
+    until the next level-1 entry, or the end of the document."""
+    tops = [(str(title), int(page) - 1)
+            for lvl, title, page in toc if lvl <= 1]
+    spans = []
+    for i, (title, start) in enumerate(tops):
+        end = tops[i + 1][1] if i + 1 < len(tops) else n_pages
+        start = max(0, min(start, n_pages))
+        end = max(start, min(end, n_pages))
+        if end > start:
+            spans.append((title, start, end - start))
+    return spans
+
+
+def parse_note_sections(raw):
+    """(sections, had_page_markers) for a notes file's text.
+
+    Split out of NotesModel.load because merging needs the distinction the
+    loader hides: a file with no `<!-- page:N -->` markers is an externally
+    authored note, and the loader's "keep it all as page 0" fallback would, in
+    a merge, dump a whole hand-written file onto one page of a chapter."""
+    raw = re.sub(r'^\s*!\[\[.*?\]\]\n+', '', raw)
+    parts = re.split(r'<!--\s*page:(\d+)\s*-->', raw)
+    if len(parts) == 1:
+        text = raw.strip()
+        return ({0: text} if text else {}), False
+    sections = {}
+    for i in range(1, len(parts), 2):
+        content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        if content:
+            sections[int(parts[i])] = content
+    return sections, True
+
+
+def read_note_sections(path):
+    """(sections, had_page_markers) for a notes sidecar on disk; ({}, False)
+    when there isn't one or it can't be read."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+    except OSError:
+        return {}, False
+    return parse_note_sections(raw)
+
+
+# ── merge import: image sidecars ──────────────────────────────────────────────
+# These take a `doc` instead of living on PDFCanvas because the merge works on
+# documents that no canvas has ever opened. PDFCanvas delegates to them, so the
+# rules about what counts as ours stay in ONE place (row 118's whole point).
+# (IMAGE_OCG_NAME itself sits above the class, which reads it at import time.)
+
+
+def image_ocg_xref(doc, create=False):
+    """Our optional content group's xref in doc — reused if it already carries
+    one, so re-saving never piles up layers."""
+    for xref, info in doc.get_ocgs().items():
+        if info.get("name") == IMAGE_OCG_NAME:
+            return xref
+    if not create:
+        return None
+    return doc.add_ocg(IMAGE_OCG_NAME, on=True)
+
+
+def our_placements(doc, page, ocg):
+    """[(resource name, xref)] of the page's images that are OURS, in
+    content-stream order — read from the Resources dict and the stream, the
+    only things that don't lie about which xref a name means."""
+    key = doc.xref_get_key(page.xref, "Resources/XObject")
+    if key[0] != "dict":
+        return []
+    # the Resources dict is cheap; settle "are any of these ours?" on it
+    # before reading the content stream, so a save walking a 500-page
+    # document only pays for the handful of pages that hold our images
+    mine = {n: int(x) for n, x in
+            re.findall(r"/([^\s/]+)\s+(\d+) 0 R", key[1])
+            if doc.xref_get_key(int(x), "OC")[1] == f"{ocg} 0 R"}
+    if not mine:
+        return []
+    out = []
+    for name in re.findall(rb"/([^\s/]+)\s+Do\b", page.read_contents()):
+        name = name.decode("latin-1")
+        if name in mine and (name, mine[name]) not in out:
+            out.append((name, mine[name]))
+    return out
+
+
+def strip_image_layer(doc, page, ocg):
+    """Remove our placements from the page, leaving the document's own images
+    strictly alone. Returns our xrefs, in order, for reuse."""
+    if not our_placements(doc, page, ocg):
+        return []           # nothing of ours here: don't rewrite the page
+    page.clean_contents()   # one normalised stream; re-read names after it
+    mine = our_placements(doc, page, ocg)
+    if not mine:
+        return []
+    content = page.read_contents()
+    for name, _xref in mine:
+        # our own insert_image blocks, and only ours: "q <matrix> cm
+        # /Name Do Q". Anchored on a name we have already proved is /OC-ours
+        content = re.sub(
+            (r"q\s+[-\d.\s]+cm\s*/%s\s+Do\s*Q\s*" % re.escape(name)).encode(),
+            b"", content)
+        doc.xref_set_key(page.xref, f"Resources/XObject/{name}", "null")
+    streams = page.get_contents()
+    if streams:
+        doc.update_stream(streams[0], content)
+    return [xref for _name, xref in mine]
+
+
+# our own placement, in the exact shape _write_image_layer writes it:
+# "q w 0 0 h x y cm /Name Do Q". The cm matrix is ground truth —
+# get_image_rects() resolves by visual match and lies when two images look alike
+_PLACEMENT_RE = re.compile(
+    rb"q\s+([-\d.]+)\s+0\s+0\s+([-\d.]+)\s+([-\d.]+)\s+"
+    rb"([-\d.]+)\s+cm\s*/([^\s/]+)\s+Do\s*Q")
+
+
+def layer_images_as_sidecar(doc, ocg):
+    """The images in doc's layer, in sidecar shape ({"<page>": [ {rect, rotate,
+    png}, … ]}) — for a source whose `-ink.json` is missing. The tilt is baked
+    into those pixels and cannot be recovered, so they come back upright;
+    everything else is editable again."""
+    pages = {}
+    for i in range(len(doc)):
+        page = doc[i]
+        names = {n: x for n, x in our_placements(doc, page, ocg)}
+        if not names:
+            continue
+        found = []
+        for m in _PLACEMENT_RE.finditer(page.read_contents()):
+            w, h, x, y, name = m.groups()
+            xref = names.get(name.decode("latin-1"))
+            if xref is None:
+                continue
+            try:
+                png = doc.extract_image(xref)["image"]
+            except (RuntimeError, KeyError, TypeError):
+                continue
+            w, h = float(w), float(h)
+            # PDF places from the BOTTOM-left, our rects are top-left down
+            top = page.rect.height - float(y) - h
+            found.append({"rect": [round(v, 2) for v in (float(x), top, w, h)],
+                          "rotate": 0.0,
+                          "png": base64.b64encode(png).decode("ascii")})
+        if found:
+            pages[str(i)] = found
+    return pages
+
+
+def images_from_sidecar(data):
+    """{page idx: [image object, …]} decoded from an image sidecar's contents.
+
+    Shared by the canvas's load_images() and the merge import, which drops a
+    merged document's images into a live model page by page."""
+    out = {}
+    for key, records in ((data or {}).get("images") or {}).items():
+        try:
+            idx = int(key)
+        except (TypeError, ValueError):
+            continue
+        images = []
+        for rec in records:
+            try:
+                png = base64.b64decode(rec.get("png", ""))
+            except (ValueError, TypeError):
+                continue
+            texture = _texture_from_png(png)
+            if texture is None:
+                continue   # unreadable bytes: skip the image, keep the doc
+            rect = rec.get("rect") or [0, 0, texture.get_width(),
+                                       texture.get_height()]
+            images.append({
+                "data": png,
+                "texture": texture,
+                "rect": tuple(float(v) for v in rect[:4]),
+                "rotate": float(rec.get("rotate", 0.0)),
+            })
+        if images:
+            out[idx] = images
+    return out
+
+
+def take_source_images(doc, path):
+    """The pasted images of a document about to be merged, in sidecar shape —
+    AND the layer taken back out of `doc`, so insert_pdf copies pages without
+    them (see this section's header: a copied layer can never be stripped
+    again, and would render under every object forever).
+
+    The source's own `-ink.json` wins when it exists: it is the truth, and it
+    is the only place a rotation or a crop survives."""
+    images = {}
+    sidecar = _ink_path_for(path)
+    if os.path.exists(sidecar):
+        try:
+            with open(sidecar, encoding="utf-8") as f:
+                images = (json.load(f) or {}).get("images", {}) or {}
+        except (OSError, ValueError, AttributeError) as e:
+            logger.warning(f"merge: cannot read {sidecar}: {e}")
+            images = {}
+    ocg = image_ocg_xref(doc)
+    if ocg is not None:
+        if not images:
+            images = layer_images_as_sidecar(doc, ocg)
+        for i in range(len(doc)):
+            strip_image_layer(doc, doc[i], ocg)
+    return images
+
+
+class MergeSource:
+    """One document going into a merge.
+
+    `path` is what gets read — for a .pptx that is the converted temp PDF,
+    while `title` and `origin` stay the name the user recognises. `notes`
+    overrides the sidecar lookup (a converted deck's speaker notes)."""
+
+    def __init__(self, path, title=None, notes=None, origin=None):
+        self.path = path
+        self.origin = origin or path
+        self.title = title or chapter_title_for(self.origin)
+        self.notes = notes
+
+
+class MergeResult:
+    def __init__(self):
+        self.pages = 0
+        self.chapters = []      # (title, start_idx, count)
+        self.skipped = []       # (name, reason)
+        self.toc = []           # the merged outline, 1-based pages
+        self.notes = {}         # page idx → markdown
+        self.images = {}        # "page idx" → sidecar image records
+        self.error = None
+
+    @property
+    def image_count(self):
+        return sum(len(v) for v in self.images.values())
+
+
+def merge_documents(sources, dest_path, keep_subchapters=True,
+                    write_sidecars=True):
+    """Merge `sources` into one PDF at dest_path, one chapter per source, and
+    (unless write_sidecars is off) write the merged `-notes.md` / `-ink.json`
+    sidecars beside it.
+
+    The sidecars are written HERE, before anything opens the result, so the new
+    tab loads a document whose notes and images are already in place — there is
+    no window in which the merged file exists without them. Merging into an
+    already-open document instead switches them off and folds the returned
+    notes/images into the live models at the insertion point."""
+    out = fitz.open()
+    result = MergeResult()
+    toc, notes, images = [], {}, {}
+    offset = 0
+    try:
+        for src_info in sources:
+            try:
+                src = fitz.open(src_info.path)
+            except Exception as e:
+                logger.warning("merge: cannot open %s: %s", src_info.path, e)
+                result.skipped.append(
+                    (os.path.basename(src_info.origin), "could not be read"))
+                continue
+            try:
+                if src.needs_pass:
+                    result.skipped.append(
+                        (os.path.basename(src_info.origin),
+                         "is password-protected"))
+                    continue
+                n = len(src)
+                if n == 0:
+                    result.skipped.append(
+                        (os.path.basename(src_info.origin), "has no pages"))
+                    continue
+                sub = normalize_toc(src.get_toc(simple=True)) if keep_subchapters else []
+                page_images = take_source_images(src, src_info.path)
+                out.insert_pdf(src)          # annots=True: ink comes along
+            finally:
+                src.close()
+            toc.append([1, src_info.title, offset + 1])
+            toc += shift_toc(sub, offset, base_level=2)
+            if src_info.notes is not None:
+                sections = dict(src_info.notes)
+            else:
+                sections, _had = read_note_sections(notes_path_for(src_info.origin))
+            for idx, text in sections.items():
+                if text.strip():
+                    notes[idx + offset] = text
+            for key, entries in page_images.items():
+                try:
+                    images[str(int(key) + offset)] = entries
+                except (TypeError, ValueError):
+                    continue
+            result.chapters.append((src_info.title, offset, n))
+            offset += n
+        result.pages = offset
+        result.toc, result.notes, result.images = toc, notes, images
+        if not offset:
+            return result
+        out.set_toc(toc)
+        tmp = dest_path + ".tmp"
+        out.save(tmp, garbage=4, deflate=True)
+        os.replace(tmp, dest_path)
+    finally:
+        out.close()
+    if not write_sidecars:
+        return result
+    if notes:
+        model = NotesModel()
+        model.pdf_name = os.path.basename(dest_path)
+        for idx, text in notes.items():
+            model.set(idx, text)
+        model.save(notes_path_for(dest_path))
+    if images:
+        tmp = _ink_path_for(dest_path) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "images": images}, f)
+        os.replace(tmp, _ink_path_for(dest_path))
+    return result
+
+
+def classify_import_paths(paths):
+    """Split a dropped file list into (mergeable, skipped) for the merge flow.
+
+    A `<name>-notes.md` whose PDF is in the same drop is NOT a file to merge —
+    it is that PDF's notes, and merge_documents picks it up from beside it. Any
+    other .md is reported: which PDF it belongs to cannot be guessed, and the
+    report is where the naming rule gets taught."""
+    mergeable, skipped = [], []
+    docs = [p for p in paths if p.lower().endswith((".pdf", ".pptx"))]
+    stems = {os.path.splitext(p)[0] for p in docs}
+    for path in paths:
+        low = path.lower()
+        if low.endswith((".pdf", ".pptx")):
+            mergeable.append(path)
+        elif low.endswith((".md", ".markdown")):
+            if path.endswith("-notes.md") and path[:-len("-notes.md")] in stems:
+                continue        # picked up as its PDF's notes
+            skipped.append((os.path.basename(path),
+                            "is a note with no document to attach it to"))
+        elif os.path.isdir(path):
+            skipped.append((os.path.basename(path), "is a folder"))
+        else:
+            skipped.append((os.path.basename(path), "is not a PDF or PowerPoint"))
+    return mergeable, skipped
 
 
 # ── autosave snapshots ────────────────────────────────────────────────────────
@@ -5643,27 +6080,11 @@ class NotesModel:
         self._notes[idx] = text
 
     def load(self, path):
-        self._notes = {}
-        try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                raw = f.read()
-        except OSError:
-            return
-        # Strip leading embed line (![[name.pdf]]) before parsing
-        raw = re.sub(r'^\s*!\[\[.*?\]\]\n+', '', raw)
-        # Format: <!-- page:N --> delimiters (invisible in markdown viewers)
-        parts = re.split(r'<!--\s*page:(\d+)\s*-->', raw)
-        if len(parts) == 1:
-            # No page markers — an externally authored .md or an arbitrary text
-            # file opened as notes: keep the whole thing as page-0 content.
-            text = raw.strip()
-            if text:
-                self._notes[0] = text
-            return
-        for i in range(1, len(parts), 2):
-            content = parts[i + 1].strip() if i + 1 < len(parts) else ""
-            if content:
-                self._notes[int(parts[i])] = content
+        # the parse lives at module level (parse_note_sections): merging notes
+        # needs the "were there page markers?" answer this loader throws away —
+        # without markers the whole file is page 0, which in a merge would dump
+        # a hand-written note onto one page of a chapter (row 123)
+        self._notes, _had_markers = read_note_sections(path)
 
     def shift_for_insert(self, idx, count=1):
         """Re-key notes after count pages were inserted at idx."""
@@ -10736,9 +11157,29 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         n = self.canvas.n_pages
         if not (0 <= src < n and 0 <= dst < n):
             return
-        self._commit_note()
-        order = PDFCanvas._move_order(n, src, dst)
+        self._reorder_pages(PDFCanvas._move_order(n, src, dst),
+                            lambda: self.canvas.move_page(src, dst))
+
+    def _move_page_range(self, src, count, dst):
+        """Move `count` consecutive pages (a chapter) as one block, notes and
+        all. One re-key for the range — see PDFCanvas.move_page_range."""
+        if not self.canvas.document or count <= 0:
+            return
+        n = self.canvas.n_pages
+        if not (0 <= src < n and src + count <= n):
+            return
+        order = PDFCanvas._move_range_order(n, src, count, dst)
+        if order == list(range(n)):
+            return
+        self._reorder_pages(order,
+                            lambda: self.canvas.move_page_range(src, count, dst))
+
+    def _reorder_pages(self, order, apply_to_canvas):
+        """Re-key the notes model and the notes timelines for a page
+        permutation, then let the canvas move the pages. The notes side goes
+        FIRST so the canvas's page restore already sees the shifted model."""
         old_to_new = {old: new for new, old in enumerate(order)}
+        self._commit_note()
         self.notes_model.reorder(old_to_new)
         self._undo_timeline = [
             ("notes", old_to_new[op[1]], op[2]) if op[0] == "notes" else op
@@ -10748,7 +11189,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("notes", old_to_new[op[1]]) + op[2:] if op[0] == "notes" else op
             for op in self._redo_timeline
         ]
-        self.canvas.move_page(src, dst)
+        apply_to_canvas()
         self._populate_toc()
         self._mark_dirty()
 
@@ -11508,6 +11949,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         else:
             self._toc_list.set_selection_mode(Gtk.SelectionMode.NONE)
             self._toc_scroll.set_size_request(230, -1)
+            # a chapter (level-1 entry) owns the pages up to the next one, and
+            # dragging its row moves that whole RANGE (row 123)
+            spans = chapter_spans(normalize_toc(toc), self.canvas.n_pages)
+            chapter_no = 0
             for level, title, page in toc:
                 label = Gtk.Label(label=title.strip() or "—", xalign=0)
                 label.set_ellipsize(Pango.EllipsizeMode.END)
@@ -11517,12 +11962,81 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 label.set_margin_bottom(4)
                 row = Gtk.ListBoxRow()
                 row.set_child(label)
-                row.toc_page = page - 1   # get_toc() pages are 1-based
+                # a deleted page leaves its entry pointing at page -1 (PyMuPDF's
+                # "no destination"); clamp so a click can't jump off the front
+                row.toc_page = max(0, page - 1)   # get_toc() pages are 1-based
+                tip = (title.strip() or "—") + " — click to jump"
+                if level <= 1 and chapter_no < len(spans):
+                    self._attach_chapter_dnd(row, chapter_no, spans)
+                    tip += ", drag to reorder this chapter"
+                    chapter_no += 1
                 row.set_tooltip_text(
-                    (title.strip() or "—")
-                    + " — click to jump (PageUp/PageDown to flip pages)")
+                    tip + " (PageUp/PageDown to flip pages)")
                 self._toc_list.append(row)
             self._toc_btn.set_tooltip_text("Toggle outline (Ctrl+T)")
+
+    # ── chapter reorder (dragging an outline row, row 123) ────────────────────
+
+    def _attach_chapter_dnd(self, row, chapter_no, spans):
+        """Make a level-1 outline row draggable onto another one.
+
+        The payload is a string, not the int the thumbnails use: the two lists
+        live in the same window and an int would let a chapter be dropped on a
+        page (and moved as if it were one single page)."""
+        title, start, count = spans[chapter_no]
+        source = Gtk.DragSource()
+        source.set_actions(Gdk.DragAction.MOVE)
+        source.connect(
+            "prepare",
+            lambda _s, _x, _y: Gdk.ContentProvider.new_for_value(
+                f"sidemark-chapter:{chapter_no}"))
+        row.add_controller(source)
+
+        target = Gtk.DropTarget.new(str, Gdk.DragAction.MOVE)
+        target.connect("motion", self._on_chapter_motion)
+        target.connect("leave", lambda _t: self._clear_drop_indicator())
+        target.connect("drop", self._on_chapter_drop, chapter_no, spans)
+        row.add_controller(target)
+
+    def _on_chapter_motion(self, target, _x, y):
+        row = target.get_widget()
+        self._show_drop_indicator(row, y > row.get_height() / 2 if row else False)
+        return Gdk.DragAction.MOVE
+
+    def _on_chapter_drop(self, target, value, _x, y, chapter_no, spans):
+        self._clear_drop_indicator()
+        if not isinstance(value, str) or not value.startswith("sidemark-chapter:"):
+            return False
+        try:
+            src_no = int(value.split(":", 1)[1])
+        except ValueError:
+            return False
+        row = target.get_widget()
+        boundary = chapter_no + (1 if row and y > row.get_height() / 2 else 0)
+        self._move_chapter(src_no, boundary, spans)
+        return True
+
+    def _move_chapter(self, src_no, boundary, spans):
+        """Move chapter `src_no` so it starts where chapter `boundary` does.
+
+        The destination is computed from PAGES, not from a count of chapters:
+        pages that belong to no chapter (anything before the first outline
+        entry — a title page, say) must stay where they are, and only a page
+        position expresses that."""
+        if not (0 <= src_no < len(spans)) or boundary in (src_no, src_no + 1):
+            return
+        _title, start, count = spans[src_no]
+        target_start = (spans[boundary][1] if boundary < len(spans)
+                        else self.canvas.n_pages)
+        dst = target_start - (count if target_start > start else 0)
+        self._confirm_page_change(
+            f"Move the chapter “{spans[src_no][0]}” "
+            f"({count} page{'s' if count != 1 else ''}) here?",
+            lambda: self._do_move_chapter(start, count, dst, spans[src_no][0]))
+
+    def _do_move_chapter(self, start, count, dst, title):
+        self._move_page_range(start, count, dst)
+        self._toast(f"Moved chapter “{title}”")
 
     def _on_toc_view_toggled(self, _btn):
         if self.canvas.document:
@@ -11728,22 +12242,36 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         except Exception as e:
             logger.warning("thumbnail file-drop read failed: %s", e)
             paths = []
-        pdfs = [p for p in paths if p.lower().endswith(".pdf")]
-        if pdfs:
-            self._insert_files_to_gap(pdfs, gap)
+        mergeable, skipped = classify_import_paths(paths)
+        if mergeable:
+            self._insert_files_to_gap(mergeable, skipped, gap)
             gdk_drop.finish(Gdk.DragAction.COPY)
         else:
             if paths:
-                self._toast("Only PDF files can be inserted into a document")
+                self._report_import_skips(
+                    skipped, "Nothing to insert",
+                    "Drop PDFs (or PowerPoint files) onto the page thumbnails.")
             gdk_drop.finish(0)
 
-    def _insert_files_to_gap(self, paths, gap):
+    def _insert_files_to_gap(self, paths, skipped, gap):
+        """Several documents dropped on the thumbnails become CHAPTERS inserted
+        at the gap; a single one stays a plain page insert (row 123).
+
+        The single-file case is deliberately unchanged: inserting a two-page
+        appendix into a document is not chapter work, and it has always been a
+        one-click confirm."""
         if not self.canvas.document:
+            return
+        # a .pptx has to be converted before its pages exist, which is the merge
+        # pipeline's job even for a single file
+        if len(paths) > 1 or paths[0].lower().endswith(".pptx"):
+            self._begin_merge_import(paths, skipped, gap=gap)
             return
         names = ", ".join(os.path.basename(p) for p in paths)
         self._confirm_page_change(
             f"Insert pages from {names} at position {gap + 1}?",
-            lambda: self._do_insert_pdfs(paths, gap))
+            lambda: (self._do_insert_pdfs(paths, gap),
+                     self._report_import_skips(skipped)) and None)
 
     def _do_insert_pdfs(self, paths, gap):
         at = max(0, min(gap, self.canvas.n_pages))
@@ -11781,6 +12309,291 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             for op in self._redo_timeline
         ]
         return self.canvas.insert_pdf_pages(at, path)
+
+    # ── merge import: several documents → one, a chapter each (row 123) ───────
+    #
+    # Two entry points, ONE pipeline: dropping several files on the page
+    # thumbnails inserts them as chapters at the drop gap, dropping them on the
+    # window offers "open all / merge" and merges into a NEW file. Both end in
+    # merge_documents(); only the destination differs.
+
+    # order choices, in dialog order. "As dropped" is honest about what it can
+    # deliver: the drop hands us an ORDERED file list, but most Linux file
+    # managers fill it in their view's display order, not the order you clicked
+    # (macOS Finder is the one usually claimed to preserve click order), so it
+    # is offered, not defaulted.
+    MERGE_ORDERS = ("Filename (1, 2, 10, 101 — numbers count as numbers)",
+                    "As dropped (the order the file manager sent)")
+
+    def _begin_merge_import(self, paths, skipped=(), gap=None):
+        """Ask how to merge `paths`, then do it. gap=None merges into a new
+        file; an int inserts the chapters into the open document at that gap."""
+        paths = list(paths)
+        skipped = list(skipped)
+        if not paths:
+            self._report_import_skips(skipped, "Nothing to merge")
+            return
+
+        order_dd = Gtk.DropDown.new_from_strings(list(self.MERGE_ORDERS))
+        order_dd.set_selected(0)
+        sub_check = Gtk.CheckButton(
+            label="Keep each document's own chapters as sub-chapters")
+        sub_check.set_active(True)
+        listbox = Gtk.ListBox()
+        listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        listbox.add_css_class("boxed-list")
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_max_content_height(220)
+        scroll.set_propagate_natural_height(True)
+        scroll.set_child(listbox)
+
+        def ordered():
+            if order_dd.get_selected() == 1:
+                return list(paths)
+            return sorted(paths, key=natural_sort_key)
+
+        def refill(*_a):
+            while (child := listbox.get_first_child()) is not None:
+                listbox.remove(child)
+            for i, path in enumerate(ordered(), 1):
+                label = Gtk.Label(label=f"{i}.  {os.path.basename(path)}",
+                                  xalign=0)
+                label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+                label.set_margin_top(6)
+                label.set_margin_bottom(6)
+                label.set_margin_start(10)
+                label.set_margin_end(10)
+                listbox.append(label)
+        refill()
+        order_dd.connect("notify::selected", refill)
+
+        hint = Gtk.Label(xalign=0, wrap=True)
+        hint.set_markup(
+            "<small>Chapters can be reordered afterwards by dragging them "
+            "in the outline sidebar (Ctrl+T).</small>")
+        hint.add_css_class("dim-label")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.append(order_dd)
+        box.append(scroll)
+        box.append(sub_check)
+        box.append(hint)
+
+        where = ("into this document" if gap is not None else
+                 "into a new document")
+        dialog = Adw.AlertDialog.new(
+            "Merge documents?",
+            f"{len(paths)} documents will be merged {where}, "
+            "one chapter each. Notes and pasted images that belong to them "
+            "come along, with their page numbers adjusted.")
+        dialog.set_extra_child(box)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("merge", "Merge")
+        dialog.set_response_appearance("merge", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("merge")
+        dialog.set_close_response("cancel")
+
+        def on_response(_d, response):
+            if response != "merge":
+                return
+            self._merge_after_convert(
+                ordered(), skipped, sub_check.get_active(), gap)
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+    def _merge_after_convert(self, paths, skipped, keep_sub, gap):
+        """Convert any .pptx in the batch (LibreOffice, off the main thread),
+        then merge. A deck's speaker notes ride in as that chapter's notes —
+        the same import a single .pptx gets when opened on its own."""
+        decks = [p for p in paths if p.lower().endswith(".pptx")]
+        if not decks:
+            self._merge_with_sources(
+                [MergeSource(p) for p in paths], skipped, keep_sub, gap)
+            return
+        toast = Adw.Toast.new(
+            f"Converting {len(decks)} PowerPoint file"
+            f"{'s' if len(decks) != 1 else ''}…")
+        toast.set_timeout(0)
+        self.toast_overlay.add_toast(toast)
+        out_dir = tempfile.mkdtemp(prefix="sidemark-merge-")
+
+        def run():
+            converted, failed = {}, []
+            for deck in decks:
+                base = os.path.splitext(os.path.basename(deck))[0]
+                try:
+                    subprocess.run(
+                        ["libreoffice", "--headless", "--convert-to", "pdf",
+                         "--outdir", out_dir, deck],
+                        check=True, capture_output=True)
+                    pdf = os.path.join(out_dir, base + ".pdf")
+                    if not os.path.exists(pdf):
+                        raise FileNotFoundError(pdf)
+                    converted[deck] = (pdf, _extract_pptx_notes(deck))
+                except FileNotFoundError:
+                    failed.append((os.path.basename(deck),
+                                   "needs LibreOffice, which isn't installed"))
+                except Exception as e:
+                    logger.warning("merge: pptx conversion failed for %s: %s",
+                                   deck, e)
+                    failed.append((os.path.basename(deck),
+                                   "could not be converted to PDF"))
+
+            def done():
+                toast.dismiss()
+                sources = []
+                for path in paths:
+                    if path.lower().endswith(".pptx"):
+                        info = converted.get(path)
+                        if info is None:
+                            continue     # already in `failed`
+                        pdf, notes = info
+                        sources.append(MergeSource(
+                            pdf, title=chapter_title_for(path),
+                            notes=notes, origin=path))
+                    else:
+                        sources.append(MergeSource(path))
+                self._merge_with_sources(
+                    sources, skipped + failed, keep_sub, gap)
+                return False
+            GLib.idle_add(done)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _merge_with_sources(self, sources, skipped, keep_sub, gap):
+        if not sources:
+            self._report_import_skips(skipped, "Nothing to merge")
+            return
+        if gap is not None:
+            self._merge_into_open_document(sources, skipped, keep_sub, gap)
+            return
+        # a new merged document is a REAL file from the start: its notes and
+        # image sidecars are derived from the PDF's path (notes_path_for /
+        # _ink_path_for), so an untitled merge would have nowhere to put them
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Save merged document as…")
+        dialog.set_initial_name("merged.pdf")
+        folder = os.path.dirname(sources[0].origin)
+        if folder and os.path.isdir(folder):
+            dialog.set_initial_folder(Gio.File.new_for_path(folder))
+        f = Gtk.FileFilter()
+        f.set_name("PDF files")
+        f.add_pattern("*.pdf")
+        store = Gio.ListStore.new(Gtk.FileFilter)
+        store.append(f)
+        dialog.set_filters(store)
+
+        def picked(dlg, result):
+            try:
+                file = dlg.save_finish(result)
+            except GLib.Error:
+                return      # dismissed
+            if not file:
+                return
+            dest = file.get_path()
+            if not dest.lower().endswith(".pdf"):
+                dest += ".pdf"
+            self._run_merge(sources, dest, keep_sub, skipped)
+        dialog.save(self, None, picked)
+
+    def _run_merge(self, sources, dest, keep_sub, skipped, then=None,
+                   write_sidecars=True):
+        """Merge off the main thread — a semester of slides is seconds of work
+        and the window must stay alive — then hand the result to `then` (or
+        open the merged file in a tab)."""
+        toast = Adw.Toast.new(f"Merging {len(sources)} documents…")
+        toast.set_timeout(0)
+        self.toast_overlay.add_toast(toast)
+
+        def run():
+            result = MergeResult()
+            try:
+                result = merge_documents(sources, dest, keep_sub,
+                                         write_sidecars=write_sidecars)
+            except Exception as e:
+                logger.error("merge failed\n%s", traceback.format_exc())
+                result.error = str(e)
+
+            def done():
+                toast.dismiss()
+                if result.error:
+                    self._show_error("Merge failed", result.error)
+                    return False
+                if not result.pages:
+                    self._report_import_skips(
+                        result.skipped + skipped, "Nothing to merge",
+                        "None of the dropped files had any pages.")
+                    return False
+                if then is not None:
+                    then(result)
+                else:
+                    self.open_file_in_tab(dest)
+                    self._toast(
+                        f"Merged {len(result.chapters)} documents into "
+                        f"{result.pages} pages")
+                self._report_import_skips(result.skipped + skipped)
+                return False
+            GLib.idle_add(done)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _merge_into_open_document(self, sources, skipped, keep_sub, gap):
+        """Insert the merged chapters into the open document at `gap`.
+
+        The merge runs to a temp file with its sidecars switched OFF, and the
+        notes/images it returns are folded into the LIVE models at the
+        insertion point — writing sidecars here would clobber the open
+        document's own."""
+        tmp_dir = tempfile.mkdtemp(prefix="sidemark-merge-")
+        tmp_pdf = os.path.join(tmp_dir, "merged.pdf")
+        self._run_merge(
+            sources, tmp_pdf, keep_sub, skipped, write_sidecars=False,
+            then=lambda result: self._apply_merge_insert(tmp_pdf, result, gap))
+
+    def _apply_merge_insert(self, tmp_pdf, result, gap):
+        at = max(0, min(gap, self.canvas.n_pages))
+        # _insert_one_pdf re-keys strokes, images, anchors, notes and both undo
+        # stacks for the pages that move down; PyMuPDF re-pages the outline
+        count = self._insert_one_pdf(at, tmp_pdf)
+        if not count:
+            return
+        for idx, text in result.notes.items():
+            self.notes_model.set(at + idx, text)
+        for idx, images in images_from_sidecar(
+                {"version": 1, "images": result.images}).items():
+            self.canvas.all_images.setdefault(at + idx, []).extend(images)
+        toc = normalize_toc(self.canvas.get_toc()) + shift_toc(result.toc, at)
+        self.canvas.set_toc(sort_toc_chapters(normalize_toc(toc)))
+        self._restore_note()
+        self._populate_toc()
+        self._mark_dirty()
+        self._toast(f"Inserted {len(result.chapters)} chapters "
+                    f"({count} pages) at page {at + 1}")
+        shutil.rmtree(os.path.dirname(tmp_pdf), ignore_errors=True)
+
+    def _report_import_skips(self, skipped, title=None, extra=None):
+        """Say which dropped files were left out and why — a dialog, not a
+        toast: a toast truncates and vanishes, and this is the one place the
+        `<name>-notes.md` rule gets taught."""
+        skipped = list(skipped)
+        if not skipped:
+            return
+        lines = [f"• {name} — {reason}" for name, reason in skipped]
+        if any("note" in reason for _n, reason in skipped):
+            lines.append(
+                "\nA notes file is merged automatically when it is named after "
+                "its document: slides.pdf → slides-notes.md (that is the name "
+                "Sidemark itself uses).")
+        if extra:
+            lines.append("\n" + extra)
+        dialog = Adw.AlertDialog.new(
+            title or f"{len(skipped)} file{'s' if len(skipped) != 1 else ''} "
+                     "could not be imported",
+            "\n".join(lines))
+        dialog.add_response("close", "Close")
+        dialog.set_default_response("close")
+        dialog.present(self)
 
     # ── confirmation (#60) ─────────────────────────────────────────────────────
     def _confirm_page_change(self, message, on_confirm):
@@ -12729,17 +13542,51 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         return [p for p in paths if p]
 
     def _open_dropped(self, paths):
-        """Open the first supported path; toast and return False otherwise."""
+        """Open dropped files; toast and return False if none are supported.
+
+        One file opens straight away, as it always has. SEVERAL ask first —
+        open them all as tabs, or merge them into one document with a chapter
+        per file (row 123). The ask is also how the merge gets discovered:
+        dropping a folder of lecture slides is exactly the moment to offer it."""
         logger.info("DnD: candidate paths = %s", paths)
-        for path in paths:
-            if path.lower().endswith(self.SUPPORTED_DND):
-                logger.info("DnD: opening %s", path)
-                self.open_file_in_tab(path)
-                return True
-        logger.info("DnD: no supported file among %s", paths)
-        self.toast_overlay.add_toast(
-            Adw.Toast.new("Drop a PDF, PPTX, or Markdown file"))
-        return False
+        supported = [p for p in paths if p.lower().endswith(self.SUPPORTED_DND)]
+        if not supported:
+            logger.info("DnD: no supported file among %s", paths)
+            self.toast_overlay.add_toast(
+                Adw.Toast.new("Drop a PDF, PPTX, or Markdown file"))
+            return False
+        if len(supported) == 1:
+            logger.info("DnD: opening %s", supported[0])
+            self.open_file_in_tab(supported[0])
+            return True
+        self._ask_open_or_merge(paths, supported)
+        return True
+
+    def _ask_open_or_merge(self, paths, supported):
+        mergeable, skipped = classify_import_paths(paths)
+        dialog = Adw.AlertDialog.new(
+            f"{len(supported)} files dropped",
+            "Open them as separate tabs, or merge them into one document "
+            "with a chapter per file?")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("open", "Open All")
+        if mergeable:
+            dialog.add_response("merge", "Merge…")
+            dialog.set_response_appearance(
+                "merge", Adw.ResponseAppearance.SUGGESTED)
+            dialog.set_default_response("merge")
+        else:
+            dialog.set_default_response("open")
+        dialog.set_close_response("cancel")
+
+        def on_response(_d, response):
+            if response == "open":
+                for path in supported:
+                    self.open_file_in_tab(path)
+            elif response == "merge":
+                self._begin_merge_import(mergeable, skipped)
+        dialog.connect("response", on_response)
+        dialog.present(self)
 
     def open_file(self, path):
         if self._dirty:

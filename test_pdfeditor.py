@@ -10783,5 +10783,404 @@ class TestClipboardLayer(unittest.TestCase):
         self.assertEqual(got["texture"].get_width(), 24)
 
 
+class TestMergeImport(unittest.TestCase):
+    """Merging several documents into one, a chapter each (row 123)."""
+
+    def _pdf(self, d, name, n_pages=2, toc=None):
+        path = os.path.join(d, name)
+        doc = fitz.open()
+        for _ in range(n_pages):
+            doc.new_page()
+        if toc:
+            doc.set_toc(toc)
+        doc.save(path)
+        doc.close()
+        return path
+
+    def _png(self, w=40, h=30, fill=(0, 1, 0)):
+        doc = fitz.open()
+        page = doc.new_page(width=w, height=h)
+        page.draw_rect(fitz.Rect(1, 1, w - 1, h - 1), fill=fill)
+        return page.get_pixmap().tobytes("png")
+
+    # ── ordering ─────────────────────────────────────────────────────────────
+
+    def test_natural_order_counts_numbers_as_numbers(self):
+        """The lecture-slides case: a plain string sort gives 1, 10, 101, 2, 99."""
+        names = ["99-asd.pdf", "1-test.pdf", "101-a.pdf", "10-sdf.pdf",
+                 "2-second.pdf"]
+        self.assertEqual(
+            sorted(names, key=sidemark.natural_sort_key),
+            ["1-test.pdf", "2-second.pdf", "10-sdf.pdf", "99-asd.pdf",
+             "101-a.pdf"])
+
+    def test_natural_order_never_compares_a_number_to_a_word(self):
+        # mixed shapes must not raise (int vs str comparison on Python 3)
+        sorted(["a.pdf", "1.pdf", "1a.pdf", "a1.pdf"],
+               key=sidemark.natural_sort_key)
+
+    # ── chapters ─────────────────────────────────────────────────────────────
+
+    def test_each_document_becomes_a_chapter(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = [self._pdf(d, n) for n in ("1-a.pdf", "2-b.pdf", "10-c.pdf")]
+            dest = os.path.join(d, "merged.pdf")
+            result = sidemark.merge_documents(
+                [sidemark.MergeSource(p) for p in paths], dest)
+            self.assertEqual(result.pages, 6)
+            doc = fitz.open(dest)
+            self.assertEqual(doc.get_toc(),
+                             [[1, "1-a", 1], [1, "2-b", 3], [1, "10-c", 5]])
+            doc.close()
+
+    def test_source_chapters_become_subchapters_only_when_asked(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self._pdf(d, "a.pdf", toc=[[1, "Intro", 1], [2, "Deep", 2]])
+            b = self._pdf(d, "b.pdf")
+            src = [sidemark.MergeSource(p) for p in (a, b)]
+            dest = os.path.join(d, "with.pdf")
+            sidemark.merge_documents(src, dest, keep_subchapters=True)
+            doc = fitz.open(dest)
+            self.assertEqual(
+                doc.get_toc(),
+                [[1, "a", 1], [2, "Intro", 1], [3, "Deep", 2], [1, "b", 3]])
+            doc.close()
+
+            flat = os.path.join(d, "without.pdf")
+            sidemark.merge_documents(src, flat, keep_subchapters=False)
+            doc = fitz.open(flat)
+            self.assertEqual(doc.get_toc(), [[1, "a", 1], [1, "b", 3]])
+            doc.close()
+
+    def test_a_source_outline_that_skips_levels_is_repaired(self):
+        """set_toc() rejects a tree that starts deep or jumps a level — and
+        documents in the wild do both, so the whole merge would fail on one."""
+        self.assertEqual(
+            sidemark.normalize_toc([[3, "a", 1], [5, "b", 2], [1, "c", 3]]),
+            [[1, "a", 1], [2, "b", 2], [1, "c", 3]])
+
+    # ── notes ────────────────────────────────────────────────────────────────
+
+    def test_notes_are_merged_with_their_page_numbers_shifted(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self._pdf(d, "a.pdf", n_pages=3)
+            b = self._pdf(d, "b.pdf", n_pages=2)
+            with open(notes_path_for(a), "w") as f:
+                f.write("![[a.pdf]]\n\n<!-- page:2 -->\n\nlast page of a\n")
+            with open(notes_path_for(b), "w") as f:
+                f.write("![[b.pdf]]\n\n<!-- page:0 -->\n\nfirst page of b\n")
+            dest = os.path.join(d, "merged.pdf")
+            sidemark.merge_documents(
+                [sidemark.MergeSource(p) for p in (a, b)], dest)
+
+            model = NotesModel()
+            model.load(notes_path_for(dest))
+            self.assertEqual(model.get(2), "last page of a")
+            self.assertEqual(model.get(3), "first page of b")   # 3 pages before it
+            self.assertEqual(model.get(0), "")
+
+    def test_a_note_with_no_page_markers_is_told_apart_from_a_page_note(self):
+        """NotesModel.load() maps a marker-less file onto page 0. Merging must
+        be able to SEE that fallback, or a hand-written note lands on one page
+        of a chapter as if it had been written there."""
+        sections, had = sidemark.parse_note_sections("just some prose\n")
+        self.assertEqual((sections, had), ({0: "just some prose"}, False))
+        sections, had = sidemark.parse_note_sections("<!-- page:4 -->\n\nx\n")
+        self.assertEqual((sections, had), ({4: "x"}, True))
+
+    def test_a_notes_file_is_claimed_by_its_document_and_reported_otherwise(self):
+        with tempfile.TemporaryDirectory() as d:
+            slides = os.path.join(d, "slides.pdf")
+            make_pdf(slides)
+            sidecar = notes_path_for(slides)      # slides-notes.md
+            open(sidecar, "w").close()
+            orphan = os.path.join(d, "thoughts.md")
+            open(orphan, "w").close()
+
+            mergeable, skipped = sidemark.classify_import_paths(
+                [slides, sidecar, orphan])
+            self.assertEqual(mergeable, [slides])
+            # its own document's sidecar is silent; the loose note is reported
+            self.assertEqual([n for n, _r in skipped], ["thoughts.md"])
+            self.assertIn("note", skipped[0][1])
+
+    # ── images ───────────────────────────────────────────────────────────────
+
+    def _pdf_with_pasted_image(self, d, name):
+        """A document as Sidemark leaves it: image objects in the sidecar, and
+        a render layer baked into the PDF for other viewers."""
+        path = self._pdf(d, name, n_pages=2)
+        canvas = PDFCanvas()
+        canvas.load(path)
+        canvas.attach_images(None)
+        canvas.go_to_page(1)
+        canvas.add_image(self._png(), at=(100, 100))
+        canvas.save(path)
+        with open(_ink_path_for(path), "w") as f:
+            json.dump(canvas.images_to_json(), f)
+        return path
+
+    def test_images_are_merged_and_their_baked_layer_does_not_come_along(self):
+        """The trap: insert_pdf copies the source's image layer AND its /OC
+        marks, but not the catalog's OCProperties — so in the merged file
+        nothing can ever strip them, and every image renders twice (once baked
+        into the page, once as the object from the merged sidecar)."""
+        with tempfile.TemporaryDirectory() as d:
+            a = self._pdf_with_pasted_image(d, "a.pdf")
+            b = self._pdf(d, "b.pdf", n_pages=1)
+            dest = os.path.join(d, "merged.pdf")
+            result = sidemark.merge_documents(
+                [sidemark.MergeSource(p) for p in (a, b)], dest)
+
+            # the image object moved with its page (page 1 of a 2-page chapter)
+            self.assertEqual(result.image_count, 1)
+            self.assertEqual(list(result.images), ["1"])
+            with open(_ink_path_for(dest)) as f:
+                self.assertEqual(list(json.load(f)["images"]), ["1"])
+
+            # …and nothing of it is baked into the merged pages
+            doc = fitz.open(dest)
+            for i in range(len(doc)):
+                self.assertEqual(
+                    re.findall(rb"/[^\s/]+\s+Do\b", doc[i].read_contents()), [],
+                    f"page {i} of the merge still has an image baked in — "
+                    f"it will render doubled under its own object")
+            doc.close()
+
+    def test_a_source_whose_sidecar_is_gone_keeps_its_images(self):
+        """Sidecar lost, PDF survived: the layer is all there is, so its images
+        are adopted into the merged sidecar rather than stripped into oblivion."""
+        with tempfile.TemporaryDirectory() as d:
+            a = self._pdf_with_pasted_image(d, "a.pdf")
+            os.unlink(_ink_path_for(a))
+            dest = os.path.join(d, "merged.pdf")
+            result = sidemark.merge_documents([sidemark.MergeSource(a)], dest)
+            self.assertEqual(result.image_count, 1)
+            self.assertEqual(list(result.images), ["1"])
+
+    def test_ink_strokes_survive_the_merge_as_editable_ink(self):
+        """Strokes are native PDF ink annotations, so insert_pdf carries them
+        and load() reads them back — no stroke-merging code, by design."""
+        with tempfile.TemporaryDirectory() as d:
+            a = self._pdf(d, "a.pdf", n_pages=2)
+            canvas = PDFCanvas()
+            canvas.load(a)
+            canvas.go_to_page(1)
+            canvas.all_strokes[1] = [{"pts": [(10, 10), (50, 50)],
+                                      "color": (1, 0, 0), "width": 2.0,
+                                      "opacity": 1.0}]
+            canvas.save(a)
+
+            dest = os.path.join(d, "merged.pdf")
+            sidemark.merge_documents(
+                [sidemark.MergeSource(self._pdf(d, "b.pdf", n_pages=3)),
+                 sidemark.MergeSource(a)], dest)
+            merged = PDFCanvas()
+            merged.load(dest)
+            self.assertEqual(len(merged.all_strokes.get(4, [])), 1,
+                             "the stroke did not land on its chapter's page")
+
+    # ── failure reporting ────────────────────────────────────────────────────
+
+    def test_unreadable_and_empty_documents_are_reported_not_fatal(self):
+        with tempfile.TemporaryDirectory() as d:
+            good = self._pdf(d, "good.pdf")
+            broken = os.path.join(d, "broken.pdf")
+            with open(broken, "w") as f:
+                f.write("not a pdf at all")
+            dest = os.path.join(d, "merged.pdf")
+            result = sidemark.merge_documents(
+                [sidemark.MergeSource(broken), sidemark.MergeSource(good)], dest)
+            self.assertEqual(result.pages, 2)
+            self.assertEqual([n for n, _r in result.skipped], ["broken.pdf"])
+            self.assertTrue(os.path.exists(dest))
+
+
+class TestChapterReorder(unittest.TestCase):
+    """Moving a whole chapter — the page RANGE it owns (row 123)."""
+
+    def _merged(self, d, chapters=(("a", 2), ("b", 3), ("c", 1))):
+        paths = []
+        for name, n in chapters:
+            path = os.path.join(d, f"{name}.pdf")
+            doc = fitz.open()
+            for _ in range(n):
+                doc.new_page()
+            doc.save(path)
+            doc.close()
+            paths.append(path)
+        dest = os.path.join(d, "merged.pdf")
+        sidemark.merge_documents([sidemark.MergeSource(p) for p in paths], dest)
+        return dest
+
+    def test_range_order_moves_the_block_as_one(self):
+        # 6 pages, move the 3-page block at 2 to the front
+        self.assertEqual(PDFCanvas._move_range_order(6, 2, 3, 0),
+                         [2, 3, 4, 0, 1, 5])
+        # …and to the end (dst counted without the block)
+        self.assertEqual(PDFCanvas._move_range_order(6, 2, 3, 3),
+                         [0, 1, 5, 2, 3, 4])
+
+    def test_chapter_spans_are_the_pages_each_chapter_owns(self):
+        toc = [[1, "a", 1], [2, "sub", 2], [1, "b", 3], [1, "c", 6]]
+        self.assertEqual(sidemark.chapter_spans(toc, 6),
+                         [("a", 0, 2), ("b", 2, 3), ("c", 5, 1)])
+
+    def test_moving_a_chapter_moves_its_pages_and_reorders_the_outline(self):
+        """select() renumbers the pages an outline entry points at, but leaves
+        the ENTRIES in their old sequence — so without the re-sort the moved
+        chapter is still listed first while sitting at the back."""
+        with tempfile.TemporaryDirectory() as d:
+            dest = self._merged(d)
+            canvas = PDFCanvas()
+            canvas.load(dest)
+            canvas.all_strokes[0] = ["a-page-0"]      # rides along with page 0
+            canvas.move_page_range(0, 2, 4)           # chapter "a" to the end
+            self.assertEqual(
+                canvas.get_toc(), [[1, "b", 1], [1, "c", 4], [1, "a", 5]])
+            self.assertEqual(canvas.all_strokes.get(4), ["a-page-0"])
+
+    def test_the_outline_stays_in_page_order_after_a_single_page_move(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = self._merged(d)
+            canvas = PDFCanvas()
+            canvas.load(dest)
+            canvas.move_page(0, 5)     # page 0 (chapter "a") to the very back
+            pages = [page for _lvl, _t, page in canvas.get_toc()]
+            self.assertEqual(pages, sorted(pages),
+                             "the outline is no longer in page order")
+
+
+class TestMergeImportInWindow(unittest.TestCase):
+    """The window half: chapters inserted into an OPEN document, and the drop
+    that offers open-all vs merge."""
+
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.mergeimport")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_merged_chapters_insert_into_the_open_document_with_their_notes(self):
+        with tempfile.TemporaryDirectory() as d:
+            host = os.path.join(d, "host.pdf")
+            make_pdf(host, n_pages=2)
+            extra = os.path.join(d, "extra.pdf")
+            make_pdf(extra, n_pages=2)
+            with open(notes_path_for(extra), "w") as f:
+                f.write("![[extra.pdf]]\n\n<!-- page:1 -->\n\nfrom the import\n")
+            merged = os.path.join(d, "tmp-merged.pdf")
+            result = sidemark.merge_documents(
+                [sidemark.MergeSource(extra)], merged, write_sidecars=False)
+
+            def body(win):
+                win._do_open_file(host)
+                win.notes_model.set(1, "host page 2")
+                win._apply_merge_insert(merged, result, gap=1)
+
+                self.assertEqual(win.canvas.n_pages, 4)
+                # the host's own note moved down with its page …
+                self.assertEqual(win.notes_model.get(3), "host page 2")
+                # … and the imported note landed on the imported page
+                self.assertEqual(win.notes_model.get(2), "from the import")
+                self.assertEqual(win.canvas.get_toc(), [[1, "extra", 2]])
+            self._run_in_window(body)
+
+    def test_dropping_several_files_asks_instead_of_opening_one(self):
+        """One file opens straight away; several must ASK — that is also how
+        the merge is discovered."""
+        with tempfile.TemporaryDirectory() as d:
+            a, b = os.path.join(d, "a.pdf"), os.path.join(d, "b.pdf")
+            make_pdf(a)
+            make_pdf(b)
+
+            def body(win):
+                asked = []
+                win._ask_open_or_merge = lambda paths, sup: asked.append(sup)
+                opened = []
+                win.open_file_in_tab = lambda p: opened.append(p)
+
+                self.assertTrue(win._open_dropped([a]))
+                self.assertEqual(opened, [a])
+                self.assertEqual(asked, [])
+
+                self.assertTrue(win._open_dropped([a, b]))
+                self.assertEqual(opened, [a])          # nothing opened yet
+                self.assertEqual(asked, [[a, b]])
+            self._run_in_window(body)
+
+    def test_several_files_on_the_thumbnails_become_chapters(self):
+        """A single dropped PDF stays a plain page insert; several become
+        chapters at the drop gap."""
+        with tempfile.TemporaryDirectory() as d:
+            host, a, b = (os.path.join(d, n)
+                          for n in ("host.pdf", "a.pdf", "b.pdf"))
+            for p in (host, a, b):
+                make_pdf(p, n_pages=2)
+
+            def body(win):
+                win._do_open_file(host)
+                asked = []
+                win._begin_merge_import = (
+                    lambda paths, skipped, gap=None: asked.append((paths, gap)))
+                inserted = []
+                win._confirm_page_change = lambda _m, on_confirm: inserted.append(1)
+
+                win._insert_files_to_gap([a], [], 1)
+                self.assertEqual((asked, len(inserted)), ([], 1))
+
+                win._insert_files_to_gap([a, b], [], 1)
+                self.assertEqual(asked, [([a, b], 1)])
+            self._run_in_window(body)
+
+    def test_the_import_dialog_builds(self):
+        """A smoke test for the dialog's widget wiring — everything else in the
+        merge flow is driven headlessly, so a typo here would ship."""
+        with tempfile.TemporaryDirectory() as d:
+            a, b = os.path.join(d, "1-a.pdf"), os.path.join(d, "2-b.pdf")
+            make_pdf(a)
+            make_pdf(b)
+
+            def body(win):
+                win._begin_merge_import([a, b], [("x.md", "is a note")])
+                win._report_import_skips([("x.md", "is a note with no document "
+                                                   "to attach it to")])
+            self._run_in_window(body)
+
+    def test_a_chapter_move_takes_the_notes_with_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            first, second = os.path.join(d, "1.pdf"), os.path.join(d, "2.pdf")
+            make_pdf(first, n_pages=2)
+            make_pdf(second, n_pages=2)
+            dest = os.path.join(d, "merged.pdf")
+            sidemark.merge_documents(
+                [sidemark.MergeSource(first), sidemark.MergeSource(second)],
+                dest)
+
+            def body(win):
+                win._do_open_file(dest)
+                # page 1, not the visible page 0: _commit_note() would write
+                # the (empty) editor over a note set behind its back
+                win.notes_model.set(1, "note of chapter 1")
+                win._do_move_chapter(0, 2, 2, "1")     # chapter 1 to the back
+                self.assertEqual(win.notes_model.get(3), "note of chapter 1")
+                self.assertEqual([t for _l, t, _p in win.canvas.get_toc()],
+                                 ["2", "1"])
+            self._run_in_window(body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

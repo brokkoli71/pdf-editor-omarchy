@@ -66,6 +66,17 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   is a render target regenerated on save; `attach_images()` is THE entry point
   after `canvas.load()` (it loads or adopts, then takes the layer back OUT of
   the open document — leave it in and every image renders twice).
+- **Merge import (row 123)** — dropping several documents at once makes ONE
+  document with a chapter per file. `merge_documents()` is the single pipeline
+  behind both entry points (thumbnails → insert chapters at the gap; window →
+  "Open All / Merge…" into a new file). Notes and image sidecars are re-keyed by
+  each chapter's page offset; ink needs no code (strokes are native PDF
+  annotations). **Before touching it, read row 123's traps** — the load-bearing
+  one is that a source's image layer MUST be stripped before `insert_pdf`, or
+  every pasted image renders twice forever (`take_source_images`). Chapters
+  reorder by dragging an outline row: `chapter_spans` → `move_page_range` (one
+  `select()`, one re-key) → `resort_toc` (`select()` re-pages the outline but
+  does not re-order it).
 - **`[[wiki links]]` (the linking workflow)** — this is the feature the project
   was designed around and it has shipped (ideas.csv row 99). In notes,
   `[[target]]` is a clickable link (Ctrl+click follows, hover shows a hand).
@@ -356,9 +367,20 @@ Do NOT trust `get_image_info(xrefs=True)` or `get_image_rects()` — they resolv
 placements by visual match and lie about xrefs; the content stream + Resources
 dict are ground truth.
 
-## Next session (2026-07-20 handoff)
+## Next session (2026-07-30 handoff)
 
-**Row 121 (shape & grid recognition) just landed — code-verified, needs an
+**Row 123 (merge import) just landed — code-verified, needs an in-app pass.**
+Drop several PDFs on the window → "Merge…"; drop several on the page
+thumbnails → chapters at the gap; drag a chapter row in the outline to move its
+whole page range. Unit-tested end to end (`TestMergeImport`,
+`TestChapterReorder`, `TestMergeImportInWindow`), and the two corrupting traps
+(the un-strippable copied image layer, the un-re-sorted outline) have tests
+that were checked to fail when the trap is reintroduced. What needs real
+hardware: the drops themselves, the .pptx path (LibreOffice), and the chapter
+drag. **Deliberately not done:** no drag-reorder inside the import dialog —
+chapters reorder in the outline afterwards, and the dialog says so.
+
+**Row 121 (shape & grid recognition) — code-verified, still needs an
 in-app pass.** The extended dwell now recognises rectangles/ellipses and snaps
 grid dividers (see "The extended dwell" under Conventions). Pure classifier,
 grid spacing and the PDF grid-divider commit/undo/redo are unit-tested
