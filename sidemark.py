@@ -283,10 +283,95 @@ def polyline_is_closed(pts):
     return diag > 1e-6 and gap < 0.30 * diag and plen > 1.4 * diag
 
 
+def _point_segment_distance(px, py, ax, ay, bx, by):
+    """Distance from a point to the SEGMENT ab (not the infinite line)."""
+    vx, vy = bx - ax, by - ay
+    span = vx * vx + vy * vy
+    if span < 1e-12:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * vx + (py - ay) * vy) / span))
+    return math.hypot(px - (ax + t * vx), py - (ay + t * vy))
+
+
+def simplify_polyline(pts, tol):
+    """Ramer–Douglas–Peucker: drop points that sit within `tol` of the chord
+    they lie on, keeping the ends. What survives is the polyline's CORNERS,
+    which is how a freehand polygon's vertices are found (row 127)."""
+    if len(pts) < 3:
+        return list(pts)
+    ax, ay = pts[0]
+    bx, by = pts[-1]
+    worst, at = -1.0, 0
+    for i in range(1, len(pts) - 1):
+        d = _point_segment_distance(pts[i][0], pts[i][1], ax, ay, bx, by)
+        if d > worst:
+            worst, at = d, i
+    if worst <= tol:
+        return [pts[0], pts[-1]]
+    return (simplify_polyline(pts[:at + 1], tol)[:-1]
+            + simplify_polyline(pts[at:], tol))
+
+
+def polygon_corners(pts, tol_frac=0.045):
+    """The corner vertices of a closed freehand loop, as an OPEN list (no
+    repeated closing point). Empty when the loop does not read as a polygon.
+
+    The tolerance is a fraction of the loop's diagonal, so a big sloppy shape
+    and a small neat one are judged alike. The count is bounded: below 3 there
+    is no polygon, and above POLYGON_MAX_CORNERS a wobbly circle starts to
+    "simplify" into a many-sided nothing, which would beat the ellipse fit on
+    residual while being obviously wrong to a human."""
+    if len(pts) < 4:
+        return []
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+    if diag < 1e-6:
+        return []
+    # close the loop first so the start/end join is simplified like any other
+    # corner — a freehand loop usually starts and ends mid-edge, and RDP pins
+    # both ends, which would otherwise leave a phantom vertex there
+    closed = list(pts) + [pts[0]]
+    simple = simplify_polyline(closed, tol_frac * diag)
+    if len(simple) > 1 and math.hypot(simple[0][0] - simple[-1][0],
+                                      simple[0][1] - simple[-1][1]) < tol_frac * diag:
+        simple = simple[:-1]
+    if not (3 <= len(simple) <= POLYGON_MAX_CORNERS):
+        return []
+    return simple
+
+
+def quad_is_axis_aligned(corners, tol_deg=12.0):
+    """Do all four edges run square to the page (within `tol_deg`)? That is
+    what makes a hand-drawn box a RECTANGLE rather than a general quadrilateral
+    — see recognize_shape for why the distinction has to be made on angle and
+    not on which candidate fits best."""
+    for i in range(len(corners)):
+        ax, ay = corners[i]
+        bx, by = corners[(i + 1) % len(corners)]
+        if math.hypot(bx - ax, by - ay) < 1e-9:
+            return False
+        deg = math.degrees(math.atan2(by - ay, bx - ax)) % 90.0
+        if min(deg, 90.0 - deg) > tol_deg:
+            return False
+    return True
+
+
+POLYGON_MAX_CORNERS = 8
+CIRCLE_TOLERANCE = 0.12   # |rx-ry| within this fraction reads as a circle
+
+# What the dwell says it recognised. One table, because the label is a
+# DECISION about what the user is told, not a per-canvas mechanic — and a
+# missing entry here is a KeyError mid-gesture, so a new kind must land in
+# both places at once.
+SNAP_LABELS = {"line": "line", "rect": "rectangle", "ellipse": "ellipse",
+               "polygon": "polygon", "vdiv": "grid", "hdiv": "grid"}
+
+
 def recognize_shape(pts):
     """Classify a freehand polyline into a clean primitive. Returns
-    (kind, new_pts) with kind "line" | "rect" | "ellipse" and new_pts the
-    canonical geometry, in the same units as the input."""
+    (kind, new_pts) with kind "line" | "rect" | "ellipse" | "polygon" and
+    new_pts the canonical geometry, in the same units as the input."""
     if len(pts) < 2:
         return "line", list(pts)
     xs = [p[0] for p in pts]
@@ -299,20 +384,45 @@ def recognize_shape(pts):
         return "line", [start, end]
     cx, cy = (minx + maxx) / 2, (miny + maxy) / 2
     rx, ry = max(w / 2, 1e-6), max(h / 2, 1e-6)
-    # Fit both candidates and keep the smaller mean residual. For a rectangle
-    # every point hugs a bbox edge (small min-edge distance); an ellipse's
-    # corners bow inward, so its points sit far from every edge there. For an
-    # ellipse the normalised radius is ~1 everywhere; a rectangle's corners
-    # push it out to ~sqrt(2). The two errors disagree exactly at the corners,
-    # which is what separates the shapes.
+    # Fit the candidates and keep the smallest residual, all as a total over
+    # the SAME points so the sums compare directly. For a rectangle every point
+    # hugs a bbox edge (small min-edge distance); an ellipse's corners bow
+    # inward, so its points sit far from every edge there. For an ellipse the
+    # normalised radius is ~1 everywhere; a rectangle's corners push it out to
+    # ~sqrt(2). The two errors disagree exactly at the corners, which is what
+    # separates the shapes. A polygon is measured against its own edges.
     rect_err = ell_err = 0.0
     for x, y in pts:
         rect_err += min(abs(x - minx), abs(x - maxx),
                         abs(y - miny), abs(y - maxy))
         ell_err += abs(math.hypot((x - cx) / rx, (y - cy) / ry) - 1.0) * (rx + ry) / 2
-    if rect_err <= ell_err:
+    corners = polygon_corners(pts)
+    poly_err = math.inf
+    if corners:
+        ring = corners + [corners[0]]
+        poly_err = sum(
+            min(_point_segment_distance(x, y, ring[i][0], ring[i][1],
+                                        ring[i + 1][0], ring[i + 1][1])
+                for i in range(len(ring) - 1))
+            for x, y in pts)
+    # RECT stays its own kind and wins its own case outright: rect_bbox_of
+    # re-derives rectangles geometrically for the grid dividers, and a
+    # hand-drawn box is ALSO a good 4-corner polygon — a slightly tilted quad
+    # through its real corners even fits BETTER than the axis-aligned bbox, so
+    # on residual alone the polygon would quietly take the grid snap away.
+    # Four corners that sit square to the page mean "rectangle".
+    if len(corners) == 4 and quad_is_axis_aligned(corners):
+        corners = []
+        poly_err = math.inf
+    if rect_err <= ell_err and rect_err <= poly_err:
         return "rect", [(minx, miny), (maxx, miny), (maxx, maxy),
                         (minx, maxy), (minx, miny)]
+    if poly_err < ell_err:
+        return "polygon", corners + [corners[0]]
+    # A hand-drawn circle lands as a faintly oval ellipse otherwise, which
+    # reads as sloppy recognition even though it is perfectly faithful.
+    if abs(rx - ry) <= CIRCLE_TOLERANCE * max(rx, ry):
+        rx = ry = (rx + ry) / 2.0
     n = max(24, len(pts))
     return "ellipse", [(cx + rx * math.cos(2 * math.pi * i / n),
                         cy + ry * math.sin(2 * math.pi * i / n))
@@ -3200,9 +3310,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 kind, pts = div
         self._straight_mode = True
         self._snap_kind = kind
-        self._snap_label = {"line": "line", "rect": "rectangle",
-                            "ellipse": "ellipse", "vdiv": "grid",
-                            "hdiv": "grid"}[kind]
+        self._snap_label = SNAP_LABELS[kind]
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         self._snap_at = (max(xs), min(ys))
@@ -8747,9 +8855,7 @@ class TextPageView(Gtk.Overlay):
                 kind, pts = div
         self._straight_mode = True
         self._snap_kind = kind
-        self._snap_label = {"line": "line", "rect": "rectangle",
-                            "ellipse": "ellipse", "vdiv": "grid",
-                            "hdiv": "grid"}[kind]
+        self._snap_label = SNAP_LABELS[kind]
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         self._snap_at = (max(xs), min(ys))

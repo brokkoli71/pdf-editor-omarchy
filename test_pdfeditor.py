@@ -717,6 +717,86 @@ class TestShapeRecognition(unittest.TestCase):
         kind, _new = sidemark.recognize_shape(pts)
         self.assertEqual(kind, "ellipse")
 
+    # ── row 127: polygons, and a circle that is actually round ──────────────
+
+    @staticmethod
+    def _wobble(pts, per=8):
+        """Resample a corner list into a freehand-ish loop: points along each
+        edge, so the classifier sees a stroke and not the answer."""
+        out = []
+        ring = list(pts) + [pts[0]]
+        for i in range(len(ring) - 1):
+            ax, ay = ring[i]
+            bx, by = ring[i + 1]
+            for k in range(per):
+                t = k / per
+                out.append((ax + (bx - ax) * t, ay + (by - ay) * t))
+        out.append(ring[0])
+        return out
+
+    def test_a_triangle_becomes_a_polygon(self):
+        kind, new = sidemark.recognize_shape(
+            self._wobble([(0, 0), (100, 10), (50, 90)]))
+        self.assertEqual(kind, "polygon")
+        self.assertEqual(len(new), 4)            # 3 corners, closed
+        self.assertEqual(new[0], new[-1])
+
+    def test_an_irregular_five_sided_shape_becomes_a_polygon(self):
+        kind, new = sidemark.recognize_shape(
+            self._wobble([(0, 0), (90, 5), (120, 70), (45, 110), (5, 60)]))
+        self.assertEqual(kind, "polygon")
+        self.assertEqual(len(new), 6)
+        self.assertEqual(new[0], new[-1])
+
+    def test_a_tilted_box_is_a_polygon_but_a_square_one_is_a_rect(self):
+        """Four corners square to the page mean RECTANGLE — the grid dividers
+        re-derive rectangles geometrically and must keep getting them."""
+        square = self._wobble([(0, 0), (100, 0), (100, 60), (0, 60)])
+        self.assertEqual(sidemark.recognize_shape(square)[0], "rect")
+        tilted = self._wobble([(20, 0), (100, 25), (80, 90), (0, 65)])
+        self.assertEqual(sidemark.recognize_shape(tilted)[0], "polygon")
+
+    def test_a_wobbly_circle_does_not_simplify_into_a_polygon(self):
+        """Above POLYGON_MAX_CORNERS a round loop starts fitting a many-sided
+        nothing better than the ellipse — it must stay an ellipse."""
+        pts = [(50 + 50 * math.cos(t / 18 * math.pi),
+                50 + 49 * math.sin(t / 18 * math.pi)) for t in range(37)]
+        self.assertEqual(sidemark.recognize_shape(pts)[0], "ellipse")
+
+    def test_a_near_circle_snaps_to_a_true_circle(self):
+        """A hand-drawn circle lands as a faintly oval ellipse otherwise, which
+        reads as sloppy recognition even though it is faithful."""
+        pts = [(50 + 50 * math.cos(t / 12 * math.pi),
+                50 + 46 * math.sin(t / 12 * math.pi)) for t in range(25)]
+        kind, new = sidemark.recognize_shape(pts)
+        self.assertEqual(kind, "ellipse")
+        xs = [p[0] for p in new]
+        ys = [p[1] for p in new]
+        # the ellipse is SAMPLED, so the spans match to within one sample step
+        self.assertAlmostEqual(max(xs) - min(xs), max(ys) - min(ys), delta=0.5)
+
+    def test_a_clear_oval_stays_an_oval(self):
+        pts = [(50 + 50 * math.cos(t / 12 * math.pi),
+                30 + 20 * math.sin(t / 12 * math.pi)) for t in range(25)]
+        _kind, new = sidemark.recognize_shape(pts)
+        xs = [p[0] for p in new]
+        ys = [p[1] for p in new]
+        self.assertGreater(max(xs) - min(xs), 2 * (max(ys) - min(ys)))
+
+    def test_every_recognised_kind_has_a_label(self):
+        """A missing entry is a KeyError mid-gesture, and both canvases read
+        this one table."""
+        for kind in ("line", "rect", "ellipse", "polygon", "vdiv", "hdiv"):
+            self.assertIn(kind, sidemark.SNAP_LABELS)
+
+    def test_simplify_polyline_keeps_corners_and_drops_the_rest(self):
+        line = [(0, 0), (10, 0), (20, 0), (30, 0)]
+        self.assertEqual(sidemark.simplify_polyline(line, 1.0),
+                         [(0, 0), (30, 0)])
+        bend = [(0, 0), (10, 0), (20, 0), (20, 10), (20, 20)]
+        self.assertEqual(sidemark.simplify_polyline(bend, 1.0),
+                         [(0, 0), (20, 0), (20, 20)])
+
     def test_rect_bbox_of_detects_generated_rect(self):
         rect = [(10, 20), (110, 20), (110, 80), (10, 80), (10, 20)]
         self.assertEqual(sidemark.rect_bbox_of(rect), (10, 20, 110, 80))
