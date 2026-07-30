@@ -34,7 +34,7 @@ import sidemark
 from sidemark import (PDFCanvas, NotesModel, notes_path_for,
                       _export_pdf_with_notes, _parse_anchors, PDFEditorWindow,
                       PDFEditorApp, DocumentSession, _pdf_needs_ocr,
-                      _ink_path_for)
+                      _ink_path_for, Bindings)
 
 # window tests open files, which records recents — keep that out of the user's
 # real ~/.local/share/sidemark/recent.json (TestRecentFiles patches its own)
@@ -5998,15 +5998,22 @@ class TestResponsiveHeader(unittest.TestCase):
                 raise AssertionError("canvas not in select mode")
         self._run_in_window(body)
 
-    def test_select_mode_toggle(self):
+    def test_ctrl_m_borrows_the_caret_while_held(self):
+        """With no active tool to toggle, Ctrl+M LENDS the left button the
+        caret for as long as it is held (row 132) — it cannot strand you in a
+        mode you forgot about."""
         def body(win):
-            # Ctrl+M flips select-text on/off
-            win._toggle_select_mode()
+            win._borrow_tool("text", Gdk.KEY_m)
             if not win.canvas.select_mode:
-                raise AssertionError("select toggle did not enable select mode")
-            win._toggle_select_mode()
+                raise AssertionError("Ctrl+M did not borrow the caret")
+            win._on_borrow_release(None, Gdk.KEY_m, 0, Gdk.ModifierType(0))
             if win.canvas.select_mode:
-                raise AssertionError("select toggle did not disable select mode")
+                raise AssertionError("the caret was not given back on release")
+            # letting go of Ctrl ends it too
+            win._borrow_tool("text", Gdk.KEY_m)
+            win._on_borrow_release(None, Gdk.KEY_Control_L, 0, Gdk.ModifierType(0))
+            if win.canvas.select_mode:
+                raise AssertionError("releasing Ctrl did not end the borrow")
         self._run_in_window(body)
 
     def test_tool_buttons_select_canvas_tool(self):
@@ -6667,6 +6674,154 @@ class TestSelectMode(unittest.TestCase):
         self.canvas._on_drag_end(g, 60, 8)
         self.assertEqual(len(self.canvas.strokes), 0)
         self.assertFalse(self.canvas._text_selecting)
+
+
+# ── button bindings: the table, and the toolbar that writes to it (row 132) ──
+
+class TestButtonBindings(unittest.TestCase):
+    """There is no active tool: every button HAS one, and clicking a tool in
+    the bar with a button is what puts it there."""
+
+    def test_defaults_are_left_pen_right_eraser_middle_pan(self):
+        b = Bindings()
+        self.assertEqual(b.tool_for(sidemark.BTN_LEFT), "pen")
+        self.assertEqual(b.tool_for(sidemark.BTN_RIGHT), "eraser")
+        self.assertEqual(b.tool_for(sidemark.BTN_MIDDLE), "pan")
+
+    def test_the_thumb_ships_unbound(self):
+        """Most mice have no thumb button, and a tool nobody can reach is
+        worse than an empty slot."""
+        b = Bindings()
+        self.assertIsNone(b.tool_for(sidemark.BTN_THUMB))
+        self.assertEqual(b.chords_for("pan"), ["middle", "ctrl+left"])
+
+    def test_a_chord_has_exactly_one_spelling(self):
+        self.assertEqual(sidemark.chord_id(1, ctrl=True, alt=True),
+                         "ctrl+alt+left")
+        self.assertEqual(sidemark.chord_id(1, alt=True, ctrl=True),
+                         "ctrl+alt+left")
+        self.assertEqual(sidemark.chord_label("ctrl+shift+alt+left"),
+                         "Ctrl+Shift+Alt+left")
+
+    def test_binding_moves_a_chord_and_reports_what_it_took(self):
+        b = Bindings()
+        self.assertEqual(b.bind("ctrl+left", "lasso"), "pan")
+        self.assertEqual(b.tool_for(1, ctrl=True), "lasso")
+        self.assertIsNone(b.bind("ctrl+right", "lasso"))   # was free
+
+    def test_a_tool_the_mode_lacks_resolves_to_nothing(self):
+        b = Bindings()
+        self.assertEqual(b.tool_for(1, ctrl=True, alt=True, mode="pdf"),
+                         "anchor")
+        self.assertIsNone(b.tool_for(1, ctrl=True, alt=True, mode="text"))
+
+    def test_select_is_an_alias_of_text_everywhere(self):
+        b = Bindings()
+        b.bind("middle", "select")
+        self.assertEqual(b.tool_for(sidemark.BTN_MIDDLE), "text")
+        self.assertEqual(sidemark.canonical_tool("select"), "text")
+
+    def test_round_trip_through_settings_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = os.environ.get("XDG_CONFIG_HOME")
+            os.environ["XDG_CONFIG_HOME"] = d
+            try:
+                b = Bindings()
+                b.bind("shift+thumb", "zoom")
+                b.save()
+                back = Bindings.load()
+                self.assertEqual(back.tool_for(sidemark.BTN_THUMB, shift=True),
+                                 "zoom")
+                # a tool that no longer exists is dropped, never kept as a
+                # binding nothing can execute
+                junk = Bindings.from_json({"left": "teleport", "right": "pen"})
+                self.assertIsNone(junk.tool_for(sidemark.BTN_LEFT))
+                self.assertEqual(junk.tool_for(sidemark.BTN_RIGHT), "pen")
+            finally:
+                if old is None:
+                    del os.environ["XDG_CONFIG_HOME"]
+                else:
+                    os.environ["XDG_CONFIG_HOME"] = old
+
+    def test_the_press_router_uses_the_table(self):
+        """The point of the refactor: routing, badges and tooltips all read the
+        same table, so rebinding actually changes what the mouse does."""
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            tmp = f.name
+        try:
+            make_pdf(tmp)
+            canvas.load(tmp)
+            canvas._fit_page(800, 600)
+            canvas.bindings.bind("right", "pan")     # right pans now
+            g = _FakeDrag(100, 100, button=3)
+            canvas._on_drag_begin(g, 100, 100)
+            self.assertTrue(canvas._panning)
+            self.assertFalse(canvas._erasing)
+            canvas._on_drag_end(g, 0, 0)
+        finally:
+            os.unlink(tmp)
+
+
+class TestBindingToolbar(unittest.TestCase):
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.bindbar")
+
+        def on_activate(a):
+            try:
+                body(PDFEditorWindow(a))
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_binding_a_chord_moves_it_and_can_be_undone(self):
+        def body(win):
+            win.bindings.replace(dict(sidemark.DEFAULT_BINDINGS))
+            win._bind_chord("ctrl+right", "lasso")
+            self.assertEqual(win.bindings.tool_for_chord("ctrl+right"), "lasso")
+            win._undo_binding("ctrl+right", None)   # was unbound before
+            self.assertIsNone(win.bindings.tool_for_chord("ctrl+right"))
+            # binding an owned chord reports the tool it displaced
+            win._bind_chord("right", "lasso")
+            self.assertEqual(win.bindings.tool_for_chord("right"), "lasso")
+            win._undo_binding("right", "eraser")
+            self.assertEqual(win.bindings.tool_for_chord("right"), "eraser")
+
+        self._run_in_window(body)
+
+    def test_the_badge_and_tooltip_come_from_the_table(self):
+        def body(win):
+            win.bindings.replace(dict(sidemark.DEFAULT_BINDINGS))
+            win._refresh_tool_bindings()
+            eraser = win._tool_btns[win._TOOL_ORDER["eraser"]]
+            self.assertTrue(eraser.has_css_class("bound-right"))
+            self.assertIn("right", eraser.get_tooltip_text())
+            # move it and both follow
+            win._bind_chord("middle", "eraser")
+            self.assertTrue(eraser.has_css_class("bound-middle"))
+            pan = win._tool_btns[win._TOOL_ORDER["pan"]]
+            self.assertFalse(pan.has_css_class("bound-middle"))
+            # a tool with nothing on it says so
+            win._clear_binding("right")
+            win._clear_binding("middle")
+            self.assertIn("not bound", eraser.get_tooltip_text())
+
+        self._run_in_window(body)
+
+    def test_reset_puts_every_button_back(self):
+        def body(win):
+            win._bind_chord("left", "lasso")
+            win._reset_bindings()
+            self.assertEqual(win.bindings.tool_for_chord("left"), "pen")
+
+        self._run_in_window(body)
 
 
 class TestToolModes(unittest.TestCase):
@@ -8119,11 +8274,11 @@ class TestHighlighter(unittest.TestCase):
                         raise AssertionError("pen segment did not disable highlighter")
                     if abs(win._width_scale.get_value() - pen_width) > 0.01:
                         raise AssertionError("scale did not return to pen width")
-                    # Ctrl+H helper flips the pair both ways
-                    win._toggle_highlighter()
+                    # Ctrl+H lends the left button the highlighter while held
+                    win._borrow_tool("highlighter", Gdk.KEY_h)
                     if not win.canvas.highlighter:
-                        raise AssertionError("Ctrl+H did not enable highlighter")
-                    win._toggle_highlighter()
+                        raise AssertionError("Ctrl+H did not borrow the highlighter")
+                    win._on_borrow_release(None, Gdk.KEY_h, 0, Gdk.ModifierType(0))
                     if win.canvas.highlighter:
                         raise AssertionError("Ctrl+H did not return to pen")
                 except Exception as e:
@@ -9516,11 +9671,12 @@ class TestTextFirstMode(unittest.TestCase):
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
+                win._set_tool_mode("text")
                 self.assertEqual(tp.tool, "text")
-                win._toggle_highlighter()            # Ctrl+H
+                win._borrow_tool("highlighter", Gdk.KEY_h)   # Ctrl+H held
                 self.assertEqual(tp.tool, "highlighter")
-                win._toggle_highlighter()            # Ctrl+H again → pen
-                self.assertEqual(tp.tool, "pen")
+                win._on_borrow_release(None, Gdk.KEY_h, 0, Gdk.ModifierType(0))
+                self.assertEqual(tp.tool, "text")            # given back
                 # lasso verbs: the window fallback targets the sheet in text mode
                 win._set_tool_mode("lasso")
                 tp._selected = [object()]             # pretend a selection

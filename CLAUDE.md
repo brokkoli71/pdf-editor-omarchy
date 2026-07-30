@@ -32,22 +32,45 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   reads `self.canvas`, `self._notes_view` etc. and transparently follows the
   active tab. When adding per-document state, add it to `DocumentSession.STATE`
   / `WIDGETS` (kept in sync with the `_session_prop` proxy list).
-- **Input chords**: module-level `chord_tool()` is THE modifier-chord grammar
-  (Ctrl=pan, Alt=ink↔text flip, Ctrl+Shift=highlighter, Ctrl+Shift+Alt=lasso,
-  Ctrl+Alt=anchor pdf-only, Shift=zoom pdf/ink-only; Shift+Alt unassigned).
-  **One exception, and it is not a fork**: with the *lasso tool* in hand Shift
-  ADDS to the selection instead of zooming. `chord_tool` answers "which TOOL
-  does this chord stand in for", and Shift+lasso is still the lasso — Shift
-  modifies it. Nothing is lost because `Alt+Shift+drag` stays the portable zoom
-  chord, which is exactly why the grammar says Shift-alone must never be
-  load-bearing. Both press routers special-case `tool != "lasso"`.
-  Buttons: left=tool, right=eraser, middle=navigation (Shift+middle=zoom
-  region — the portable zoom chord), thumb=middle's ergonomic stand-in
-  (hold=pan, Shift+hold=zoom region, scroll-while-held=zoom). Gesture
-  routing, the
-  transient tool-button highlight and tooltips must all derive from it —
-  never grow a second mapping. Chord routing merges window-tracked held
-  modifiers (`_chord_state`) so keyboard+touch works; see ideas.csv row 115.
+- **Button bindings — there is no "active tool" (row 132).** Every mouse
+  button, alone or under modifiers, HAS a tool, and pressing it uses that tool:
+  left draws, right erases, middle pans, at the same time. `Bindings` is THE
+  table (`DEFAULT_BINDINGS`; persisted in settings.json under
+  `button_bindings`), ONE instance per window shared by every canvas and sheet.
+  Defaults: left pen, right eraser, middle pan, **thumb unbound** (most mice
+  have none); chords Ctrl=pan, Ctrl+Shift=highlighter, Ctrl+Shift+Alt=lasso,
+  Ctrl+Alt=anchor (pdf-only), Shift and Alt+Shift=zoom. `chord_tool()` survives
+  as a thin resolver for callers that only want the left button's grammar.
+  - **The toolbar is the binding surface**: click a tool with the button you
+    want it on. Plain left-click is the exception — it stays "put this on the
+    left button", so picking a tool feels unchanged.
+  - **Routing, badges and tooltips all read the table** (`_refresh_tool_bindings`
+    generates both). A second mapping is how the bar comes to claim one thing
+    while the mouse does another. Each canvas has ONE press router
+    (`PDFCanvas._on_drag_begin` → `_begin_tool`, `TextPageView._on_press_begin`);
+    the sheet's router either claims the press for its tool or DENIES so the
+    caret keeps it.
+  - **`canvas.tool` is derived**: the tool of the button being pressed, else
+    what LEFT would do. Assigning to it binds left. `highlighter` /
+    `select_mode` are derived the same way — **never assign them alongside a
+    tool change**, or `select_mode = False` hands the caret's button back to
+    the pen.
+  - **Two exceptions, both AT the router, neither a fork of the table**: with
+    the lasso on the plain button Shift ADDS to the selection (Shift+lasso is
+    still the lasso), and a live selection is grabbable with any tool (row 125)
+    — which on the sheet must be claimed on the capture gesture or a pasted
+    image is unmovable.
+  - **The thumb is a real button**: button 10 never reaches a `GestureDrag`, so
+    its press is replayed through the same router with a `_SyntheticDrag`.
+    That is what lets it hold any tool instead of a hardwired pan.
+  - **Keyboard tool shortcuts are hold-to-borrow**: Ctrl+H lends left the
+    highlighter while held (`_borrow_tool` / `_on_borrow_release`), Ctrl+M the
+    caret. Releasing either key gives the button back.
+  - `TOOL_MODES` drives the bar order, the `_MODE_CHROME` tool rows and the
+    resolver, so a tool cannot be in the bar and missing from the grammar.
+    `"select"` is an alias of `"text"` — one I-beam button serves both modes.
+  - Chord routing merges window-tracked held modifiers (`_chord_state`) so
+    keyboard+touch works; see ideas.csv rows 115 and 132.
 - **Modes**: a tab is either a PDF or a text-first page, tracked by
   `doc_mode` (`"pdf"` | `"text"`) on the session
   (`_enter_text_mode`/`_leave_text_mode`; `_text_mode` survives as a

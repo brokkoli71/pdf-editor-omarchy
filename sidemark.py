@@ -962,6 +962,25 @@ DEFAULT_BINDINGS = {
 }
 
 
+INPUT_DEBUG = bool(os.environ.get("SIDEMARK_INPUT_DEBUG"))
+
+
+def log_press(surface, chord, tool, note=""):
+    """One line per press: which chord, which tool it resolved to, where.
+
+    Input bugs are invisible from the outside — "sometimes it draws, sometimes
+    it doesn't" is the same sentence whether the chord resolved wrong, the
+    gesture never fired, or the tool ran and did nothing. This says which.
+    Always in the session log; with SIDEMARK_INPUT_DEBUG=1 also on stderr, so
+    you can watch it in the terminal you launched from while you click."""
+    msg = f"[input] {surface:4} {chord:24} -> {tool or 'nothing'}"
+    if note:
+        msg += f"  ({note})"
+    logger.info(msg)
+    if INPUT_DEBUG:
+        print(msg, file=sys.stderr, flush=True)
+
+
 def chord_id(button, ctrl=False, shift=False, alt=False):
     """The canonical id of a button+modifier chord, e.g. `ctrl+shift+left`."""
     name = BUTTON_NAMES.get(button, str(button))
@@ -1020,6 +1039,11 @@ class Bindings:
         tool = canonical_tool(tool)
         return tool if tool_in_mode(tool, mode) else None
 
+    def tool_for_chord(self, chord):
+        """The tool bound to a chord id, ignoring document mode."""
+        tool = self._table.get(chord)
+        return canonical_tool(tool) if tool else None
+
     def chords_for(self, tool, mode=None):
         """Every chord bound to a tool, in a stable order (plain buttons before
         modified ones) — this is what the tooltips and the badges are built
@@ -1057,6 +1081,10 @@ class Bindings:
 
     def reset(self):
         self._table = dict(DEFAULT_BINDINGS)
+
+    def replace(self, table):
+        """Swap the whole table (undoing a reset)."""
+        self._table = dict(table)
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -3028,6 +3056,8 @@ class PDFCanvas(Gtk.DrawingArea):
         additive = False
         if shift and not ctrl and not alt and plain == "lasso":
             tool, additive = "lasso", True
+        log_press("pdf", chord_id(btn, ctrl, shift, alt), tool,
+                  "" if tool else "unbound")
         if tool is None:
             self._ignoring = True
             return
@@ -3550,11 +3580,21 @@ class PDFCanvas(Gtk.DrawingArea):
         self.queue_draw()
 
     def _on_drag_end(self, gesture, offset_x, offset_y):
+        """The press is over — but `_press_tool` must outlive the whole
+        handler: the stroke is COMMITTED in here, and `_pen_attrs` asks
+        `self.tool` for its colour and width. Clearing it up front is why a
+        highlighter stroke drawn with any button but left committed as pen ink.
+        The body has many early returns, so the reset lives in a finally."""
+        try:
+            self._drag_end(gesture, offset_x, offset_y)
+        finally:
+            self._press_tool = None   # `tool` means the left button again
+
+    def _drag_end(self, gesture, offset_x, offset_y):
         logger.debug(f"drag end offset=({offset_x:.0f},{offset_y:.0f})")
         # a button gesture's transient toolbar highlight ends with the press
         # (no-op for plain tool drags — the window falls back to held chords)
         self._fire_gesture_tool(None)
-        self._press_tool = None      # `tool` goes back to meaning the left button
         self._cancel_straight_timer()
         self._cancel_circle_lasso()   # a lift ends the hold (row 126)
         was_straight = self._straight_mode
@@ -8339,6 +8379,7 @@ class TextPageView(Gtk.Overlay):
         # button — which is what the cursor and the ink handlers want to know
         self.bindings = Bindings()
         self._press_tool = None
+        self._borrowed_tool = None    # hold-to-borrow keyboard shortcut
         self._ink_additive = False
         self.zoom = 1.0           # sheet zoom: paper, text and ink together
         # per-document sheet width (the wrap column), persisted in the ink
@@ -8623,7 +8664,7 @@ class TextPageView(Gtk.Overlay):
         """The tool of the press in flight, else the LEFT button's — which is
         what the cursor should promise and what the ink handlers mean when they
         ask. Anything the sheet has no implementation for reads as "text"."""
-        tool = self._press_tool
+        tool = self._press_tool or self._borrowed_tool
         if tool is None:
             tool = self.bindings.tool_for(BTN_LEFT, mode="text")
         return tool if tool in ("pen", "highlighter", "eraser", "lasso",
@@ -9263,6 +9304,9 @@ class TextPageView(Gtk.Overlay):
         if grab and tool != "lasso":
             tool, additive = "lasso", False
 
+        log_press("text", chord_id(btn, ctrl, shift, alt), tool,
+                  "grab" if grab else ("caret" if tool == "text" else
+                                       ("unbound" if tool is None else "")))
         if tool is None or tool == "text":
             # The press belongs to the caret (click, text selection, the
             # context menu). It also ends any live selection, exactly as a
@@ -9311,6 +9355,14 @@ class TextPageView(Gtk.Overlay):
             self._on_ink_update(gesture, dx, dy)
 
     def _on_press_end(self, gesture, dx, dy):
+        """Same rule as PDFCanvas._on_drag_end: `_press_tool` has to survive
+        the commit, because pen_style asks `self.tool` for the ink."""
+        try:
+            self._press_end(gesture, dx, dy)
+        finally:
+            self._press_tool = None
+
+    def _press_end(self, gesture, dx, dy):
         if self._rerase_press is not None:
             x, y = self._rerase_press
             self._rerase_press = None
@@ -9318,7 +9370,6 @@ class TextPageView(Gtk.Overlay):
                 self._rerase_started = False
                 self._fire_gesture_tool(None)
                 self._on_ink_end(gesture, dx, dy)
-                self._press_tool = None
                 return
             self._reopen_context_menu(x, y)
             return
@@ -9327,7 +9378,6 @@ class TextPageView(Gtk.Overlay):
         elif self._press_tool is not None:
             self._on_ink_end(gesture, dx, dy)
         self._fire_gesture_tool(None)
-        self._press_tool = None
 
     def _reopen_context_menu(self, x, y):
         """A clean right-CLICK: our up-front claim swallowed the press the
@@ -11081,6 +11131,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._closed_tabs = []   # reopen stack for Ctrl+Shift+T (file paths)
         self._share_revision = 0  # bumps on every change; drives live phone share
         self._notes_link_updating = False   # guards the row-129 checkbox
+        # THE button table (row 132), shared by every canvas and sheet in this
+        # window and persisted in settings.json
+        self.bindings = Bindings.load()
+        self._bindings_list = None   # built with the pen popover
+        self._tool_btns = None       # built with the header
+        self._borrow_key = None      # the key a hold-to-borrow is waiting on
         self._path = None
         self._notes_path = None   # set when a .md file is opened without an associated PDF
         self._active_notes_path = None  # the .md a loaded PDF saves notes to (default sidecar, or a user-chosen file remembered per-PDF)
@@ -11137,6 +11193,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # build the first document's canvas / notes / sidebar / search subtree
         # into the active session (additional tabs reuse the same builder)
         self._build_document_widgets(self._active_session)
+        # paint the tool buttons from the table once everything exists
+        self._refresh_tool_bindings()
 
         GLib.timeout_add_seconds(60, self._autosave_tick)
         self._transient_tool = None    # window-level: highlights a shared tool button
@@ -11197,6 +11255,32 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             }}
             .drop-before {{ box-shadow: inset 0 3px 0 0 {acc_hex}; }}
             .drop-after  {{ box-shadow: inset 0 -3px 0 0 {acc_hex}; }}
+            /* row 132: a tool wears the colour of each UNMODIFIED button it
+               owns — a dot bottom-right plus that edge tinted. Modified chords
+               deliberately get none, or every button wears a constellation;
+               they live in the generated tooltip instead. The inset shadows
+               are stacked so a tool on two buttons shows both. */
+            /* box-shadow, NOT border: a border on a .linked toolbar button is
+               overridden by libadwaita's own linked-button rules, and the
+               badges silently never appeared. inset shadows are what
+               .current-page / .drop-before already use here, and they stack,
+               so a tool on two buttons shows both stripes. */
+            .bound-left   {{ box-shadow: inset 0 -3px 0 0 {acc_hex}; }}
+            .bound-right  {{ box-shadow: inset 0 -3px 0 0 #d4562b; }}
+            .bound-middle {{ box-shadow: inset 0 -3px 0 0 #3a9a5c; }}
+            .bound-thumb  {{ box-shadow: inset 0 -3px 0 0 #c99a1e; }}
+            .bound-left.bound-right {{
+                box-shadow: inset 3px -3px 0 0 #d4562b,
+                            inset -3px -3px 0 0 {acc_hex};
+            }}
+            .bound-left.bound-middle {{
+                box-shadow: inset 3px -3px 0 0 #3a9a5c,
+                            inset -3px -3px 0 0 {acc_hex};
+            }}
+            .bound-right.bound-middle {{
+                box-shadow: inset 3px -3px 0 0 #3a9a5c,
+                            inset -3px -3px 0 0 #d4562b;
+            }}
         """
         # (the presentation bar styles live in their own per-window provider —
         # _scale_present_bar — because they scale with the window size)
@@ -11592,6 +11676,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                            self._mode_zoom, self._mode_anchor)
         for b, m in zip(self._tool_btns, self._TOOL_BAR_ORDER):
             b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
+            self._attach_binding_click(b, m)
             tools_box.append(b)
 
         # ── pen settings popover: width / colour / smoothing (mode is on bar) ──
@@ -11651,6 +11736,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                             self._pmode_zoom, self._pmode_anchor)
         for b, m in zip(self._ptool_btns, self._TOOL_BAR_ORDER):
             b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
+            self._attach_binding_click(b, m)
             pmode_box.append(b)
         self._pen_modes_section.append(pmode_box)
         self._pen_modes_section.set_visible(False)
@@ -11742,6 +11828,35 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "What holding still mid-stroke snaps to")
         self._shape_snap_dd.connect("notify::selected", self._on_shape_snap_changed)
         popover_box.append(self._shape_snap_dd)
+
+        # ── buttons (row 132) ────────────────────────────────────────────────
+        # The list is the discovery surface — chord-clicking a tool is fast but
+        # unguessable — and the only way to CLEAR a binding: a chord-click can
+        # move one, never remove it. It is also the way back from binding
+        # panning away from yourself.
+        popover_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        btn_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_label = Gtk.Label(label="Buttons", xalign=0)
+        btn_label.add_css_class("dim-label")
+        btn_label.set_hexpand(True)
+        btn_header.append(btn_label)
+        reset_btn = Gtk.Button(label="Reset")
+        reset_btn.add_css_class("flat")
+        reset_btn.set_tooltip_text("Put every mouse button back to its default tool")
+        reset_btn.connect("clicked", lambda *_: self._reset_bindings())
+        btn_header.append(reset_btn)
+        popover_box.append(btn_header)
+        hint = Gtk.Label(
+            label="Click a tool with a mouse button (and modifiers) to bind it.",
+            xalign=0)
+        hint.add_css_class("dim-label")
+        hint.add_css_class("caption")
+        hint.set_wrap(True)
+        hint.set_max_width_chars(34)
+        popover_box.append(hint)
+        self._bindings_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                                      spacing=2)
+        popover_box.append(self._bindings_list)
 
         popover = Gtk.Popover()
         popover.set_child(popover_box)
@@ -11926,6 +12041,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                          lambda c, kv, kc, st: self.canvas._on_modifier_key(c, kv, kc, st, True))
         mod_ctrl.connect("key-released",
                          lambda c, kv, kc, st: self.canvas._on_modifier_key(c, kv, kc, st, False))
+        # the same controller ends a hold-to-borrow (row 132): letting go of
+        # the letter OR the Ctrl gives the button back to its own tool
+        mod_ctrl.connect("key-released", self._on_borrow_release)
         self.add_controller(mod_ctrl)
 
         # A modifier released while another window has focus never sends us
@@ -11967,6 +12085,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         Writes per-document widgets onto `s`, never onto self. Called once/tab."""
         s.win = self
         s.canvas = PDFCanvas()
+        # ONE table for the whole window: rebinding in any tab is instantly
+        # true in every other, and on the text pages too (row 132)
+        s.canvas.bindings = self.bindings
         s.canvas.surround_color = self._theme_surround
         s.canvas.zoom_accent = self._theme_acc
         s.canvas.set_vexpand(True)
@@ -12169,6 +12290,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if s._text_page is not None:
             return s._text_page
         tp = TextPageView(font_px=self._notes_font_px)
+        tp.bindings = self.bindings      # the window's one table (row 132)
         # ink strokes use the same shared pen/highlighter settings as the canvas
         tp.pen_style = lambda hl, s=s: (
             (s.canvas.hl_color, s.canvas.hl_width, s.canvas.hl_opacity) if hl
@@ -12232,11 +12354,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._update_header_for_mode()
 
     def _update_header_for_mode(self):
-        """Hide the PDF-only chrome while a text-first page is shown. Pen,
-        highlighter and eraser stay; the PDF select tool swaps for the caret
-        tool (leftmost, so 'just type' reads as the default)."""
+        """Hide the PDF-only chrome while a text-first page is shown. Every
+        tool the mode has stays, including the one caret button both modes
+        share; the tool tooltips are regenerated because which chords are
+        live depends on the mode (anchor has none on a text page)."""
         mode = (self._active_session.doc_mode if self._active_session
                 else "pdf")
+        self._refresh_tool_bindings()
         for name, modes in self._MODE_CHROME.items():
             vis = mode in modes
             getattr(self, name).set_visible(vis)
@@ -14440,6 +14564,170 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     _TOOL_BAR_ORDER = TOOL_BAR_ORDER
     _TOOL_ORDER = TOOL_INDEX
 
+    # ── the toolbar as a binding surface (row 132) ───────────────────────────
+
+    def _attach_binding_click(self, button, tool):
+        """Click a tool with the mouse button you want it on, and it goes
+        there. Plain unmodified LEFT is the exception: it stays the ordinary
+        "put this on the left button" toggle, so nothing about picking a tool
+        changed. Everything else — any other button, or left under modifiers —
+        binds that chord and is swallowed, so the toggle never fires.
+
+        Capture phase, `set_button(0)`: the ToggleButton's own click gesture
+        would otherwise claim the press first. The thumb needs the legacy
+        controller for the usual reason (a GestureClick never sees button 10).
+        """
+        click = Gtk.GestureClick()
+        click.set_button(0)
+        click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+        def _pressed(gesture, _n, _x, _y):
+            btn = gesture.get_current_button()
+            state = gesture.get_current_event_state()
+            ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+            shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+            alt = bool(state & Gdk.ModifierType.ALT_MASK)
+            if btn == BTN_LEFT and not (ctrl or shift or alt):
+                return          # the plain pick: let the toggle have it
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            self._bind_chord(chord_id(btn, ctrl, shift, alt), tool)
+
+        click.connect("pressed", _pressed)
+        button.add_controller(click)
+
+        legacy = Gtk.EventControllerLegacy()
+
+        def _legacy(ctrl_, event):
+            if event is None:
+                event = ctrl_.get_current_event()
+            if event is None or event.get_event_type() != Gdk.EventType.BUTTON_PRESS:
+                return False
+            if event.get_button() != BTN_THUMB:
+                return False
+            state = event.get_modifier_state()
+            self._bind_chord(
+                chord_id(BTN_THUMB,
+                         bool(state & Gdk.ModifierType.CONTROL_MASK),
+                         bool(state & Gdk.ModifierType.SHIFT_MASK),
+                         bool(state & Gdk.ModifierType.ALT_MASK)), tool)
+            return True
+
+        legacy.connect("event", _legacy)
+        button.add_controller(legacy)
+
+    def _bind_chord(self, chord, tool):
+        """Move `chord` onto `tool` and say so. A chord maps to exactly one
+        tool, so binding always takes it from somewhere — the toast names what
+        it displaced and offers the way back, because a mis-click here quietly
+        changes what your mouse does."""
+        tool = canonical_tool(tool)
+        if self.bindings.tool_for_chord(chord) == tool:
+            return
+        previous = self.bindings.bind(chord, tool)
+        log_press("bind", chord, tool, f"was {previous}" if previous else "was free")
+        self.bindings.save()
+        self._refresh_tool_bindings()
+        label = chord_label(chord)
+        msg = (f"{label} → {TOOL_LABELS[tool]}"
+               + (f" (was {TOOL_LABELS[previous]})" if previous else ""))
+        toast = Adw.Toast.new(msg)
+        toast.set_button_label("Undo")
+        toast.connect("button-clicked",
+                      lambda *_: self._undo_binding(chord, previous))
+        toast.set_timeout(5)
+        self.toast_overlay.add_toast(toast)
+
+    def _undo_binding(self, chord, previous):
+        if previous is None:
+            self.bindings.clear(chord)
+        else:
+            self.bindings.bind(chord, previous)
+        self.bindings.save()
+        self._refresh_tool_bindings()
+
+    def _refresh_tool_bindings(self):
+        """Repaint every tool button from the table: the badge for each plain
+        button it owns, and a tooltip listing all of its chords. Generated, so
+        the bar cannot claim one thing while the mouse does another."""
+        if getattr(self, "_tool_btns", None) is None:
+            return          # called while the header is still being built
+        mode = (self._active_session.doc_mode if self._active_session else "pdf")
+        for tool in TOOL_BAR_ORDER:
+            plain = self.bindings.plain_buttons_for(tool)
+            chords = self.bindings.chords_for(tool, mode=mode)
+            tip = TOOL_LABELS[tool]
+            if chords:
+                tip += " — " + " · ".join(chord_label(c) for c in chords)
+            else:
+                tip += " — not bound"
+            for grp in (self._tool_btns, self._ptool_btns):
+                b = grp[self._TOOL_ORDER[tool]]
+                b.set_tooltip_text(tip)
+                for name in BUTTON_NAMES.values():
+                    b.remove_css_class(f"bound-{name}")
+                for chord in plain:
+                    b.add_css_class(f"bound-{chord}")
+        if self._bindings_list is not None:
+            self._populate_bindings_list()
+
+    def _populate_bindings_list(self):
+        """Rebuild the popover's binding rows from the table."""
+        child = self._bindings_list.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self._bindings_list.remove(child)
+            child = nxt
+        mode = (self._active_session.doc_mode if self._active_session else "pdf")
+        for chord, tool in self.bindings.items():
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            text = f"{chord_label(chord)} → {TOOL_LABELS.get(tool, tool)}"
+            lbl = Gtk.Label(label=text, xalign=0)
+            lbl.set_hexpand(True)
+            lbl.add_css_class("caption")
+            if not tool_in_mode(tool, mode):
+                # the tool exists, this page just hasn't got it (anchor on a
+                # text page) — shown, not hidden, so the table reads the same
+                # everywhere and the chord isn't a mystery when you switch
+                lbl.add_css_class("dim-label")
+                lbl.set_tooltip_text(f"Not available on a {mode} page")
+            row.append(lbl)
+            clear = Gtk.Button()
+            clear.set_icon_name("window-close-symbolic")
+            clear.add_css_class("flat")
+            clear.set_tooltip_text(f"Unbind {chord_label(chord)}")
+            clear.connect("clicked",
+                          lambda _b, c=chord: self._clear_binding(c))
+            row.append(clear)
+            self._bindings_list.append(row)
+
+    def _clear_binding(self, chord):
+        previous = self.bindings.clear(chord)
+        self.bindings.save()
+        self._refresh_tool_bindings()
+        if previous:
+            toast = Adw.Toast.new(f"{chord_label(chord)} unbound")
+            toast.set_button_label("Undo")
+            toast.connect("button-clicked",
+                          lambda *_: self._undo_binding(chord, previous))
+            toast.set_timeout(5)
+            self.toast_overlay.add_toast(toast)
+
+    def _reset_bindings(self):
+        before = self.bindings.to_json()
+        self.bindings.reset()
+        self.bindings.save()
+        self._refresh_tool_bindings()
+        toast = Adw.Toast.new("Buttons reset to defaults")
+        toast.set_button_label("Undo")
+        toast.connect("button-clicked", lambda *_: self._restore_bindings(before))
+        toast.set_timeout(5)
+        self.toast_overlay.add_toast(toast)
+
+    def _restore_bindings(self, table):
+        self.bindings.replace(table)
+        self.bindings.save()
+        self._refresh_tool_bindings()
+
     def _attach_select_style_menu(self, button):
         """Long-press a select-tool button to pick reading-order vs rectangular."""
         pop = Gtk.Popover()
@@ -14685,12 +14973,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             level = cur
         self._apply_collapse_level(level)
 
-    def _toggle_select_mode(self):
-        """Ctrl+M: put the caret on the left button, or hand it back to the pen."""
-        if self._mode_text.get_active():
-            self._mode_pen.set_active(True)
-        else:
-            self._mode_text.set_active(True)
+
 
     # ── presentation control bar (timer + large prev/next) ───────────────────
     def _build_present_bar(self):
@@ -15091,12 +15374,38 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if self._text_page is not None and self._text_page.has_lasso_selection():
             self._text_page.recolor_selected(color, width, opacity)
 
-    def _toggle_highlighter(self):
-        """Ctrl+H: flip highlighter on/off, falling back to pen."""
-        if self._mode_hl.get_active():
-            self._mode_pen.set_active(True)
-        else:
-            self._mode_hl.set_active(True)
+    # ── hold-to-borrow (row 132) ─────────────────────────────────────────────
+    # With no active tool to toggle, a tool shortcut LENDS the left button its
+    # tool for as long as you hold the keys — the keyboard twin of a modifier
+    # chord, and it cannot strand you in a mode you forgot you were in.
+
+    def _borrow_tool(self, tool, keyval):
+        tool = canonical_tool(tool)
+        if not tool_in_mode(tool, self._active_session.doc_mode
+                            if self._active_session else "pdf"):
+            return
+        self._borrow_key = keyval
+        for surface in (self.canvas, self._text_page):
+            if surface is not None:
+                surface._borrowed_tool = tool
+        self._apply_transient_highlight(tool)
+        if self.canvas is not None:
+            self.canvas.set_cursor(self.canvas._default_cursor())
+
+    def _on_borrow_release(self, _ctrl, keyval, _keycode, _state):
+        if self._borrow_key is None:
+            return False
+        if keyval not in (self._borrow_key, Gdk.KEY_Control_L,
+                          Gdk.KEY_Control_R):
+            return False
+        self._borrow_key = None
+        for surface in (self.canvas, self._text_page):
+            if surface is not None:
+                surface._borrowed_tool = None
+        self._apply_transient_highlight(self._chord_highlight_tool())
+        if self.canvas is not None:
+            self.canvas.set_cursor(self.canvas._default_cursor())
+        return False
 
     def _sync_pen_popover(self):
         """Point the width scale and color button at the active tool."""
@@ -16328,10 +16637,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 self._show_search()
                 return True
             if keyval == Gdk.KEY_h:
-                self._toggle_highlighter()
+                self._borrow_tool("highlighter", keyval)
                 return True
             if keyval == Gdk.KEY_m:
-                self._toggle_select_mode()
+                self._borrow_tool("text", keyval)
                 return True
             if keyval == Gdk.KEY_e:
                 self._on_export()
