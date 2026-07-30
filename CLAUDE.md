@@ -9,7 +9,7 @@
 
 ## What this is
 
-Sidemark is a **single-file GTK4/libadwaita Python app** (`sidemark.py`, ~12.6k
+Sidemark is a **single-file GTK4/libadwaita Python app** (`sidemark.py`, ~16.7k
 lines): a PDF annotator with a live Markdown notes panel, built for lecture
 notes and presenting. One window, two document modes (PDF + text — see below).
 There is no other source module on this branch. Dependencies:
