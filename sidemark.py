@@ -468,6 +468,60 @@ def welded_vertices(shapes, x, y, eps=VERTEX_WELD_EPS):
     return out
 
 
+def nearest_vertex_point(shapes, x, y, hit, held=()):
+    """Nearest control point among `shapes` to (x, y), within `hit`."""
+    best, at = hit, None
+    for st, verts in shapes:
+        for i, (vx, vy) in enumerate(verts):
+            if (id(st), i) in held:
+                continue
+            d = math.hypot(vx - x, vy - y)
+            if d <= best:
+                best, at = d, (vx, vy)
+    return at
+
+
+def nearest_edge_point(shapes, x, y, hit, held=()):
+    """Nearest point ON an edge of `shapes`, within `hit` — the projection of
+    (x, y) onto the closest segment.
+
+    Segments touching a held vertex are skipped: the point in your hand always
+    lies on its own two edges, so without this it would snap to itself and
+    never move. This is a POSITIONAL snap only — the point lands there and is
+    then an ordinary vertex. Nothing binds it to the edge, and if that edge
+    later moves the point stays put; a real binding needs stored constraints
+    and stable stroke ids (row 129)."""
+    best, at = hit, None
+    for st, verts in shapes:
+        closed = len(verts) > 2
+        n = len(verts)
+        for i in range(n if closed else n - 1):
+            j = (i + 1) % n
+            if (id(st), i) in held or (id(st), j) in held:
+                continue
+            ax, ay = verts[i]
+            bx, by = verts[j]
+            vx, vy = bx - ax, by - ay
+            span = vx * vx + vy * vy
+            if span < 1e-12:
+                continue
+            t = max(0.0, min(1.0, ((x - ax) * vx + (y - ay) * vy) / span))
+            px, py = ax + t * vx, ay + t * vy
+            d = math.hypot(px - x, py - y)
+            if d <= best:
+                best, at = d, (px, py)
+    return at
+
+
+def snap_point(shapes, x, y, hit, held=()):
+    """Where a dragged point should sit: a control point if one is in reach,
+    otherwise a point on an edge. A vertex is the stronger target and has to
+    win — landing NEXT TO a corner you were aiming at is the whole failure
+    this ordering prevents."""
+    return (nearest_vertex_point(shapes, x, y, hit, held)
+            or nearest_edge_point(shapes, x, y, hit, held))
+
+
 def draw_vertex_snap_ring(ctx, pt, accent):
     """Halo round the control point a dragged one is currently snapped onto —
     the visual half of "snapped, but not committed until you let go"."""
@@ -1251,6 +1305,10 @@ class PDFCanvas(Gtk.DrawingArea):
         # LIST, because welded points move as the one point they now are
         self._vertex_drag = []
         self._vertex_snap_at = None      # screen point it is snapped onto
+        # snap targets while the pen still holds a freshly recognised shape's
+        # last point: frozen at dwell time so the set cannot change mid-drag
+        self._live_snap_shapes = []
+        self._live_snap_at = None
         self._selected_strokes = []    # references into self.strokes, selected
         self._lasso_moving = False
         self._lasso_move_start = None
@@ -3254,6 +3312,10 @@ class PDFCanvas(Gtk.DrawingArea):
                     # polygon can be adjusted without lifting, exactly as the
                     # straight line always could. A closed ring moves both ends
                     # (index 0 is the shared point), or it tears open.
+                    self._live_snap_at = self._live_snap_target(
+                        sx + offset_x, sy + offset_y)
+                    if self._live_snap_at:
+                        pt = self._screen_to_pdf(*self._live_snap_at)
                     idx = (0 if self._snap_kind == "polygon"
                            else len(self.current_stroke) - 1)
                     self.current_stroke = move_shape_vertex(
@@ -3469,6 +3531,8 @@ class PDFCanvas(Gtk.DrawingArea):
                     self.on_user_action()
             self.current_stroke = []
             self._snap_kind = self._snap_label = None
+            self._live_snap_shapes = []
+            self._live_snap_at = None
             if self.on_live_draw:
                 self.on_live_draw()   # drop the live stroke from the mirror
         self._temp_highlighter = False
@@ -3527,6 +3591,12 @@ class PDFCanvas(Gtk.DrawingArea):
         self._straight_mode = True
         self._snap_kind = kind
         self._snap_label = SNAP_LABELS[kind]
+        # the pen keeps hold of the last control point from here (see
+        # _on_drag_update), so the page's control points become live magnets
+        self._live_snap_shapes = (self._page_shapes_screen()
+                                  if kind in ("line", "path", "polygon")
+                                  else [])
+        self._live_snap_at = None
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         self._snap_at = (max(xs), min(ys))
@@ -4217,20 +4287,38 @@ class PDFCanvas(Gtk.DrawingArea):
                 at = (st, i)
         return at
 
+    def _snap_reach(self):
+        return vertex_snap_radius(self.get_width(), self.get_height())
+
     def _vertex_snap_target(self, sx, sy):
-        """Screen point of the nearest control point NOT in hand, within the
-        snap reach — or None. Only the selection's own points: snapping to
-        something you cannot see would be a magnet in the dark."""
+        """Where the dragged control point should sit — another control point
+        if one is in reach, else a point on an edge. Only the selection's own
+        shapes: snapping to something you cannot see is a magnet in the dark."""
         held = {(id(st), i) for st, i, _o in self._vertex_drag}
-        best, at = vertex_snap_radius(self.get_width(), self.get_height()), None
-        for st, verts in self._selected_shapes():
-            for i, (vx, vy) in enumerate(verts):
-                if (id(st), i) in held:
-                    continue
-                d = math.hypot(vx - sx, vy - sy)
-                if d <= best:
-                    best, at = d, (vx, vy)
-        return at
+        return snap_point(self._selected_shapes(), sx, sy, self._snap_reach(),
+                          held)
+
+    def _page_shapes_screen(self):
+        """[(stroke, screen vertices)] for EVERY corner polyline on the page —
+        the snap targets offered while DRAWING, where there is no selection to
+        take them from."""
+        out = []
+        for st in self.strokes:
+            verts = shape_vertices(st["pts"])
+            if verts:
+                out.append((st, [self._pdf_to_screen(x, y) for x, y in verts]))
+        return out
+
+    def _live_snap_target(self, sx, sy):
+        """The snap for the control point the pen still holds after a dwell.
+
+        Targets come from the whole PAGE, not a selection: the shape being
+        drawn is not committed yet, so there is nothing selected to aim at.
+        This is what lets a freshly recognised path join up with what is
+        already on the page without lifting the pen."""
+        if not self._live_snap_shapes:
+            return None
+        return snap_point(self._live_snap_shapes, sx, sy, self._snap_reach())
 
     def _lasso_chip_at(self, sx, sy):
         """Is the screen point on the loop⇄box chip? Only a selection that HAS
@@ -4403,6 +4491,19 @@ class PDFCanvas(Gtk.DrawingArea):
                 if self._selection_loop:
                     cx, cy = lasso_chip_centre(x0, y0, pad)
                     draw_lasso_chip(ctx, cx, cy, boxed, self.zoom_accent)
+        # live snap magnets: the page's control points near the pen while it
+        # still holds a freshly recognised shape's last point. Only the ones
+        # WITHIN REACH are drawn — every control point on the page at once is
+        # noise, and what you need to see is what you can actually hit.
+        if self._live_snap_shapes and self._straight_mode:
+            near = self._snap_reach() * 3.0
+            mx, my = self._mouse_x, self._mouse_y
+            shown = [(vx, vy) for _st, verts in self._live_snap_shapes
+                     for vx, vy in verts
+                     if math.hypot(vx - mx, vy - my) <= near]
+            draw_shape_vertices(ctx, shown, self.zoom_accent)
+            if self._live_snap_at:
+                draw_vertex_snap_ring(ctx, self._live_snap_at, self.zoom_accent)
         # the loop being drawn
         if self._lassoing and len(self._lasso_path) >= 2:
             ctx.set_source_rgba(ar, ag, ab, 0.9)
@@ -7846,6 +7947,8 @@ class TextPageView(Gtk.Overlay):
         self._selection_auto = False
         self._vertex_drag = []          # [(stroke, index, stored pts)] in hand
         self._vertex_snap_at = None     # overlay point it is snapped onto
+        self._live_snap_shapes = []     # magnets while a live shape is held
+        self._live_snap_at = None
         self._lasso_moving = False
         self._lasso_moved = False
         self._lasso_drag = (0.0, 0.0)  # live move offset while dragging
@@ -9030,10 +9133,12 @@ class TextPageView(Gtk.Overlay):
                     # the pen keeps hold of the LAST control point (PDF-canvas
                     # parity — see PDFCanvas._on_drag_update for why index 0 is
                     # the one a closed ring moves)
+                    self._live_snap_at = self._live_snap_target(x, y)
+                    tx, ty = self._live_snap_at or (x, y)
                     idx = (0 if self._snap_kind == "polygon"
                            else len(self.current_stroke) - 1)
                     self.current_stroke = move_shape_vertex(
-                        self.current_stroke, idx, x, y)
+                        self.current_stroke, idx, tx, ty)
                 # a recognised rectangle/ellipse/divider is frozen until release
             else:
                 self.current_stroke.append((x, y))
@@ -9135,6 +9240,8 @@ class TextPageView(Gtk.Overlay):
                     self._selection_auto = True
             self.current_stroke = []
             self._snap_kind = self._snap_label = None
+            self._live_snap_shapes = []
+            self._live_snap_at = None
         elif self._erased_now:
             self._undo_ops.append(("erase", self._erased_now))
             self._redo_ops.clear()
@@ -9179,6 +9286,10 @@ class TextPageView(Gtk.Overlay):
         self._straight_mode = True
         self._snap_kind = kind
         self._snap_label = SNAP_LABELS[kind]
+        self._live_snap_shapes = (self._page_shapes_overlay()
+                                  if kind in ("line", "path", "polygon")
+                                  else [])
+        self._live_snap_at = None
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         self._snap_at = (max(xs), min(ys))
@@ -9610,18 +9721,30 @@ class TextPageView(Gtk.Overlay):
                 at = (st, i)
         return at
 
+    def _snap_reach(self):
+        return vertex_snap_radius(self.ink.get_width(), self.ink.get_height())
+
     def _vertex_snap_target(self, x, y):
+        """PDFCanvas._vertex_snap_target's twin — a control point if one is in
+        reach, else a point on an edge."""
         held = {(id(st), i) for st, i, _o in self._vertex_drag}
-        best, at = vertex_snap_radius(self.ink.get_width(),
-                                      self.ink.get_height()), None
-        for st, verts in self._selected_shapes():
-            for i, (vx, vy) in enumerate(verts):
-                if (id(st), i) in held:
-                    continue
-                d = math.hypot(vx - x, vy - y)
-                if d <= best:
-                    best, at = d, (vx, vy)
-        return at
+        return snap_point(self._selected_shapes(), x, y, self._snap_reach(),
+                          held)
+
+    def _page_shapes_overlay(self):
+        out = []
+        for st in self.strokes:
+            verts = shape_vertices(self._stroke_overlay_pts(st))
+            if verts:
+                out.append((st, verts))
+        return out
+
+    def _live_snap_target(self, x, y):
+        """Snap for the control point the pen still holds after a dwell — see
+        PDFCanvas._live_snap_target for why the targets are the whole page."""
+        if not self._live_snap_shapes:
+            return None
+        return snap_point(self._live_snap_shapes, x, y, self._snap_reach())
 
     def _overlay_to_stroke_pts(self, st, overlay_pts):
         """The exact inverse of _stroke_overlay_pts: overlay points back into
@@ -10368,6 +10491,16 @@ class TextPageView(Gtk.Overlay):
             if self._selection_loop is not None:
                 cx, cy = lasso_chip_centre(x0, y0, pad)
                 draw_lasso_chip(ctx, cx, cy, boxed, self.accent())
+        if self._live_snap_shapes and self._straight_mode:
+            # only the magnets within reach — see PDFCanvas._draw_lasso
+            near = self._snap_reach() * 3.0
+            mx, my = self.current_stroke[-1] if self.current_stroke else (0, 0)
+            shown = [(vx, vy) for _st, verts in self._live_snap_shapes
+                     for vx, vy in verts
+                     if math.hypot(vx - mx, vy - my) <= near]
+            draw_shape_vertices(ctx, shown, self.accent())
+            if self._live_snap_at:
+                draw_vertex_snap_ring(ctx, self._live_snap_at, self.accent())
         if self._lassoing and len(self._lasso_path) >= 2:
             ctx.set_source_rgba(ar, ag, ab, 0.9)
             ctx.set_line_width(1.5)

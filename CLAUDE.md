@@ -337,11 +337,16 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     before release lets go. Release leaves them sharing a coordinate, and
     `welded_vertices()` re-derives the join at every grab so they drag as one.
     **Nothing is stored** — that is what makes a weld survive a reload, a
-    sidecar round-trip and undo. Binding a vertex to a point ON an edge cannot
-    work this way and needs stable per-stroke ids; read row 129 before trying.
-    After the dwell fires, the pen keeps hold of the last control point of a
-    `line`/`path`/`polygon` (index 0 for a closed ring), so a recognised shape
-    is adjustable without lifting.
+    sidecar round-trip and undo. `snap_point` falls back to the nearest point
+    on an EDGE when no vertex is in reach (a vertex must win, or you land
+    beside the corner you aimed at); that snap is **positional only** — the
+    point lands there and does not follow the edge afterwards, which is what
+    keeps row 129's false-positive problem out, since nothing is persisted.
+    After the dwell fires the pen keeps hold of the last control point of a
+    `line`/`path`/`polygon` (index 0 for a closed ring), and every corner
+    polyline on the PAGE becomes a live magnet for it (`_live_snap_shapes`,
+    frozen at dwell time, only those within reach painted) — so a fresh shape
+    joins what is already drawn without lifting.
   - **Lasso verbs**: select / move / resize / rotate / `Ctrl+D` duplicate /
     `Del`. Rotation is a knob on a stalk above the box; Shift snaps to
     `ROTATE_SNAP_DEG`. A tilt is stored as an ANGLE and applied at render — it
@@ -437,9 +442,6 @@ than writing a line about having finished it. The chronology lives in
   derive-at-drag-time model genuinely cannot do; it needs stored constraints
   and therefore stable per-stroke ids in both persistence paths. Decide the
   identity question before the geometry.
-- **Endpoint snapping while DRAWING** (row 127's last item) — a new line's end
-  snapping to a nearby stroke's end, as opposed to welding two control points
-  after the fact, which has shipped.
 
 - **Row 129 (notes continued across pages)** — "link to previous page" /
   "unlink", one boolean per page, no general linking graph (the user's scope

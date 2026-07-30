@@ -3774,6 +3774,76 @@ class TestLassoSelect(unittest.TestCase):
         canvas.toggle_selection_box()
         self.assertEqual(len(canvas._selected_shapes()[0][1]), 2)
 
+    def test_a_control_point_snaps_onto_an_edge_but_is_not_bound_to_it(self):
+        """Positional only: the point LANDS on the line and is then an
+        ordinary vertex. Moving that line later leaves it where it was — a
+        real binding needs stored constraints (row 129)."""
+        canvas = self._canvas()
+        edge = self._stroke([(100, 300), (300, 300)])
+        free = self._stroke([(200, 200), (200, 285)])
+        canvas.all_strokes[0] = [edge, free]
+        canvas._set_selected([edge, free])
+        canvas._selection_boxed = True
+        grab = canvas._pdf_to_screen(200, 285)
+        canvas._on_drag_begin(_FakeDrag(*grab), *grab)
+        canvas._on_drag_update(_FakeDrag(*grab), 0, 8)   # towards the line
+        self.assertIsNotNone(canvas._vertex_snap_at)
+        canvas._on_drag_end(_FakeDrag(*grab), 0, 8)
+        self.assertEqual(free["pts"][1], (200, 300))     # sits ON the edge
+        # now move the edge: the landed point does NOT follow
+        canvas._set_selected([edge])
+        canvas._selection_boxed = True
+        end = canvas._pdf_to_screen(300, 300)
+        canvas._on_drag_begin(_FakeDrag(*end), *end)
+        canvas._on_drag_update(_FakeDrag(*end), 0, 60)
+        canvas._on_drag_end(_FakeDrag(*end), 0, 60)
+        self.assertEqual(free["pts"][1], (200, 300))
+
+    def test_a_vertex_beats_an_edge_as_a_snap_target(self):
+        """Landing NEXT TO the corner you were aiming at is the failure this
+        ordering prevents."""
+        shapes = [({"pts": []}, [(0, 0), (100, 0)])]
+        # (98, 3) is near the segment AND near the (100, 0) corner
+        self.assertEqual(sidemark.snap_point(shapes, 98, 3, 10.0), (100, 0))
+        # far from either corner, it takes the edge
+        self.assertEqual(sidemark.snap_point(shapes, 50, 3, 10.0), (50, 0))
+        self.assertIsNone(sidemark.snap_point(shapes, 50, 40, 10.0))
+
+    def test_a_live_shape_snaps_to_the_page_while_the_pen_is_down(self):
+        """After the dwell the pen still holds the last control point, and the
+        page's control points become magnets — so a fresh path joins what is
+        already there without lifting."""
+        canvas = self._canvas()
+        target = self._stroke([(300, 100), (300, 200)])
+        canvas.all_strokes[0] = [target]
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(0, 0), 0, 0)
+        canvas.current_stroke = [(100, 100), (150, 100), (200, 100),
+                                 (200, 150), (200, 200)]
+        canvas._snap_to_shape()
+        self.assertEqual(canvas._snap_kind, "path")
+        self.assertTrue(canvas._live_snap_shapes)   # magnets armed
+        # drag the held last point to just shy of the target's top end
+        canvas._on_drag_update(_FakeDrag(0, 0), 296, 103)
+        self.assertIsNotNone(canvas._live_snap_at)
+        self.assertEqual(canvas.current_stroke[-1], (300, 100))
+        canvas._on_drag_end(_FakeDrag(0, 0), 296, 103)
+        self.assertEqual(canvas.all_strokes[0][-1]["pts"][-1], (300, 100))
+        self.assertEqual(canvas._live_snap_shapes, [])   # and disarmed
+
+    def test_a_frozen_shape_arms_no_live_magnets(self):
+        """A rectangle/ellipse is settled by the dwell — the pen is not holding
+        one of its control points, so there is nothing to snap."""
+        canvas = self._canvas()
+        canvas.all_strokes[0] = [self._stroke([(300, 100), (300, 200)])]
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(0, 0), 0, 0)
+        canvas.current_stroke = [(0, 0), (40, 1), (81, 0), (80, 30), (79, 61),
+                                 (40, 60), (1, 59), (0, 30), (0, 0)]
+        canvas._snap_to_shape()
+        self.assertEqual(canvas._snap_kind, "rect")
+        self.assertEqual(canvas._live_snap_shapes, [])
+
     def _two_lines_meeting_near(self, canvas):
         """Two 2-point strokes whose ends are close but not touching."""
         a = self._stroke([(100, 100), (200, 100)])
