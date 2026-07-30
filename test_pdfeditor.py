@@ -3875,6 +3875,55 @@ class TestLassoSelect(unittest.TestCase):
         canvas._on_drag_update(_FakeDrag(0, 0), 200, 108)
         self.assertEqual(canvas.current_stroke[-1], (200, 100))
 
+    @staticmethod
+    def _squiggle(x0, y0, n=60):
+        """Freehand ink: many points, so it gets no control points."""
+        return [(x0 + i * 2.0, y0 + 8 * math.sin(i / 4.0)) for i in range(n)]
+
+    def test_a_live_shape_snaps_onto_freehand_ink(self):
+        """Freehand ink is a polyline like any other — snapping a corner onto a
+        sketched line needs no new geometry, just the targets."""
+        canvas = self._canvas()
+        squig = self._stroke(self._squiggle(300, 300))
+        canvas.all_strokes[0] = [squig]
+        self.assertEqual(sidemark.shape_vertices(squig["pts"]), [])   # freehand
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(0, 0), 0, 0)
+        canvas.current_stroke = [(100, 100), (150, 100), (200, 100),
+                                 (200, 150), (200, 200)]
+        canvas._snap_to_shape()
+        self.assertTrue(canvas._curve_snap_cache)   # the squiggle is a target
+        # aim just off a point in the squiggle's middle
+        mid = squig["pts"][30]
+        canvas._on_drag_update(_FakeDrag(0, 0), mid[0] + 3, mid[1] + 3)
+        self.assertIsNotNone(canvas._live_snap_at)
+        landed = canvas.current_stroke[-1]
+        self.assertAlmostEqual(landed[0], mid[0], delta=4.0)
+        self.assertAlmostEqual(landed[1], mid[1], delta=4.0)
+
+    def test_a_freehand_end_is_a_vertex_target_its_middle_is_not(self):
+        """The ends of a pen line are real, aimable points. Its interior
+        samples are not: there are hundreds, they are sampling artefacts, and
+        treating them as corners would grab a different pixel every time."""
+        curve = [(0, 0), (10, 1), (20, 0), (30, 1), (40, 0)]
+        curves = [({"pts": curve}, curve)]
+        # near the far END: the endpoint wins as a VERTEX target
+        self.assertEqual(
+            sidemark.snap_point([], 42, 2, 6.0, (), curves), (40, 0))
+        # over the middle: it snaps onto the line, not to a sample point
+        got = sidemark.snap_point([], 15, 3, 6.0, (), curves)
+        self.assertIsNotNone(got)
+        self.assertNotIn(got, curve)
+
+    def test_curve_targets_are_bbox_filtered(self):
+        """A page of handwriting is tens of thousands of segments and this runs
+        on every motion event."""
+        near = [(0, 0), (10, 10)]
+        far = [(900, 900), (910, 910)]
+        pairs = [("n", near), ("f", far)]
+        got = sidemark.curve_snap_shapes(pairs, 5, 5, 20.0)
+        self.assertEqual([k for k, _p in got], ["n"])
+
     def test_a_frozen_shape_arms_no_live_magnets(self):
         """A rectangle/ellipse is settled by the dwell — the pen is not holding
         one of its control points, so there is nothing to snap."""

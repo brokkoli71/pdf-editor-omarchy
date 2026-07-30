@@ -346,7 +346,13 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     `line`/`path`/`polygon` (index 0 for a closed ring), and every corner
     polyline on the PAGE becomes a live magnet for it (`_live_snap_shapes`,
     frozen at dwell time, only those within reach painted) — so a fresh shape
-    joins what is already drawn without lifting.
+    joins what is already drawn without lifting. The live shape's OWN points
+    and edges are targets too (the held point and its two edges excluded, or it
+    pins itself). **Freehand ink** snaps as well, via `snap_point`'s `curves`
+    list: its two endpoints as vertices, its polyline as edges, its interior
+    samples deliberately not vertices. Snap candidate sets are **frozen per
+    gesture** and bbox-filtered (`curve_snap_shapes`) — rebuilding them per
+    motion event on a page of handwriting is tens of thousands of segments.
   - **Lasso verbs**: select / move / resize / rotate / `Ctrl+D` duplicate /
     `Del`. Rotation is a knob on a stalk above the box; Shift snaps to
     `ROTATE_SNAP_DEG`. A tilt is stored as an ANGLE and applied at render — it

@@ -513,13 +513,42 @@ def nearest_edge_point(shapes, x, y, hit, held=()):
     return at
 
 
-def snap_point(shapes, x, y, hit, held=()):
+def curve_snap_shapes(pairs, x, y, hit):
+    """Freehand strokes as snap targets, as [(key, pts)] — anything within
+    reach of (x, y), the rest dropped by a bbox test first.
+
+    Freehand ink is a polyline like any other, so snapping a corner ONTO a
+    sketched line needs no new geometry; what it needs is the prefilter, since
+    a page of handwriting is tens of thousands of segments and this runs on
+    every motion event."""
+    out = []
+    for key, pts in pairs:
+        if len(pts) < 2:
+            continue
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        if (min(xs) - hit <= x <= max(xs) + hit
+                and min(ys) - hit <= y <= max(ys) + hit):
+            out.append((key, pts))
+    return out
+
+
+def snap_point(shapes, x, y, hit, held=(), curves=()):
     """Where a dragged point should sit: a control point if one is in reach,
     otherwise a point on an edge. A vertex is the stronger target and has to
     win — landing NEXT TO a corner you were aiming at is the whole failure
-    this ordering prevents."""
-    return (nearest_vertex_point(shapes, x, y, hit, held)
-            or nearest_edge_point(shapes, x, y, hit, held))
+    this ordering prevents.
+
+    `shapes` are corner polylines, offering both their vertices and their
+    edges. `curves` are freehand strokes, offering their two ENDPOINTS as
+    vertices — the ends of a pen line are real, aimable points — and their
+    whole polyline as edges. Their interior points are NOT vertex targets: a
+    freehand stroke has hundreds, they are sampling artefacts rather than
+    anything a person drew deliberately, and treating them as corners would
+    make the snap grab a different pixel every time."""
+    ends = [(key, [pts[0], pts[-1]]) for key, pts in curves]
+    return (nearest_vertex_point(list(shapes) + ends, x, y, hit, held)
+            or nearest_edge_point(list(shapes) + list(curves), x, y, hit, held))
 
 
 def draw_vertex_snap_ring(ctx, pt, accent):
@@ -1309,6 +1338,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # last point: frozen at dwell time so the set cannot change mid-drag
         self._live_snap_shapes = []
         self._live_snap_at = None
+        self._curve_snap_cache = []     # freehand targets, frozen per gesture
         self._selected_strokes = []    # references into self.strokes, selected
         self._lasso_moving = False
         self._lasso_move_start = None
@@ -3069,6 +3099,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self._vertex_drag = [(a, i, list(a["pts"]))
                                  for a, i in welded_vertices(here, vx, vy)]
             self._vertex_snap_at = None
+            self._curve_snap_cache = self._page_curves_screen()
             self._selection_auto = False
             self.set_cursor(Gdk.Cursor.new_from_name("crosshair", None))
             return
@@ -3408,6 +3439,7 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._vertex_drag:
             held, self._vertex_drag = self._vertex_drag, []
             self._vertex_snap_at = None
+            self._curve_snap_cache = []
             self.set_cursor(self._default_cursor())
             # released on a target: the two points now SHARE a coordinate, and
             # welded_vertices picks them up together from here on
@@ -3532,6 +3564,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self.current_stroke = []
             self._snap_kind = self._snap_label = None
             self._live_snap_shapes = []
+            self._curve_snap_cache = []
             self._live_snap_at = None
             if self.on_live_draw:
                 self.on_live_draw()   # drop the live stroke from the mirror
@@ -3593,9 +3626,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self._snap_label = SNAP_LABELS[kind]
         # the pen keeps hold of the last control point from here (see
         # _on_drag_update), so the page's control points become live magnets
-        self._live_snap_shapes = (self._page_shapes_screen()
-                                  if kind in ("line", "path", "polygon")
-                                  else [])
+        live = kind in ("line", "path", "polygon")
+        self._live_snap_shapes = self._page_shapes_screen() if live else []
+        self._curve_snap_cache = self._page_curves_screen() if live else []
         self._live_snap_at = None
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
@@ -4296,7 +4329,7 @@ class PDFCanvas(Gtk.DrawingArea):
         shapes: snapping to something you cannot see is a magnet in the dark."""
         held = {(id(st), i) for st, i, _o in self._vertex_drag}
         return snap_point(self._selected_shapes(), sx, sy, self._snap_reach(),
-                          held)
+                          held, self._curve_targets(sx, sy))
 
     def _page_shapes_screen(self):
         """[(stroke, screen vertices)] for EVERY corner polyline on the page —
@@ -4308,6 +4341,21 @@ class PDFCanvas(Gtk.DrawingArea):
             if verts:
                 out.append((st, [self._pdf_to_screen(x, y) for x, y in verts]))
         return out
+
+    def _page_curves_screen(self):
+        """[(stroke, screen pts)] for the FREEHAND strokes — the ones with no
+        control points, which are still perfectly good lines to snap onto."""
+        return [(st, [self._pdf_to_screen(x, y) for x, y in st["pts"]])
+                for st in self.strokes if not shape_vertices(st["pts"])]
+
+    def _curve_targets(self, sx, sy):
+        """The freehand targets near the pointer, from the set FROZEN at the
+        start of this gesture. Converting every freehand point to screen coords
+        on every motion event is what makes this slow on a page of
+        handwriting — and neither the page nor the view moves mid-drag, so
+        there is nothing to recompute."""
+        return curve_snap_shapes(self._curve_snap_cache, sx, sy,
+                                 self._snap_reach())
 
     def _held_vertex_index(self):
         """Which control point the pen is holding after a dwell: the LAST one
@@ -4341,7 +4389,8 @@ class PDFCanvas(Gtk.DrawingArea):
         if not self._live_snap_shapes and not self.current_stroke:
             return None
         return snap_point(self._live_snap_all(), sx, sy, self._snap_reach(),
-                          {(id(self), self._held_vertex_index())})
+                          {(id(self), self._held_vertex_index())},
+                          self._curve_targets(sx, sy))
 
     def _lasso_chip_at(self, sx, sy):
         """Is the screen point on the loop⇄box chip? Only a selection that HAS
@@ -7975,6 +8024,7 @@ class TextPageView(Gtk.Overlay):
         self._vertex_snap_at = None     # overlay point it is snapped onto
         self._live_snap_shapes = []     # magnets while a live shape is held
         self._live_snap_at = None
+        self._curve_snap_cache = []     # freehand targets, frozen per gesture
         self._lasso_moving = False
         self._lasso_moved = False
         self._lasso_drag = (0.0, 0.0)  # live move offset while dragging
@@ -9195,6 +9245,7 @@ class TextPageView(Gtk.Overlay):
         if self._vertex_drag:
             held, self._vertex_drag = self._vertex_drag, []
             self._vertex_snap_at = None
+            self._curve_snap_cache = []
             self.ink.set_cursor(None)
             entries = [(a, orig, list(a["pts"])) for a, _i, orig in held
                        if a["pts"] != orig]
@@ -9267,6 +9318,7 @@ class TextPageView(Gtk.Overlay):
             self.current_stroke = []
             self._snap_kind = self._snap_label = None
             self._live_snap_shapes = []
+            self._curve_snap_cache = []
             self._live_snap_at = None
         elif self._erased_now:
             self._undo_ops.append(("erase", self._erased_now))
@@ -9312,9 +9364,9 @@ class TextPageView(Gtk.Overlay):
         self._straight_mode = True
         self._snap_kind = kind
         self._snap_label = SNAP_LABELS[kind]
-        self._live_snap_shapes = (self._page_shapes_overlay()
-                                  if kind in ("line", "path", "polygon")
-                                  else [])
+        live = kind in ("line", "path", "polygon")
+        self._live_snap_shapes = self._page_shapes_overlay() if live else []
+        self._curve_snap_cache = self._page_curves_overlay() if live else []
         self._live_snap_at = None
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
@@ -9568,6 +9620,7 @@ class TextPageView(Gtk.Overlay):
             self._vertex_drag = [(a, i, list(a["pts"]))
                                  for a, i in welded_vertices(here, vx, vy)]
             self._vertex_snap_at = None
+            self._curve_snap_cache = self._page_curves_overlay()
             self._selection_auto = False
             self.ink.set_cursor(Gdk.Cursor.new_from_name("crosshair"))
             return
@@ -9755,7 +9808,7 @@ class TextPageView(Gtk.Overlay):
         reach, else a point on an edge."""
         held = {(id(st), i) for st, i, _o in self._vertex_drag}
         return snap_point(self._selected_shapes(), x, y, self._snap_reach(),
-                          held)
+                          held, self._curve_targets(x, y))
 
     def _page_shapes_overlay(self):
         out = []
@@ -9764,6 +9817,21 @@ class TextPageView(Gtk.Overlay):
             if verts:
                 out.append((st, verts))
         return out
+
+    def _page_curves_overlay(self):
+        """The FREEHAND strokes — no control points, still good lines to snap
+        onto (PDFCanvas._page_curves_screen's twin)."""
+        out = []
+        for st in self.strokes:
+            pts = self._stroke_overlay_pts(st)
+            if not shape_vertices(pts):
+                out.append((st, pts))
+        return out
+
+    def _curve_targets(self, x, y):
+        """Frozen per gesture — see PDFCanvas._curve_targets."""
+        return curve_snap_shapes(self._curve_snap_cache, x, y,
+                                 self._snap_reach())
 
     def _held_vertex_index(self):
         return (0 if self._snap_kind == "polygon"
@@ -9784,7 +9852,8 @@ class TextPageView(Gtk.Overlay):
         if not self._live_snap_shapes and not self.current_stroke:
             return None
         return snap_point(self._live_snap_all(), x, y, self._snap_reach(),
-                          {(id(self), self._held_vertex_index())})
+                          {(id(self), self._held_vertex_index())},
+                          self._curve_targets(x, y))
 
     def _overlay_to_stroke_pts(self, st, overlay_pts):
         """The exact inverse of _stroke_overlay_pts: overlay points back into
