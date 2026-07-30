@@ -214,16 +214,21 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   callers route through. One guard in the shared helper is a *smaller* diff than
   a guard per caller, and patching only the path the report named leaves every
   sibling caller broken — which is exactly how the eraser drifted (row 116).
-- **The extended dwell (`_snap_to_shape`, row 121).** Holding still mid-stroke
-  no longer only makes a line: `recognize_shape()` also cleans a closed loop
-  into an axis-aligned **rectangle/ellipse**, and a straight line drawn inside a
-  rectangle becomes an evenly-spaced **grid divider** (re-spacing its siblings,
-  one undo entry — PDF's `("grid", …)` op / the sheet's grouped
+- **The extended dwell (`_snap_to_shape`, rows 121 + 127).** Holding still
+  mid-stroke no longer only makes a line: `recognize_shape()` cleans a closed
+  loop into an axis-aligned **rectangle**, an **ellipse** (a near-circle snaps
+  to a true circle), or an irregular **polygon**, and a straight line drawn
+  inside a rectangle becomes an evenly-spaced **grid divider** (re-spacing its
+  siblings, one undo entry — PDF's `("grid", …)` op / the sheet's grouped
   `("reshape", …)`). Recognised shapes are ordinary **strokes** (polylines), no
   new object kind — they lasso/erase/round-trip for free. The **line is always
   the fallback**, so the `shape_snap` setting's "lines"/"off" can't regress the
   classic snap. Rectangles are detected geometrically (`rect_bbox_of`), so grid
-  snapping survives a reload with no stored tag.
+  snapping survives a reload with no stored tag — **which is why rect must beat
+  polygon on ANGLE, not on fit**: a tilted quad through a box's real corners
+  fits better than its bbox, so on residual alone the polygon takes the grid
+  snap away (`quad_is_axis_aligned`). Every kind needs an entry in the shared
+  `SNAP_LABELS`; a missing one is a KeyError mid-gesture.
 - **Geometry you STORE must not go through the int-truncating coord helpers.**
   `window_to_buffer_coords`/`buffer_to_window_coords` only take ints, so a
   per-point conversion rounds every point on the way in *and* out. Invisible
@@ -406,9 +411,12 @@ than writing a line about having finished it. The chronology lives in
   at `get_end_iter()`, making the click merely the other end of the span; check
   `buffer.get_selection_bounds()` after the switch alone, before any click.
 
-- **Row 127 (polygon recognition + vertex editing)** — designed, not built.
-  Start with "select the shape right after it snaps": nearly free, and nothing
-  else in the row is reachable without it.
+- **Row 127 (vertex editing)** — the classifier half has shipped (polygons,
+  true circles). What is left: vertex handles on a single-shape lasso
+  selection (drag a corner, both adjacent edges follow) and endpoint snapping
+  between strokes. *Do not* revive "auto-select the shape after it snaps" — a
+  live selection owns its interior as the grab region, so it would block
+  drawing inside a box you just drew (see row 127's notes).
 
 - **Row 119 (crop)** — the last piece of the image feature. Its design is
   settled in row 118 and must not be re-litigated: a field on the model applied
