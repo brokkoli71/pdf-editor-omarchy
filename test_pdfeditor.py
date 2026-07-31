@@ -5987,11 +5987,11 @@ class TestResponsiveHeader(unittest.TestCase):
 
     def test_popover_modes_stay_in_sync(self):
         def body(win):
-            # switching on the bar reflects into the popover mirror, and back
-            win._mode_hl.set_active(True)
-            if not win._pmode_hl.get_active():
-                raise AssertionError("popover mode did not mirror the bar")
-            win._pmode_text.set_active(True)
+            # the bar and its popover mirror bind the same shared table
+            win._mode_hl.emit("clicked")
+            if win.bindings.tool_for_chord("left") != "highlighter":
+                raise AssertionError("the bar did not bind the left button")
+            win._pmode_text.emit("clicked")
             if win.bindings.tool_for_chord("left") != "text":
                 raise AssertionError("the popover did not bind the left button")
             if not win.canvas.select_mode:
@@ -6002,12 +6002,10 @@ class TestResponsiveHeader(unittest.TestCase):
         def body(win):
             # the new modifier-shortcut tools select on the canvas and mirror
             # into the popover group
-            win._mode_pan.set_active(True)
+            win._mode_pan.emit("clicked")
             if win.canvas.tool != "pan":
                 raise AssertionError("pan button did not select the pan tool")
-            if not win._pmode_pan.get_active():
-                raise AssertionError("popover pan mirror not synced")
-            win._mode_anchor.set_active(True)
+            win._mode_anchor.emit("clicked")
             if win.canvas.tool != "anchor":
                 raise AssertionError("anchor button did not select the anchor tool")
             # highlighter/select flags only set for their own tools
@@ -6017,11 +6015,9 @@ class TestResponsiveHeader(unittest.TestCase):
 
     def test_lasso_tool_button(self):
         def body(win):
-            win._mode_lasso.set_active(True)
+            win._mode_lasso.emit("clicked")
             if win.canvas.tool != "lasso":
                 raise AssertionError("lasso button did not select the lasso tool")
-            if not win._pmode_lasso.get_active():
-                raise AssertionError("popover lasso mirror not synced")
             # lasso is its own tool, not the text-select or highlighter mode
             if win.canvas.highlighter or win.canvas.select_mode:
                 raise AssertionError("lasso tool wrongly set hl/select flags")
@@ -6030,11 +6026,11 @@ class TestResponsiveHeader(unittest.TestCase):
 
     def test_leaving_lasso_tool_clears_selection(self):
         def body(win):
-            win._mode_lasso.set_active(True)
+            win._mode_lasso.emit("clicked")
             win.canvas.all_strokes[0] = [
                 {"pts": [(50, 50)], "color": (0, 0, 0), "width": 2.0, "opacity": 1.0}]
             win.canvas._set_selected(win.canvas.all_strokes[0])
-            win._mode_pen.set_active(True)   # switching tool drops the selection
+            win._mode_pen.emit("clicked")   # switching tool drops the selection
             if win.canvas.has_lasso_selection():
                 raise AssertionError("selection survived a tool switch")
 
@@ -6042,7 +6038,7 @@ class TestResponsiveHeader(unittest.TestCase):
 
     def test_recolor_via_pen_popover(self):
         def body(win):
-            win._mode_lasso.set_active(True)
+            win._mode_lasso.emit("clicked")
             s = {"pts": [(50, 50), (60, 60)], "color": (0.0, 0.0, 0.0),
                  "width": 2.0, "opacity": 1.0}
             win.canvas.all_strokes[0] = [s]
@@ -6056,7 +6052,7 @@ class TestResponsiveHeader(unittest.TestCase):
 
     def test_modifier_highlights_matching_tool_button(self):
         def body(win):
-            win._mode_pen.set_active(True)
+            win._mode_pen.emit("clicked")
             # holding Ctrl lights the pan button transiently, no tool change
             win._highlight_transient_tool(True, False, False)
             if not win._mode_pan.has_css_class("tool-transient"):
@@ -6073,7 +6069,7 @@ class TestResponsiveHeader(unittest.TestCase):
         # button gestures (right-drag erase, middle-drag pan) light the
         # matching button too — same .tool-transient path as the chords
         def body(win):
-            win._mode_pen.set_active(True)
+            win._mode_pen.emit("clicked")
             win._highlight_gesture_tool("eraser")
             if not win._mode_eraser.has_css_class("tool-transient"):
                 raise AssertionError("eraser not highlighted during right-drag")
@@ -8236,7 +8232,7 @@ class TestHighlighter(unittest.TestCase):
                     pen_width = win.canvas.pen_width
                     pen_color = win.canvas.pen_color
 
-                    win._mode_hl.set_active(True)
+                    win._mode_hl.emit("clicked")
                     if not win.canvas.highlighter:
                         raise AssertionError("toggle did not enable highlighter")
                     win._width_scale.set_value(18.0)
@@ -8252,7 +8248,7 @@ class TestHighlighter(unittest.TestCase):
                     if win.canvas.pen_color != pen_color:
                         raise AssertionError("color button leaked into pen_color")
 
-                    win._mode_pen.set_active(True)   # grouped: back to pen
+                    win._mode_pen.emit("clicked")   # back to the pen
                     if win.canvas.highlighter:
                         raise AssertionError("pen segment did not disable highlighter")
                     if abs(win._width_scale.get_value() - pen_width) > 0.01:
@@ -9218,8 +9214,12 @@ class TestTextFirstMode(unittest.TestCase):
                 buf = win._notes_view.get_buffer()
                 self.assertIn("first paragraph line", buf.get_text(
                     buf.get_start_iter(), buf.get_end_iter(), True))
-                # the caret tool is preselected; clicks reach the text
-                self.assertTrue(win._mode_text.get_active())
+                # row 132: opening a text page does NOT rewrite the shared
+                # binding table, so the left button keeps the tool it had
+                # (the pen by default) and the sheet's ink stays targetable
+                self.assertEqual(win.bindings.tool_for_chord("left"), "pen")
+                # the ink overlay is never the event target: the sheet's
+                # capture-phase router sees every press above it (set_tool)
                 self.assertFalse(s._text_page.ink.get_can_target())
 
             self._run_in_window(body)

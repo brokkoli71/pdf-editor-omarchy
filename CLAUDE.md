@@ -517,7 +517,18 @@ when something lands, fold its invariants upward and delete it from here rather
 than writing a line about having finished it. The chronology lives in
 `ideas.csv` and git.
 
-**In flight — all three are code-verified and need a pass in the real app:**
+**In flight — all four are code-verified and need a pass in the real app:**
+
+- **Row 132 (rebindable buttons).** The model change has shipped and the
+  behavior is described above, but the user's hands-on verdict is *"still not
+  100% correct"* with no repro captured — **getting one is the next session's
+  first job**, not more code reading. The `[input]` log resolves every press
+  (`[input] text right -> highlighter`) and `[bar] table` / `[bar] stripes`
+  print the table beside the painter on every refresh; that pair is what tells
+  a routing bug from a painting one. Row 132's TODO block lists the four known
+  ones (the stripe position, the caret on a non-left button in text mode, the
+  thumb with a non-pan tool, and 17 stale `TestTextFirstMode` tests) with the
+  fix for each. **The full suite has not been run since the routing work.**
 
 - **Rows 125–127 (the lasso keeps its loop; circle to lasso; shape
   recognition and control points).** Unit-tested on both canvases

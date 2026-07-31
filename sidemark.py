@@ -9400,11 +9400,14 @@ class TextPageView(Gtk.Overlay):
             self.ink.queue_draw()
             return
         self._zoom_selecting = False
-        button = gesture.get_current_button()
         self._erased_now = []
-        if self.tool == "lasso" and button != 3:
+        # `self.tool` is the tool of the press in flight (the router put it in
+        # `_press_tool`), so the button itself must NOT be consulted here — a
+        # right press means the eraser only because that is what the table
+        # says, and hardwiring it made every other tool bound to right erase.
+        if self.tool == "lasso":
             self._lasso_begin(x, y, additive=self._ink_additive)
-        elif self.tool == "eraser" or button == 3:
+        elif self.tool == "eraser":
             self._erase_at(x, y)
         else:
             self._cancel_straight_timer()
@@ -11140,7 +11143,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._dirty = False
         self._suppress_dirty = False
         self._syncing_pen = False   # guard while pen popover mirrors tool state
-        self._syncing_mode = False  # guard while tool-mode toggles mirror each other
         # responsive header: natural width (px) of the button clusters at each
         # collapse level, measured once from the real widgets — no hard-coded
         # threshold. _header_controls is the non-content width (window buttons +
@@ -11241,16 +11243,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 border: 1px solid shade({bg_hex}, 0.75);
             }}
             .pen-swatch:hover {{ border: 2px solid {fg_hex}; }}
-            /* row 132: there is no active tool to show, so a checked tool
-               button must not look pressed — the painted stripe is the only
-               signal. Scoped to the tool buttons, so every other toggle in
-               the app keeps its normal checked state. */
-            .tool-btn:checked {{
-                background: none;
-                background-image: none;
-                box-shadow: none;
-                border-color: transparent;
-            }}
             .tool-transient {{
                 background-color: alpha({acc_hex}, 0.30);
                 box-shadow: inset 0 0 0 1px {acc_hex};
@@ -11633,55 +11625,47 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # modifier (Ctrl=pan, Alt=select, Shift=zoom, Ctrl+Shift=highlighter,
         # Ctrl+Alt=anchor, Ctrl+Shift+Alt=lasso) lights the button up transiently,
         # so the hidden gestures are visible in the UI.
-        self._mode_pen = Gtk.ToggleButton()
+        self._mode_pen = Gtk.Button()
         self._mode_pen.set_icon_name("document-edit-symbolic")
         self._mode_pen.set_tooltip_text("Pen")
-        self._mode_pen.set_active(True)
-        self._mode_hl = Gtk.ToggleButton()
+        self._mode_hl = Gtk.Button()
         self._mode_hl.set_child(_glyph(_draw_mode_hl))
         self._mode_hl.set_tooltip_text(
             "Highlighter (Ctrl+H · Ctrl+Shift+drag · long-press for free-hand / text)")
-        self._mode_hl.set_group(self._mode_pen)
-        self._mode_eraser = Gtk.ToggleButton()
+        self._mode_eraser = Gtk.Button()
         self._mode_eraser.set_child(_glyph(_draw_mode_eraser))
         self._mode_eraser.set_tooltip_text("Eraser (right-drag)")
-        self._mode_eraser.set_group(self._mode_pen)
-        self._mode_lasso = Gtk.ToggleButton()
+        self._mode_lasso = Gtk.Button()
         self._mode_lasso.set_child(_glyph(_draw_mode_lasso))
         self._mode_lasso.set_tooltip_text(
             "Lasso ink (Ctrl+Shift+Alt+drag · drag a loop to select, then drag "
             "to move · Delete · change colour to recolour)")
-        self._mode_lasso.set_group(self._mode_pen)
         # ONE caret button for both document modes (the I-beam the user
         # picked): a PDF page selects its text with it, a text page places the
         # caret with it. The tool id is "text"; "select" is kept as an alias
         # because settings, chords and older code still say it.
-        self._mode_text = Gtk.ToggleButton()
+        self._mode_text = Gtk.Button()
         self._mode_text.set_child(_glyph(_draw_mode_text))
         # the Alt-hold ink hint lives on the pen / eraser tooltips (the tools it
         # actually refers to), set per-mode in _update_header_for_mode
-        self._mode_text.set_group(self._mode_pen)
-        self._mode_pan = Gtk.ToggleButton()
+        self._mode_pan = Gtk.Button()
         self._mode_pan.set_child(_glyph(_draw_mode_pan, 20))
         self._mode_pan.set_tooltip_text(
             "Pan (Ctrl+drag · middle-drag · hold thumb button, scroll to zoom)")
-        self._mode_pan.set_group(self._mode_pen)
-        self._mode_zoom = Gtk.ToggleButton()
+        self._mode_zoom = Gtk.Button()
         self._mode_zoom.set_icon_name(_themed_icon("zoom-in-symbolic"))
         self._mode_zoom.set_tooltip_text(
             "Zoom to region (Shift+drag · Alt+Shift+drag · Shift+middle/thumb-drag)")
-        self._mode_zoom.set_group(self._mode_pen)
-        self._mode_anchor = Gtk.ToggleButton()
+        self._mode_anchor = Gtk.Button()
         self._mode_anchor.set_child(_glyph(_draw_mode_anchor))
         self._mode_anchor.set_tooltip_text("Anchor / callout (Ctrl+Alt+click/drag)")
-        self._mode_anchor.set_group(self._mode_pen)
         self._tools_box = tools_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         tools_box.add_css_class("linked")
         self._tool_btns = (self._mode_pen, self._mode_hl, self._mode_eraser,
                            self._mode_lasso, self._mode_text, self._mode_pan,
                            self._mode_zoom, self._mode_anchor)
         for b, m in zip(self._tool_btns, self._TOOL_BAR_ORDER):
-            b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
+            b.connect("clicked", lambda _b, m=m: self._set_tool_mode(m))
             b.add_css_class("tool-btn")
             self._attach_binding_click(b, m)
             self._add_binding_strip(b, m)
@@ -11701,49 +11685,41 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         mode_label.add_css_class("dim-label")
         self._pen_modes_section.append(mode_label)
 
-        self._pmode_pen = Gtk.ToggleButton()
+        self._pmode_pen = Gtk.Button()
         self._pmode_pen.set_icon_name("document-edit-symbolic")
         self._pmode_pen.set_tooltip_text("Pen")
-        self._pmode_pen.set_active(True)
-        self._pmode_hl = Gtk.ToggleButton()
+        self._pmode_hl = Gtk.Button()
         self._pmode_hl.set_child(_glyph(_draw_mode_hl))
         self._pmode_hl.set_tooltip_text(
             "Highlighter (Ctrl+H · Ctrl+Shift+drag · long-press for free-hand / text)")
-        self._pmode_hl.set_group(self._pmode_pen)
-        self._pmode_eraser = Gtk.ToggleButton()
+        self._pmode_eraser = Gtk.Button()
         self._pmode_eraser.set_child(_glyph(_draw_mode_eraser))
         self._pmode_eraser.set_tooltip_text("Eraser (right-drag)")
-        self._pmode_eraser.set_group(self._pmode_pen)
-        self._pmode_lasso = Gtk.ToggleButton()
+        self._pmode_lasso = Gtk.Button()
         self._pmode_lasso.set_child(_glyph(_draw_mode_lasso))
         self._pmode_lasso.set_tooltip_text(
             "Lasso ink (Ctrl+Shift+Alt+drag · drag a loop to select, then drag "
             "to move · Delete · change colour to recolour)")
-        self._pmode_lasso.set_group(self._pmode_pen)
-        self._pmode_text = Gtk.ToggleButton()
+        self._pmode_text = Gtk.Button()
         self._pmode_text.set_child(_glyph(_draw_mode_text))
-        self._pmode_text.set_group(self._pmode_pen)
-        self._pmode_pan = Gtk.ToggleButton()
+        self._pmode_pan = Gtk.Button()
         self._pmode_pan.set_child(_glyph(_draw_mode_pan, 20))
         self._pmode_pan.set_tooltip_text(
             "Pan (Ctrl+drag · middle-drag · hold thumb button, scroll to zoom)")
-        self._pmode_pan.set_group(self._pmode_pen)
-        self._pmode_zoom = Gtk.ToggleButton()
+        self._pmode_zoom = Gtk.Button()
         self._pmode_zoom.set_icon_name(_themed_icon("zoom-in-symbolic"))
         self._pmode_zoom.set_tooltip_text(
             "Zoom to region (Shift+drag · Alt+Shift+drag · Shift+middle/thumb-drag)")
-        self._pmode_zoom.set_group(self._pmode_pen)
-        self._pmode_anchor = Gtk.ToggleButton()
+        self._pmode_anchor = Gtk.Button()
         self._pmode_anchor.set_child(_glyph(_draw_mode_anchor))
         self._pmode_anchor.set_tooltip_text("Anchor / callout (Ctrl+Alt+click/drag)")
-        self._pmode_anchor.set_group(self._pmode_pen)
         pmode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         pmode_box.add_css_class("linked")
         self._ptool_btns = (self._pmode_pen, self._pmode_hl, self._pmode_eraser,
                             self._pmode_lasso, self._pmode_text, self._pmode_pan,
                             self._pmode_zoom, self._pmode_anchor)
         for b, m in zip(self._ptool_btns, self._TOOL_BAR_ORDER):
-            b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
+            b.connect("clicked", lambda _b, m=m: self._set_tool_mode(m))
             b.add_css_class("tool-btn")
             self._attach_binding_click(b, m)
             self._add_binding_strip(b, m)
@@ -12415,10 +12391,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             b.set_tooltip_text(eraser_tip)
         for b in (self._mode_zoom, self._pmode_zoom):
             b.set_tooltip_text(zoom_tip)
-        # leaving a text page with the caret active: hand it to the PDF select
-        # button (same mode underneath, different face)
-        if mode != "text" and self._mode_text.get_active():
-            self._set_tool_mode("select")
+        # Leaving a text page with the caret on left needs no hand-over: the
+        # binding table is per-window, "select" is an alias of "text", and
+        # `canvas.tool` derives from the table — so the PDF canvas already
+        # resolves the left button to its own face of the same tool.
         # the ☰ menu shows only the active mode's actions
         for m, items in (("pdf", self._pdf_menu_items),
                          ("text", self._text_menu_items)):
@@ -14635,11 +14611,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         there. Plain unmodified LEFT is the exception: it stays the ordinary
         "put this on the left button" toggle, so nothing about picking a tool
         changed. Everything else — any other button, or left under modifiers —
-        binds that chord and is swallowed, so the toggle never fires.
+        binds that chord and is swallowed, so the plain pick never fires.
 
-        Capture phase, `set_button(0)`: the ToggleButton's own click gesture
+        Capture phase, `set_button(0)`: the Button's own click gesture
         would otherwise claim the press first. The thumb needs the legacy
         controller for the usual reason (a GestureClick never sees button 10).
+
+        Modifiers come from the window's TRACKED held keys merged with the
+        event state, the same rule the canvas routers use (`_chord_state`).
+        The event state alone is not enough here: a press on a header button
+        can arrive without the modifier mask, and a Ctrl+click that reads as
+        unmodified falls into the plain-left path — silently binding the tool
+        to the LEFT button, which is the one outcome the user did not ask for.
         """
         click = Gtk.GestureClick()
         click.set_button(0)
@@ -14648,9 +14631,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         def _pressed(gesture, _n, _x, _y):
             btn = gesture.get_current_button()
             state = gesture.get_current_event_state()
-            ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
-            shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
-            alt = bool(state & Gdk.ModifierType.ALT_MASK)
+            held_ctrl, held_shift, held_alt = self._held_mods
+            ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK) or held_ctrl
+            shift = bool(state & Gdk.ModifierType.SHIFT_MASK) or held_shift
+            alt = bool(state & Gdk.ModifierType.ALT_MASK) or held_alt
             if btn == BTN_LEFT and not (ctrl or shift or alt):
                 return          # the plain pick: let the toggle have it
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
@@ -14872,42 +14856,31 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._syncing_highlight_style = False
 
     def _set_tool_mode(self, mode):
-        """Put `mode` on the LEFT mouse button (row 132) and mirror the choice
-        into both toggle groups.
+        """Put `mode` on the LEFT mouse button (row 132).
+
+        The tool buttons are plain `Gtk.Button`s, not toggles: with no active
+        tool there is no state for one to show, and a checked button would say
+        "this is the mode you are in" — the model row 132 replaced. The painted
+        stripe is the only signal, so this method's whole job is the binding.
 
         `highlighter` / `select_mode` are derived from the left binding now, so
         setting them here would fight it: `select_mode = False` while the caret
         is on left hands the button straight back to the pen.
         """
         mode = canonical_tool(mode)
-        if self._syncing_mode:
-            return
-        self._syncing_mode = True
-        try:
-            # the plain left-click path binds too — logged here so the stream
-            # shows every binding, not only the chord-clicks
-            log_press("bind", "left", mode,
-                      f"was {self.bindings.tool_for_chord('left')}")
-            self.canvas.tool = mode
-            if mode != "lasso":
-                self.canvas.clear_lasso_selection()
-            # cursor reflects what the left button would do right now
-            self.canvas.set_cursor(self.canvas._default_cursor())
-            # text-first page: pen/highlighter/eraser/lasso work the sheet's
-            # ink, everything else falls back to the text caret
-            if self._text_page is not None:
-                self._text_page.set_tool(mode)
-            # The buttons stay a radio group internally — GTK fights an
-            # attempt to leave a grouped toggle unchecked, and every caller and
-            # test flips them through `set_active`. What goes away is the LOOK:
-            # `.tool-btn` neutralises the checked styling, so the painted
-            # stripe is the only signal. A checked toggle would say "this is
-            # the mode you are in", which is the model this replaced.
-            idx = self._TOOL_ORDER[mode]
-            for grp in (self._tool_btns, self._ptool_btns):
-                grp[idx].set_active(True)
-        finally:
-            self._syncing_mode = False
+        # the plain left-click path binds too — logged here so the stream
+        # shows every binding, not only the chord-clicks
+        log_press("bind", "left", mode,
+                  f"was {self.bindings.tool_for_chord('left')}")
+        self.canvas.tool = mode
+        if mode != "lasso":
+            self.canvas.clear_lasso_selection()
+        # cursor reflects what the left button would do right now
+        self.canvas.set_cursor(self.canvas._default_cursor())
+        # text-first page: pen/highlighter/eraser/lasso work the sheet's
+        # ink, everything else falls back to the text caret
+        if self._text_page is not None:
+            self._text_page.set_tool(mode)
         # the left button just changed hands — repaint the stripes, which
         # otherwise only followed the chord-click path
         self._refresh_tool_bindings()
@@ -14916,23 +14889,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _highlight_transient_tool(self, ctrl, shift, alt):
         """Light up the tool button matching the modifiers currently held, so
-        the chord gestures are discoverable. Purely visual — the selected tool
-        and behaviour are untouched. The mapping is the shared chord_tool
-        grammar, evaluated for the active tab's document mode."""
+        the chord gestures are discoverable. Purely visual — the bindings and
+        behaviour are untouched."""
         self._held_mods = (ctrl, shift, alt)
         if self._gesture_tool is None:
             self._apply_transient_highlight(self._chord_highlight_tool())
 
     def _chord_highlight_tool(self):
+        """What the LEFT button would do under the modifiers held right now,
+        read from the TABLE (row 132) — not from the `chord_tool` grammar,
+        which is only the default the table was seeded with. Reading the
+        grammar meant a rebound chord lit the tool it used to run, which is
+        exactly the "the bar claims one thing while the mouse does another"
+        failure the generated badges and tooltips exist to prevent."""
         ctrl, shift, alt = self._held_mods
-        if self._active_session and self._active_session._text_mode:
-            tp = self._text_page
-            # Shift-alone only means zoom while an ink tool owns the sheet
-            # (with the caret it is text selection — see chord_tool)
-            ink_active = (tp is not None and tp.tool in
-                          ("pen", "highlighter", "eraser", "lasso", "zoom"))
-            return chord_tool(ctrl, shift, alt, "text", ink_active)
-        return chord_tool(ctrl, shift, alt, "pdf")
+        if not (ctrl or shift or alt):
+            return None          # nothing held: no chord to advertise
+        mode = (self._active_session.doc_mode if self._active_session else "pdf")
+        return self.bindings.tool_for(BTN_LEFT, ctrl, shift, alt, mode=mode)
 
     def _highlight_gesture_tool(self, tool):
         """Light the tool a BUTTON gesture is standing in for while it is in
@@ -17059,6 +17033,16 @@ class PDFEditorApp(Adw.Application):
         except (ValueError, ImportError):
             add_signal = GLib.unix_signal_add
         add_signal(GLib.PRIORITY_DEFAULT, signal.SIGINT, self._on_sigint)
+        # The middle button is a BOUND button here (row 132) — pan by default,
+        # anything the user puts there — so GTK's middle-click primary paste
+        # must not fire behind it. A GtkTextView pastes the primary selection
+        # from its own click gesture, which our capture-phase press router
+        # cannot reliably out-claim, and there is no per-widget switch: the
+        # setting is app-wide, which is the right scope anyway, since the
+        # middle button means the same thing on every surface Sidemark has.
+        settings = Gtk.Settings.get_default()
+        if settings is not None:
+            settings.set_property("gtk-enable-primary-paste", False)
 
     def _on_sigint(self):
         logger.info("Interrupted (Ctrl+C) — shutting down")
