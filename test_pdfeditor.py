@@ -7868,27 +7868,43 @@ class TestSingleInstanceArgs(unittest.TestCase):
     in one place; a second launch forwards here."""
 
     def test_file_only(self):
-        self.assertEqual(PDFEditorApp._parse_open_args(["a.pdf"]), ("a.pdf", 0))
+        self.assertEqual(PDFEditorApp._parse_open_args(["a.pdf"]),
+                         ("a.pdf", 0, None))
 
     def test_page_before_or_after_file(self):
-        self.assertEqual(
-            PDFEditorApp._parse_open_args(["--page", "3", "a.pdf"]), ("a.pdf", 3))
-        self.assertEqual(
-            PDFEditorApp._parse_open_args(["a.pdf", "--page", "5"]), ("a.pdf", 5))
+        self.assertEqual(PDFEditorApp._parse_open_args(["--page", "3", "a.pdf"]),
+                         ("a.pdf", 3, None))
+        self.assertEqual(PDFEditorApp._parse_open_args(["a.pdf", "--page", "5"]),
+                         ("a.pdf", 5, None))
 
     def test_verbose_and_unknown_flags_ignored(self):
-        self.assertEqual(
-            PDFEditorApp._parse_open_args(["-v", "a.pdf"]), ("a.pdf", 0))
-        self.assertEqual(
-            PDFEditorApp._parse_open_args(["--frobnicate", "a.pdf"]), ("a.pdf", 0))
+        self.assertEqual(PDFEditorApp._parse_open_args(["-v", "a.pdf"]),
+                         ("a.pdf", 0, None))
+        self.assertEqual(PDFEditorApp._parse_open_args(["--frobnicate", "a.pdf"]),
+                         ("a.pdf", 0, None))
 
     def test_bad_page_value_ignored(self):
         self.assertEqual(
             PDFEditorApp._parse_open_args(["--page", "nope", "a.pdf"]),
-            ("a.pdf", 0))
+            ("a.pdf", 0, None))
 
     def test_no_args(self):
-        self.assertEqual(PDFEditorApp._parse_open_args([]), (None, 0))
+        self.assertEqual(PDFEditorApp._parse_open_args([]), (None, 0, None))
+
+    def test_new_asks_for_a_blank_document(self):
+        self.assertEqual(PDFEditorApp._parse_open_args(["--new"]),
+                         (None, 0, "pdf"))
+        self.assertEqual(PDFEditorApp._parse_open_args(["--new-text"]),
+                         (None, 0, "text"))
+
+    def test_a_named_file_beats_new(self):
+        """Naming a file AND asking for a blank one is contradictory; opening
+        the file you named is the safe reading — the blank page is one click
+        away in the ☰ menu, the file you meant might not be."""
+        self.assertEqual(PDFEditorApp._parse_open_args(["--new", "a.pdf"]),
+                         ("a.pdf", 0, None))
+        self.assertEqual(PDFEditorApp._parse_open_args(["a.pdf", "--new-text"]),
+                         ("a.pdf", 0, None))
 
 
 class TestReorderPages(unittest.TestCase):

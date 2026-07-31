@@ -200,12 +200,15 @@ Options:
   -h, --help            Show this help message and exit.
   -v, --verbose         Enable verbose (debug-level) logging.
       --page N          Open FILE at page N (0-based page index).
+      --new             Open a blank PDF page (ignored if FILE is given).
+      --new-text        Open a blank text-first page instead.
       --list-recent     Print recent files as "name<TAB>path" and exit
                         (for launcher integrations); no window is shown.
 
 Examples:
   sidemark lecture.pdf
   sidemark --page 5 lecture.pdf
+  sidemark --new
   sidemark notes.md
 """
 
@@ -17881,9 +17884,13 @@ class PDFEditorApp(Adw.Application):
 
     @staticmethod
     def _parse_open_args(args):
-        """Pull a file path and --page N out of one launch's arguments (argv
-        without the program name). Unknown flags are ignored."""
-        path, page = None, 0
+        """Pull a file path, --page N and --new/--new-text out of one launch's
+        arguments (argv without the program name). Unknown flags are ignored.
+
+        Returns (path, page, new), where `new` is None, "pdf" or "text". A
+        path wins over --new: naming a file and asking for a blank one is
+        contradictory, and opening the file you named is the safe reading."""
+        path, page, new = None, 0, None
         i = 0
         while i < len(args):
             a = args[i]
@@ -17894,24 +17901,41 @@ class PDFEditorApp(Adw.Application):
                     pass
                 i += 2
                 continue
+            if a == "--new":
+                new = "pdf"
+                i += 1
+                continue
+            if a == "--new-text":
+                new = "text"
+                i += 1
+                continue
             if a in ("-v", "--verbose"):
                 i += 1
                 continue
             if not a.startswith("-") and path is None:
                 path = a
             i += 1
-        return path, page
+        return path, page, (None if path else new)
 
     def do_command_line(self, command_line):
         """Every launch (this process or a forwarded one from a second
         invocation) lands here in the single primary instance; open the file it
         names — as a tab in the window you were last using, or a new window."""
         args = command_line.get_arguments()
-        path, page = self._parse_open_args(args[1:])
+        path, page, new = self._parse_open_args(args[1:])
         if path and not os.path.isabs(path):
             cwd = command_line.get_cwd()
             if cwd:
                 path = os.path.join(cwd, path)
+        if new:
+            reused = self._open_blank(new)
+            if command_line.get_is_remote():
+                kind = "text page" if new == "text" else "page"
+                where = "the current window" if reused else "a new window"
+                command_line.print_literal(
+                    f"Sidemark is already running — opened a blank {kind} "
+                    f"in {where}.\n")
+            return 0
         reused = self._open_target(path, page)
         # A second launch forwards here and exits immediately; tell its shell
         # why, so it doesn't just look like the command silently did nothing.
@@ -17945,6 +17969,23 @@ class PDFEditorApp(Adw.Application):
                 return w
         return None
 
+    def _open_blank(self, kind):
+        """`--new` / `--new-text`: a blank document, following the SAME window
+        policy as opening a file — a tab in the window you were last using,
+        else a new window. Routed through the very actions the ☰ menu uses, so
+        the flag cannot drift from the menu item it mirrors.
+        Returns True if an existing window was reused."""
+        win = self._reuse_target()
+        if win is None:
+            # a fresh window opens ON the blank document instead of the
+            # scratchpad — see open_new_window
+            self.open_new_window(blank=kind)
+            return False
+        win.present()          # raise it so the new tab is in front
+        GLib.idle_add(lambda: (win._on_new_text_page() if kind == "text"
+                               else win._on_new_pdf(None)) and False)
+        return True
+
     def _open_target(self, path, page):
         """Open `path` following the window policy: a real file lands as a tab
         in the reuse target when one exists (so opening several files doesn't
@@ -17961,14 +18002,21 @@ class PDFEditorApp(Adw.Application):
         self.open_new_window(path, page)
         return False
 
-    def open_new_window(self, path=None, page=0):
-        logger.info("Opening new window: %s", path or "(scratchpad)")
+    def open_new_window(self, path=None, page=0, blank=None):
+        logger.info("Opening new window: %s",
+                    path or (f"(blank {blank})" if blank else "(scratchpad)"))
         win = PDFEditorWindow(self)
         win.present()
         if path and os.path.isfile(path):
             win.open_file(path)
             if page > 0:
                 win._go_to_page(page)
+        elif blank:
+            # `--new` REPLACES the scratchpad rather than joining it: the
+            # scratchpad is what an empty launch means, and a launch that
+            # asked for a blank page did not ask for two documents.
+            GLib.idle_add(lambda: (win._on_new_text_page() if blank == "text"
+                                   else win._on_new_pdf(None)) and False)
         else:
             if path:
                 logger.warning("File not found: %s", path)
@@ -17987,7 +18035,7 @@ def main():
     # Fail fast on a named file that doesn't exist, before we hand the launch
     # off to the (possibly already-running) primary instance. Checked here so
     # the error surfaces on the launching terminal with its own cwd.
-    path, _page = PDFEditorApp._parse_open_args(args)
+    path, _page, _new = PDFEditorApp._parse_open_args(args)
     if path and not os.path.isfile(path):
         print(f"File not found: {path}", file=sys.stderr)
         sys.exit(1)

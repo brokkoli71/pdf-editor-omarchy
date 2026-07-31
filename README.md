@@ -95,6 +95,7 @@ Installs the app, creates a launcher entry, registers it as the default handler 
 sidemark [OPTIONS] [FILE]      # FILE: a .pdf, .pptx, .md, or text file
 sidemark --help                # full option list
 sidemark --page 5 lecture.pdf  # open at a given page
+sidemark --new                 # start on a blank page (--new-text for paper)
 ```
 
 Tab-completion for the `sidemark` command's options and files is installed automatically (start a new shell to pick it up). To complete `./install.sh`'s own flags, `source extras/install.sh.bash` from the repo (both work in zsh after `autoload -U +X bashcompinit && bashcompinit`).
