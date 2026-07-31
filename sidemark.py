@@ -51,11 +51,48 @@ def _add_recent(path):
     os.replace(tmp, RECENT_PATH)
 
 
+# Where an INSTALLED copy of the script lives. Anything else — a working-tree
+# checkout you launch for a smoke test — is a different copy of the app, and
+# `_copy_key` is what tells the two apart.
+_INSTALLED_PATHS = (
+    "/usr/share/sidemark/sidemark.py",
+    os.path.expanduser("~/.local/share/sidemark/sidemark.py"),
+)
+
+
+def _copy_key():
+    """"" for the installed copy, else a short stable key for THIS copy.
+
+    One answer, two users: it suffixes the GApplication id (so a checkout never
+    forwards into the instance you actually use) and it suffixes settings.json
+    (so smoke-testing a checkout cannot rewrite the button table, pen width or
+    font size of the app you work in). Both are the same question — "is this
+    the app, or a copy of it?" — and answering it twice is how they drift.
+
+    `SIDEMARK_INSTANCE=<name>` forces a key: share on purpose, or isolate a
+    throwaway profile. An empty value means "be the installed copy"."""
+    override = os.environ.get("SIDEMARK_INSTANCE")
+    if override is not None:
+        key = re.sub(r'[^A-Za-z0-9]', '', override)
+        return f"i{key}" if key else ""
+    try:
+        src = os.path.realpath(os.path.abspath(__file__))
+    except NameError:                        # e.g. exec'd without a __file__
+        return ""
+    if src in {os.path.realpath(p) for p in _INSTALLED_PATHS}:
+        return ""
+    # ids can't start with a digit, so the path hash carries a letter prefix
+    return "v" + hashlib.sha1(src.encode("utf-8")).hexdigest()[:12]
+
+
 def _settings_path():
-    # resolved at call time so tests can redirect via XDG_CONFIG_HOME
+    # resolved at call time so tests can redirect via XDG_CONFIG_HOME, and so a
+    # copy of the app keeps its own settings (see _copy_key)
+    key = _copy_key()
+    name = f"settings-{key}.json" if key else "settings.json"
     return os.path.join(
         os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
-        "sidemark", "settings.json")
+        "sidemark", name)
 
 
 def _load_settings():
@@ -949,16 +986,23 @@ BUTTON_LABELS = {"left": "Left", "middle": "Middle", "right": "Right",
 MOD_ORDER = ("ctrl", "shift", "alt")
 
 DEFAULT_BINDINGS = {
-    # A CLEAN START (the user's call, 2026-07-31): three buttons, no modifier
-    # chords at all. The old grammar's chords were a fixed table nobody chose;
-    # now that every chord is bindable, shipping a pile of them only makes it
-    # unclear what is yours and what was ours. Bind what you want.
+    # The shipped defaults (the user's call, 2026-07-31): the three buttons
+    # every mouse has, and four chords, no more. Every chord is bindable, so
+    # this is a starting point rather than a grammar — a short table keeps it
+    # clear what is yours and what was ours. Bind what you want.
+    # The THUMB is deliberately unbound: most mice do not have one, and a
+    # default nobody can press is a default nobody chose.
     "left": "pen",
+    "middle": "lasso",
     "right": "eraser",
-    "middle": "pan",
-    # the thumb pans, full stop — it is the ergonomic stand-in for the middle
-    # button and nobody wants it doing anything else (the user's call)
-    "thumb": "pan",
+    "ctrl+left": "pan",
+    "ctrl+right": "text",
+    "shift+left": "zoom",
+    # Alt+left is the text cursor because Alt is how you follow a PDF link,
+    # and following a link IS the cursor tool's click (`_open_link_at`). Left
+    # unbound under Alt meant Alt lit the links up and then nothing opened
+    # them — the modifier promised something the table could not deliver.
+    "alt+left": "text",
 }
 
 
@@ -1622,13 +1666,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self._press_tool = None       # the tool of the press in flight
         # set for the duration of a Ctrl+Shift+drag: a one-off highlighter stroke
         self._temp_highlighter = False
-        # transient tool implied by the modifiers currently held down — surfaced
-        # to the header so the matching tool button lights up (discoverability).
+        # the modifiers currently held down — surfaced to the header, which
+        # repaints the toolbar's binding stripes so they show what each mouse
+        # button would do under them (discoverability)
         self.on_modifier_tool = None   # callback(ctrl, shift, alt) on change
-        self.on_gesture_tool = None    # callback(tool_or_None): a button
-        # gesture (right-drag erase, middle/thumb pan, Shift+middle zoom)
-        # started / ended — drives the same transient toolbar highlight as
-        # the modifier chords, so button gestures are discoverable too
 
         # word-level text selection (Alt+drag) and link opening (Alt+click)
         self._text_selecting = False
@@ -2698,8 +2739,14 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _update_anchor_hover(self, x, y):
         """Show a grab cursor over anchor circles and callout boxes so it's clear
-        they can be dragged. Yields to link-hover (Alt) and stays out of its way."""
-        over = (self._hovered_link_rect is None and not self._alt_held
+        they can be dragged. Yields to link-hover and stays out of its way."""
+        # While a MODIFIER is what makes the left button the caret, the pointer
+        # belongs to link-following and must not offer a drag instead. With the
+        # caret simply picked in the bar there is nothing transient to get out
+        # of the way of — anchors stay draggable, so they keep saying so.
+        borrowed_caret = ((self._ctrl_held or self._shift_held or self._alt_held)
+                          and self.link_hover_active())
+        over = (self._hovered_link_rect is None and not borrowed_caret
                 and self.page is not None
                 and (self._anchor_hit_test(x, y) is not None
                      or self._callout_hit_test(x, y) is not None
@@ -2937,10 +2984,6 @@ class PDFCanvas(Gtk.DrawingArea):
             self.on_modifier_tool(self._ctrl_held, self._shift_held,
                                   self._alt_held)
 
-    def _fire_gesture_tool(self, tool):
-        if self.on_gesture_tool:
-            self.on_gesture_tool(tool)
-
     def _chord_state(self, gesture):
         """Modifier state for chord routing: the gesture's event state OR-ed
         with the tracked held keys. Touch sequences on Wayland don't carry
@@ -2974,9 +3017,19 @@ class PDFCanvas(Gtk.DrawingArea):
                 "zoom": "crosshair", "anchor": "crosshair"}.get(self.tool)
         return Gdk.Cursor.new_from_name(name, None) if name else None
 
+    def link_hover_active(self):
+        """Links light up exactly when a click would FOLLOW one: when the left
+        button's tool right now — under whatever modifiers are held — is the
+        text cursor, whose click is `_open_link_at`. Reading the table instead
+        of testing for Alt is what keeps the promise and the behaviour the same
+        thing: rebind Alt+left away and the links stop glowing under Alt too."""
+        return self.bindings.tool_for(
+            BTN_LEFT, self._ctrl_held, self._shift_held, self._alt_held,
+            mode=self.doc_mode) == "text"
+
     def _update_link_hover(self):
         new_rect = None
-        if self._alt_held and self.page:
+        if self.link_hover_active() and self.page:
             px, py = self._screen_to_pdf(self._hover_x, self._hover_y)
             for link in self.page.get_links():
                 r = link["from"]
@@ -2986,7 +3039,10 @@ class PDFCanvas(Gtk.DrawingArea):
         if new_rect == self._hovered_link_rect:
             return
         self._hovered_link_rect = new_rect
-        self.set_cursor(Gdk.Cursor.new_from_name("pointer", None) if new_rect else None)
+        # falling off a link goes back to the TOOL's cursor, not to none — with
+        # the caret on the left button the I-beam is what the page should wear
+        self.set_cursor(Gdk.Cursor.new_from_name("pointer", None) if new_rect
+                        else self._default_cursor())
         self.queue_draw()
 
     def _on_click_pressed(self, gesture, n_press, x, y):
@@ -3067,10 +3123,6 @@ class PDFCanvas(Gtk.DrawingArea):
         self._zoom_selecting = False
         self._selected_words = []
         self._press_tool = tool
-        # a press that is not the plain button's own tool is a "gesture": the
-        # toolbar lights that tool up so the binding is discoverable
-        if tool != plain:
-            self._fire_gesture_tool(tool)
         self._begin_tool(tool, start_x, start_y, chorded=(tool != plain),
                          additive=additive)
 
@@ -3589,9 +3641,6 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _drag_end(self, gesture, offset_x, offset_y):
         logger.debug(f"drag end offset=({offset_x:.0f},{offset_y:.0f})")
-        # a button gesture's transient toolbar highlight ends with the press
-        # (no-op for plain tool drags — the window falls back to held chords)
-        self._fire_gesture_tool(None)
         self._cancel_straight_timer()
         self._cancel_circle_lasso()   # a lift ends the hold (row 126)
         was_straight = self._straight_mode
@@ -7307,6 +7356,31 @@ class NotesModel:
             self._notes[start] = f"{head}\n\n{mine}" if head else mine
         return True
 
+    def link_forward(self, idx, page_count):
+        """Continue idx from the page before it AND carry the run on through
+        every following page that has nothing of its own to say. Returns the
+        pages newly linked.
+
+        One tick is meant to cover a whole run of slides — the point of the
+        feature is one set of notes across five pages, and asking for five
+        clicks to get there is asking for the thing the feature exists to
+        avoid. The stop condition is a page that ALREADY has notes: absorbing
+        those into the run is the one outcome you cannot see coming from the
+        checkbox you clicked, so the cascade stops short of it.
+
+        A page already linked is not re-linked but does not stop the walk —
+        its `own_text` is "" by construction, so the run simply flows through
+        it and the pages beyond join the same run."""
+        if not self.link(idx):
+            return []
+        linked, nxt = [idx], idx + 1
+        while nxt < page_count and not self.own_text(nxt).strip():
+            if nxt not in self._links:
+                self.link(nxt)
+                linked.append(nxt)
+            nxt += 1
+        return linked
+
     def unlink(self, idx):
         """Split the run at idx. The text stays with the run's first page and
         idx starts empty — deterministic beats guessing which half of a
@@ -7315,6 +7389,17 @@ class NotesModel:
             return False
         self._links.discard(idx)
         return True
+
+    def unlink_forward(self, idx):
+        """Break the run at idx and at every page after it, returning the pages
+        freed. The mirror of `link_forward`: a tail that one tick created comes
+        apart with one untick. Pages BEFORE idx keep their run and the body
+        stays on its first page — untick means "this page is not a
+        continuation", never "throw away the notes"."""
+        pages = [p for p in self.run_pages(idx) if p >= idx]
+        for p in pages:
+            self.unlink(p)
+        return pages
 
     def set_links(self, pages):
         """Replace the link flags wholesale (a merge, a re-key, an undo).
@@ -8406,8 +8491,6 @@ class TextPageView(Gtk.Overlay):
         self._erased_now = []     # strokes removed during the ongoing erase drag
         self.on_ink_action = None   # a draw/erase gesture finished (undo timeline)
         self.on_ink_changed = None  # any ink mutation (dirty tracking)
-        self.on_gesture_tool = None  # callback(tool_or_None): a button gesture
-        # started / ended — transient toolbar highlight, PDF-canvas parity
         self.get_held_mods = None    # callback() -> (ctrl, shift, alt) from the
         # window's key tracking; merged into chord routing for touch drags
         # (color, width, opacity) for the given highlighter flag — the window
@@ -8899,10 +8982,6 @@ class TextPageView(Gtk.Overlay):
 
     # ── grab pan (PDF-canvas parity) ─────────────────────────────────────────
 
-    def _fire_gesture_tool(self, tool):
-        if self.on_gesture_tool:
-            self.on_gesture_tool(tool)
-
     def _chord_state(self, gesture):
         """Modifier state for chord routing: the gesture's event state OR-ed
         with the window-tracked held keys (get_held_mods → the session
@@ -9325,8 +9404,6 @@ class TextPageView(Gtk.Overlay):
 
         gesture.set_state(Gtk.EventSequenceState.CLAIMED)
         self._press_tool = tool
-        if tool != plain:
-            self._fire_gesture_tool(tool)
         if tool == "pan":
             self._begin_pan()
             return
@@ -9340,7 +9417,6 @@ class TextPageView(Gtk.Overlay):
                     return              # still a click; menu on release
                 self._rerase_started = True
                 self._press_tool = "eraser"
-                self._fire_gesture_tool("eraser")
                 self._on_ink_begin(gesture, *self._rerase_press)
             self._on_ink_update(gesture, dx, dy)
             return
@@ -9364,7 +9440,6 @@ class TextPageView(Gtk.Overlay):
             self._rerase_press = None
             if self._rerase_started:
                 self._rerase_started = False
-                self._fire_gesture_tool(None)
                 self._on_ink_end(gesture, dx, dy)
                 return
             self._reopen_context_menu(x, y)
@@ -9373,7 +9448,6 @@ class TextPageView(Gtk.Overlay):
             self._pan_end()
         elif self._press_tool is not None:
             self._on_ink_end(gesture, dx, dy)
-        self._fire_gesture_tool(None)
 
     def _reopen_context_menu(self, x, y):
         """A clean right-CLICK: our up-front claim swallowed the press the
@@ -11078,7 +11152,7 @@ class DocumentSession:
         "_notes_link_check", "_notes_link_hint",
         "_search_revealer", "_search_entry", "_search_label", "_paned",
         "_toc_list", "_toc_scroll", "_toc_revealer", "_toc_switch",
-        "_toc_seg_outline", "_toc_seg_pages", "content", "_text_page",
+        "_toc_seg_outline", "_toc_seg_pages", "content", "_body", "_text_page",
     )
 
     def __init__(self):
@@ -11195,9 +11269,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._refresh_tool_bindings()
 
         GLib.timeout_add_seconds(60, self._autosave_tick)
-        self._transient_tool = None    # window-level: highlights a shared tool button
         self._held_mods = (False, False, False)   # last seen (ctrl, shift, alt)
-        self._gesture_tool = None      # a button gesture's tool, while in flight
+        # set by a tool press that bound a CHORD, consumed by the `clicked`
+        # that follows it — the claim cannot swallow that click on its own
+        self._binding_press = False
         self._ocr_seen = set()         # PDFs we've already offered to OCR this session
         self._ocr_hint_shown = False   # one-time "install ocrmypdf" hint
 
@@ -11243,10 +11318,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 border: 1px solid shade({bg_hex}, 0.75);
             }}
             .pen-swatch:hover {{ border: 2px solid {fg_hex}; }}
-            .tool-transient {{
-                background-color: alpha({acc_hex}, 0.30);
-                box-shadow: inset 0 0 0 1px {acc_hex};
-            }}
             .current-page {{
                 box-shadow: inset 0 0 0 2px {acc_hex};
                 border-radius: 4px;
@@ -11665,7 +11736,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                            self._mode_lasso, self._mode_text, self._mode_pan,
                            self._mode_zoom, self._mode_anchor)
         for b, m in zip(self._tool_btns, self._TOOL_BAR_ORDER):
-            b.connect("clicked", lambda _b, m=m: self._set_tool_mode(m))
+            b.connect("clicked", lambda _b, m=m: self._pick_tool(m))
             b.add_css_class("tool-btn")
             self._attach_binding_click(b, m)
             self._add_binding_strip(b, m)
@@ -11719,7 +11790,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                             self._pmode_lasso, self._pmode_text, self._pmode_pan,
                             self._pmode_zoom, self._pmode_anchor)
         for b, m in zip(self._ptool_btns, self._TOOL_BAR_ORDER):
-            b.connect("clicked", lambda _b, m=m: self._set_tool_mode(m))
+            b.connect("clicked", lambda _b, m=m: self._pick_tool(m))
             b.add_css_class("tool-btn")
             self._attach_binding_click(b, m)
             self._add_binding_strip(b, m)
@@ -12109,7 +12180,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s.canvas.on_canvas_press = lambda *a: s.win._clear_thumb_selection(*a)
         s.canvas.on_nav_history = lambda *a: s.win._on_nav_history(*a)
         s.canvas.on_modifier_tool = lambda *a: s.win._highlight_transient_tool(*a)
-        s.canvas.on_gesture_tool = lambda t: s.win._highlight_gesture_tool(t)
         # responsive collapse tick (the HeaderBar itself never fires ::resize)
         s.canvas.connect("resize", lambda *_: s.win._update_header_collapse())
 
@@ -12205,7 +12275,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._search_revealer.set_reveal_child(False)
 
         canvas_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        canvas_box.append(s._search_revealer)
         canvas_box.append(s.canvas)
 
         # ── split pane ────────────────────────────────────────────────────────
@@ -12276,9 +12345,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._toc_revealer.set_child(toc_box)
         s._toc_revealer.set_reveal_child(False)
 
-        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        content.append(s._toc_revealer)
-        content.append(s._paned)
+        # The search bar sits ABOVE the whole document area, not inside the PDF
+        # column: the column is `_paned`, which is HIDDEN on a text-first page,
+        # and a revealer nobody can see is what "Ctrl+F does nothing" looks
+        # like. One bar, both modes — the search itself was already mode-blind
+        # (it reads the notes model, which a text page writes to on page 0).
+        body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        # stated, not inferred: the revealer takes its natural height and the
+        # document area takes the rest. Leaving it to propagate from the canvas
+        # works until the canvas is the hidden one (text mode).
+        body.set_vexpand(True)
+        body.set_hexpand(True)
+        body.append(s._toc_revealer)
+        body.append(s._paned)
+        s._body = body
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content.append(s._search_revealer)
+        content.append(body)
         s.content = content
         return s
 
@@ -12308,14 +12391,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "changed", lambda *a: s.win._on_notes_changed(*a))
         tp.on_ink_action = lambda: s.win._on_ink_action()
         tp.on_ink_changed = lambda: s.win._mark_dirty()
-        tp.on_gesture_tool = lambda t: s.win._highlight_gesture_tool(t)
         # the session's canvas holds the window-fed modifier tracking; the
         # sheet merges it into chord routing so keyboard+touch chords work
         tp.get_held_mods = lambda s=s: (s.canvas._ctrl_held,
                                         s.canvas._shift_held,
                                         s.canvas._alt_held)
         tp.set_visible(False)
-        s.content.append(tp)
+        s._body.append(tp)
         s._text_page = tp
         return tp
 
@@ -13265,46 +13347,57 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 and self.canvas.n_pages > 1)
 
     def _link_notes_to_previous(self):
-        """Continue this page's notes from the page before it."""
+        """Continue this page's notes from the page before it — and from here
+        through every following blank page (`link_forward`), so a run of slides
+        costs one tick rather than one per page."""
         idx = self.canvas.current_page_idx
         if not self._can_link_notes() or idx <= 0:
             return
         self._commit_note()
-        if not self.notes_model.link(idx):
+        linked = self.notes_model.link_forward(idx, self.canvas.n_pages)
+        if not linked:
             return
         self._restore_note()
         self._populate_toc()      # the page strip carries the run marker too
         self._mark_dirty()
         start = self.notes_model.run_start(idx)
-        self._toast(f"Notes continue from page {start + 1}")
+        msg = f"Notes continue from page {start + 1}"
+        if len(linked) > 1:
+            msg += f" — pages {linked[0] + 1}–{linked[-1] + 1}"
+        self._toast(msg)
 
     def _unlink_notes_from_previous(self, idx=None):
-        """Split the run at this page. The body stays with the run's first page
-        — say which, and offer the way back, because the alternative is
-        guessing which half of a paragraph belonged to which slide."""
+        """Split the run at this page and at every page after it. The body
+        stays with the run's first page — say which, and offer the way back,
+        because the alternative is guessing which half of a paragraph belonged
+        to which slide."""
         if idx is None:
             idx = self.canvas.current_page_idx
         if not self.notes_model.is_linked(idx):
             return
         self._commit_note()
         start = self.notes_model.run_start(idx)
-        self.notes_model.unlink(idx)
+        freed = self.notes_model.unlink_forward(idx)
         self._restore_note()
         self._populate_toc()
         self._mark_dirty()
-        toast = Adw.Toast.new(f"Notes stayed with page {start + 1}")
+        msg = f"Notes stayed with page {start + 1}"
+        if len(freed) > 1:
+            msg += f" — pages {freed[0] + 1}–{freed[-1] + 1} start empty"
+        toast = Adw.Toast.new(msg)
         toast.set_button_label("Undo")
-        toast.connect("button-clicked", lambda *_: self._relink_notes(idx))
+        toast.connect("button-clicked", lambda *_: self._relink_notes(freed))
         toast.set_timeout(6)
         self.toast_overlay.add_toast(toast)
 
-    def _relink_notes(self, idx):
-        """Undo an unlink. The page has been empty since the split, so this
-        cannot merge stray text back into the run."""
-        if self.notes_model.is_linked(idx):
-            return
+    def _relink_notes(self, pages):
+        """Undo an unlink, restoring the whole tail it freed. Those pages have
+        been empty since the split, so this cannot merge stray text back into
+        the run — and they are re-linked in order, because a later page can
+        only continue one already back in the run."""
         self._commit_note()
-        self.notes_model.link(idx)
+        for idx in sorted(pages):
+            self.notes_model.link(idx)
         self._restore_note()
         self._populate_toc()
         self._mark_dirty()
@@ -13346,8 +13439,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             check.set_tooltip_text(
                 f"Write ONE set of notes across page {idx} and this page: the "
                 f"text lives on page {start} and both pages show and edit it.\n"
-                f"Clearing this leaves the text on page {start}; this page "
-                f"starts empty again.")
+                f"The run carries on through the following pages until one "
+                f"already has notes of its own.\n"
+                f"Clearing this leaves the text on page {start}; this page and "
+                f"the ones after it start empty again.")
             self._notes_link_updating = True
             check.set_active(linked)
             self._notes_link_updating = False
@@ -14593,10 +14688,28 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         button.set_child(overlay)
         self._tool_strips.setdefault(tool, []).append(strip)
 
+    def _live_buttons_for(self, tool):
+        """The buttons that would run `tool` RIGHT NOW.
+
+        With nothing held that is the plain table. With a modifier down it is
+        the chord table under those modifiers, so the stripes MOVE as you hold
+        Ctrl or Alt and the bar is a live readout of your hand rather than a
+        static badge. A button whose chord is unbound shows nothing, because
+        that is what pressing it would do — the table has no fallback to the
+        plain binding, and neither does the paint."""
+        ctrl, shift, alt = self._held_mods
+        if not (ctrl or shift or alt):
+            return self.bindings.plain_buttons_for(tool)
+        mode = (self._active_session.doc_mode if self._active_session else "pdf")
+        return [name for btn, name in sorted(BUTTON_NAMES.items())
+                if self.bindings.tool_for(btn, ctrl, shift, alt,
+                                          mode=mode) == canonical_tool(tool)]
+
     def _draw_binding_strip(self, _area, ctx, w, h, tool):
-        """A segment per UNMODIFIED button this tool owns, side by side — so a
-        tool on two buttons wears both colours and an unbound tool wears none."""
-        plain = self.bindings.plain_buttons_for(tool)
+        """A segment per button that would run this tool as the mouse sits now,
+        side by side — so a tool on two buttons wears both colours and one no
+        button reaches wears none."""
+        plain = self._live_buttons_for(tool)
         if not plain:
             return
         seg = w / len(plain)
@@ -14613,16 +14726,21 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         changed. Everything else — any other button, or left under modifiers —
         binds that chord and is swallowed, so the plain pick never fires.
 
-        Capture phase, `set_button(0)`: the Button's own click gesture
-        would otherwise claim the press first. The thumb needs the legacy
-        controller for the usual reason (a GestureClick never sees button 10).
+        **CLAIMING THE PRESS DOES NOT SWALLOW THE CLICK.** `GtkButton`'s own
+        `GtkGestureClick` is in the CAPTURE phase too (probe it with
+        `observe_controllers()`), and same widget + same phase run in the order
+        they were ADDED — the Button's was added at construction, so it runs
+        first and our claim arrives too late to cancel it. `clicked` still
+        fires, and the symptom is Ctrl+clicking a tool binding Ctrl+left *and*
+        stealing plain left, which is the one outcome nobody asked for. So the
+        press sets `_binding_press` and `_pick_tool` consumes it; the flag, not
+        the claim, is what makes the two paths exclusive.
 
         Modifiers come from the window's TRACKED held keys merged with the
         event state, the same rule the canvas routers use (`_chord_state`).
         The event state alone is not enough here: a press on a header button
         can arrive without the modifier mask, and a Ctrl+click that reads as
-        unmodified falls into the plain-left path — silently binding the tool
-        to the LEFT button, which is the one outcome the user did not ask for.
+        unmodified falls into the plain-left path.
         """
         click = Gtk.GestureClick()
         click.set_button(0)
@@ -14635,8 +14753,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK) or held_ctrl
             shift = bool(state & Gdk.ModifierType.SHIFT_MASK) or held_shift
             alt = bool(state & Gdk.ModifierType.ALT_MASK) or held_alt
+            self._binding_press = False
             if btn == BTN_LEFT and not (ctrl or shift or alt):
                 return          # the plain pick: let the toggle have it
+            # only LEFT produces a `clicked` to swallow — the Button's gesture
+            # is primary-only, so flagging any other button would eat the next
+            # plain pick instead of this one
+            self._binding_press = (btn == BTN_LEFT)
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
             self._bind_chord(chord_id(btn, ctrl, shift, alt), tool)
 
@@ -14662,6 +14785,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         legacy.connect("event", _legacy)
         button.add_controller(legacy)
+
+    def _pick_tool(self, tool):
+        """The plain left-click path — put `tool` on the left button.
+
+        Swallowed when the press that produced this click already bound a
+        CHORD: GTK does not cancel the Button's own click gesture when our
+        capture controller claims the press (see `_attach_binding_click`), so
+        without this a Ctrl+click would bind Ctrl+left and take plain left with
+        it."""
+        if self._binding_press:
+            self._binding_press = False
+            return
+        self._set_tool_mode(tool)
 
     def _bind_chord(self, chord, tool):
         """Move `chord` onto `tool` and say so. A chord maps to exactly one
@@ -14720,6 +14856,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 grp[self._TOOL_ORDER[tool]].set_tooltip_text(tip)
             for strip in self._tool_strips.get(tool, ()):
                 strip.queue_draw()
+        if self._active_session is not None and not self._text_mode:
+            # links glow exactly while the caret is what a click would run
+            # (`link_hover_active`), so a rebind has to re-ask right away —
+            # otherwise the page keeps yesterday's answer until you move the
+            # mouse, and picking the cursor tool looks like it did nothing
+            self.canvas._update_link_hover()
         if self._bindings_list is not None:
             self._populate_bindings_list()
 
@@ -14888,46 +15030,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._color_swatch.queue_draw()
 
     def _highlight_transient_tool(self, ctrl, shift, alt):
-        """Light up the tool button matching the modifiers currently held, so
-        the chord gestures are discoverable. Purely visual — the bindings and
-        behaviour are untouched."""
-        self._held_mods = (ctrl, shift, alt)
-        if self._gesture_tool is None:
-            self._apply_transient_highlight(self._chord_highlight_tool())
+        """The modifiers held changed: repaint the binding stripes so they show
+        what the mouse buttons do UNDER those modifiers (`_live_buttons_for`).
 
-    def _chord_highlight_tool(self):
-        """What the LEFT button would do under the modifiers held right now,
-        read from the TABLE (row 132) — not from the `chord_tool` grammar,
-        which is only the default the table was seeded with. Reading the
-        grammar meant a rebound chord lit the tool it used to run, which is
-        exactly the "the bar claims one thing while the mouse does another"
-        failure the generated badges and tooltips exist to prevent."""
-        ctrl, shift, alt = self._held_mods
-        if not (ctrl or shift or alt):
-            return None          # nothing held: no chord to advertise
-        mode = (self._active_session.doc_mode if self._active_session else "pdf")
-        return self.bindings.tool_for(BTN_LEFT, ctrl, shift, alt, mode=mode)
-
-    def _highlight_gesture_tool(self, tool):
-        """Light the tool a BUTTON gesture is standing in for while it is in
-        flight (right-drag erase, middle/thumb-drag pan, Shift+middle zoom) —
-        so the hidden gestures announce themselves in the toolbar the moment
-        they are used. None on release falls back to any still-held chord."""
-        self._gesture_tool = tool
-        self._apply_transient_highlight(
-            tool if tool is not None else self._chord_highlight_tool())
-
-    def _apply_transient_highlight(self, tool):
-        if tool == self._transient_tool:
+        This is the whole of the modifier feedback — there is no second signal
+        lighting one button up. A tool wearing a coloured stripe and a tool
+        wearing a glow said two different things about the same table, and the
+        stripe is the one that names WHICH button, so it is the one that
+        survived. Purely visual: the bindings are untouched."""
+        if self._held_mods == (ctrl, shift, alt):
             return
-        self._transient_tool = tool
-        for grp in (self._tool_btns, self._ptool_btns):
-            for b in grp:
-                b.remove_css_class("tool-transient")
-        if tool is not None:
-            idx = self._TOOL_ORDER[tool]
-            for grp in (self._tool_btns, self._ptool_btns):
-                grp[idx].add_css_class("tool-transient")
+        self._held_mods = (ctrl, shift, alt)
+        self._repaint_binding_strips()
+
+    def _repaint_binding_strips(self):
+        for strips in self._tool_strips.values():
+            for strip in strips:
+                strip.queue_draw()
 
     # ── notes-panel font size ────────────────────────────────────────────────
     _NOTES_FONT_DEFAULT = 13
@@ -16739,6 +16858,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     # ── search ────────────────────────────────────────────────────────────────
 
     def _show_search(self):
+        # a text page has no PDF to search, and a placeholder that promises one
+        # is the kind of small lie that makes a feature feel broken
+        self._search_entry.set_placeholder_text(
+            "Search page…" if self._text_mode else "Search PDF & notes…")
         self._search_revealer.set_reveal_child(True)
         self._search_entry.grab_focus()
 
@@ -16975,34 +17098,16 @@ BASE_APP_ID = "de.hspitz.sidemark"
 # Where an installed copy lives (AUR package / install.sh). A copy running from
 # one of these paths keeps the canonical id so it matches the .desktop file for
 # its icon/name and every launch shares one instance (tabs drag between windows).
-_INSTALLED_PATHS = (
-    "/usr/share/sidemark/sidemark.py",
-    os.path.expanduser("~/.local/share/sidemark/sidemark.py"),
-)
-
-
 def _application_id():
-    """The GApplication id, scoped to this *version* of the code so a launch
-    only ever joins another instance running the same copy.
+    """The GApplication id, scoped to this *copy* of the code so a launch only
+    ever joins another instance running the same one.
 
-    The installed copy uses the plain id `de.hspitz.sidemark`. Any other copy —
-    a working-tree checkout you launch for a smoke test — gets its own id keyed
-    to its path, so it never forwards into (and vanishes behind) the instance
-    you have installed and are using. Set SIDEMARK_INSTANCE=<name> to force a
-    specific suffix (share on purpose, or isolate a throwaway instance)."""
-    override = os.environ.get("SIDEMARK_INSTANCE")
-    if override is not None:
-        key = re.sub(r'[^A-Za-z0-9]', '', override)
-        return f"{BASE_APP_ID}.i{key}" if key else BASE_APP_ID
-    try:
-        src = os.path.realpath(os.path.abspath(__file__))
-    except NameError:                        # e.g. exec'd without a __file__
-        return BASE_APP_ID
-    if src in {os.path.realpath(p) for p in _INSTALLED_PATHS}:
-        return BASE_APP_ID
-    # id elements can't start with a digit, so prefix the path hash with a letter
-    key = hashlib.sha1(src.encode("utf-8")).hexdigest()[:12]
-    return f"{BASE_APP_ID}.v{key}"
+    The installed copy uses the plain id `de.hspitz.sidemark`; any other gets
+    the `_copy_key` suffix, so a checkout never forwards into (and vanishes
+    behind) the instance you have installed and are using. Recent files stay
+    shared — a copy is a different app, not a different person."""
+    key = _copy_key()
+    return f"{BASE_APP_ID}.{key}" if key else BASE_APP_ID
 
 
 class PDFEditorApp(Adw.Application):

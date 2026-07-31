@@ -47,5 +47,15 @@ if [ ! -S "$RT/$SOCK" ]; then
   [ -S "$RT/$SOCK" ] || { echo "weston failed to start; see $LOG" >&2; exit 1; }
 fi
 
+# A THROWAWAY CONFIG HOME, or the suite runs against — and WRITES — your real
+# settings.json. `Bindings.save()` persists on every rebind, so a test that
+# rebinds a chord silently rewrote the user's button table, and every window
+# test after it resolved presses through whatever the last run happened to
+# leave behind. Both failure modes are invisible: the tests still pass on the
+# machine that broke them, and the app comes up with a table nobody chose.
+CFG="$RT/config"
+mkdir -p "$CFG"
+
 exec env XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY="$SOCK" GDK_BACKEND=wayland \
+  XDG_CONFIG_HOME="$CFG" \
   SIDEMARK_TEST=1 /usr/bin/python3 -m pytest "${TIER[@]}" "${@:-test_pdfeditor.py}" -q

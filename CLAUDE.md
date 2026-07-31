@@ -37,13 +37,25 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   left draws, right erases, middle pans, at the same time. `Bindings` is THE
   table (`DEFAULT_BINDINGS`; persisted in settings.json under
   `button_bindings`), ONE instance per window shared by every canvas and sheet.
-  Defaults: left pen, right eraser, middle pan, **thumb unbound** (most mice
-  have none); chords Ctrl=pan, Ctrl+Shift=highlighter, Ctrl+Shift+Alt=lasso,
-  Ctrl+Alt=anchor (pdf-only), Shift and Alt+Shift=zoom. `chord_tool()` survives
-  as a thin resolver for callers that only want the left button's grammar.
+  Defaults (the user's table, 2026-07-31): left pen, middle lasso, right
+  eraser, plus four chords — Ctrl+left pan, Ctrl+right text cursor, Shift+left
+  zoom-to-region, **Alt+left text cursor** (Alt is how you follow a PDF link,
+  and following a link IS the caret's click). The **thumb is unbound** (most
+  mice have none). Nothing else is bound out of the box; the rest is the
+  user's to bind. `chord_tool()` survives as a thin resolver for callers that
+  only want the left button's grammar.
   - **The toolbar is the binding surface**: click a tool with the button you
     want it on. Plain left-click is the exception — it stays "put this on the
-    left button", so picking a tool feels unchanged.
+    left button", so picking a tool feels unchanged. **Claiming the press does
+    not swallow the click**: `GtkButton`'s own gesture is CAPTURE-phase too and
+    was added first, so `clicked` fires anyway — `_binding_press` is the flag
+    that makes the two paths exclusive, not the claim.
+  - **The stripes are a LIVE readout, and they are the ONLY signal.** Holding
+    a modifier repaints them from the chord table (`_live_buttons_for`), so the
+    bar always shows what each button would do right now; an unbound chord
+    shows nothing, because that is what pressing it would do. There is no
+    second highlight — a glow that lit one tool without naming a button said
+    something different from the stripe beside it about the same table.
   - **Routing, badges and tooltips all read the table** (`_refresh_tool_bindings`
     generates both). A second mapping is how the bar comes to claim one thing
     while the mouse does another. Each canvas has ONE press router
@@ -63,6 +75,10 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   - **The thumb is a real button**: button 10 never reaches a `GestureDrag`, so
     its press is replayed through the same router with a `_SyntheticDrag`.
     That is what lets it hold any tool instead of a hardwired pan.
+  - **Links glow exactly when a click would follow one**: `link_hover_active()`
+    is "the left button's tool right now is `text`", never "Alt is down". One
+    predicate for the glow and for `_open_link_at`, or the modifier promises
+    what the table cannot deliver.
   - **Keyboard tool shortcuts are hold-to-borrow**: Ctrl+H lends left the
     highlighter while held (`_borrow_tool` / `_on_borrow_release`), Ctrl+M the
     caret. Releasing either key gives the button back.
@@ -129,13 +145,26 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   than re-linking two unrelated slides; the load-bearing one is
   `shift_for_delete`, where deleting a run's START hands the body to the next
   page in the run instead of dropping the whole run's text. PDF-only, and the
-  UI is one checkbox in the notes header (`_update_notes_link_ui`).
+  UI is one checkbox in the notes header (`_update_notes_link_ui`). **The tick
+  CASCADES**: `link_forward` carries the run through every following page that
+  has nothing of its own, stopping at the first page that already has notes
+  (`link()` would append it into the run — the one outcome you cannot see
+  coming from a checkbox); `unlink_forward` breaks the run at that page and
+  every page after it. One tick covers a run of slides, one untick undoes it.
 - Single-instance app (`Gio.Application`, `HANDLES_COMMAND_LINE`): a second
   launch forwards its argv to the primary, which opens the file as a tab in the
   last-used window (`_open_target`/`open_file_in_tab`). For manual testing
   always launch standalone: `SIDEMARK_STANDALONE=1 /usr/bin/python3
   sidemark.py [FILE]` (the env var sets `NON_UNIQUE` so it bypasses the running
   instance — Ctrl+R reload uses the same trick to re-read the code).
+- **A COPY of the app is a different app.** `_copy_key()` is the one answer to
+  "is this the installed script or a checkout?" — `""` for an installed path,
+  else a hash of the source path (`SIDEMARK_INSTANCE=<name>` forces one). It
+  suffixes both the GApplication id AND `settings.json`, so smoke-testing a
+  checkout can neither join the running instance nor rewrite the button table,
+  pen width or font size of the app you actually work in. Recent files
+  (`recent.json`) stay shared on purpose — a copy is a different app, not a
+  different person. Answer that question in one place or the two drift.
 
 ## Testing & verification
 
@@ -159,6 +188,12 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   backgrounded, so start it, do other work, and read the output file **once**
   — polling it with short sleeps buys nothing; and never re-run a suite on an
   unchanged tree because the output was hard to read (fix the grep instead).
+- **Settings are isolated per run and per test.** `run_tests.sh` points
+  `XDG_CONFIG_HOME` at a throwaway dir and a conftest fixture deletes
+  `settings.json` after every test. `Bindings.save()` persists on every rebind,
+  so without both the suite rewrote the *user's* button table and every later
+  window test routed presses through whatever the last run left behind — a test
+  that passes alone, fails in a suite, and blames the wrong feature.
 - Tests set `SIDEMARK_TEST=1` and use the system `/usr/bin/python3` (not venv
   shims). Window tests build a real `PDFEditorWindow` inside a throwaway
   `Adw.Application` and pump the main loop (`_settle()` pattern — copy it).
@@ -256,6 +291,12 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     controllers (`_on_global_key`, `_on_undo_key`, the sheet's own). `_on_key`
     is **bubble** and loses to whatever has focus — put a new app-level
     shortcut in capture unless the editor should win (Ctrl+C, Delete, arrows).
+  - **A widget in the wrong CONTAINER is unreachable the same way.** Ctrl+F
+    "did nothing" on a text page because the search revealer lived inside the
+    PDF column (`_paned`), which text mode HIDES — the handler ran and revealed
+    something nobody could see. It lives above both modes now (`s._body`).
+    Whenever a feature is dead in exactly one mode, check where its widget
+    hangs before reading its handler.
   - **Capture on a CHILD only fires while focus is inside that child.**
     Ctrl+C/Ctrl+V on `TextPageView` looked right and died the moment you
     picked a tool from the toolbar — that focuses the *button*, so the sheet
@@ -509,7 +550,7 @@ never land at all — that call is deferred indefinitely. The one rule that
 stays, because it is free: **do NOT merge/push Deck into `master` without
 asking.**
 
-## Current work & loose ends (2026-07-30)
+## Current work & loose ends (2026-07-31)
 
 Everything shipped is described as behavior in the sections above; this section
 is only *what is in flight* and *what is free to pick up*. Keep it that way —
@@ -517,18 +558,7 @@ when something lands, fold its invariants upward and delete it from here rather
 than writing a line about having finished it. The chronology lives in
 `ideas.csv` and git.
 
-**In flight — all four are code-verified and need a pass in the real app:**
-
-- **Row 132 (rebindable buttons).** The model change has shipped and the
-  behavior is described above, but the user's hands-on verdict is *"still not
-  100% correct"* with no repro captured — **getting one is the next session's
-  first job**, not more code reading. The `[input]` log resolves every press
-  (`[input] text right -> highlighter`) and `[bar] table` / `[bar] stripes`
-  print the table beside the painter on every refresh; that pair is what tells
-  a routing bug from a painting one. Row 132's TODO block lists the four known
-  ones (the stripe position, the caret on a non-left button in text mode, the
-  thumb with a non-pan tool, and 17 stale `TestTextFirstMode` tests) with the
-  fix for each. **The full suite has not been run since the routing work.**
+**In flight — all three are code-verified and need a pass in the real app:**
 
 - **Rows 125–127 (the lasso keeps its loop; circle to lasso; shape
   recognition and control points).** Unit-tested on both canvases
@@ -568,9 +598,11 @@ than writing a line about having finished it. The chronology lives in
 - **Row 111** — duplicate-download dialog.
 - **Row 117** — the suite is flaky under full-run load: one test fails per full
   run while passing in isolation and on a clean tree. Wants its own session.
-  One cause is now known and written up under "layout needs a live frame clock"
-  above — that is the shape to check any new full-run-only failure against
-  before assuming a race, since a stalled clock reads exactly like one.
+  TWO causes are now known, and both read exactly like a race, so check them
+  first: a stalled frame clock (see "layout needs a live frame clock" above)
+  and shared settings state (a test that rebound a chord leaked its table into
+  every window built after it — fixed by the isolation note under Testing, so
+  re-measure the flakiness before digging).
 - **Rows 26/27/64** — older, unranked.
 
 **Won't do:** presenter/share for text mode (row 106 item 7); a vertex truly

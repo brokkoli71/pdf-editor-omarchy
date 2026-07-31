@@ -171,6 +171,25 @@ class TestLinkNavigation(unittest.TestCase):
         c.load(pdf)
         return c
 
+    def test_links_glow_exactly_when_a_click_would_follow_one(self):
+        """The hover highlight is not "Alt is down" — it is "the left button is
+        the caret right now", which is the tool whose click is `_open_link_at`.
+        Reading the table instead of testing for Alt keeps the promise and the
+        behaviour the same thing."""
+        c = self._canvas()
+        self.assertFalse(c.link_hover_active())    # the pen is on left
+        c._alt_held = True
+        self.assertTrue(c.link_hover_active())     # Alt+left ships as the caret
+        c._alt_held = False
+        c.tool = "text"                            # …and so does picking it
+        self.assertTrue(c.link_hover_active())
+        # rebind Alt away and the links stop glowing under it: a modifier that
+        # runs no caret must not promise one
+        c.tool = "pen"
+        c.bindings.clear("alt+left")
+        c._alt_held = True
+        self.assertFalse(c.link_hover_active())
+
     def test_follow_goto_changes_page_and_records_history(self):
         c = self._canvas()
         c.scale, c.offset_x, c.offset_y = 1.5, 12.0, -40.0
@@ -319,6 +338,10 @@ class TestZoomToRegion(unittest.TestCase):
         """Shift+middle-drag is the portable zoom chord (the middle button is
         the navigation button): it rubber-bands a zoom region, not a pan."""
         c = self._canvas()
+        # NOT the default table: middle ships as the lasso, where Shift is the
+        # additive-selection exception and can never resolve to another tool
+        c.bindings.bind("middle", "pan")
+        c.bindings.bind("shift+middle", "zoom")
         g = _FakeDrag(100, 100, button=2, state=Gdk.ModifierType.SHIFT_MASK)
         c._on_drag_begin(g, 100, 100)
         self.assertTrue(c._zoom_selecting)
@@ -330,6 +353,7 @@ class TestZoomToRegion(unittest.TestCase):
 
     def test_plain_middle_drag_still_pans(self):
         c = self._canvas()
+        c.bindings.bind("middle", "pan")
         g = _FakeDrag(100, 100, button=2)
         c._on_drag_begin(g, 100, 100)
         self.assertTrue(c._panning)
@@ -1186,6 +1210,55 @@ class TestLinkedPageNotes(unittest.TestCase):
         self.assertEqual(m.get(4), "")     # 4 still continues 3, now empty
         self.assertEqual(m.run_start(4), 3)
 
+    # ── the cascade: one tick covers a run of slides ─────────────────────────
+
+    def test_link_forward_carries_on_until_a_page_has_notes(self):
+        """The feature is ONE set of notes across five slides; asking for five
+        clicks to get there is asking for the thing it exists to avoid. The
+        stop is a page that already has notes — absorbing those is the one
+        outcome you cannot see coming from the checkbox you clicked."""
+        m = NotesModel()
+        m.set(0, "the long thought")
+        m.set(4, "a new topic")
+        self.assertEqual(m.link_forward(1, 6), [1, 2, 3])
+        self.assertEqual(m.run_pages(0), [0, 1, 2, 3])
+        self.assertEqual(m.get(3), "the long thought")
+        self.assertFalse(m.is_linked(4))
+        self.assertEqual(m.own_text(4), "a new topic")   # never swallowed
+
+    def test_link_forward_stops_at_the_last_page(self):
+        m = NotesModel()
+        m.set(0, "one")
+        self.assertEqual(m.link_forward(1, 3), [1, 2])
+        self.assertEqual(m.links(), {1, 2})
+        self.assertEqual(m.link_forward(1, 3), [])   # already a run: no-op
+
+    def test_link_forward_flows_through_a_page_already_linked(self):
+        """An existing link is not a stop sign — its `own_text` is "" by
+        construction, so the run flows through it and the pages beyond join
+        the same run rather than starting a second one."""
+        m = NotesModel()
+        m.set(0, "head")
+        m.set(3, "elsewhere")
+        m.set_links({2})
+        self.assertEqual(m.link_forward(1, 5), [1])
+        self.assertEqual(m.run_pages(0), [0, 1, 2])
+        self.assertEqual(m.get(2), "head")
+
+    def test_unlink_forward_breaks_the_tail_and_keeps_the_head(self):
+        """The mirror of the cascade: what one tick joined, one untick parts.
+        Pages BEFORE idx keep their run and the body stays where it lives —
+        untick means "this page is not a continuation", never "lose the text"."""
+        m = NotesModel()
+        m.set(0, "shared")
+        m.set_links({1, 2, 3})
+        self.assertEqual(m.unlink_forward(2), [2, 3])
+        self.assertEqual(m.run_pages(0), [0, 1])
+        self.assertEqual(m.get(1), "shared")
+        self.assertEqual(m.get(2), "")
+        self.assertEqual(m.get(3), "")
+        self.assertEqual(m.own_text(0), "shared")
+
     def test_page_zero_can_never_be_linked(self):
         m = NotesModel()
         self.assertFalse(m.link(0))
@@ -1344,7 +1417,8 @@ class TestLinkedNotesInWindow(unittest.TestCase):
             self._write_note(win, "shared")
             win._go_to_page(1)
             win._notes_link_check.set_active(True)
-            self.assertEqual(win.notes_model.links(), {1})
+            # the tick cascades through the blank pages after it
+            self.assertEqual(win.notes_model.links(), {1, 2})
             self.assertEqual(win._notes_view.get_source_text(), "shared")
             win._notes_link_check.set_active(False)
             self.assertEqual(win.notes_model.links(), set())
@@ -1354,9 +1428,41 @@ class TestLinkedNotesInWindow(unittest.TestCase):
             win._go_to_page(0)
             win._go_to_page(1)
             self.assertTrue(win._notes_link_check.get_active())
-            self.assertEqual(win.notes_model.links(), {1})
+            self.assertEqual(win.notes_model.links(), {1, 2})
 
         self._run_in_window(3, body)
+
+    def test_one_tick_covers_every_blank_page_after_it(self):
+        """The point of the feature is one body across a run of slides, and the
+        cost of it must not be one click per slide. Unticking anywhere frees
+        that page and everything after it, so the way back is one click too."""
+        def body(win):
+            self._write_note(win, "one thought, several slides")
+            win._go_to_page(3)
+            self._write_note(win, "a different topic")
+            win._go_to_page(1)
+            win._notes_link_check.set_active(True)
+            # …up to, but never into, the page that already had notes
+            self.assertEqual(win.notes_model.run_pages(0), [0, 1, 2])
+            self.assertEqual(win._notes_view.get_source_text(),
+                             "one thought, several slides")
+            win._go_to_page(2)
+            self.assertTrue(win._notes_link_check.get_active())
+            self.assertEqual(win._notes_view.get_source_text(),
+                             "one thought, several slides")
+            win._go_to_page(3)
+            self.assertFalse(win._notes_link_check.get_active())
+            self.assertEqual(win._notes_view.get_source_text(),
+                             "a different topic")
+            # and one untick takes the whole tail apart again
+            win._go_to_page(1)
+            win._notes_link_check.set_active(False)
+            self.assertEqual(win.notes_model.run_pages(0), [0])
+            self.assertEqual(win.notes_model.get(2), "")
+            self.assertEqual(win.notes_model.own_text(0),
+                             "one thought, several slides")
+
+        self._run_in_window(5, body)
 
     def test_typing_on_a_continued_page_edits_the_run(self):
         def body(win):
@@ -1394,8 +1500,9 @@ class TestLinkedNotesInWindow(unittest.TestCase):
             self.assertEqual(win._notes_view.get_source_text(), "")
             self.assertEqual(win.notes_model.own_text(0), "shared")
             self.assertFalse(win._notes_link_check.get_active())
-            # the toast's Undo re-links, with nothing lost either way
-            win._relink_notes(1)
+            # the toast's Undo re-links the whole tail it freed, with nothing
+            # lost either way
+            win._relink_notes([1, 2])
             self.assertEqual(win._notes_view.get_source_text(), "shared")
 
         self._run_in_window(3, body)
@@ -1408,8 +1515,9 @@ class TestLinkedNotesInWindow(unittest.TestCase):
             win._on_save(None)
             path = win._path
             win._do_open_file(path)
-            self.assertEqual(win.notes_model.links(), {1})
+            self.assertEqual(win.notes_model.links(), {1, 2})
             self.assertEqual(win.notes_model.get(1), "written once")
+            self.assertEqual(win.notes_model.get(2), "written once")
 
         self._run_in_window(3, body)
 
@@ -3798,7 +3906,8 @@ class TestLassoSelect(unittest.TestCase):
     def test_ctrl_shift_alt_drag_lassos_regardless_of_tool(self):
         canvas = self._canvas()
         a, b = self._two_strokes(canvas)
-        canvas.tool = "pen"   # the modifier gesture overrides the sticky tool
+        canvas.tool = "pen"   # the chord's tool overrides the left button's
+        canvas.bindings.bind("ctrl+shift+alt+left", "lasso")
         mods = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
                 | Gdk.ModifierType.ALT_MASK)
         canvas._on_drag_begin(_FakeDrag(30, 30, state=mods), 30, 30)
@@ -5545,6 +5654,7 @@ class TestCallouts(unittest.TestCase):
     def test_long_drag_fires_callout_callback(self):
         canvas = PDFCanvas()
         canvas.scale, canvas.offset_x, canvas.offset_y = 1.0, 0.0, 0.0
+        canvas.bindings.bind("ctrl+alt+left", "anchor")
         placed = []
         canvas.on_callout_placed = lambda x, y: placed.append((x, y))
         canvas._on_drag_begin(self._drag_gesture(), 100, 100)
@@ -6050,39 +6160,34 @@ class TestResponsiveHeader(unittest.TestCase):
 
         self._run_in_window(body)
 
-    def test_modifier_highlights_matching_tool_button(self):
+    def test_the_stripes_follow_the_modifiers_held(self):
+        """The binding stripes are a LIVE readout of the mouse: hold a modifier
+        and they move to whatever each button would run under it. There is no
+        second signal (the old glow lit ONE tool and never said which button),
+        so a stripe is the only thing that has to stay honest."""
         def body(win):
-            win._mode_pen.emit("clicked")
-            # holding Ctrl lights the pan button transiently, no tool change
-            win._highlight_transient_tool(True, False, False)
-            if not win._mode_pan.has_css_class("tool-transient"):
-                raise AssertionError("pan button not highlighted while Ctrl held")
-            if win.canvas.tool != "pen":
-                raise AssertionError("transient highlight must not change the tool")
-            # releasing clears it
-            win._highlight_transient_tool(False, False, False)
-            if win._mode_pan.has_css_class("tool-transient"):
-                raise AssertionError("highlight not cleared on release")
-        self._run_in_window(body)
+            win.bindings.replace(dict(sidemark.DEFAULT_BINDINGS))
+            self.assertEqual(win._live_buttons_for("pen"), ["left"])
+            self.assertEqual(win._live_buttons_for("lasso"), ["middle"])
+            self.assertEqual(win._live_buttons_for("pan"), [])   # a chord only
 
-    def test_button_gesture_highlights_tool_button(self):
-        # button gestures (right-drag erase, middle-drag pan) light the
-        # matching button too — same .tool-transient path as the chords
-        def body(win):
-            win._mode_pen.emit("clicked")
-            win._highlight_gesture_tool("eraser")
-            if not win._mode_eraser.has_css_class("tool-transient"):
-                raise AssertionError("eraser not highlighted during right-drag")
-            if win.canvas.tool != "pen":
-                raise AssertionError("gesture highlight must not change the tool")
-            # release falls back to the still-held chord (Ctrl → pan)
-            win._highlight_transient_tool(True, False, False)
-            win._highlight_gesture_tool(None)
-            if win._mode_eraser.has_css_class("tool-transient"):
-                raise AssertionError("gesture highlight not cleared on release")
-            if not win._mode_pan.has_css_class("tool-transient"):
-                raise AssertionError("release did not fall back to held chord")
-            win._highlight_transient_tool(False, False, False)
+            win._highlight_transient_tool(True, False, False)    # Ctrl down
+            self.assertEqual(win._live_buttons_for("pan"), ["left"])
+            self.assertEqual(win._live_buttons_for("text"), ["right"])
+            self.assertEqual(win._live_buttons_for("pen"), [])   # left is pan
+            # Ctrl+middle is unbound, so the middle button says nothing — the
+            # table has no fallback to the plain binding, and neither does the
+            # paint
+            self.assertEqual(win._live_buttons_for("lasso"), [])
+
+            win._highlight_transient_tool(False, False, True)    # Alt down
+            self.assertEqual(win._live_buttons_for("text"), ["left"])
+
+            win._highlight_transient_tool(False, False, False)   # released
+            self.assertEqual(win._live_buttons_for("pen"), ["left"])
+            # holding a modifier never touches the table itself
+            self.assertEqual(win.bindings.tool_for_chord("left"), "pen")
+
         self._run_in_window(body)
 
     def test_select_style_menu_switches_canvas_style(self):
@@ -6513,6 +6618,43 @@ class TestNotesSearch(unittest.TestCase):
             a, b = b, a
         return buf.get_text(a, b, False)
 
+    def test_search_works_on_a_text_first_page(self):
+        """Ctrl+F did nothing on a text page: the search bar lived inside the
+        PDF column (`_paned`), which is HIDDEN there — the handler ran and
+        revealed a widget nobody could see. It sits above BOTH modes now. The
+        search itself was already mode-blind: a text page commits its sheet to
+        the notes model on page 0, which is what _find_note_matches reads."""
+        def body(a):
+            win = PDFEditorWindow(a); win.present()
+            with tempfile.TemporaryDirectory() as d:
+                md = os.path.join(d, "note.md")
+                with open(md, "w", encoding="utf-8") as f:
+                    f.write("a needle on the sheet\nand another needle\n")
+                win._do_open_file(md)
+                self.assertTrue(win._text_mode)
+
+                win._show_search()
+                self.assertTrue(win._search_revealer.get_reveal_child())
+                # the bar is not inside the hidden PDF column
+                self.assertFalse(win._paned.get_visible())
+                parent = win._search_revealer.get_parent()
+                while parent is not None:
+                    self.assertIsNot(parent, win._paned)
+                    parent = parent.get_parent()
+                self.assertEqual(win._search_entry.get_placeholder_text(),
+                                 "Search page…")
+
+                win._search_entry.set_text("needle")
+                win._on_search_changed(win._search_entry)
+                self.assertEqual([m[0] for m in win._search_matches],
+                                 ["note", "note"])
+                self.assertEqual(win._search_label.get_label(), "1 / 2")
+                self.assertEqual(self._sel(win), "needle")
+                win._search_next()
+                self.assertEqual(win._search_label.get_label(), "2 / 2")
+                self.assertEqual(self._sel(win), "needle")
+        self._run_in_window(body)
+
     def test_find_note_matches_offsets(self):
         def body(a):
             win = PDFEditorWindow(a); win.present()
@@ -6599,6 +6741,9 @@ class TestMiddleMousePan(unittest.TestCase):
         os.unlink(self._tmp)
 
     def test_middle_drag_pans_like_ctrl_drag(self):
+        # pan is a CHORD by default (Ctrl+left); put it on the middle button,
+        # which is what this class is about
+        self.canvas.bindings.bind("middle", "pan")
         g = mock.Mock()
         g.get_current_button.return_value = 2
         g.get_current_event_state.return_value = Gdk.ModifierType(0)
@@ -6660,17 +6805,31 @@ class TestButtonBindings(unittest.TestCase):
     """There is no active tool: every button HAS one, and clicking a tool in
     the bar with a button is what puts it there."""
 
-    def test_defaults_are_left_pen_right_eraser_middle_pan(self):
+    def test_alt_left_is_the_text_cursor(self):
+        """Alt is how you follow a PDF link, and following a link IS the cursor
+        tool's click. Left unbound under Alt meant Alt lit the links up and
+        then nothing opened them — the modifier promising what the table could
+        not deliver."""
+        b = Bindings()
+        self.assertEqual(b.tool_for(sidemark.BTN_LEFT, alt=True), "text")
+
+    def test_defaults_are_pen_lasso_eraser_and_four_chords(self):
         b = Bindings()
         self.assertEqual(b.tool_for(sidemark.BTN_LEFT), "pen")
+        self.assertEqual(b.tool_for(sidemark.BTN_MIDDLE), "lasso")
         self.assertEqual(b.tool_for(sidemark.BTN_RIGHT), "eraser")
-        self.assertEqual(b.tool_for(sidemark.BTN_MIDDLE), "pan")
+        self.assertEqual(b.tool_for(sidemark.BTN_LEFT, ctrl=True), "pan")
+        self.assertEqual(b.tool_for(sidemark.BTN_RIGHT, ctrl=True), "text")
+        self.assertEqual(b.tool_for(sidemark.BTN_LEFT, shift=True), "zoom")
 
-    def test_the_thumb_pans(self):
-        """The ergonomic stand-in for the middle button, and nothing else."""
+    def test_the_thumb_starts_unbound(self):
+        """Most mice have no thumb button — a default nobody can press is a
+        default nobody chose. It is bindable like every other chord."""
         b = Bindings()
+        self.assertIsNone(b.tool_for(sidemark.BTN_THUMB))
+        self.assertEqual(b.chords_for("pan"), ["ctrl+left"])
+        b.bind("thumb", "pan")
         self.assertEqual(b.tool_for(sidemark.BTN_THUMB), "pan")
-        self.assertEqual(b.chords_for("pan"), ["middle", "thumb"])
 
     def test_a_chord_has_exactly_one_spelling(self):
         self.assertEqual(sidemark.chord_id(1, ctrl=True, alt=True),
@@ -6682,9 +6841,9 @@ class TestButtonBindings(unittest.TestCase):
 
     def test_binding_moves_a_chord_and_reports_what_it_took(self):
         b = Bindings()
-        self.assertEqual(b.bind("middle", "lasso"), "pan")
-        self.assertEqual(b.tool_for(sidemark.BTN_MIDDLE), "lasso")
-        self.assertIsNone(b.bind("ctrl+right", "lasso"))   # was free
+        self.assertEqual(b.bind("middle", "pan"), "lasso")
+        self.assertEqual(b.tool_for(sidemark.BTN_MIDDLE), "pan")
+        self.assertIsNone(b.bind("ctrl+middle", "lasso"))   # was free
 
     def test_a_tool_the_mode_lacks_resolves_to_nothing(self):
         b = Bindings()
@@ -6759,13 +6918,33 @@ class TestBindingToolbar(unittest.TestCase):
         if errors:
             raise errors[0]
 
+    def test_a_chord_click_does_not_also_steal_the_left_button(self):
+        """GTK does NOT cancel a Button's own click gesture when our capture
+        controller claims the press: both are CAPTURE on the same widget and
+        the Button's was added first, so it runs first. The chord bind flags
+        the press and the `clicked` GTK delivers anyway is swallowed — without
+        it, Ctrl+clicking a tool bound Ctrl+left AND took plain left with it."""
+        def body(win):
+            win.bindings.replace(dict(sidemark.DEFAULT_BINDINGS))
+            # what a modified press does, then the click that follows it
+            win._bind_chord("ctrl+left", "eraser")
+            win._binding_press = True
+            win._mode_eraser.emit("clicked")
+            self.assertEqual(win.bindings.tool_for_chord("ctrl+left"), "eraser")
+            self.assertEqual(win.bindings.tool_for_chord("left"), "pen")
+            # …and the flag is consumed, so the next PLAIN pick still works
+            win._mode_eraser.emit("clicked")
+            self.assertEqual(win.bindings.tool_for_chord("left"), "eraser")
+
+        self._run_in_window(body)
+
     def test_binding_a_chord_moves_it_and_can_be_undone(self):
         def body(win):
             win.bindings.replace(dict(sidemark.DEFAULT_BINDINGS))
-            win._bind_chord("ctrl+right", "lasso")
-            self.assertEqual(win.bindings.tool_for_chord("ctrl+right"), "lasso")
-            win._undo_binding("ctrl+right", None)   # was unbound before
-            self.assertIsNone(win.bindings.tool_for_chord("ctrl+right"))
+            win._bind_chord("ctrl+middle", "lasso")
+            self.assertEqual(win.bindings.tool_for_chord("ctrl+middle"), "lasso")
+            win._undo_binding("ctrl+middle", None)   # was unbound before
+            self.assertIsNone(win.bindings.tool_for_chord("ctrl+middle"))
             # binding an owned chord reports the tool it displaced
             win._bind_chord("right", "lasso")
             self.assertEqual(win.bindings.tool_for_chord("right"), "lasso")
@@ -6786,7 +6965,8 @@ class TestBindingToolbar(unittest.TestCase):
             win._bind_chord("middle", "eraser")
             self.assertEqual(sorted(win.bindings.plain_buttons_for("eraser")),
                              ["middle", "right"])
-            self.assertEqual(win.bindings.plain_buttons_for("pan"), ["thumb"])
+            # pan ships on a CHORD only, so it wears no badge
+            self.assertEqual(win.bindings.plain_buttons_for("pan"), [])
             # a tool with nothing on it says so
             win._clear_binding("right")
             win._clear_binding("middle")
@@ -6890,6 +7070,7 @@ class TestToolModes(unittest.TestCase):
         # Ctrl+Shift+drag lays down a highlighter stroke regardless of the
         # sticky tool, and reverts (no sticky-tool change) on release
         self.canvas.tool = "pen"
+        self.canvas.bindings.bind("ctrl+shift+left", "highlighter")
         g = mock.Mock()
         g.get_current_button.return_value = 1
         g.get_current_event_state.return_value = (
@@ -9195,6 +9376,16 @@ class TestTextFirstMode(unittest.TestCase):
         self._settle()
         return md
 
+    @staticmethod
+    def _caret(win):
+        """Put the caret on the left button.
+
+        These tests were written when the sheet's default tool WAS the caret.
+        One table serves both modes now (row 132) and it ships with the pen on
+        left, so a test about caret behaviour has to say so — riding the
+        default table is exactly what made them stale."""
+        win._set_tool_mode("text")
+
     def _draw_stroke(self, win, y=100.0):
         tp = win._active_session._text_page
         win._set_tool_mode("pen")
@@ -9401,7 +9592,6 @@ class TestTextFirstMode(unittest.TestCase):
                 tp = win._active_session._text_page
                 win._set_tool_mode("zoom")
                 self.assertEqual(tp.tool, "zoom")
-                self.assertTrue(tp.ink.get_can_target())   # grabs the drag
                 self.assertTrue(win._mode_zoom.get_visible())
                 g = _FakeDrag(100, 100)                    # NO Shift modifier
                 tp._on_press_begin(g, 100, 100)
@@ -9458,6 +9648,9 @@ class TestTextFirstMode(unittest.TestCase):
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
+                # pan ships on Ctrl+left only; the middle button is the lasso,
+                # so this test binds the half of itself that is not a default
+                win.bindings.bind("middle", "pan")
                 # pin a generous scroll range so the assertions don't ride on
                 # the sheet's laid-out height (which varies across the suite)
                 va = tp.scroll.get_vadjustment()
@@ -9488,8 +9681,9 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertAlmostEqual(va.get_value(), 60.0, places=3)
                 tp._on_press_end(g2, 0, 40)
 
-                # a plain left-drag is NOT a pan — the gesture denies itself so
-                # drawing / text selection keep the sequence
+                # a plain left-drag is NOT a pan — with the caret on left the
+                # gesture denies itself so text selection keeps the sequence
+                self._caret(win)
                 g3 = _FakeDrag(50, 50, button=1)
                 tp._on_press_begin(g3, 50, 50)
                 self.assertFalse(tp._panning)
@@ -9620,7 +9814,9 @@ class TestTextFirstMode(unittest.TestCase):
                 self._open_md(win, d)
                 self._settle()
                 tp = win._active_session._text_page
-                self.assertEqual(tp.tool, "text")          # caret is the default
+                self._caret(win)
+                win.bindings.bind("ctrl+shift+left", "highlighter")
+                self.assertEqual(tp.tool, "text")          # the caret has left
                 hl_opacity = tp.pen_style(True)[2]
                 self.assertLess(hl_opacity, 1.0)           # highlighter is translucent
                 g = _FakeDrag(120, 120, state=(Gdk.ModifierType.CONTROL_MASK
@@ -9636,7 +9832,7 @@ class TestTextFirstMode(unittest.TestCase):
                 # without Ctrl+Shift the gesture denies itself (no stroke)
                 g2 = _FakeDrag(120, 120)
                 tp._on_press_begin(g2, 120, 120)
-                self.assertIsNone(tp._temp_hl_saved_tool)
+                self.assertIsNone(tp._press_tool)   # the caret keeps the press
                 self.assertEqual(g2.claimed, Gtk.EventSequenceState.DENIED)
 
             self._run_in_window(body)
@@ -9701,6 +9897,7 @@ class TestTextFirstMode(unittest.TestCase):
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
+                self._caret(win)      # the edge drag is the caret's, not ink's
                 tp.set_zoom(1.0)
                 self._settle()
                 b = tp._paper_bounds()
@@ -9767,6 +9964,7 @@ class TestTextFirstMode(unittest.TestCase):
 
             def body(win):
                 self._open_md(win, d)
+                self._caret(win)
                 win._do_open_file(pdf)
                 s = win._active_session
                 self.assertFalse(s._text_mode)
@@ -9778,6 +9976,8 @@ class TestTextFirstMode(unittest.TestCase):
                 # button wears an "active" look any more — the stripe is the
                 # only signal (row 132)
                 self.assertTrue(win._mode_text.get_visible())
+                # the button table is the WINDOW's, not the mode's: switching
+                # documents must not silently rebind anything
                 self.assertEqual(win.bindings.tool_for_chord("left"), "text")
                 for item in win._pdf_menu_items:
                     self.assertTrue(item.get_visible(), item)
@@ -9797,17 +9997,21 @@ class TestTextFirstMode(unittest.TestCase):
 
         self._run_in_window(body)
 
-    def test_pen_tool_targets_the_ink_overlay(self):
+    def test_picking_a_tool_puts_it_on_the_left_button(self):
+        """The ink overlay is never made targetable (`set_tool`): the
+        capture-phase router sees every press above it, so targeting would only
+        take the caret's clicks away for no gain. What a tool pick changes is
+        the TABLE — and `tp.tool` reads it back."""
         with tempfile.TemporaryDirectory() as d:
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
                 for mode in ("pen", "highlighter", "eraser"):
                     win._set_tool_mode(mode)
-                    self.assertTrue(tp.ink.get_can_target(), mode)
                     self.assertEqual(tp.tool, mode)
-                win._set_tool_mode("select")
-                self.assertFalse(tp.ink.get_can_target())
+                    self.assertEqual(win.bindings.tool_for_chord("left"), mode)
+                    self.assertFalse(tp.ink.get_can_target(), mode)
+                win._set_tool_mode("select")     # one I-beam serves both modes
                 self.assertEqual(tp.tool, "text")
 
             self._run_in_window(body)
@@ -9858,6 +10062,7 @@ class TestTextFirstMode(unittest.TestCase):
                 px, py = tp._stroke_overlay_pts(tp.strokes[0])[0]
                 fake = types.SimpleNamespace(
                     get_current_button=lambda: 1,
+                    set_state=lambda _s: None,
                     get_current_event_state=lambda: Gdk.ModifierType(0))
                 tp._on_press_begin(fake, px, py)
                 tp._on_press_end(fake, 0, 0)
@@ -9877,7 +10082,7 @@ class TestTextFirstMode(unittest.TestCase):
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
-                tp.tool = "pen"
+                win._set_tool_mode("pen")
                 tp._commit_stroke([(120.0, 120.0), (420.0, 120.0)])
                 self.assertEqual(len(tp.strokes), 1)
                 self.assertEqual(len(tp.strokes[0]["pts"]), 2)   # a straight line
@@ -9894,7 +10099,7 @@ class TestTextFirstMode(unittest.TestCase):
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
-                tp.tool = "pen"
+                win._set_tool_mode("pen")
                 tp._commit_stroke([(120.0, 120.0), (420.0, 120.0)])
                 pts = tp._stroke_overlay_pts(tp.strokes[0])
                 # far off the line — outside every segment's hit radius
@@ -9912,7 +10117,7 @@ class TestTextFirstMode(unittest.TestCase):
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
-                tp.tool = "pen"
+                win._set_tool_mode("pen")
                 tp._commit_stroke([(120.0, 120.0), (420.0, 120.0)])
                 st = tp.strokes[0]
                 st["font_px"] = tp.font_px          # drawn 1:1
@@ -10014,6 +10219,9 @@ class TestTextFirstMode(unittest.TestCase):
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
+                self._caret(win)
+                win.bindings.bind(sidemark.chord_id(1, shift=True, alt=True),
+                                  "zoom")
                 self.assertEqual(tp.tool, "text")        # caret owns the sheet
                 g = _FakeDrag(60, 60, state=(Gdk.ModifierType.ALT_MASK
                                              | Gdk.ModifierType.SHIFT_MASK))
@@ -10029,13 +10237,14 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertEqual(tp.tool, "text")        # caret restored
                 self.assertEqual(tp.strokes, [])
 
-                # plain Alt still draws — the escape it always was
+                # plain Alt is the CARET by default (it is how you follow a
+                # link), so it neither zooms nor draws — Shift is what turns
+                # the chord into the marquee
                 g2 = _FakeDrag(60, 60, state=Gdk.ModifierType.ALT_MASK)
                 tp._on_press_begin(g2, 60.0, 60.0)
                 self.assertFalse(tp._zoom_selecting)
-                self.assertEqual(tp.tool, "pen")
-                tp._on_press_end(g2, 10.0, 10.0)
                 self.assertEqual(tp.tool, "text")
+                self.assertEqual(g2.claimed, Gtk.EventSequenceState.DENIED)
 
             self._run_in_window(body)
 
@@ -10062,7 +10271,7 @@ class TestTextFirstMode(unittest.TestCase):
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
-                tp.tool = "pen"
+                win._set_tool_mode("pen")
                 pen_w = tp.pen_style(False)[1]
 
                 tp.set_zoom(1.0)
@@ -10244,6 +10453,11 @@ class TestTextFirstMode(unittest.TestCase):
                 self._open_md(win, d)
                 self._settle()
                 tp = win._active_session._text_page
+                self._caret(win)
+                # Alt+left is the CARET by default now (it is how you follow a
+                # link); the quick-pen this test is about is a binding like any
+                # other, so bind it rather than assume it
+                win.bindings.bind("alt+left", "pen")
                 self.assertEqual(tp.tool, "text")
                 g = self._fake_drag(alt=True)
                 tp._on_press_begin(g, 300.0, 100.0)
@@ -10270,6 +10484,9 @@ class TestTextFirstMode(unittest.TestCase):
                 self._open_md(win, d)
                 self._settle()
                 tp = win._active_session._text_page
+                self._caret(win)
+                win.bindings.bind("alt+left", "pen")
+                win.bindings.bind("alt+right", "eraser")
                 # draw a stroke with the Alt+left quick-pen
                 g = self._fake_drag(alt=True, button=1)
                 tp._on_press_begin(g, 300.0, 100.0)
@@ -10281,15 +10498,18 @@ class TestTextFirstMode(unittest.TestCase):
                 sx, sy = tp._stroke_overlay_pts(tp.strokes[0])[0]
                 e = self._fake_drag(alt=True, button=3, start=(sx, sy))
                 tp._on_press_begin(e, sx, sy)
+                # a RIGHT press is ambiguous until it moves — erase on a drag,
+                # the context menu on a clean click — so the tool only lands
+                # once the press has travelled past the click threshold
+                tp._on_press_update(e, 8.0, 0.0)
                 self.assertEqual(tp.tool, "eraser")   # switched mid-gesture
-                tp._on_press_update(e, 0.0, 2.0)
-                tp._on_press_end(e, 0.0, 2.0)
+                tp._on_press_end(e, 8.0, 0.0)
                 self.assertEqual(len(tp.strokes), 0)  # erased
                 self.assertEqual(tp.tool, "text")     # caret restored
-                # Alt+MIDDLE is left for panning — the quick-ink gesture denies
+                # Alt+MIDDLE is unbound — the press is nobody's and is denied
                 m = self._fake_drag(alt=True, button=2)
                 tp._on_press_begin(m, 300.0, 100.0)
-                self.assertIsNone(tp._alt_saved_tool)  # not claimed as ink
+                self.assertIsNone(tp._press_tool)
 
             self._run_in_window(body)
 
@@ -10784,6 +11004,10 @@ class TestTextPageLasso(unittest.TestCase):
                 self._open_md(win, d)
                 tp = self._draw_stroke(
                     win, [(300.0, 100.0 + i * 3) for i in range(5)])
+                # the chord is not a default — this test is about the MECHANISM
+                # (a chord lassoes while the caret owns the left button), so it
+                # binds the chord it drives instead of riding the table
+                win.bindings.bind("ctrl+shift+alt+left", "lasso")
                 win._set_tool_mode("select")     # back to the caret
                 self.assertEqual(tp.tool, "text")
                 x0, y0, x1, y1 = self._bbox(
@@ -10823,6 +11047,7 @@ class TestTextPageLasso(unittest.TestCase):
                 lasso_chord = (Gdk.ModifierType.CONTROL_MASK
                                | Gdk.ModifierType.SHIFT_MASK
                                | Gdk.ModifierType.ALT_MASK)
+                win.bindings.bind("ctrl+shift+alt+left", "lasso")
                 self.assertEqual(press(lasso_chord),
                                  Gtk.EventSequenceState.CLAIMED)
                 # plain left is the pen by default — also claimed
@@ -10833,8 +11058,11 @@ class TestTextPageLasso(unittest.TestCase):
                 self.assertEqual(press(Gdk.ModifierType(0)),
                                  Gtk.EventSequenceState.DENIED)
                 # an unbound chord is nobody's: denied, never swallowed
-                self.assertEqual(press(Gdk.ModifierType.ALT_MASK),
-                                 Gtk.EventSequenceState.DENIED)
+                # (Alt+left is NOT one — it ships as the caret, so the DENY it
+                # earns is the caret's, not an empty table's)
+                self.assertEqual(
+                    press(Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.ALT_MASK),
+                    Gtk.EventSequenceState.DENIED)
 
             self._run_in_window(body)
 
@@ -10845,6 +11073,11 @@ class TestTextPageLasso(unittest.TestCase):
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
+                # the middle button ships as the lasso, where Shift is the
+                # additive-selection exception at the router and can never
+                # resolve to another tool — so bind the chord under test
+                win.bindings.bind("middle", "pan")
+                win.bindings.bind("shift+middle", "zoom")
                 z0 = tp.zoom
                 g = self._chord_gesture(Gdk.ModifierType.SHIFT_MASK, button=2,
                                         sx=100.0, sy=100.0)
@@ -11008,6 +11241,21 @@ class TestInstanceId(unittest.TestCase):
     def test_empty_env_override_falls_back_to_base(self):
         os.environ["SIDEMARK_INSTANCE"] = ""
         self.assertEqual(self.sm._application_id(), self.sm.BASE_APP_ID)
+
+    def test_a_copy_keeps_its_own_settings_file(self):
+        """The instance id and the settings file answer ONE question — "is this
+        the app, or a copy of it?" — so smoke-testing a checkout cannot rewrite
+        the button table, pen width or font size of the app you work in."""
+        installed = self.sm._settings_path()          # this checkout
+        self.assertRegex(os.path.basename(installed), r"^settings-v[0-9a-f]+\.json$")
+        self.sm._INSTALLED_PATHS = (os.path.realpath(self.sm.__file__),)
+        self.assertEqual(os.path.basename(self.sm._settings_path()),
+                         "settings.json")
+        self.assertNotEqual(installed, self.sm._settings_path())
+        # an explicit instance name is its own profile, installed or not
+        os.environ["SIDEMARK_INSTANCE"] = "scratch"
+        self.assertEqual(os.path.basename(self.sm._settings_path()),
+                         "settings-iscratch.json")
 
 
 class TestOpenTargetReuse(unittest.TestCase):

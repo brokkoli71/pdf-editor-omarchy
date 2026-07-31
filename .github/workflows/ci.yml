@@ -46,6 +46,9 @@ jobs:
       - name: Run tests
         env:
           GDK_BACKEND: wayland
+          # a throwaway config home: Bindings.save() persists on every rebind,
+          # so the suite must never write the settings.json of whoever runs it
+          XDG_CONFIG_HOME: /tmp/sidemark-ci-config
         run: python3 test_pdfeditor.py -v
 
   # Install script — verifies files land in the right places and uninstall cleans up.

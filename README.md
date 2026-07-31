@@ -37,16 +37,16 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Anchor markers** (`Ctrl+Alt+click`) — numbered circles placed on the PDF that link to the corresponding paragraph in your notes
 - **Callout boxes** (`Ctrl+Alt+drag`) — an anchor plus its note paragraph rendered in a box on the PDF, arrow included; drag the anchor or the box to reposition. Renders the same inline math and Markdown as the notes; included in exports
 - **Standalone text boxes** (`Ctrl+Alt+right-click`) — drop typed text straight on the page, no anchor; edit it in the notes panel, drag it to reposition; included in exports
-- **Notes that run over several pages** — tick **Continue from page N** in the notes header and this page shares the previous page's notes, so a thought started on slide 12 keeps going on 13 and 14 without copying anything; untick it to split the run again
+- **Notes that run over several pages** — tick **Continue from page N** in the notes header and this page shares the previous page's notes, so a thought started on slide 12 keeps going on 13 and 14 without copying anything. One tick carries on through the blank pages that follow, stopping where notes already exist; unticking splits the run from that page onwards
 - **Date / time snippets** — type `/date`, `/time`, or `/now` then Space to expand
 - **Choose where notes live** — each PDF gets a `<filename>-notes.md` sidecar, created only once you actually write something; pick **Notes file…** from the ☰ menu to point several PDFs at one shared Markdown file (remembered per PDF)
-- **Text-first mode** — open a bare `.md` (or **New text page**, `Ctrl+Alt+N`) and the window becomes one endless A4 sheet of live Markdown you can **draw on** with the same pen, highlighter, eraser and lasso — shape snap, smoothing, move/resize/duplicate included (`Alt+drag` draws without leaving the text tool; ink rides along with the text you anchor it to). Drag the paper's side edge to set the sheet width — handy on a half-screen window — and it's remembered per document. The file stays **pure Markdown** — ink lives in a `<name>-ink.json` sidecar — and **Export as PDF** renders text and ink to A4 pages. Launching Sidemark without a file opens a persistent scratchpad page
+- **Text-first mode** — open a bare `.md` (or **New text page**, `Ctrl+Alt+N`) and the window becomes one endless A4 sheet of live Markdown you can **draw on** with the same pen, highlighter, eraser and lasso — shape snap, smoothing, move/resize/duplicate included (ink rides along with the text you anchor it to). Drag the paper's side edge to set the sheet width — handy on a half-screen window — and it's remembered per document. The file stays **pure Markdown** — ink lives in a `<name>-ink.json` sidecar — and **Export as PDF** renders text and ink to A4 pages. Launching Sidemark without a file opens a persistent scratchpad page
 
 ### Navigation
 
-- **Pan & zoom** — scroll to pan, `Ctrl+scroll` or pinch to zoom (centered on the cursor), `Shift+drag` or `Shift+middle-drag` to zoom to region (the middle-button form also works on text pages, where `Shift` alone selects text), `Shift+click` to fit page. The mouse's thumb button doubles as an ergonomic wheel-button: hold to pan, scroll while held to zoom, `Shift+hold` for zoom to region
+- **Pan & zoom** — scroll to pan, `Ctrl+scroll` or pinch to zoom (centered on the cursor), `Ctrl+drag` to pan, `Shift+drag` to zoom to region, `Shift+click` to fit page
 - **Page flip** — `PageDown` / `PageUp` or the mouse **back/forward side buttons** (they work even while typing notes); scrolling past a page edge flips automatically
-- **Follow links** — `Alt+click` a footnote, citation, or cross-reference to jump to its target (scrolling to the exact spot, even on the same page); `Alt+Left` jumps back to where you were reading. External URLs open in your browser
+- **Follow links** — `Alt+click` a footnote, citation, or cross-reference to jump to its target (scrolling to the exact spot, even on the same page); `Alt+Left` jumps back to where you were reading. External URLs open in your browser. Links light up while `Alt` is held, or whenever the text-cursor tool is in hand
 - **Outline & thumbnails** — `Ctrl+T` toggles a sidebar between table of contents and page thumbnails; drag thumbnails to reorder pages, drop documents onto the sidebar to import them as chapters at that spot, drag a chapter in the outline to move all of its pages at once, or drag pages **out to a file manager** to export them as a standalone PDF (annotations and notes included), like macOS Preview
 - **Add / delete pages** — insert blank pages with the same dimensions as the current page
 - **Presenter view** (`F5`) — mirrors the current page fullscreen on a second screen, your ink updating **live** while you draw, and can be driven from either side (clicker-friendly). Your own window switches to a presenter layout — current slide, a **peek at the next one**, a presentation timer and large prev/next buttons — none of it visible to the audience
@@ -166,8 +166,7 @@ pip install pymupdf
 | Scroll past page edge | Flip to next / previous page (keeps zoom) |
 | `Ctrl+scroll` | Zoom in/out (centered on the cursor) |
 | Pinch (two-finger) | Zoom and pan together — the points under your fingers stay fixed on the page |
-| `Ctrl+drag` / Middle-drag | Pan |
-| Mouse thumb button (hold) | Pan by moving the mouse; scroll while holding to zoom |
+| `Ctrl+drag` | Pan (every mouse button is rebindable — click a tool in the bar with the button you want it on) |
 | `Shift+drag` | Zoom to region |
 | `Shift+click` | Fit page |
 
@@ -241,7 +240,7 @@ plain `[[…]]` text, so links round-trip through Obsidian.
 | `Ctrl+O` | Open file (in a new tab) |
 | `Ctrl+N` | New blank PDF (in a new tab) |
 | `Ctrl+Alt+N` | New text page — endless Markdown paper you can draw on |
-| `Alt+Drag` / `Alt+Right-drag` | On a text page: draw / erase without leaving the text tool. The pen, highlighter, eraser, lasso, pan and zoom tools — and their `Ctrl`/middle-drag (pan), `Shift+drag` (zoom to region) and `Ctrl+H` (highlighter) gestures — all match the PDF canvas, so switching modes needs no relearning |
+| Drawing on a text page | The pen, highlighter, eraser, lasso, pan and zoom tools all work on the paper exactly as they do on a PDF, and every mouse button is rebindable the same way — switching modes needs no relearning |
 | `Ctrl+Scroll` / pinch | On a text page: zoom the sheet — paper, text and ink together (`Ctrl+0` resets; `Shift+click` with a drawing tool fits the width) |
 | `Ctrl+S` | Save (prompts for name if untitled) |
 | `Ctrl+W` | Close the current tab (prompts to save unsaved changes; closes the window with the last tab) |

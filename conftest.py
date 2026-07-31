@@ -11,6 +11,7 @@ still passes; it only lands in the wrong speed tier. The full suite
 (no -m filter) is unaffected, as is CI's `python3 test_pdfeditor.py`.
 """
 import inspect
+import os
 import re
 
 import pytest
@@ -24,6 +25,24 @@ def pytest_configure(config):
         "markers",
         "window: builds real windows/apps — the slow tier, skipped by "
         "./run_tests.sh --fast (-m 'not window')")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_settings():
+    """Every test starts from the SHIPPED defaults.
+
+    Settings are one file (`_settings_path`, under XDG_CONFIG_HOME — pointed at
+    a throwaway dir by run_tests.sh) and `Bindings.save()` writes to it on every
+    rebind. Without this, a test that binds a chord leaks its table into every
+    window built after it, in file order: the failure is a test that passes
+    alone and fails in a suite, blaming the wrong feature. Deleting the file
+    between tests is enough — the table is only read when a window is built."""
+    yield
+    import sidemark
+    try:
+        os.unlink(sidemark._settings_path())
+    except OSError:
+        pass
 
 
 def pytest_collection_modifyitems(config, items):
