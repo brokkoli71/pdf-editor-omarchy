@@ -151,6 +151,28 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   (`link()` would append it into the run — the one outcome you cannot see
   coming from a checkbox); `unlink_forward` breaks the run at that page and
   every page after it. One tick covers a run of slides, one untick undoes it.
+- **Bookmarks (row 134)** — a page can be marked, and the marks live in the
+  SAME sidecar marker as the row-129 link flag: `<!-- page:13 bookmark -->`,
+  `bookmark="Eigenvalues"` when renamed, composing with ` continued`. A name is
+  escaped on write, and escaping `>` is what makes `-->` unrepresentable, so a
+  name can never terminate the comment it lives in. **A bookmark needs no
+  adjacency rule** — that is the whole difference from a link: a link is a
+  relationship BETWEEN pages so every re-key must ask whether it survived, a
+  bookmark is a property OF one page so it just follows it (and a deleted page
+  takes its bookmark with it). **The label is derived, never stored** (the
+  page's first `own_text` line, else its chapter, else nothing) so editing
+  notes cannot leave a label describing what used to be there; renaming stores
+  one that then wins. `_sync_bookmark_chrome` is the single place deciding
+  where the verb lives — the header button when there is room, the ☰ menu entry
+  when the header has collapsed, never both — and `_new_bookmark_list` is the
+  single builder behind both list widgets. PDF-only.
+- **Reopen where you left off** lives in `recent.json` (`_recent_page` /
+  `_remember_recent_page`), NOT the sidecar: a sidecar appears only once you
+  write something, and storing the reading position there would drop a `.md`
+  beside every PDF you merely glanced at. Two traps: loading fires a page-0
+  change, so `_restoring_page` stops it erasing the position it is about to
+  restore, and the write must NOT re-order the list or "recent" comes to mean
+  "whatever tab I scrolled in last".
 - Single-instance app (`Gio.Application`, `HANDLES_COMMAND_LINE`): a second
   launch forwards its argv to the primary, which opens the file as a tab in the
   last-used window (`_open_target`/`open_file_in_tab`). For manual testing
@@ -268,8 +290,9 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   This generalises the image contract and the chord grammar below; it is not
   their private rule. Walk a new feature through both before calling it done,
   and if one side genuinely can't have it, say so loudly in `ideas.csv`. There
-  is exactly ONE stated exception today: linked page notes (row 129), because a
-  text-first page has no page-to-page structure to continue.
+  are exactly TWO stated exceptions today, both for the same reason — a
+  text-first page is one endless sheet with no page structure: linked page
+  notes (row 129) and bookmarks (row 134).
 - **Event reachability — a correct handler can still never run.** When a
   gesture "does nothing", test the PATH, not the handler (all of these tested
   fine in isolation while being unreachable in the app):

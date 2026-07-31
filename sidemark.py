@@ -39,10 +39,18 @@ def _load_recent():
             if isinstance(it, dict) and os.path.isfile(it.get("path", ""))]
 
 
-def _add_recent(path):
+def _add_recent(path, page=None):
     path = os.path.abspath(path)
+    keep = next((it for it in _load_recent() if it.get("path") == path), {})
     items = [it for it in _load_recent() if it.get("path") != path]
-    items.insert(0, {"path": path, "ts": time.time()})
+    entry = {"path": path, "ts": time.time()}
+    # the reading position survives a re-open: _add_recent runs BEFORE the
+    # document is loaded, so dropping it here would erase the page we are
+    # about to restore
+    page = keep.get("page") if page is None else page
+    if page:
+        entry["page"] = int(page)
+    items.insert(0, entry)
     del items[RECENT_MAX:]
     os.makedirs(os.path.dirname(RECENT_PATH), exist_ok=True)
     tmp = RECENT_PATH + ".tmp"
@@ -83,6 +91,45 @@ def _copy_key():
         return ""
     # ids can't start with a digit, so the path hash carries a letter prefix
     return "v" + hashlib.sha1(src.encode("utf-8")).hexdigest()[:12]
+
+
+def _recent_page(path):
+    """The page this document was last read at, or 0.
+
+    Lives in recent.json rather than the sidecar because reopening where you
+    left off must not CREATE a file: a sidecar appears only once you actually
+    write something, and dropping a .md beside every PDF you glanced at would
+    break that promise. The cost is the recent list's own limit — an older
+    document reopens at page 1, which is what it did before anyway."""
+    path = os.path.abspath(path)
+    for it in _load_recent():
+        if it.get("path") == path:
+            try:
+                return max(0, int(it.get("page") or 0))
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _remember_recent_page(path, page):
+    """Record the reading position WITHOUT re-ordering the list — turning a
+    page is not opening a file, and letting it bump the entry to the top would
+    make "recent" mean "whatever tab I scrolled in last"."""
+    path = os.path.abspath(path)
+    items = _load_recent()
+    for it in items:
+        if it.get("path") == path:
+            if int(it.get("page") or 0) == int(page):
+                return
+            it["page"] = int(page)
+            break
+    else:
+        return
+    os.makedirs(os.path.dirname(RECENT_PATH), exist_ok=True)
+    tmp = RECENT_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f)
+    os.replace(tmp, RECENT_PATH)
 
 
 def _settings_path():
@@ -5769,18 +5816,44 @@ class NoteSections(NamedTuple):
     """What a notes sidecar says: per-page bodies, which pages CONTINUE their
     predecessor (row 129), and whether the file carried page markers at all.
 
-    A named tuple rather than a plain 3-tuple because `sections, had = ...`
-    unpacking is spread across the merge import — growing a third field must
-    fail loudly at the call sites that need updating, not silently rebind
+    A named tuple rather than a plain tuple because `sections, had = ...`
+    unpacking is spread across the merge import — growing a field must fail
+    loudly at the call sites that need updating, not silently rebind
     `had_markers` to the link set."""
     sections: dict
     linked: set
     had_markers: bool
+    bookmarks: dict = {}     # page idx → label ("" = derive one for display)
 
 
 # `<!-- page:12 -->` opens a page's notes; the ` continued` variant says the
 # page shares the run above it and so has no body of its own (row 129).
-_PAGE_MARKER_RE = r'<!--\s*page:(\d+)(\s+continued)?\s*-->'
+# One marker carries every invisible per-page fact: `<!-- page:13 continued -->`
+# says the page continues the one before it (row 129), `<!-- page:13 bookmark -->`
+# that it is bookmarked, `bookmark="Eigenvalues"` that the bookmark was renamed.
+# They compose (`<!-- page:13 continued bookmark -->`) and old files still parse,
+# because "no attributes" has always been the ordinary case.
+_MARKER_ATTRS_RE = r'(?:\s+continued|\s+bookmark(?:="[^"\n]*")?)*'
+_PAGE_MARKER_RE = r'<!--\s*page:(\d+)(' + _MARKER_ATTRS_RE + r')\s*-->'
+
+
+def _esc_marker(text):
+    """A bookmark name, safe inside a marker. Escaping `>` is what makes `-->`
+    unrepresentable, so a name can never terminate the comment it lives in."""
+    return (text.replace("&", "&amp;").replace('"', "&quot;")
+                .replace(">", "&gt;").replace("\n", " ").strip())
+
+
+def _unesc_marker(text):
+    return (text.replace("&gt;", ">").replace("&quot;", '"')
+                .replace("&amp;", "&"))
+
+
+def _clean_name(text):
+    """A bookmark name as STORED: one line, no padding. Escaping is a
+    serialisation concern and happens in `save` — keep the model's copy the
+    text the user typed, or a rename round-trip grows `&amp;`s."""
+    return " ".join((text or "").split())
 
 
 def parse_note_sections(raw):
@@ -5794,18 +5867,22 @@ def parse_note_sections(raw):
     parts = re.split(_PAGE_MARKER_RE, raw)
     if len(parts) == 1:
         text = raw.strip()
-        return NoteSections({0: text} if text else {}, set(), False)
-    sections, linked = {}, set()
-    # re.split yields [prefix, page, continued, body, page, continued, body...]
-    # — one group per marker capture, so the stride is 3, not 2.
+        return NoteSections({0: text} if text else {}, set(), False, {})
+    sections, linked, bookmarks = {}, set(), {}
+    # re.split yields [prefix, page, attrs, body, page, attrs, body...] — one
+    # group per marker capture, so the stride is 3, not 2.
     for i in range(1, len(parts), 3):
         idx = int(parts[i])
         content = parts[i + 2].strip() if i + 2 < len(parts) else ""
-        if parts[i + 1]:
+        attrs = parts[i + 1] or ""
+        if re.search(r'\bcontinued\b', attrs):
             linked.add(idx)
+        bm = re.search(r'\bbookmark\b(?:="([^"\n]*)")?', attrs)
+        if bm:
+            bookmarks[idx] = _unesc_marker(bm.group(1) or "")
         if content:
             sections[idx] = content
-    return NoteSections(sections, linked, True)
+    return NoteSections(sections, linked, True, bookmarks)
 
 
 def read_note_sections(path):
@@ -5815,7 +5892,7 @@ def read_note_sections(path):
         with open(path, encoding="utf-8", errors="replace") as f:
             raw = f.read()
     except OSError:
-        return NoteSections({}, set(), False)
+        return NoteSections({}, set(), False, {})
     return parse_note_sections(raw)
 
 
@@ -6004,6 +6081,7 @@ class MergeResult:
         self.toc = []           # the merged outline, 1-based pages
         self.notes = {}         # page idx → markdown
         self.linked = set()     # page idxs that continue their predecessor
+        self.bookmarks = {}     # page idx → bookmark name ("" = derived)
         self.images = {}        # "page idx" → sidecar image records
         self.error = None
 
@@ -6025,7 +6103,7 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
     notes/images into the live models at the insertion point."""
     out = fitz.open()
     result = MergeResult()
-    toc, notes, images, linked = [], {}, {}, set()
+    toc, notes, images, linked, bookmarks = [], {}, {}, set(), {}
     offset = 0
     try:
         for src_info in sources:
@@ -6055,10 +6133,11 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
             toc.append([1, src_info.title, offset + 1])
             toc += shift_toc(sub, offset, base_level=2)
             if src_info.notes is not None:
-                sections, src_links = dict(src_info.notes), set()
+                sections, src_links, src_marks = dict(src_info.notes), set(), {}
             else:
                 parsed = read_note_sections(notes_path_for(src_info.origin))
                 sections, src_links = parsed.sections, parsed.linked
+                src_marks = parsed.bookmarks
             for idx, text in sections.items():
                 if text.strip():
                     notes[idx + offset] = text
@@ -6066,6 +6145,9 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
             # shift; a source's page 0 can never be linked, which is what keeps
             # one chapter's notes from reaching into the one before it
             linked |= {idx + offset for idx in src_links if 0 < idx < n}
+            # a bookmark marks a page, so the chapter offset is the whole story
+            bookmarks.update({idx + offset: name
+                              for idx, name in src_marks.items() if 0 <= idx < n})
             for key, entries in page_images.items():
                 try:
                     images[str(int(key) + offset)] = entries
@@ -6076,6 +6158,7 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
         result.pages = offset
         result.toc, result.notes, result.images = toc, notes, images
         result.linked = linked
+        result.bookmarks = bookmarks
         if not offset:
             return result
         out.set_toc(toc)
@@ -6086,12 +6169,13 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
         out.close()
     if not write_sidecars:
         return result
-    if notes or linked:
+    if notes or linked or bookmarks:
         model = NotesModel()
         model.pdf_name = os.path.basename(dest_path)
         for idx, text in notes.items():
             model.set(idx, text)     # links go on AFTER, or set() would
         model.set_links(linked)      # route a run's pages onto its start
+        model.set_bookmarks(bookmarks)
         model.save(notes_path_for(dest_path))
     if images:
         tmp = _ink_path_for(dest_path) + ".tmp"
@@ -7316,6 +7400,11 @@ class NotesModel:
     def __init__(self):
         self._notes = {}
         self._links = set()   # pages that continue their predecessor
+        # page idx → bookmark label; "" means "derive one for display" (the
+        # page's first note line, its chapter title, else the page number). A
+        # bookmark is a property OF a page, so unlike a link it needs no
+        # adjacency rule: it simply follows its page through every re-key.
+        self._bookmarks = {}
         self.pdf_name = None  # written as ![[name.pdf]] at top of the file
 
     # ── runs ─────────────────────────────────────────────────────────────────
@@ -7401,6 +7490,46 @@ class NotesModel:
             self.unlink(p)
         return pages
 
+    # ── bookmarks ────────────────────────────────────────────────────────────
+
+    def is_bookmarked(self, idx):
+        return idx in self._bookmarks
+
+    def bookmark_name(self, idx):
+        """The stored name, "" when the label is derived at display time."""
+        return self._bookmarks.get(idx, "")
+
+    def bookmarks(self):
+        """[(page, name)] in page order — what the list shows."""
+        return sorted(self._bookmarks.items())
+
+    def add_bookmark(self, idx, name=""):
+        self._bookmarks[idx] = _clean_name(name)
+        return True
+
+    def remove_bookmark(self, idx):
+        return self._bookmarks.pop(idx, None) is not None
+
+    def toggle_bookmark(self, idx):
+        """Returns True if the page is bookmarked afterwards. A re-add keeps
+        no memory of an old name — removing a bookmark removes its name too,
+        which is the only reading of "clicking again removes it"."""
+        if self.remove_bookmark(idx):
+            return False
+        self.add_bookmark(idx)
+        return True
+
+    def rename_bookmark(self, idx, name):
+        """Name a bookmark, or clear the name back to the derived label."""
+        if idx not in self._bookmarks:
+            return False
+        self._bookmarks[idx] = _clean_name(name)
+        return True
+
+    def set_bookmarks(self, marks):
+        """Replace the bookmarks wholesale (a merge, a re-key, an undo)."""
+        self._bookmarks = {int(k): v for k, v in dict(marks).items()}
+
     def set_links(self, pages):
         """Replace the link flags wholesale (a merge, a re-key, an undo).
         Texts must already be in place: `set` routes through a link, so
@@ -7434,9 +7563,11 @@ class NotesModel:
         return self._notes.get(idx, "")
 
     def has_content(self):
-        """True if anything is worth a sidecar (drives lazy file creation) —
-        a bare link flag counts: losing it would silently re-split a run."""
-        return bool(self._links) or any(v.strip() for v in self._notes.values())
+        """True if anything is worth a sidecar (drives lazy file creation) — a
+        bare link flag or bookmark counts: losing a link would silently
+        re-split a run, and losing a bookmark loses the only copy of it."""
+        return (bool(self._links) or bool(self._bookmarks)
+                or any(v.strip() for v in self._notes.values()))
 
     def set(self, idx, text):
         """Write page idx's notes — to the run's first page when it is linked,
@@ -7450,6 +7581,7 @@ class NotesModel:
         # a hand-written note onto one page of a chapter (row 123)
         parsed = read_note_sections(path)
         self._notes, self._links = parsed.sections, set(parsed.linked)
+        self._bookmarks = dict(parsed.bookmarks)
         self._normalize()
 
     # ── re-keying (every path that re-pages a document; see row 123) ─────────
@@ -7463,6 +7595,10 @@ class NotesModel:
             for k, v in self._notes.items()
         }
         self._links = {(k + count if k >= idx else k) for k in self._links}
+        # a bookmark marks a PAGE, so it just rides along — no adjacency rule
+        # to preserve and nothing the inserted blank pages could inherit
+        self._bookmarks = {(k + count if k >= idx else k): v
+                           for k, v in self._bookmarks.items()}
         # the new pages are blank and unlinked, so the run is broken anyway:
         # cut the tail loose rather than let its text reach across the gap
         self._links.discard(idx + count)
@@ -7484,6 +7620,10 @@ class NotesModel:
         self._links = {(k - 1 if k > idx else k)
                        for k in self._links if k != idx}
         self._links.discard(0)
+        # the deleted page's bookmark goes with it: it marked THAT page, and
+        # handing it to a neighbour would silently point somewhere else
+        self._bookmarks = {(k - 1 if k > idx else k): v
+                           for k, v in self._bookmarks.items() if k != idx}
 
     def reorder(self, old_to_new):
         """Re-key notes after pages were reordered. old_to_new maps each old
@@ -7499,17 +7639,28 @@ class NotesModel:
             if new == prev + 1:
                 kept.add(new)
         self._links = {k for k in kept if k > 0}
+        self._bookmarks = {old_to_new.get(k, k): v
+                           for k, v in self._bookmarks.items()}
         self._normalize()   # a torn-off page may now own text behind a link
 
     def save(self, path):
         sections = []
-        for idx in sorted(set(self._notes) | self._links):
+        for idx in sorted(set(self._notes) | self._links | set(self._bookmarks)):
+            attrs = ""
             if idx in self._links:
-                # marker only: the body lives on the run's first page. This is
-                # the one place an EMPTY page still has to be written out.
-                sections.append(f"<!-- page:{idx} continued -->")
-            elif self._notes.get(idx, "").strip():
-                sections.append(f"<!-- page:{idx} -->\n\n{self._notes[idx].strip()}")
+                attrs += " continued"
+            if idx in self._bookmarks:
+                name = self._bookmarks[idx]
+                attrs += f' bookmark="{_esc_marker(name)}"' if name else " bookmark"
+            # a linked page's body lives on the run's first page, never here
+            body = "" if idx in self._links else self._notes.get(idx, "").strip()
+            if not attrs and not body:
+                continue
+            # an EMPTY page is still written out when it carries a marker —
+            # a continued page (row 129) or a bookmark is invisible state that
+            # exists nowhere else
+            sections.append(f"<!-- page:{idx}{attrs} -->"
+                            + (f"\n\n{body}" if body else ""))
         body = "\n\n".join(sections) + "\n" if sections else ""
         embed = f"![[{self.pdf_name}]]\n\n" if self.pdf_name else ""
         tmp = path + ".tmp"
@@ -11204,6 +11355,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._closed_tabs = []   # reopen stack for Ctrl+Shift+T (file paths)
         self._share_revision = 0  # bumps on every change; drives live phone share
         self._notes_link_updating = False   # guards the row-129 checkbox
+        self._bookmark_updating = False     # the same guard for the bookmark toggle
+        self._bookmark_lists = []           # every live copy of the list widget
+        self._bookmark_pop = None
+        # set while a document is loading: the load fires a page-0 change, and
+        # remembering THAT would erase the position we are about to restore
+        self._restoring_page = False
         # THE button table (row 132), shared by every canvas and sheet in this
         # window and persisted in settings.json
         self.bindings = Bindings.load()
@@ -11483,6 +11640,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         msep2.set_margin_top(2)
         msep2.set_margin_bottom(2)
         menu_box.append(msep2)
+        # The bookmark button's UNDERSTUDY: shown only while the header is too
+        # narrow to carry the button (see _sync_bookmark_chrome), so the verb
+        # is never unreachable and never offered twice.
+        self._bookmark_menu_item = _menu_item(
+            "Bookmarks", lambda: self._show_menu_page("bookmarks"),
+            "Jump to a bookmark, or bookmark this page (Ctrl+B)")
+        self._bookmark_menu_item.set_visible(False)
         _menu_item("Keyboard shortcuts", lambda: self._show_menu_page("shortcuts"),
                    "Show the full list of keyboard shortcuts")
 
@@ -11496,6 +11660,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         recent_scroll.set_child(self._recent_list_box)
         self._menu_stack.add_named(
             self._menu_subpage("Recent files", recent_scroll), "recent")
+        bm_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._bookmark_menu_toggle = Gtk.Button()
+        self._bookmark_menu_toggle.add_css_class("flat")
+        self._bookmark_menu_toggle.set_child(
+            Gtk.Label(label="Add bookmark", xalign=0))
+        self._bookmark_menu_toggle.connect(
+            "clicked", lambda _b: (menu_pop.popdown(), self._toggle_bookmark()))
+        bm_page.append(self._bookmark_menu_toggle)
+        bm_scroll, bm_list = self._new_bookmark_list()
+        bm_list.connect("row-activated", self._on_bookmark_row_activated)
+        bm_page.append(bm_scroll)
+        self._menu_stack.add_named(
+            self._menu_subpage("Bookmarks", bm_page), "bookmarks")
         self._menu_stack.add_named(
             self._menu_subpage("Keyboard shortcuts",
                                self._build_shortcuts_content()), "shortcuts")
@@ -11968,6 +12145,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         search_btn.set_tooltip_text("Search PDF & notes (Ctrl+F)")
         search_btn.connect("clicked", lambda _: self._show_search())
 
+        # Bookmarks. A ToggleButton because a bookmark IS page state and the
+        # button's job is to show it — unlike the tool buttons (row 132), where
+        # there is no active tool for a checked look to mean.
+        self._bookmark_btn = Gtk.ToggleButton()
+        self._bookmark_btn.set_icon_name(
+            _themed_icon("user-bookmarks-symbolic", "bookmark-new-symbolic"))
+        self._bookmark_btn.connect("toggled", self._on_bookmark_toggled)
+        self._attach_bookmark_popover(self._bookmark_btn)
+
         self._present_btn = Gtk.ToggleButton()
         self._present_btn.set_icon_name(
             _themed_icon("video-display-symbolic", "display-symbolic"))
@@ -12004,6 +12190,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         self._header_end = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self._header_end.append(search_btn)
+        self._header_end.append(self._bookmark_btn)
         self._header_end.append(self._present_btn)
         self._header_end.append(self._share_btn)
         self._header_end.append(self._notes_toggle)
@@ -12451,6 +12638,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 twin = getattr(self, "_pmode_" + name[len("_mode_"):], None)
                 if twin is not None:
                     twin.set_visible(vis)
+        # the loop above only knows the MODE; the bookmark verb also depends on
+        # whether the header still has room for its button
+        self._sync_bookmark_chrome()
         # The pen / eraser tooltips carry the text-mode Alt-hold ink hint on the
         # tool itself (not on the caret), and drop it in PDF mode where Alt+drag
         # means text-select instead. Same pen either way — no "quick pen".
@@ -12546,6 +12736,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Ctrl+Scroll",   "Zoom the sheet (paper, text and ink together)"),
             ("Ctrl+0",        "Reset the sheet zoom"),
             ("Ctrl+F",        "Search text in PDF"),
+            ("Ctrl+B",        "Bookmark this page — bold, while writing notes "
+                              "(hold the bookmark button for the list)"),
             ("Ctrl+S",        "Save"),
             ("Ctrl+Shift+S",  "Save as…"),
             ("Ctrl+E",        "Export PDF with notes"),
@@ -12596,6 +12788,197 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         scroll.set_max_content_height(480)
         return scroll
 
+    # ── the bookmark list: one builder, two homes ────────────────────────────
+
+    def _new_bookmark_list(self):
+        """A scrollable list of every bookmark, registered so both copies (the
+        button's popover and the menu sub-page for when the button collapses
+        away) repaint from one call. Two lists, ONE builder — a second
+        implementation is how the popover and the menu come to disagree about
+        what is bookmarked."""
+        box = Gtk.ListBox()
+        box.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        box.add_css_class("boxed-list")
+        # F2 renames whatever is selected — the pen button on each row is the
+        # discoverable half of the same verb
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._on_bookmark_list_key)
+        box.add_controller(keys)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_max_content_height(320)
+        scroll.set_propagate_natural_height(True)
+        scroll.set_propagate_natural_width(True)
+        scroll.set_child(box)
+        self._bookmark_lists.append(box)
+        return scroll, box
+
+    def _refresh_bookmark_lists(self):
+        for box in self._bookmark_lists:
+            self._fill_bookmark_list(box)
+
+    def _fill_bookmark_list(self, box):
+        child = box.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            box.remove(child)
+            child = nxt
+        marks = self.notes_model.bookmarks() if self._can_bookmark() else []
+        if not marks:
+            row = Gtk.ListBoxRow()
+            row.set_activatable(False)
+            row.set_selectable(False)
+            empty = Gtk.Label(label="No bookmarks yet", xalign=0)
+            empty.add_css_class("dim-label")
+            empty.set_margin_top(8); empty.set_margin_bottom(8)
+            empty.set_margin_start(8); empty.set_margin_end(8)
+            row.set_child(empty)
+            box.append(row)
+            return
+        for idx, name in marks:
+            box.append(self._bookmark_row(idx, name))
+
+    def _bookmark_row(self, idx, name):
+        row = Gtk.ListBoxRow()
+        row._page_idx = idx          # what a click jumps to, and F2 renames
+        line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        line.set_margin_top(4); line.set_margin_bottom(4)
+        line.set_margin_start(8); line.set_margin_end(4)
+        num = Gtk.Label(label=str(idx + 1), xalign=1)
+        num.add_css_class("dim-label")
+        num.set_width_chars(3)
+        line.append(num)
+        label = Gtk.Label(label=self._bookmark_label(idx, name), xalign=0)
+        label.set_hexpand(True)
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+        label.set_max_width_chars(28)
+        line.append(label)
+        rename = Gtk.Button()
+        rename.set_icon_name("document-edit-symbolic")
+        rename.add_css_class("flat")
+        rename.set_tooltip_text("Rename this bookmark (F2)")
+        rename.connect("clicked", lambda _b, r=row: self._begin_rename(r))
+        line.append(rename)
+        drop = Gtk.Button()
+        drop.set_icon_name("window-close-symbolic")
+        drop.add_css_class("flat")
+        drop.set_tooltip_text(f"Remove the bookmark on page {idx + 1}")
+        drop.connect("clicked", lambda _b, i=idx: self._drop_bookmark(i))
+        line.append(drop)
+        row.set_child(line)
+        row._label_widget = label
+        row._row_box = line
+        return row
+
+    def _on_bookmark_row_activated(self, box, row):
+        """Click a row to jump there. A row mid-rename keeps the press — the
+        entry has focus and activating would throw the edit away."""
+        idx = getattr(row, "_page_idx", None)
+        if idx is None or getattr(row, "_renaming", False):
+            return
+        self._go_to_page(idx)
+        pop = getattr(self, "_bookmark_pop", None)
+        if pop is not None:
+            pop.popdown()
+        self._menu_pop.popdown()
+
+    def _on_bookmark_list_key(self, _ctrl, keyval, _keycode, _state):
+        if keyval != Gdk.KEY_F2:
+            return False
+        box = _ctrl.get_widget()
+        row = box.get_selected_row()
+        if row is None or getattr(row, "_page_idx", None) is None:
+            return False
+        self._begin_rename(row)
+        return True
+
+    def _begin_rename(self, row):
+        """Swap the row's label for an entry in place. Enter commits, Escape
+        restores — no dialog, because renaming is a one-word edit and a modal
+        for it would cost more than the rename."""
+        if getattr(row, "_renaming", False):
+            return
+        idx = row._page_idx
+        row._renaming = True
+        entry = Gtk.Entry()
+        entry.set_hexpand(True)
+        entry.set_text(self._bookmark_label(idx))
+        entry.select_region(0, -1)
+        row._row_box.insert_child_after(entry, row._label_widget)
+        row._label_widget.set_visible(False)
+
+        def finish(commit):
+            if not getattr(row, "_renaming", False):
+                return
+            row._renaming = False
+            if commit:
+                # committing the DERIVED label as a name would freeze today's
+                # first note line into the file; only a real change is stored
+                text = entry.get_text().strip()
+                self._rename_bookmark(idx, "" if text == self._bookmark_label(idx, "")
+                                      else text)
+            row._row_box.remove(entry)
+            row._label_widget.set_visible(True)
+
+        entry.connect("activate", lambda _e: finish(True))
+        esc = Gtk.EventControllerKey()
+        esc.connect("key-pressed",
+                    lambda _c, kv, _kc, _st: (kv == Gdk.KEY_Escape
+                                              and (finish(False) or True)))
+        entry.add_controller(esc)
+        entry.grab_focus()
+
+    def _rename_bookmark(self, idx, name):
+        if not self.notes_model.rename_bookmark(idx, name):
+            return
+        self._mark_dirty()
+        self._refresh_bookmark_lists()
+
+    def _drop_bookmark(self, idx):
+        if not self.notes_model.remove_bookmark(idx):
+            return
+        self._mark_dirty()
+        self._populate_toc()
+        self._update_bookmark_ui()
+        self._refresh_bookmark_lists()
+
+    def _attach_bookmark_popover(self, button):
+        """Long-press the bookmark button for the add/remove verb plus the full
+        list. A long press, not a right-click: the button is a toggle and a
+        secondary click on it does nothing else."""
+        pop = Gtk.Popover()
+        pop.set_parent(button)
+        self._bookmark_pop = pop
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_start(8); box.set_margin_end(8)
+        box.set_margin_top(8); box.set_margin_bottom(8)
+        self._bookmark_toggle_item = Gtk.Button()
+        self._bookmark_toggle_item.add_css_class("flat")
+        self._bookmark_toggle_item.set_child(
+            Gtk.Label(label="Add bookmark", xalign=0))
+        self._bookmark_toggle_item.connect(
+            "clicked", lambda _b: (pop.popdown(), self._toggle_bookmark()))
+        box.append(self._bookmark_toggle_item)
+        box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        scroll, listbox = self._new_bookmark_list()
+        listbox.connect("row-activated", self._on_bookmark_row_activated)
+        box.append(scroll)
+        pop.set_child(box)
+
+        def _popup(*_a):
+            if not self._can_bookmark():
+                return
+            self._bookmark_toggle_item.get_child().set_label(
+                "Remove bookmark"
+                if self.notes_model.is_bookmarked(self.canvas.current_page_idx)
+                else "Add bookmark")
+            self._refresh_bookmark_lists()
+            pop.popup()
+
+        lp = Gtk.GestureLongPress()
+        lp.connect("pressed", lambda *_: _popup())
+        button.add_controller(lp)
+
     def _menu_subpage(self, title, content):
         """A menu stack sub-page: a '← title' back header above the content. The
         back button returns to the main menu page (no popover involved)."""
@@ -12621,11 +13004,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         box.append(content)
         return box
 
+    def _prepare_bookmark_menu_page(self):
+        """The menu sub-page says the same thing the popover does, because both
+        ask this before showing."""
+        self._bookmark_menu_toggle.get_child().set_label(
+            "Remove bookmark"
+            if (self._can_bookmark()
+                and self.notes_model.is_bookmarked(self.canvas.current_page_idx))
+            else "Add bookmark")
+        self._bookmark_menu_toggle.set_sensitive(self._can_bookmark())
+        self._refresh_bookmark_lists()
+
     def _show_menu_page(self, name):
         """Switch the ☰ menu to a sub-page in place (recent / shortcuts) — keeps
         the single menu popover open instead of opening a racing sibling one."""
         if name == "recent":
             self._rebuild_recent_menu()
+        elif name == "bookmarks":
+            self._prepare_bookmark_menu_page()
         self._menu_stack.set_visible_child_name(name)
 
     # ── page & notes handshake ────────────────────────────────────────────────
@@ -13198,6 +13594,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._page_label.set_label(f"{idx + 1} / {n}")
         self._restore_note()
         self._update_search_canvas()
+        self._update_bookmark_ui()
+        self._remember_page(idx)
         if self._toc_thumbs and self._toc_revealer.get_reveal_child():
             self._select_thumb(idx)
         if self._presenter is not None:
@@ -13206,6 +13604,86 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _go_to_page(self, idx):
         self._commit_note()
         self.canvas.go_to_page(idx)
+
+    # ── bookmarks (row 134) ──────────────────────────────────────────────────
+
+    def _can_bookmark(self):
+        """PDF-only, like linked page notes: a text-first page is one endless
+        sheet with no page structure to mark. Said loudly here and in
+        `_MODE_CHROME` rather than left to the button being hidden."""
+        return not self._text_mode and self.canvas.document is not None
+
+    def _bookmark_label(self, idx, name=None):
+        """What a bookmark row says. A stored name wins; otherwise it is
+        DERIVED at display time — the page's own first note line, else the
+        chapter it falls in, else nothing — so adding a bookmark stays one
+        click and the row still says something useful. Derived, never stored:
+        editing the notes must not leave a label describing what used to be
+        there."""
+        if name is None:
+            name = self.notes_model.bookmark_name(idx)
+        if name:
+            return name
+        # own_text, not get: on a continued page (row 129) the run's body
+        # belongs to its first page, and labelling five slides alike helps
+        # nobody
+        line = next((ln.strip() for ln in
+                     self.notes_model.own_text(idx).splitlines() if ln.strip()),
+                    "")
+        if not line:
+            line = self._chapter_title_at(idx)
+        line = re.sub(r'^#+\s*', '', line).strip()
+        return line[:60]
+
+    def _chapter_title_at(self, idx):
+        """The outline entry covering page idx, if the document has one."""
+        title = ""
+        try:
+            toc = self.canvas.get_toc()
+        except Exception:
+            return ""
+        for entry in toc:
+            if len(entry) >= 3 and entry[2] - 1 <= idx:
+                title = entry[1]
+            else:
+                break
+        return title or ""
+
+    def _toggle_bookmark(self):
+        """The button's whole verb: click adds, click again removes."""
+        if not self._can_bookmark():
+            return
+        idx = self.canvas.current_page_idx
+        added = self.notes_model.toggle_bookmark(idx)
+        self._mark_dirty()
+        self._populate_toc()
+        self._update_bookmark_ui()
+        self._refresh_bookmark_lists()
+        self._toast(f"Bookmarked page {idx + 1}" if added
+                    else f"Bookmark removed from page {idx + 1}")
+
+    def _on_bookmark_toggled(self, btn):
+        """The checkbox IS the page's boolean — but `_update_bookmark_ui`
+        writes to it on every page turn, so ignore the toggle when it merely
+        reports the state we just put there (the row-129 checkbox pattern)."""
+        if self._bookmark_updating:
+            return
+        self._toggle_bookmark()
+
+    def _update_bookmark_ui(self):
+        """Point the button at the page you are on."""
+        if getattr(self, "_bookmark_btn", None) is None:
+            return
+        on = self._can_bookmark() and self.notes_model.is_bookmarked(
+            self.canvas.current_page_idx)
+        self._bookmark_updating = True
+        self._bookmark_btn.set_active(on)
+        self._bookmark_updating = False
+        page = self.canvas.current_page_idx + 1
+        self._bookmark_btn.set_tooltip_text(
+            (f"Remove the bookmark on page {page}" if on
+             else f"Bookmark page {page}")
+            + " (Ctrl+B) — hold for the list of bookmarks")
 
     def _follow_note_link(self, link):
         """Navigate a [[wiki link]] clicked in the notes (Ctrl+click). A same-
@@ -13916,7 +14394,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # a continued page (row 129) is marked in the strip too — the panel
             # only tells you once you are already on the page
             linked = self.notes_model.is_linked(i)
-            num = Gtk.Label(label=f"{i + 1} ⤸" if linked else str(i + 1))
+            # …and so is a bookmark: the strip is where you look for the page
+            # you want, so the marks that help you find it belong here
+            marked = self.notes_model.is_bookmarked(i)
+            num = Gtk.Label(label=str(i + 1) + (" ⤸" if linked else "")
+                            + (" ★" if marked else ""))
             num.add_css_class("dim-label")
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             box.set_margin_top(6)
@@ -13932,6 +14414,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 (f"Page {i + 1} — notes continued from page "
                  f"{self.notes_model.run_start(i) + 1}" if linked else
                  f"Page {i + 1}")
+                + (f" — bookmarked: {self._bookmark_label(i)}" if marked else "")
                 + " — click to open (PageUp/PageDown to flip), "
                   "Ctrl+click to select, drag to reorder or export")
             self._add_thumb_dnd(row, i)
@@ -14479,6 +14962,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # after the texts, or set() would route a run's page onto its start
             self.notes_model.set_links(
                 self.notes_model.links() | {at + idx for idx in result.linked})
+        if result.bookmarks:
+            marks = dict(self.notes_model._bookmarks)
+            marks.update({at + idx: name
+                          for idx, name in result.bookmarks.items()})
+            self.notes_model.set_bookmarks(marks)
         for idx, images in images_from_sidecar(
                 {"version": 1, "images": result.images}).items():
             self.canvas.all_images.setdefault(at + idx, []).extend(images)
@@ -14646,6 +15134,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         "_nav_box":      ("pdf",),
         "_pages_box":    ("pdf",),
         "_share_btn":    ("pdf",),
+        # a text page is one endless sheet with no page structure to bookmark —
+        # the same reason linked page notes are PDF-only (row 129)
+        "_bookmark_btn": ("pdf",),
         "_notes_toggle": ("pdf",),
         "_present_btn":  ("pdf",),
         "_pen_btn":      ("pdf", "text"),
@@ -15092,10 +15583,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         mode = (self._active_session.doc_mode if self._active_session
                 else "pdf")
         self._search_btn.set_visible(level < 3)
+        self._sync_bookmark_chrome()
         self._present_btn.set_visible(
             level < 3 and mode in self._MODE_CHROME["_present_btn"])
         self._share_btn.set_visible(
             level < 3 and mode in self._MODE_CHROME["_share_btn"])
+
+    def _sync_bookmark_chrome(self):
+        """Where the bookmark verb lives right now. `_MODE_CHROME` answers "does
+        this mode have it", the collapse level answers "is there room" — and the
+        menu entry is the button's UNDERSTUDY, shown exactly when the button has
+        been collapsed away. One place decides, so they are never both there and
+        never both gone."""
+        mode = (self._active_session.doc_mode if self._active_session else "pdf")
+        has = mode in self._MODE_CHROME["_bookmark_btn"]
+        room = self._collapse_level < 3
+        self._bookmark_btn.set_visible(has and room)
+        self._bookmark_menu_item.set_visible(has and not room)
 
     # widen-to-expand needs this much extra slack over the bare fit, so a level
     # change doesn't flicker on 1px resize jitter at the boundary
@@ -15569,6 +16073,26 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     # ── recent files ──────────────────────────────────────────────────────────
 
+    def _remember_page(self, idx):
+        """Remember where you are reading, per document.
+
+        # ceiling: one small atomic write per page turn — flipping a deck end to
+        # end writes recent.json once per page. Coalesce on a timer if that ever
+        # shows up in a profile; a crash would then lose the last few seconds.
+        """
+        if self._restoring_page or self._text_mode or self._is_untitled:
+            return
+        path = self._path
+        if path:
+            _remember_recent_page(path, idx)
+
+    def _restore_reading_page(self, path):
+        """Reopen where you left off. An explicit `#page=N` on the command line
+        or in a link is applied AFTER open_file, so it still wins."""
+        page = _recent_page(path)
+        if 0 < page < self.canvas.n_pages:
+            self._go_to_page(page)
+
     def _remember_recent(self, path):
         path = os.path.abspath(path)
         # the scratchpad and unsaved blanks are noise in a recents list
@@ -15812,6 +16336,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.notes_model.pdf_name = os.path.basename(path)
         self.notes_model.load(self._active_notes_path)
         self._hide_search()
+        self._restoring_page = True
         self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
         self._load_pdf_images(path)
         self._populate_toc()
@@ -15824,6 +16349,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # created lazily on first save once something is actually written.
         self._set_notes_shown(self.notes_model.has_content())
         self._remember_recent(path)
+        self._restoring_page = False
+        self._restore_reading_page(path)
+        self._update_bookmark_ui()
         self._maybe_offer_recovery(path)
         self._maybe_offer_ocr(path)
 
@@ -16777,6 +17305,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 return True
             if keyval == Gdk.KEY_f:
                 self._show_search()
+                return True
+            if keyval == Gdk.KEY_b:
+                # Ctrl+B is BOLD in the notes editor, which claims it at capture
+                # while focused — so this only ever fires with the page in hand
+                self._toggle_bookmark()
                 return True
             if keyval == Gdk.KEY_e:
                 self._on_export()

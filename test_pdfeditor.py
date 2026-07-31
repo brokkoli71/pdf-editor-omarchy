@@ -1357,6 +1357,276 @@ class TestLinkedPageNotes(unittest.TestCase):
         self.assertEqual(m.own_text(0), "the long thought")
 
 
+class TestBookmarks(unittest.TestCase):
+    """Row 134. A bookmark is a property OF a page, stored invisibly in the
+    sidecar next to the row-129 link flag — so unlike a link it needs no
+    adjacency rule and simply follows its page through every re-key."""
+
+    def test_a_bookmark_round_trips_through_the_sidecar(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "n.md")
+            m = NotesModel()
+            m.set(0, "intro")
+            m.add_bookmark(0)
+            m.add_bookmark(4, "Eigenvalues")
+            m.save(path)
+            raw = open(path, encoding="utf-8").read()
+            self.assertIn("<!-- page:0 bookmark -->", raw)
+            self.assertIn('<!-- page:4 bookmark="Eigenvalues" -->', raw)
+            back = NotesModel()
+            back.load(path)
+            self.assertEqual(back.bookmarks(), [(0, ""), (4, "Eigenvalues")])
+            self.assertEqual(back.own_text(0), "intro")
+
+    def test_a_name_can_never_terminate_the_comment_it_lives_in(self):
+        """`-->` inside a name would end the marker early and turn the rest of
+        the file into visible junk. Escaping `>` makes it unrepresentable."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "n.md")
+            m = NotesModel()
+            evil = 'a --> "quoted" & sneaky'
+            m.add_bookmark(1, evil)
+            m.set(2, "body that must survive")
+            m.save(path)
+            self.assertNotIn("--> ", open(path, encoding="utf-8").read()
+                             .split("bookmark=")[1].split("-->")[0])
+            back = NotesModel()
+            back.load(path)
+            self.assertEqual(back.bookmark_name(1), evil)
+            self.assertEqual(back.own_text(2), "body that must survive")
+
+    def test_a_bookmark_composes_with_a_linked_page(self):
+        """Both are attributes of the same marker, so a continued page can be
+        bookmarked and neither fact survives at the other's expense."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "n.md")
+            m = NotesModel()
+            m.set(0, "shared")
+            m.set_links({1})
+            m.add_bookmark(1, "part two")
+            m.save(path)
+            self.assertIn('<!-- page:1 continued bookmark="part two" -->',
+                          open(path, encoding="utf-8").read())
+            back = NotesModel()
+            back.load(path)
+            self.assertEqual(back.links(), {1})
+            self.assertEqual(back.bookmarks(), [(1, "part two")])
+            self.assertEqual(back.get(1), "shared")
+            self.assertEqual(back.own_text(1), "")
+
+    def test_old_sidecars_still_parse(self):
+        m = sidemark.parse_note_sections(
+            "<!-- page:0 -->\n\nx\n\n<!-- page:1 continued -->\n")
+        self.assertEqual(m.sections, {0: "x"})
+        self.assertEqual(m.linked, {1})
+        self.assertEqual(m.bookmarks, {})
+
+    def test_a_bookmark_alone_is_worth_a_sidecar(self):
+        """has_content drives lazy file creation; the sidecar is the only copy
+        of a bookmark, so losing the file loses the bookmark."""
+        m = NotesModel()
+        m.add_bookmark(2)
+        self.assertTrue(m.has_content())
+
+    def test_toggle_adds_then_removes_and_forgets_the_name(self):
+        m = NotesModel()
+        self.assertTrue(m.toggle_bookmark(3))
+        m.rename_bookmark(3, "named")
+        self.assertFalse(m.toggle_bookmark(3))
+        self.assertTrue(m.toggle_bookmark(3))
+        self.assertEqual(m.bookmark_name(3), "")
+
+    def test_a_bookmark_follows_its_page_through_every_rekey(self):
+        """No adjacency rule to preserve, unlike a link: it marks ONE page."""
+        m = NotesModel()
+        m.add_bookmark(2, "keep me")
+        m.add_bookmark(4)
+        m.shift_for_insert(1)               # a page lands before both
+        self.assertEqual(m.bookmarks(), [(3, "keep me"), (5, "")])
+        m.shift_for_delete(0)
+        self.assertEqual(m.bookmarks(), [(2, "keep me"), (4, "")])
+        m.reorder({2: 7, 4: 1})             # dragged apart
+        self.assertEqual(m.bookmarks(), [(1, ""), (7, "keep me")])
+
+    def test_deleting_a_bookmarked_page_drops_its_bookmark(self):
+        """Handing it to a neighbour would leave a bookmark pointing at a page
+        nobody marked."""
+        m = NotesModel()
+        m.add_bookmark(1, "gone")
+        m.add_bookmark(3, "stays")
+        m.shift_for_delete(1)
+        self.assertEqual(m.bookmarks(), [(2, "stays")])
+
+    def test_merge_import_carries_bookmarks_into_their_chapter(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, b = os.path.join(d, "a.pdf"), os.path.join(d, "b.pdf")
+            make_pdf(a, n_pages=2)
+            make_pdf(b, n_pages=3)
+            m = NotesModel()
+            m.add_bookmark(1, "b's second page")
+            m.save(notes_path_for(b))
+            dest = os.path.join(d, "merged.pdf")
+            result = sidemark.merge_documents(
+                [sidemark.MergeSource(a), sidemark.MergeSource(b)], dest)
+            self.assertEqual(result.bookmarks, {3: "b's second page"})
+            merged = NotesModel()
+            merged.load(notes_path_for(dest))
+            self.assertEqual(merged.bookmarks(), [(3, "b's second page")])
+
+
+class TestBookmarksInWindow(unittest.TestCase):
+    """The button, its understudy in the menu, and reopening where you left off."""
+
+    def _run_in_window(self, pdf_pages, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.bookmarks")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "deck.pdf")
+                    make_pdf(pdf, n_pages=pdf_pages)
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    body(win, pdf)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_the_button_is_the_pages_boolean(self):
+        def body(win, _pdf):
+            win._go_to_page(2)
+            self.assertFalse(win._bookmark_btn.get_active())
+            win._toggle_bookmark()
+            self.assertTrue(win._bookmark_btn.get_active())
+            self.assertEqual(win.notes_model.bookmarks(), [(2, "")])
+            # turning the page re-points the button without re-running the verb
+            win._go_to_page(0)
+            self.assertFalse(win._bookmark_btn.get_active())
+            win._go_to_page(2)
+            self.assertTrue(win._bookmark_btn.get_active())
+            self.assertEqual(win.notes_model.bookmarks(), [(2, "")])
+            win._toggle_bookmark()
+            self.assertEqual(win.notes_model.bookmarks(), [])
+
+        self._run_in_window(4, body)
+
+    def test_the_label_is_derived_not_stored(self):
+        """Adding stays one click and the row still says something useful —
+        and editing the notes must not leave a label describing what used to
+        be there, which is what storing it would do."""
+        def body(win, _pdf):
+            win._go_to_page(1)
+            win._toggle_bookmark()
+            # nothing to derive from yet: the row still carries the page
+            # number of its own, so an empty label is honest rather than a lie
+            self.assertEqual(win._bookmark_label(1), "")
+            win.notes_model.set(1, "# Eigenvalues\nbody")
+            self.assertEqual(win._bookmark_label(1), "Eigenvalues")
+            win.notes_model.set(1, "# Something else\nbody")
+            self.assertEqual(win._bookmark_label(1), "Something else")
+            # a stored name wins and survives a notes edit
+            win._rename_bookmark(1, "My spot")
+            win.notes_model.set(1, "# Third title\nbody")
+            self.assertEqual(win._bookmark_label(1), "My spot")
+            self.assertEqual(win.notes_model.bookmark_name(1), "My spot")
+
+        self._run_in_window(3, body)
+
+    def test_a_continued_page_is_not_labelled_with_the_runs_body(self):
+        """own_text, not get: labelling five slides of a run alike helps
+        nobody (row 129's trap, in a new place)."""
+        def body(win, _pdf):
+            win.notes_model.set(0, "the shared thought")
+            win.notes_model.set_links({1})
+            win._go_to_page(1)
+            win._toggle_bookmark()
+            self.assertNotEqual(win._bookmark_label(1), "the shared thought")
+
+        self._run_in_window(3, body)
+
+    def test_the_menu_entry_is_the_buttons_understudy(self):
+        """Shown exactly when the header is too narrow for the button, so the
+        verb is never offered twice and never unreachable."""
+        def body(win, _pdf):
+            win._apply_collapse_level(0)
+            self.assertTrue(win._bookmark_btn.get_visible())
+            self.assertFalse(win._bookmark_menu_item.get_visible())
+            win._apply_collapse_level(3)
+            self.assertFalse(win._bookmark_btn.get_visible())
+            self.assertTrue(win._bookmark_menu_item.get_visible())
+            # …and neither is offered on a text page, which has no pages
+            win._on_new_text_page()
+            self.assertFalse(win._can_bookmark())
+            self.assertFalse(win._bookmark_btn.get_visible())
+            self.assertFalse(win._bookmark_menu_item.get_visible())
+
+        self._run_in_window(3, body)
+
+    def test_the_list_jumps_and_both_copies_agree(self):
+        """Two lists, ONE builder — a second implementation is how the popover
+        and the menu come to disagree about what is bookmarked."""
+        def body(win, _pdf):
+            win._go_to_page(2)
+            win._toggle_bookmark()
+            win._go_to_page(4)
+            win._toggle_bookmark()
+            self.assertGreaterEqual(len(win._bookmark_lists), 2)
+            for box in win._bookmark_lists:
+                pages = []
+                row = box.get_first_child()
+                while row is not None:
+                    if getattr(row, "_page_idx", None) is not None:
+                        pages.append(row._page_idx)
+                    row = row.get_next_sibling()
+                self.assertEqual(pages, [2, 4])
+            # activating a row goes to its page
+            box = win._bookmark_lists[0]
+            win._go_to_page(0)
+            row = box.get_first_child()
+            win._on_bookmark_row_activated(box, row)
+            self.assertEqual(win.canvas.current_page_idx, 2)
+
+        self._run_in_window(6, body)
+
+    def test_reopening_lands_on_the_page_you_left(self):
+        """Stored in recent.json, not the sidecar: reopening where you left off
+        must not CREATE a .md beside a PDF you only read."""
+        def body(win, pdf):
+            self.assertEqual(win.canvas.current_page_idx, 0)
+            win._go_to_page(3)
+            self.assertEqual(sidemark._recent_page(pdf), 3)
+            # merely reading wrote no sidecar
+            self.assertFalse(os.path.exists(notes_path_for(pdf)))
+            win2 = PDFEditorWindow(win.get_application())
+            win2.present()
+            win2._do_open_file(pdf)
+            self.assertEqual(win2.canvas.current_page_idx, 3)
+            # …and loading did not overwrite the memory with page 0
+            self.assertEqual(sidemark._recent_page(pdf), 3)
+
+        self._run_in_window(6, body)
+
+    def test_an_out_of_range_memory_is_ignored(self):
+        """Pages can be deleted between sessions; a stale index must not throw
+        the reader past the end of the document."""
+        def body(win, pdf):
+            sidemark._remember_recent_page(pdf, 99)
+            win2 = PDFEditorWindow(win.get_application())
+            win2.present()
+            win2._do_open_file(pdf)
+            self.assertEqual(win2.canvas.current_page_idx, 0)
+
+        self._run_in_window(3, body)
+
+
 class TestLinkedNotesInWindow(unittest.TestCase):
     """The verbs and the strip, driven through a real window."""
 

@@ -38,6 +38,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Callout boxes** (`Ctrl+Alt+drag`) — an anchor plus its note paragraph rendered in a box on the PDF, arrow included; drag the anchor or the box to reposition. Renders the same inline math and Markdown as the notes; included in exports
 - **Standalone text boxes** (`Ctrl+Alt+right-click`) — drop typed text straight on the page, no anchor; edit it in the notes panel, drag it to reposition; included in exports
 - **Notes that run over several pages** — tick **Continue from page N** in the notes header and this page shares the previous page's notes, so a thought started on slide 12 keeps going on 13 and 14 without copying anything. One tick carries on through the blank pages that follow, stopping where notes already exist; unticking splits the run from that page onwards
+- **Bookmarks** — mark a page with the bookmark button (or `Ctrl+B`) and hold the button for a list of every mark to jump to; rename any of them. Sidemark also reopens each document on the page you last read
 - **Date / time snippets** — type `/date`, `/time`, or `/now` then Space to expand
 - **Choose where notes live** — each PDF gets a `<filename>-notes.md` sidecar, created only once you actually write something; pick **Notes file…** from the ☰ menu to point several PDFs at one shared Markdown file (remembered per PDF)
 - **Text-first mode** — open a bare `.md` (or **New text page**, `Ctrl+Alt+N`) and the window becomes one endless A4 sheet of live Markdown you can **draw on** with the same pen, highlighter, eraser and lasso — shape snap, smoothing, move/resize/duplicate included (ink rides along with the text you anchor it to). Drag the paper's side edge to set the sheet width — handy on a half-screen window — and it's remembered per document. The file stays **pure Markdown** — ink lives in a `<name>-ink.json` sidecar — and **Export as PDF** renders text and ink to A4 pages. Launching Sidemark without a file opens a persistent scratchpad page
@@ -174,7 +175,7 @@ pip install pymupdf
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+B` | Bold selection |
+| `Ctrl+B` | Bold selection while writing notes; bookmarks the page otherwise (hold the bookmark button for the list) |
 | `(` `[` `{` `"` … | Surround the selection with the bracket / quote pair |
 | `Ctrl+I` | Italic selection |
 | `Ctrl+E` | Inline code selection |
