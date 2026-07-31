@@ -26,8 +26,8 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 
 - **Draw** with a configurable pen — strokes are saved as native PDF ink annotations and are individually erasable by right-click-dragging
 - **Shape snap** — hold still mid-stroke to clean up what you drew: a straight line, or a neat rectangle or ellipse from a rough loop. Draw a line inside a box and it becomes an evenly-spaced grid divider — handy for tables and matrices. Set it to lines-only or off in the pen settings
-- **Highlighter** (`Ctrl+H`) — wide translucent strokes with their own color and width, saved like any annotation. Long-press the tool for **mark text**, which lays clean highlight bands over the words you drag across — still ink, so erase and undo work unchanged
-- **Lasso ink** (lasso tool, or `Ctrl+Shift+Alt+drag`) — loop around strokes to select them (GoodNotes-style), or just click one; `Shift` adds more to the selection. The loop stays as the selection's outline: drag anywhere inside it to **move**, or tap the chip at its top-left to swap it for a resize box — corner handle to **resize** (a side handle **stretches** one axis), the knob above to **rotate**. `Ctrl+D` to **duplicate**, `Delete` to remove, or pick a new colour/width to **recolour** — each a single undo step
+- **Highlighter** — wide translucent strokes with their own color and width, saved like any annotation. Long-press the tool for **mark text**, which lays clean highlight bands over the words you drag across — still ink, so erase and undo work unchanged
+- **Lasso ink** (middle-drag, or the lasso tool on any button) — loop around strokes to select them (GoodNotes-style), or just click one; `Shift` adds more to the selection. The loop stays as the selection's outline: drag anywhere inside it to **move**, or tap the chip at its top-left to swap it for a resize box — corner handle to **resize** (a side handle **stretches** one axis), the knob above to **rotate**. `Ctrl+D` to **duplicate**, `Delete` to remove, or pick a new colour/width to **recolour** — each a single undo step
 - **Paste images** (`Ctrl+V`) — drop a picture from the clipboard onto a PDF page or a text page and it behaves like ink: move, resize and rotate it with the lasso, forever — never a flattened stamp. Whatever tool you're holding, a fresh paste is ready to drag straight away. `Ctrl+C` copies a selection back out — Sidemark gets the real strokes and images, every other app gets a picture
 - **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) — works across both the canvas and notes; undo a stroke, an erase, or a burst of typing in the order you made them
 
@@ -60,7 +60,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Share to phone (live)** — the **QR-code button** opens a **live view** in a phone's browser that follows along as you draw, annotate and flip pages, with a download of the fully exported PDF — so an audience can watch on their own phones while you teach. Works on the same Wi-Fi, or from anywhere via [Tailscale](https://tailscale.com); the QR code needs the optional [`qrencode`](https://fukuchi.org/works/qrencode/) tool
 - **Tabs** — files open as tabs (the strip appears only with more than one document); `Ctrl+W` closes, `Ctrl+Shift+T` reopens, and tabs drag out into their own window or between windows. Sidemark runs as a **single instance**: every launch lands as a tab in the window you were last using (`SIDEMARK_NEW_WINDOW=1` gives each launch its own window)
 - **Recent files** — in-app menu, XDG recent-files integration (GTK / GNOME / KDE file dialogs), and an optional walker / Omarchy launcher menu
-- **Text selection** — `Alt+drag` selects words in reading order and copies them (`Ctrl+M` makes plain drags select instead of draw); long-press the select tool for a **rectangular** marquee, handy for tables and code
+- **Text selection** — `Alt+drag` selects words in reading order and copies them (or put the text-cursor tool on a button to make plain drags select); long-press the select tool for a **rectangular** marquee, handy for tables and code
 - **Design scheme** — inherits accent color and dark / light mode from Omarchy, GNOME, or KDE automatically
 - **Tool switch** — a segmented header control picks the active tool: pen, highlighter, eraser, lasso, text-select, pan, zoom and anchor. Each tool is the modifier-free version of a gesture, and holding a gesture's modifier lights its button up — so the shortcuts are discoverable
 - **Responsive header** — the compact single-row toolbar folds progressively as the window narrows (file actions live in the ☰ menu), so the core controls stay reachable at any width
@@ -131,12 +131,10 @@ pip install pymupdf
 | Left-drag | Draw stroke |
 | Hold still mid-stroke | Snaps to a clean line, rectangle or ellipse — or, for a line inside a box, an even grid divider (GoodNotes-style); keep holding and move to aim a line, release to commit |
 | Right-drag | Erase stroke (including from previous sessions) |
-| `Ctrl+H` | Toggle highlighter — wide translucent strokes, own color/width in pen settings |
-| `Ctrl+Shift+drag` | Draw one highlighter stroke without switching tool (reverts on release) |
-| Lasso tool / `Ctrl+Shift+Alt+drag` | Loop around strokes to select them, then drag inside the loop to move · chip at its corner for the resize box · `Ctrl+D` to duplicate · `Delete` to remove · change colour/width to recolour · `Escape` to clear |
+| Middle-drag | Lasso: loop around strokes to select them, then drag inside the loop to move · chip at its corner for the resize box · `Ctrl+D` to duplicate · `Delete` to remove · change colour/width to recolour · `Escape` to clear |
+| Click a tool with any button | Binds that tool to that button — every row in this table is a default you can change |
 | `Ctrl+Z` | Undo the last action — a stroke, an erase, or a burst of typing — works across drawing and notes regardless of where the cursor is |
 | `Ctrl+Y` / `Ctrl+Shift+Z` | Redo the last undone action |
-| `Ctrl+M` | Toggle draw / select-text mode — in select mode a plain left-drag highlights text instead of drawing (the cursor changes to indicate the active mode) |
 | `Alt+drag` | Select & copy text (snaps to whole words) — works in either mode |
 | Long-press select tool | Switch text selection between reading-order (default) and rectangular |
 | Long-press highlighter tool | Switch highlighter between free-hand (default) and mark-text (drag over words to highlight whole lines) |

@@ -42,8 +42,11 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   zoom-to-region, **Alt+left text cursor** (Alt is how you follow a PDF link,
   and following a link IS the caret's click). The **thumb is unbound** (most
   mice have none). Nothing else is bound out of the box; the rest is the
-  user's to bind. `chord_tool()` survives as a thin resolver for callers that
-  only want the left button's grammar.
+  user's to bind. `chord_tool()` is **vestigial** — the old fixed grammar, now
+  with no production callers and only tests referencing it. Do not route
+  anything new through it; `Bindings` is the table. It is kept because the
+  older modifier chords it encodes are the obvious defaults to *offer* if a
+  binding preset ever lands.
   - **The toolbar is the binding surface**: click a tool with the button you
     want it on. Plain left-click is the exception — it stays "put this on the
     left button", so picking a tool feels unchanged. **Claiming the press does
@@ -79,9 +82,12 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     is "the left button's tool right now is `text`", never "Alt is down". One
     predicate for the glow and for `_open_link_at`, or the modifier promises
     what the table cannot deliver.
-  - **Keyboard tool shortcuts are hold-to-borrow**: Ctrl+H lends left the
-    highlighter while held (`_borrow_tool` / `_on_borrow_release`), Ctrl+M the
-    caret. Releasing either key gives the button back.
+  - **There are no keyboard tool shortcuts.** Ctrl+H (highlighter) and Ctrl+M
+    (caret) were hold-to-borrow and were REMOVED with row 132 — a key that
+    lends a button a tool is a second mapping beside the table, which is the
+    one thing this design does not allow. Tools change by binding them. (The
+    README documented both for a while after they stopped existing; if a
+    shortcut is reintroduced it has to come from the table, not beside it.)
   - `TOOL_MODES` drives the bar order, the `_MODE_CHROME` tool rows and the
     resolver, so a tool cannot be in the bar and missing from the grammar.
     `"select"` is an alias of `"text"` — one I-beam button serves both modes.
@@ -368,8 +374,9 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   no-ops in text mode (this is what broke Ctrl+R) — use
   `self._path or self._notes_path`. If a feature really is PDF-only, say so
   loudly (`_on_export`, `_ocr_current`) rather than returning in silence.
-- **One table, not two**: `chord_tool` (chords), `zoom_factor_for_scroll`
-  (scroll→zoom rate), `erase_radius` (what counts as touching ink),
+- **One table, not two**: `Bindings` (which button runs which tool),
+  `zoom_factor_for_scroll` (scroll→zoom rate),
+  `erase_radius` (what counts as touching ink),
   `clipboard_content_for`/`paste_objects` (the clipboard), `draw_image` (how a
   pasted image looks), `recognize_shape`/`rect_bbox_of`/`even_divider_positions`
   /`draw_snap_label` (the extended-dwell shape snap, row 121) are shared by both
@@ -430,7 +437,7 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   shared helper held parity; the one place that reimplemented (the eraser) was
   the one with a live bug. If one mode genuinely cannot do one of these, say so
   loudly in `ideas.csv` — do not let it drift silently.
-  **To audit parity, reuse row 116's method**: walk `chord_tool` × {pdf, text},
+  **To audit parity, reuse row 116's method**: walk `Bindings` × {pdf, text},
   compare sign / magnitude / **anchor** / clamping on each, and for every
   behavior ask "does a test drive BOTH sides?". It is what found the eraser.
   - **Ctrl+V pastes at the POINTER** when it is over the surface, else the
