@@ -910,6 +910,58 @@ def draw_lasso_chip(ctx, cx, cy, boxed, accent):
     ctx.restore()
 
 
+def lasso_delete_centre(x0, y0, pad):
+    """Centre of the DELETE button for a selection box whose top-left corner is
+    (x0, y0) — directly below the mode chip, on the same vertical.
+
+    Below rather than beside: the chip already sits diagonally out from the
+    corner, so going further left would walk it off a selection near the page
+    edge, while the space below it is the box's own left margin and is always
+    there. Sharing the chip's x also makes the two read as one small stack of
+    verbs rather than two unrelated dots."""
+    cx, cy = lasso_chip_centre(x0, y0, pad)
+    return (cx, cy + LASSO_CHIP_SIZE + LASSO_CHIP_GAP)
+
+
+def lasso_delete_hit(cx, cy, px, py, slop=3.0):
+    """Is (px, py) on the delete button centred at (cx, cy)? Same target size
+    as the chip — it has to be hit with a pen on the first try, and it must be
+    no HARDER to hit than the chip it sits under."""
+    return lasso_chip_hit(cx, cy, px, py, slop)
+
+
+def draw_lasso_delete(ctx, cx, cy):
+    """Paint the delete button: a bare red cross, no ground.
+
+    Lighter than the chip on purpose — the chip is a filled control you toggle,
+    this is a mark you tap once. What separates them is COLOUR and SHAPE (red
+    strokes vs the accent-on-white square), which is what has to stop a mis-tap
+    on the destructive one; it never needed a disc to do that.
+
+    The paint is lighter but the TARGET is not: `lasso_delete_hit` still covers
+    the full chip-sized square, so it stays as easy to hit with a pen as the
+    control above it. Do not shrink the hit box to match the ink."""
+    a = LASSO_CHIP_SIZE * 0.30
+    ctx.save()
+    ctx.set_dash([])
+    ctx.set_line_cap(cairo.LineCap.ROUND)
+    ctx.move_to(cx - a, cy - a)
+    ctx.line_to(cx + a, cy + a)
+    ctx.move_to(cx + a, cy - a)
+    ctx.line_to(cx - a, cy + a)
+    # a white underlay so the cross survives dark ink or a pasted photo —
+    # invisible against the page, and the alternative is a control that
+    # vanishes exactly where you most want to delete something
+    ctx.set_line_width(3.6)
+    ctx.set_source_rgba(1, 1, 1, 0.7)
+    ctx.stroke_preserve()
+    ctx.set_line_width(2.0)
+    ctx.set_source_rgba(0.85, 0.20, 0.16, 0.98)
+    ctx.stroke()
+    ctx.restore()
+    ctx.new_path()      # a shared painter must not leave a current point
+
+
 # ── circle to lasso (row 126) ───────────────────────────────────────────────
 # Draw a loop with the PEN, lift, then press and hold on that stroke: it turns
 # into the lasso path. The point is that you never leave the pen — the same
@@ -3524,6 +3576,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # that gating on self._selected fell into (row 118).
         if (self._lasso_rotate_handle_at(sx, sy)
                 or self._lasso_chip_at(sx, sy)
+                or self._lasso_delete_at(sx, sy)
                 or self._shape_vertex_at(sx, sy) is not None
                 or self._lasso_handle_at(sx, sy) is not None):
             return True
@@ -3577,10 +3630,21 @@ class PDFCanvas(Gtk.DrawingArea):
             self._selection_auto = False
             self.set_cursor(Gdk.Cursor.new_from_name("crosshair", None))
             return
+        # Both little controls below are TAPS, and a pen tap always jitters —
+        # so each kills the rest of the gesture. Without that the follow-up
+        # drag-update falls through every branch to the drawing one and the
+        # tap leaves a stray mark next to the button you just pressed.
+        if self._lasso_delete_at(start_x, start_y):
+            # the red cross throws the selection away — one undo entry, the
+            # same op the Delete key produces, so there is one delete verb
+            self.delete_selected_strokes()
+            self._ignoring = True
+            return
         if self._lasso_chip_at(start_x, start_y):
             # the chip swaps the loop for the resize box and back; it claims
             # the press so nothing else reads it as a grab or a fresh loop
             self.toggle_selection_box()
+            self._ignoring = True
             return
         if (self.has_lasso_selection()
                 and self._lasso_rotate_handle_at(start_x, start_y)):
@@ -4887,6 +4951,19 @@ class PDFCanvas(Gtk.DrawingArea):
         cx, cy = lasso_chip_centre(x0, y0, 5.0)
         return lasso_chip_hit(cx, cy, sx, sy)
 
+    def _lasso_delete_at(self, sx, sy):
+        """Is the screen point on the delete button? It rides with the chip, so
+        it appears under exactly the same condition — a selection that has a
+        loop. Boxed selections reach Delete from the keyboard."""
+        if not self.has_lasso_selection() or not self._selection_loop:
+            return False
+        bbox = self._selection_bbox()
+        if bbox is None:
+            return False
+        x0, y0 = self._pdf_to_screen(bbox[0], bbox[1])
+        cx, cy = lasso_delete_centre(x0, y0, 5.0)
+        return lasso_delete_hit(cx, cy, sx, sy)
+
     def toggle_selection_box(self):
         self._selection_boxed = not self._selection_boxed
         self.queue_draw()
@@ -5045,6 +5122,8 @@ class PDFCanvas(Gtk.DrawingArea):
                 if self._selection_loop:
                     cx, cy = lasso_chip_centre(x0, y0, pad)
                     draw_lasso_chip(ctx, cx, cy, boxed, self.zoom_accent)
+                    dx, dy = lasso_delete_centre(x0, y0, pad)
+                    draw_lasso_delete(ctx, dx, dy)
         # live snap magnets: the page's control points near the pen while it
         # still holds a freshly recognised shape's last point. Only the ones
         # WITHIN REACH are drawn — every control point on the page at once is
@@ -9672,6 +9751,7 @@ class TextPageView(Gtk.Overlay):
         # `is not None`: handle 0 is a real corner and falsy (row 118's trap).
         if (self._lasso_rotate_handle_at(x, y)
                 or self._lasso_chip_at(x, y)
+                or self._lasso_delete_at(x, y)
                 or self._shape_vertex_at(x, y) is not None
                 or self._lasso_handle_at(x, y) is not None):
             return True
@@ -10309,10 +10389,19 @@ class TextPageView(Gtk.Overlay):
             self._selection_auto = False
             self.ink.set_cursor(Gdk.Cursor.new_from_name("crosshair"))
             return
+        # Taps, both of them, and a pen tap always jitters — each kills the
+        # rest of the gesture or the drift draws (PDFCanvas._lasso_press's twin).
+        if self._lasso_delete_at(x, y):
+            # the red cross throws the selection away — the same op the Delete
+            # key produces, so there is one delete verb
+            self.delete_selected_strokes()
+            self._ink_ignoring = True
+            return
         if self._lasso_chip_at(x, y):
             # the chip swaps the loop for the resize box and back, claiming the
             # press so nothing reads it as a grab or a fresh loop
             self.toggle_selection_box()
+            self._ink_ignoring = True
             return
         if self.has_lasso_selection() and self._lasso_rotate_handle_at(x, y):
             # the knob above the box spins the whole selection about its centre
@@ -10565,6 +10654,18 @@ class TextPageView(Gtk.Overlay):
             return False
         cx, cy = lasso_chip_centre(bbox[0], bbox[1], 5.0)
         return lasso_chip_hit(cx, cy, x, y)
+
+    def _lasso_delete_at(self, x, y):
+        """Is the overlay point on the delete button? Rides with the chip, so
+        it appears under the same condition (PDFCanvas._lasso_delete_at's
+        twin)."""
+        if not self.has_lasso_selection() or self._selection_loop is None:
+            return False
+        bbox = self._selection_bbox()
+        if bbox is None:
+            return False
+        cx, cy = lasso_delete_centre(bbox[0], bbox[1], 5.0)
+        return lasso_delete_hit(cx, cy, x, y)
 
     def toggle_selection_box(self):
         self._selection_boxed = not self._selection_boxed
@@ -11285,6 +11386,8 @@ class TextPageView(Gtk.Overlay):
             if self._selection_loop is not None:
                 cx, cy = lasso_chip_centre(x0, y0, pad)
                 draw_lasso_chip(ctx, cx, cy, boxed, self.accent())
+                dx, dy = lasso_delete_centre(x0, y0, pad)
+                draw_lasso_delete(ctx, dx, dy)
         if self._straight_mode and self._snap_kind in ("line", "path",
                                                         "polygon"):
             # only the magnets within reach — see PDFCanvas._draw_lasso

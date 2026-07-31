@@ -3941,6 +3941,15 @@ class _FakeDrag:
 class TestLassoSelect(unittest.TestCase):
     """#48 — lasso-select ink strokes, then move / delete / recolour them."""
 
+    @staticmethod
+    def _drag_gesture(sx, sy, button=1):
+        g = mock.Mock()
+        g.get_current_button.return_value = button
+        g.get_current_event.return_value = None
+        g.get_current_event_state.return_value = Gdk.ModifierType(0)
+        g.get_start_point.return_value = (True, sx, sy)
+        return g
+
     def _canvas(self, n_pages=2):
         canvas = PDFCanvas()
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
@@ -4256,6 +4265,82 @@ class TestLassoSelect(unittest.TestCase):
         # and back again
         canvas._lasso_press(*self._chip_point(canvas))
         self.assertFalse(canvas._selection_is_boxed())
+
+    def _delete_point(self, canvas):
+        bbox = canvas._selection_bbox()
+        x0, y0 = canvas._pdf_to_screen(bbox[0], bbox[1])
+        return sidemark.lasso_delete_centre(x0, y0, 5.0)
+
+    def test_the_delete_button_removes_the_selection(self):
+        """The red cross beside the chip throws the selection away, using the
+        SAME op the Delete key does so there is one delete verb and one undo
+        entry."""
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._loop_select(canvas)
+        before = len(canvas.strokes)
+        picked = len(canvas._selected_strokes)
+        self.assertTrue(picked)
+        dx, dy = self._delete_point(canvas)
+        self.assertTrue(canvas._lasso_delete_at(dx, dy))
+        canvas._lasso_press(dx, dy)
+        # it claims the press — never a fresh loop or a move
+        self.assertFalse(canvas._lassoing)
+        self.assertFalse(canvas._lasso_moving)
+        # exactly what was selected went, and nothing else
+        self.assertEqual(len(canvas.strokes), before - picked)
+        self.assertFalse(canvas.has_lasso_selection())
+        canvas.undo_last()     # ONE entry, the whole selection back
+        self.assertEqual(len(canvas.strokes), before)
+
+    def test_tapping_the_chip_or_delete_never_draws(self):
+        """A pen tap ALWAYS jitters, so both little controls have to kill the
+        rest of the gesture. Without it the follow-up drag-update falls through
+        every branch to the drawing one and the tap leaves a stray mark right
+        next to the button you pressed."""
+        for target, expect_deleted in (("chip", False), ("delete", True)):
+            with self.subTest(target=target):
+                canvas = self._canvas()
+                self._two_strokes(canvas)
+                self._loop_select(canvas)
+                before = len(canvas.strokes)
+                picked = len(canvas._selected_strokes)
+                px, py = (self._chip_point(canvas) if target == "chip"
+                          else self._delete_point(canvas))
+                g = self._drag_gesture(px, py)
+                canvas._on_drag_begin(g, px, py)
+                # the hand drifts a few px before lifting
+                canvas._on_drag_update(g, 5, 4)
+                canvas._on_drag_update(g, 9, 7)
+                canvas._on_drag_end(g, 9, 7)
+                self.assertEqual(canvas.current_stroke, [])
+                want = before - picked if expect_deleted else before
+                self.assertEqual(len(canvas.strokes), want)
+
+    def test_the_delete_button_and_the_chip_do_not_overlap(self):
+        """Two adjacent targets, one of them destructive: they must not share a
+        pixel, or a mis-tap on the mode toggle deletes your work."""
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._loop_select(canvas)
+        cx, cy = self._chip_point(canvas)
+        dx, dy = self._delete_point(canvas)
+        self.assertFalse(canvas._lasso_delete_at(cx, cy))
+        self.assertFalse(canvas._lasso_chip_at(dx, dy))
+        # and neither steals the corner resize handle
+        hx, hy = self._corner_handle_point(canvas)
+        self.assertFalse(canvas._lasso_delete_at(hx, hy))
+
+    def test_the_delete_button_rides_with_the_chip(self):
+        """It appears exactly when the chip does — on a selection that has a
+        loop. A boxed selection reaches Delete from the keyboard."""
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._loop_select(canvas)
+        dx, dy = self._delete_point(canvas)
+        self.assertTrue(canvas._lasso_delete_at(dx, dy))
+        canvas._set_selected(list(canvas.strokes))     # a click-selection: no loop
+        self.assertFalse(canvas._lasso_delete_at(dx, dy))
 
     def test_the_chip_misses_the_top_left_resize_handle(self):
         """The chip sits diagonally outside the corner precisely so it cannot
@@ -11202,6 +11287,41 @@ class TestTextPageLasso(unittest.TestCase):
                 self.assertTrue(tp._selection_is_boxed())
                 self.assertEqual(tp._lasso_handle_at(bbox[0] - 5.0,
                                                      bbox[1] - 5.0), 0)
+
+            self._run_in_window(body)
+
+    def test_the_delete_button_removes_the_selection_on_the_sheet(self):
+        """The red cross is one contract across both surfaces, like the chip
+        it sits under — a delete button on a PDF and not on paper would read
+        as a bug."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(
+                    win, [(300.0, 100.0 + i * 3) for i in range(5)])
+                st = tp.strokes[0]
+                self._lasso_around(win, tp, self._bbox(
+                    tp._stroke_overlay_pts(st)))
+                self.assertEqual(tp._selected, [st])
+                bbox = tp._selection_bbox()
+                dx, dy = sidemark.lasso_delete_centre(bbox[0], bbox[1], 5.0)
+                self.assertTrue(tp._lasso_delete_at(dx, dy))
+                # it must not collide with the chip directly above it
+                cx, cy = sidemark.lasso_chip_centre(bbox[0], bbox[1], 5.0)
+                self.assertFalse(tp._lasso_delete_at(cx, cy))
+                self.assertFalse(tp._lasso_chip_at(dx, dy))
+                # it claims the press rather than starting a loop — and the
+                # hand drifting a few px before the lift must NOT draw, the
+                # same contract as the PDF canvas (a pen tap always jitters)
+                g = self._gesture(dx, dy)
+                tp._on_press_begin(g, dx, dy)
+                tp._on_press_update(g, 5.0, 4.0)
+                tp._on_press_update(g, 9.0, 7.0)
+                tp._on_press_end(g, 9.0, 7.0)
+                self.assertFalse(tp._lassoing)
+                self.assertEqual(tp.strokes, [])
+                self.assertEqual(tp.current_stroke, [])
+                self.assertFalse(tp.has_lasso_selection())
 
             self._run_in_window(body)
 

@@ -509,7 +509,20 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     (`_point_in_selection` → point-in-polygon), and a chip diagonally outside
     the box's top-left corner switches to the 8-handle resize box and back
     (`lasso_chip_centre`/`lasso_chip_hit`/`draw_lasso_chip`, one policy for
-    both canvases). **Handles and the rotate knob hit-test to nothing in loop
+    both canvases). A red **delete** cross rides directly below it (row 138,
+    `lasso_delete_*`), appearing under the same condition and calling
+    `delete_selected_strokes()` — the Delete key's own op, so there is ONE
+    delete verb. It is a bare red cross — no ground — against the chip's
+    filled square: colour and shape are the only guard on a destructive target
+    sitting next to a harmless one, so keep them distinct and keep their hit
+    regions disjoint. Its PAINT is light, its hit box is not (full chip size)
+    — never shrink the target to match the ink. **Any tap target on a canvas
+    must kill the REST of the gesture** (`_ignoring` / `_ink_ignoring`), not
+    just consume the press: a pen tap always jitters, and the drawing branch
+    is the LAST one in `_on_drag_update`, so a consumed press that forgets
+    this leaves a stray mark beside the button you pressed. Test it by
+    dragging after the tap — a tap-only test passes against the bug.
+    **Handles and the rotate knob hit-test to nothing in loop
     mode** — a hit-test that outlives its painter is exactly how a frame drifts
     from what a grab catches. A click / paste / duplicate / additive selection
     has no loop and so shows the box; `_set_selected` clears the loop and
