@@ -62,7 +62,8 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Recent files** — in-app menu, XDG recent-files integration (GTK / GNOME / KDE file dialogs), and an optional walker / Omarchy launcher menu
 - **Text selection** — `Alt+drag` selects words in reading order and copies them (or put the text-cursor tool on a button to make plain drags select); long-press the select tool for a **rectangular** marquee, handy for tables and code
 - **Design scheme** — inherits accent color and dark / light mode from Omarchy, GNOME, or KDE automatically
-- **Tool switch** — a segmented header control picks the active tool: pen, highlighter, eraser, lasso, text-select, pan, zoom and anchor. Each tool is the modifier-free version of a gesture, and holding a gesture's modifier lights its button up — so the shortcuts are discoverable
+- **Tools live on mouse buttons** — there is no "active tool" to switch between: left draws, right erases and middle lassos *at the same time*, and every button and modifier chord is rebindable. Click a tool in the header with the button you want it on, and it goes there — coloured stripes under each tool show which buttons run it, and they repaint live as you hold a modifier, so the bar is always a readout of what your hand would do right now
+- **Stylus and touchscreen** — a pen's ends *are* mouse buttons: the tip draws, the eraser barrel button erases, the other barrel button lassos, so the defaults work the moment you pick up a stylus. A finger pans rather than draws, which keeps a resting palm from scribbling on the page while you write — rebind it like any other button if you'd rather draw with your finger
 - **Responsive header** — the compact single-row toolbar folds progressively as the window narrows (file actions live in the ☰ menu), so the core controls stay reachable at any width
 
 ## Installation

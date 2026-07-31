@@ -48,8 +48,11 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   older modifier chords it encodes are the obvious defaults to *offer* if a
   binding preset ever lands.
   - **The toolbar is the binding surface**: click a tool with the button you
-    want it on. Plain left-click is the exception — it stays "put this on the
-    left button", so picking a tool feels unchanged. **Claiming the press does
+    want it on — including a FINGER and the pen's eraser barrel
+    (`toolbar_binding_for`), which is the same law, not an extension of it.
+    Plain left-click is the exception — it stays "put this on the left
+    button", so picking a tool feels unchanged, and a pen TIP tap goes down
+    that path because a tip press IS a left press. **Claiming the press does
     not swallow the click**: `GtkButton`'s own gesture is CAPTURE-phase too and
     was added first, so `clicked` fires anyway — `_binding_press` is the flag
     that makes the two paths exclusive, not the claim.
@@ -78,6 +81,37 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   - **The thumb is a real button**: button 10 never reaches a `GestureDrag`, so
     its press is replayed through the same router with a `_SyntheticDrag`.
     That is what lets it hold any tool instead of a hardwired pan.
+  - **A stylus's ends ARE mouse buttons (row 135).** `button_for_event()` maps
+    the hardware to a button identity — tip→left, eraser barrel→right, other
+    barrel+tip→middle, finger→`BTN_FINGER` — so the pen needs NO table of its
+    own and every consumer (table, stripes, badges, tooltips, popover, the
+    binding surface) is untouched. The shipped defaults are therefore already
+    the pen workflow, and the eraser barrel wears the right button's colour,
+    which is how the bar teaches the mapping. If you find yourself adding a
+    source dimension to `Bindings`, you have taken the superseded design
+    (`notes/stylus-input-plan.md`). *ceiling: tip and left-click are one
+    identity and cannot hold different tools.*
+    - **Read `get_device_tool()`, NEVER `device.get_source()`** — GTK delivers
+      the LOGICAL pointer for a stylus, whose source reports `MOUSE`. The
+      obvious API is the wrong one. A touch is the one with an event sequence.
+    - **A finger pans, and that IS the palm rejection.** On a convertible the
+      palm lands *before* the tip, so whatever a stray touch runs must not be
+      the pen. libinput already drops a palm contact itself in ~110 ms and
+      sends nothing at all during a pen stroke — so do **not** add proximity
+      timers or `TOUCH_CANCEL` handling; re-measure first if a palm ever draws.
+    - **The barrel button must be tracked and DENIED, not read off the
+      gesture** (`track_barrel`): pressed before the tip it claims the
+      `GestureDrag` and the tip's press then never produces a drag-begin at
+      all. Same reason the window tracks held keys for touch.
+    - **No tilt** on this class of panel: the axes exist and are flat zero, so
+      a presence check passes and the feature silently does nothing.
+    - **A new DEFAULT binding reaches nobody who has customised their table**
+      — a saved table is the whole truth, which is what makes an unbind stick.
+      `settings.json` therefore also stores `button_defaults_seeded`, the
+      default keys ever offered; a key not on it is new and seeded once, a key
+      on it but absent was cleared on purpose and stays gone. Never merge
+      `DEFAULT_BINDINGS` over the saved table on load — that resurrects every
+      binding the user removed. This is how `finger: pan` shipped dead.
   - **Links glow exactly when a click would follow one**: `link_hover_active()`
     is "the left button's tool right now is `text`", never "Alt is down". One
     predicate for the glow and for `_open_link_at`, or the modifier promises
@@ -588,7 +622,25 @@ when something lands, fold its invariants upward and delete it from here rather
 than writing a line about having finished it. The chronology lives in
 `ideas.csv` and git.
 
-**In flight — all three are code-verified and need a pass in the real app:**
+**In flight — all four are code-verified and need a pass in the real app:**
+
+- **Row 135 (stylus, touch and palm).** The whole feature is gestures, so
+  none of it is verified: the pen tip drawing, the eraser barrel erasing, the
+  other barrel lassoing, a finger panning, and a palm not drawing while you
+  write. Hardware is a Goodix GXTP7380 convertible panel — the measurements
+  behind every decision are in `ideas.csv` row 135, and
+  `extras/input_probe.py` re-runs them (`--followup` for the awkward cases).
+  Two known rough edges to judge in the hand, both left deliberately: a *tap*
+  with the eraser barrel opens the sheet's context menu (a right press is
+  deferred there, and forking the router on device is worse), and row 126's
+  circle-to-lasso relies on a pen *lift* that a mid-stroke barrel flip
+  manufactures. Row 136 (a hardware-report script + GitHub issue template for
+  other people's devices) is the planned follow-up.
+  **Open, deferred to its own session:** on this laptop palm detection stops
+  working while the CHARGER IS PLUGGED IN — most likely charger noise on the
+  capacitive digitiser rather than anything in Sidemark. Re-measure on AC vs
+  battery with `extras/input_probe.py` before touching code; the question is
+  whether libinput's ~110 ms `TOUCH_END` still arrives when plugged in.
 
 - **Rows 125–127 (the lasso keeps its loop; circle to lasso; shape
   recognition and control points).** Unit-tested on both canvases

@@ -513,6 +513,7 @@ class TestPinchZoom(unittest.TestCase):
         c._post_pinch = True
         gesture = mock.Mock()
         gesture.get_current_button.return_value = 1
+        gesture.get_current_event.return_value = None
         gesture.get_current_event_state.return_value = Gdk.ModifierType(0)
         c.select_mode = False
         c._anchor_hit_test = lambda *a: None
@@ -5328,7 +5329,9 @@ class TestPresenterMode(unittest.TestCase):
                 pres = win._presenter
 
                 def press(button):
-                    stub = types.SimpleNamespace(get_current_button=lambda: button)
+                    stub = types.SimpleNamespace(
+                        get_current_button=lambda: button,
+                        get_current_event=lambda: None)
                     pres._on_click(stub, 1, 0, 0)
 
                 press(1)                  # left click → next
@@ -5917,6 +5920,7 @@ class TestCallouts(unittest.TestCase):
     def _drag_gesture(self):
         g = mock.Mock()
         g.get_current_button.return_value = 1
+        g.get_current_event.return_value = None
         g.get_current_event_state.return_value = (
             Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK)
         return g
@@ -5945,6 +5949,7 @@ class TestCallouts(unittest.TestCase):
     def _plain_drag_gesture(self):
         g = mock.Mock()
         g.get_current_button.return_value = 1
+        g.get_current_event.return_value = None
         g.get_current_event_state.return_value = Gdk.ModifierType(0)
         g.get_start_point.return_value = (True, 100.0, 100.0)
         return g
@@ -6439,7 +6444,9 @@ class TestResponsiveHeader(unittest.TestCase):
             win.bindings.replace(dict(sidemark.DEFAULT_BINDINGS))
             self.assertEqual(win._live_buttons_for("pen"), ["left"])
             self.assertEqual(win._live_buttons_for("lasso"), ["middle"])
-            self.assertEqual(win._live_buttons_for("pan"), [])   # a chord only
+            # pan's only PLAIN button is the finger, so its stripe is how the
+            # bar says a touch pans rather than draws (row 135)
+            self.assertEqual(win._live_buttons_for("pan"), ["finger"])
 
             win._highlight_transient_tool(True, False, False)    # Ctrl down
             self.assertEqual(win._live_buttons_for("pan"), ["left"])
@@ -7016,6 +7023,7 @@ class TestMiddleMousePan(unittest.TestCase):
         self.canvas.bindings.bind("middle", "pan")
         g = mock.Mock()
         g.get_current_button.return_value = 2
+        g.get_current_event.return_value = None
         g.get_current_event_state.return_value = Gdk.ModifierType(0)
         self.canvas._on_drag_begin(g, 100, 100)
         self.assertTrue(self.canvas._panning)
@@ -7047,6 +7055,7 @@ class TestSelectMode(unittest.TestCase):
     def _plain_drag(self):
         g = mock.Mock()
         g.get_current_button.return_value = 1
+        g.get_current_event.return_value = None
         g.get_current_event_state.return_value = Gdk.ModifierType(0)
         return g
 
@@ -7070,6 +7079,27 @@ class TestSelectMode(unittest.TestCase):
 
 
 # ── button bindings: the table, and the toolbar that writes to it (row 132) ──
+
+def _stylus_event(kind, button=1, press=True):
+    """A fake Gdk event for the four things a surface can be pressed with.
+
+    Real stylus hardware cannot be in the suite, so this encodes what the
+    hardware was MEASURED to send (ideas.csv row 135) — most importantly that
+    a stylus carries a device TOOL while reporting its device source as
+    MOUSE, which is why `button_for_event` reads the tool and never the
+    source. A touch is the one with an event sequence."""
+    tool = None
+    if kind in ("pen", "eraser"):
+        tool = types.SimpleNamespace(
+            get_tool_type=lambda: (Gdk.DeviceToolType.ERASER if kind == "eraser"
+                                   else Gdk.DeviceToolType.PEN))
+    return types.SimpleNamespace(
+        get_event_sequence=lambda: (object() if kind == "touch" else None),
+        get_device_tool=lambda: tool,
+        get_button=lambda: button,
+        get_event_type=lambda: (Gdk.EventType.BUTTON_PRESS if press
+                                else Gdk.EventType.BUTTON_RELEASE))
+
 
 class TestButtonBindings(unittest.TestCase):
     """There is no active tool: every button HAS one, and clicking a tool in
@@ -7097,9 +7127,136 @@ class TestButtonBindings(unittest.TestCase):
         default nobody chose. It is bindable like every other chord."""
         b = Bindings()
         self.assertIsNone(b.tool_for(sidemark.BTN_THUMB))
-        self.assertEqual(b.chords_for("pan"), ["ctrl+left"])
+        # the FINGER ships bound (to pan) where the thumb does not: every
+        # touchscreen has one, and what a stray touch runs is what decides
+        # whether a resting palm draws (row 135)
+        self.assertEqual(b.chords_for("pan"), ["finger", "ctrl+left"])
         b.bind("thumb", "pan")
         self.assertEqual(b.tool_for(sidemark.BTN_THUMB), "pan")
+
+    def test_stylus_ends_are_mouse_buttons(self):
+        """Row 135 — the pen does not get its own table: its ends ARE buttons.
+
+        Tip → left, eraser barrel → right, other barrel + tip → middle, finger
+        → its own identity. That is what lets the shipped defaults already be
+        the pen workflow, and the bar teach the mapping in button colours."""
+        ev = _stylus_event
+        self.assertEqual(sidemark.button_for_event(ev("pen"), 1),
+                         sidemark.BTN_LEFT)
+        self.assertEqual(sidemark.button_for_event(ev("eraser"), 1),
+                         sidemark.BTN_RIGHT)
+        self.assertEqual(
+            sidemark.button_for_event(ev("pen"), 1, barrel_held=True),
+            sidemark.BTN_MIDDLE)
+        self.assertEqual(sidemark.button_for_event(ev("touch"), 1),
+                         sidemark.BTN_FINGER)
+        # a mouse carries no device tool and is left exactly as it was —
+        # a mouse user must see no change whatsoever from this feature
+        for btn in (1, 2, 3, sidemark.BTN_THUMB):
+            self.assertEqual(sidemark.button_for_event(ev("mouse"), btn), btn)
+        # and with no event at all (the thumb's synthetic drag) the raw
+        # button still stands
+        self.assertEqual(sidemark.button_for_event(None, 3), 3)
+
+    def test_the_pen_runs_the_shipped_defaults(self):
+        """The point of aliasing: `left: pen` / `right: eraser` / `middle:
+        lasso` mean tip draws, eraser barrel erases, other barrel lassos —
+        with no pen-specific rows in the table at all."""
+        b = Bindings()
+        ev = _stylus_event
+        tip = sidemark.button_for_event(ev("pen"), 1)
+        rubber = sidemark.button_for_event(ev("eraser"), 1)
+        barrel = sidemark.button_for_event(ev("pen"), 1, barrel_held=True)
+        self.assertEqual(b.tool_for(tip), "pen")
+        self.assertEqual(b.tool_for(rubber), "eraser")
+        self.assertEqual(b.tool_for(barrel), "lasso")
+        self.assertEqual(b.tool_for(sidemark.BTN_FINGER), "pan")
+
+    def test_the_finger_is_an_ordinary_rebindable_button(self):
+        """Scenario 3 (touch-only, finger draws) is one rebind away, and it
+        persists like any other — the default is a default, not a law."""
+        b = Bindings()
+        b.bind("finger", "pen")
+        self.assertEqual(b.tool_for(sidemark.BTN_FINGER), "pen")
+        self.assertEqual(Bindings.from_json(b.to_json())
+                         .tool_for(sidemark.BTN_FINGER), "pen")
+
+    def test_a_pen_barrel_press_is_tracked_and_never_reaches_a_gesture(self):
+        """It must be consumed HERE: pressed before the tip — how a hand holds
+        a pen — it otherwise claims the GestureDrag and the tip's own press
+        never produces a drag-begin, so `barrel+tip` could never resolve."""
+        surface = types.SimpleNamespace(_barrel_held=False)
+        self.assertTrue(sidemark.track_barrel(
+            surface, _stylus_event("pen", button=2, press=True)))
+        self.assertTrue(surface._barrel_held)
+        self.assertTrue(sidemark.track_barrel(
+            surface, _stylus_event("pen", button=2, press=False)))
+        self.assertFalse(surface._barrel_held)
+        # a MOUSE middle-click carries no device tool, so it is left alone and
+        # still runs whatever the table says
+        self.assertFalse(sidemark.track_barrel(
+            surface, _stylus_event("mouse", button=2, press=True)))
+        self.assertFalse(surface._barrel_held)
+
+    def test_a_new_default_reaches_an_existing_customised_table(self):
+        """The bug that shipped: a saved table is the whole truth, so `finger:
+        pan` never arrived for anyone who had ever customised their bindings —
+        their table simply had no such key, and a finger did nothing."""
+        sidemark._save_setting("button_bindings",
+                               {"left": "pen", "right": "eraser"})
+        b = Bindings.load()
+        self.assertEqual(b.tool_for(sidemark.BTN_FINGER), "pan")
+        # what the user DID have is untouched
+        self.assertEqual(b.tool_for(sidemark.BTN_LEFT), "pen")
+
+    def test_seeding_happens_once_so_an_unbind_sticks(self):
+        """The other half: a default already offered and then cleared must
+        stay cleared, or every load resurrects what you removed."""
+        sidemark._save_setting("button_bindings",
+                               {"left": "pen", "right": "eraser"})
+        Bindings.load()                       # seeds finger, records it
+        b = Bindings.load()
+        b.clear("finger")
+        b.save()
+        self.assertIsNone(Bindings.load().tool_for(sidemark.BTN_FINGER))
+
+    def test_the_toolbar_binds_what_you_touched_it_with(self):
+        """Row 135: the bar is the binding surface for the pen and a finger
+        too. A finger tap binds the FINGER — not a trap, since `pan` is in the
+        bar, so a finger given the pen is one tap on `pan` from panning again.
+        The pen TIP stays the plain pick, because a tip press IS a left press."""
+        tb = sidemark.toolbar_binding_for
+        # the plain pick — nothing changed about picking a tool with a mouse
+        self.assertEqual(tb(None, 1, False, False, False), (None, False))
+        self.assertEqual(tb(_stylus_event("pen"), 1, False, False, False),
+                         (None, False))
+        # a finger binds the finger, and its `clicked` MUST be swallowed:
+        # touch reaches GtkButton's primary-only gesture like a left press, so
+        # without the swallow the tap would bind the finger AND steal the tip
+        self.assertEqual(tb(_stylus_event("touch"), 1, False, False, False),
+                         ("finger", True))
+        # the eraser barrel binds the right button, for free
+        self.assertEqual(tb(_stylus_event("eraser"), 1, False, False, False),
+                         ("right", True))
+        # unchanged: a modified left still binds its chord and is swallowed,
+        # a middle press binds and is NOT (it produced no `clicked` to eat)
+        self.assertEqual(tb(None, 1, True, False, False), ("ctrl+left", True))
+        self.assertEqual(tb(None, 2, False, False, False), ("middle", False))
+
+    def test_the_barrel_controller_swallows_only_the_pen_button(self):
+        """It rides its OWN capture-phase controller so it runs ahead of the
+        drag gesture; a mouse middle-click must still fall straight through to
+        it, or the lasso stops working on the middle button."""
+        canvas = PDFCanvas()
+        pen = _stylus_event("pen", button=2, press=True)
+        self.assertTrue(canvas._on_barrel_event(mock.Mock(), pen))
+        self.assertTrue(canvas._barrel_held)
+        mouse = _stylus_event("mouse", button=2, press=True)
+        self.assertFalse(canvas._on_barrel_event(mock.Mock(), mouse))
+        # PyGObject sometimes fails to marshal the signal arg (probe_thumb.py)
+        ctrl = mock.Mock()
+        ctrl.get_current_event.return_value = None
+        self.assertFalse(canvas._on_barrel_event(ctrl, None))
 
     def test_a_chord_has_exactly_one_spelling(self):
         self.assertEqual(sidemark.chord_id(1, ctrl=True, alt=True),
@@ -7235,8 +7392,9 @@ class TestBindingToolbar(unittest.TestCase):
             win._bind_chord("middle", "eraser")
             self.assertEqual(sorted(win.bindings.plain_buttons_for("eraser")),
                              ["middle", "right"])
-            # pan ships on a CHORD only, so it wears no badge
-            self.assertEqual(win.bindings.plain_buttons_for("pan"), [])
+            # pan ships on one plain button — the FINGER — so its badge is
+            # how the bar teaches that a touch pans rather than draws
+            self.assertEqual(win.bindings.plain_buttons_for("pan"), ["finger"])
             # a tool with nothing on it says so
             win._clear_binding("right")
             win._clear_binding("middle")
@@ -7272,9 +7430,46 @@ class TestToolModes(unittest.TestCase):
     def _plain_drag(self):
         g = mock.Mock()
         g.get_current_button.return_value = 1
+        g.get_current_event.return_value = None
         g.get_current_event_state.return_value = Gdk.ModifierType(0)
         g.get_start_point.return_value = (True, 100, 100)
         return g
+
+    def _stylus_drag(self, kind, barrel=False):
+        g = self._plain_drag()
+        g.get_current_event.return_value = _stylus_event(kind)
+        self.canvas._barrel_held = barrel
+        return g
+
+    def test_the_stylus_routes_through_the_table_as_mouse_buttons(self):
+        """Row 135, on the real PDF router: the pen's ends resolve through the
+        SAME table as the mouse, so the shipped defaults already are the pen
+        workflow and nothing pen-specific exists downstream."""
+        self.canvas.bindings.replace(dict(sidemark.DEFAULT_BINDINGS))
+        # tip draws
+        self.canvas._on_drag_begin(self._stylus_drag("pen"), 100, 100)
+        self.assertEqual(self.canvas._press_tool, "pen")
+        self.assertEqual(len(self.canvas.current_stroke), 1)
+        # the eraser barrel erases, without touching the tool the tip holds
+        self.canvas._on_drag_begin(self._stylus_drag("eraser"), 100, 100)
+        self.assertEqual(self.canvas._press_tool, "eraser")
+        # the other barrel lassos
+        self.canvas._on_drag_begin(self._stylus_drag("pen", barrel=True),
+                                   100, 100)
+        self.assertEqual(self.canvas._press_tool, "lasso")
+        # and a finger pans rather than drawing — which is what makes a
+        # resting palm harmless (it lands before the tip does)
+        self.canvas._on_drag_begin(self._stylus_drag("touch"), 100, 100)
+        self.assertEqual(self.canvas._press_tool, "pan")
+        self.assertTrue(self.canvas._panning)
+
+    def test_a_finger_rebound_to_the_pen_draws_again(self):
+        """The touch-only scenario is a rebind, not a fork in the code."""
+        self.canvas.bindings.replace(dict(sidemark.DEFAULT_BINDINGS))
+        self.canvas.bindings.bind("finger", "pen")
+        self.canvas._on_drag_begin(self._stylus_drag("touch"), 100, 100)
+        self.assertEqual(self.canvas._press_tool, "pen")
+        self.assertEqual(len(self.canvas.current_stroke), 1)
 
     def test_pan_tool_pans_on_plain_drag(self):
         self.canvas.tool = "pan"
@@ -7343,6 +7538,7 @@ class TestToolModes(unittest.TestCase):
         self.canvas.bindings.bind("ctrl+shift+left", "highlighter")
         g = mock.Mock()
         g.get_current_button.return_value = 1
+        g.get_current_event.return_value = None
         g.get_current_event_state.return_value = (
             Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)
         g.get_start_point.return_value = (True, 100, 100)
@@ -7513,6 +7709,7 @@ class TestTextHighlight(unittest.TestCase):
     def _plain_drag(self):
         g = mock.Mock()
         g.get_current_button.return_value = 1
+        g.get_current_event.return_value = None
         g.get_current_event_state.return_value = Gdk.ModifierType(0)
         g.get_start_point.return_value = (True, 100, 100)
         return g
@@ -10332,6 +10529,7 @@ class TestTextFirstMode(unittest.TestCase):
                 px, py = tp._stroke_overlay_pts(tp.strokes[0])[0]
                 fake = types.SimpleNamespace(
                     get_current_button=lambda: 1,
+                    get_current_event=lambda: None,
                     set_state=lambda _s: None,
                     get_current_event_state=lambda: Gdk.ModifierType(0))
                 tp._on_press_begin(fake, px, py)
@@ -10715,6 +10913,7 @@ class TestTextFirstMode(unittest.TestCase):
             get_current_event_state=lambda: state,
             set_state=lambda s: None,
             get_current_button=lambda: button,
+            get_current_event=lambda: None,
             get_start_point=lambda: (True, start[0], start[1]))
 
     def test_alt_drag_draws_with_pen_in_text_tool(self):
@@ -10880,7 +11079,37 @@ class TestTextPageLasso(unittest.TestCase):
             get_current_event_state=lambda: Gdk.ModifierType(0),
             set_state=lambda s: None,
             get_current_button=lambda: 1,
+            get_current_event=lambda: None,
             get_start_point=lambda: (True, sx, sy))
+
+    def test_the_stylus_routes_the_same_way_on_a_text_page(self):
+        """Row 135 parity: the pen's ends are mouse buttons on the SHEET too.
+        The two modes are one app — a stylus that erases on a PDF and draws on
+        a text page would read as a bug, not a scope call."""
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                win.bindings.replace(dict(sidemark.DEFAULT_BINDINGS))
+
+                def press(kind, barrel=False):
+                    g = self._gesture(300.0, 100.0)
+                    g.get_current_event = lambda: _stylus_event(kind)
+                    tp._barrel_held = barrel
+                    tp._on_press_begin(g, 300.0, 100.0)
+                    if tp._rerase_press is not None:
+                        # the sheet defers a RIGHT press until it moves (the
+                        # context menu owns a clean right click), so the
+                        # eraser barrel arrives one drag-update later
+                        tp._on_press_update(g, 20.0, 20.0)
+                    return tp._press_tool
+
+                self.assertEqual(press("pen"), "pen")
+                self.assertEqual(press("eraser"), "eraser")
+                self.assertEqual(press("pen", barrel=True), "lasso")
+                self.assertEqual(press("touch"), "pan")
+
+        self._run_in_window(body)
 
     def _draw_stroke(self, win, pts):
         tp = win._active_session._text_page
@@ -11262,6 +11491,7 @@ class TestTextPageLasso(unittest.TestCase):
             get_current_event_state=lambda: mods,
             set_state=lambda s: None,
             get_current_button=lambda: button,
+            get_current_event=lambda: None,
             get_start_point=lambda: (True, sx, sy))
 
     def test_chord_lasso_selects_with_caret_active(self):
@@ -11309,6 +11539,7 @@ class TestTextPageLasso(unittest.TestCase):
                         get_current_event_state=lambda: mods,
                         set_state=lambda s: seen.append(s),
                         get_current_button=lambda: button,
+                        get_current_event=lambda: None,
                         get_start_point=lambda: (True, 300.0, 100.0))
                     tp._on_press_begin(g, 300.0, 100.0)
                     tp._on_press_end(g, 0.0, 0.0)

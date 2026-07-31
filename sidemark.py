@@ -1024,10 +1024,16 @@ def tool_in_mode(tool, mode):
 # tool nobody can reach is worse than an empty slot. Assign it if you have it.
 
 BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_THUMB = 1, 2, 3, 10
+# A finger is its own button, not button 1. It is the only input with no
+# physical button behind it, so it gets a synthetic number above every real
+# one; everything downstream (the table, the stripes, the badges, the popover)
+# then treats it as an ordinary button for free.
+BTN_FINGER = 11
 BUTTON_NAMES = {BTN_LEFT: "left", BTN_MIDDLE: "middle",
-                BTN_RIGHT: "right", BTN_THUMB: "thumb"}
+                BTN_RIGHT: "right", BTN_THUMB: "thumb",
+                BTN_FINGER: "finger"}
 BUTTON_LABELS = {"left": "Left", "middle": "Middle", "right": "Right",
-                 "thumb": "Thumb"}
+                 "thumb": "Thumb", "finger": "Finger"}
 # order matters: it is the order modifiers are written in a chord id, so one
 # chord has exactly one spelling and settings.json stays diffable
 MOD_ORDER = ("ctrl", "shift", "alt")
@@ -1050,6 +1056,11 @@ DEFAULT_BINDINGS = {
     # unbound under Alt meant Alt lit the links up and then nothing opened
     # them — the modifier promised something the table could not deliver.
     "alt+left": "text",
+    # A FINGER PANS, and that is what makes a resting palm harmless: on a
+    # convertible the palm lands before the pen tip does, so whatever a stray
+    # touch runs, it must not be the pen. Rebind it to `pen` for a touch-only
+    # tablet with no stylus (see ideas.csv row 135).
+    "finger": "pan",
 }
 
 
@@ -1070,6 +1081,94 @@ def log_press(surface, chord, tool, note=""):
     logger.info(msg)
     if INPUT_DEBUG:
         print(msg, file=sys.stderr, flush=True)
+
+
+def button_for_event(event, button, barrel_held=False):
+    """THE mapping from a physical input to a BUTTON IDENTITY (row 135).
+
+    A stylus and a touchscreen do not get their own binding table: the pen's
+    ends *are* mouse buttons, so everything downstream — the table, the colour
+    stripes, the badges, the tooltips, the popover, the toolbar binding
+    surface — keeps speaking one language and needs no change at all.
+
+        pen tip              -> left      (draws, by default)
+        eraser barrel + tip  -> right     (erases, by default)
+        other barrel + tip   -> middle    (lassos, by default)
+        finger               -> finger    (pans, by default)
+
+    So the shipped defaults already ARE the pen workflow, and the eraser
+    barrel literally wears the right button's colour in the bar, which is how
+    the mapping teaches itself.
+
+    ceiling: tip and left-click are ONE identity and cannot hold different
+    tools. If they ever must, the identity needs a source qualifier — which
+    costs the whole table a dimension (notes/stylus-input-plan.md).
+
+    Reads `get_device_tool()`, never `device.get_source()`: GTK delivers the
+    LOGICAL pointer for a stylus, whose source reports MOUSE. The obvious API
+    is the wrong one — measured, ideas.csv row 135.
+    """
+    if event is None:
+        return button
+    # Neither a finger nor a mouse carries a device tool, so the tool cannot
+    # tell them apart. The event SEQUENCE can: it is set on a touch and None
+    # on a pointer.
+    if event.get_event_sequence() is not None:
+        return BTN_FINGER
+    tool = event.get_device_tool()
+    if tool is None:
+        return button
+    if tool.get_tool_type() == Gdk.DeviceToolType.ERASER:
+        # The barrel that flips the tool type. It arrives on PROXIMITY before
+        # the tip lands and sends no button of its own, so the tip's button 1
+        # is what carries it here.
+        return BTN_RIGHT if button == BTN_LEFT else button
+    if barrel_held and button == BTN_LEFT:
+        return BTN_MIDDLE
+    return button
+
+
+def toolbar_binding_for(event, raw_button, ctrl, shift, alt):
+    """What a press on a TOOL BUTTON should do: `(chord, swallow_click)`.
+
+    `chord` is None for the plain pick — the ordinary "put this on the left
+    button" toggle, which is what an unmodified left press and a pen TIP tap
+    both are. Anything else names the chord to bind, so the bar binds what you
+    touched it with: a finger tap binds `finger`, an eraser-barrel tap binds
+    `right` (row 135).
+
+    `swallow_click` is separate and not the same question. GTK does NOT cancel
+    GtkButton's own click gesture when our capture controller claims the press,
+    so a `clicked` arrives anyway and would run the plain pick on top of the
+    bind. It must be swallowed exactly when the press reached that gesture,
+    which is primary-only: a raw left press, or a touch tap, which GTK also
+    delivers as primary. Flagging anything else would eat the NEXT plain pick
+    instead of this one."""
+    btn = button_for_event(event, raw_button)
+    if btn == BTN_LEFT and not (ctrl or shift or alt):
+        return None, False
+    swallow = (raw_button == BTN_LEFT or btn == BTN_FINGER)
+    return chord_id(btn, ctrl, shift, alt), swallow
+
+
+def track_barrel(surface, event):
+    """Track a pen's plain barrel button as a HELD flag, for both canvases.
+
+    Returns True when the event WAS that button, so the caller stops: the
+    press must not reach a gesture. Pressed before the tip — which is how a
+    hand holds a pen — it otherwise claims the GestureDrag, and then the tip's
+    own press never produces a drag-begin at all, so `barrel+tip` could never
+    resolve. Denying it here is what leaves the tip free to start the drag.
+
+    A mouse's middle button carries no device tool and so is never consumed.
+    """
+    t = event.get_event_type()
+    if t not in (Gdk.EventType.BUTTON_PRESS, Gdk.EventType.BUTTON_RELEASE):
+        return False
+    if event.get_button() != BTN_MIDDLE or event.get_device_tool() is None:
+        return False
+    surface._barrel_held = (t == Gdk.EventType.BUTTON_PRESS)
+    return True
 
 
 def chord_id(button, ctrl=False, shift=False, alt=False):
@@ -1107,6 +1206,12 @@ class _SyntheticDrag:
 
     def get_current_event_state(self):
         return self._state
+
+    def get_current_event(self):
+        # No event to read a device tool from, so `button_for_event` leaves the
+        # button exactly as given. A thumb press is a thumb press whatever is
+        # in your other hand.
+        return None
 
     def set_state(self, _state):
         pass          # nothing to claim: there is no real event sequence
@@ -1195,7 +1300,38 @@ class Bindings:
 
     @classmethod
     def load(cls):
-        return cls.from_json(_load_settings().get("button_bindings"))
+        """Load the saved table, SEEDING any default that has never been
+        offered before.
+
+        A saved table is the whole truth — that is what lets you unbind a
+        chord and have it stay unbound. But it also means a default added in a
+        later version reaches nobody who has ever customised their bindings:
+        the row shipped, and their table simply had no such key. (That is
+        exactly how `finger: pan` failed to arrive, row 135.)
+
+        So settings remember which default KEYS have been seen. A key missing
+        from that list is new since the user's table was written, and gets
+        seeded once; a key on the list that is absent from the table was
+        deliberately cleared, and stays gone. Do not "fix" this by merging
+        DEFAULT_BINDINGS over the saved table on every load — that resurrects
+        every binding the user ever removed."""
+        settings = _load_settings()
+        saved = settings.get("button_bindings")
+        bindings = cls.from_json(saved)
+        seen = settings.get("button_defaults_seeded")
+        if not isinstance(seen, list):
+            # First run under this scheme. A table already on disk predates
+            # the list, so everything in it counts as seen; a fresh install
+            # has just taken the defaults wholesale and is seeded by them.
+            seen = list(saved.keys()) if isinstance(saved, dict) else []
+        fresh = [c for c in DEFAULT_BINDINGS if c not in seen]
+        if fresh:
+            for chord in fresh:
+                bindings._table.setdefault(chord, DEFAULT_BINDINGS[chord])
+            _save_setting("button_defaults_seeded",
+                          sorted(set(seen) | set(DEFAULT_BINDINGS)))
+            bindings.save()
+        return bindings
 
     def save(self):
         _save_setting("button_bindings", self.to_json())
@@ -1702,6 +1838,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._post_pinch_base = (0.0, 0.0)
 
         self._thumb_gesture = None     # a thumb-button press in flight
+        self._barrel_held = False      # a pen's plain barrel button (row 135)
 
         # There is no single "active tool" — every mouse button has one (row
         # 132). `bindings` is THE table and the window shares one instance
@@ -1796,6 +1933,17 @@ class PDFCanvas(Gtk.DrawingArea):
         thumb = Gtk.EventControllerLegacy()
         thumb.connect("event", self._on_thumb_event)
         self.add_controller(thumb)
+
+        # A pen's plain barrel button (row 135). CAPTURE, and its OWN
+        # controller: it has to run BEFORE the drag gesture, because pressed
+        # ahead of the tip — how a hand holds a pen — the barrel would
+        # otherwise claim the drag and the tip's press would never produce a
+        # drag-begin at all. The thumb's controller above stays bubble-phase
+        # on purpose; button 10 reaches no gesture, so it never needed this.
+        barrel = Gtk.EventControllerLegacy()
+        barrel.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        barrel.connect("event", self._on_barrel_event)
+        self.add_controller(barrel)
 
         click = Gtk.GestureClick.new()
         click.set_button(1)
@@ -2745,6 +2893,14 @@ class PDFCanvas(Gtk.DrawingArea):
 
     # ── input handlers ────────────────────────────────────────────────────────
 
+    def _on_barrel_event(self, ctrl, event):
+        """Track (and swallow) a pen's plain barrel button — see track_barrel."""
+        if event is None:   # PyGObject sometimes fails to marshal the arg
+            event = ctrl.get_current_event()
+        if event is None:
+            return False
+        return track_barrel(self, event)
+
     def _on_thumb_event(self, ctrl, event):
         if event is None:   # PyGObject sometimes fails to marshal the arg
             event = ctrl.get_current_event()
@@ -3119,7 +3275,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self._post_pinch = False   # a fresh press starts a normal interaction
         self._dismissed_selection = False
         self._text_highlighting = False
-        btn = gesture.get_current_button()
+        btn = button_for_event(gesture.get_current_event(),
+                               gesture.get_current_button(),
+                               self._barrel_held)
         state = self._chord_state(gesture)
         ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
         shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
@@ -8812,6 +8970,7 @@ class TextPageView(Gtk.Overlay):
         # controller catches the thumb button press/release (GestureClick's high
         # buttons are unreliable — the PDF canvas uses the same legacy route).
         self._thumb_gesture = None     # a thumb-button press in flight
+        self._barrel_held = False      # a pen's plain barrel button (row 135)
         self._mouse_xy = (0.0, 0.0)
         self._pointer_in = False   # is the pointer over the sheet? (paste target)
         motion = Gtk.EventControllerMotion()
@@ -8822,6 +8981,17 @@ class TextPageView(Gtk.Overlay):
         thumb = Gtk.EventControllerLegacy()
         thumb.connect("event", self._on_thumb_event)
         self.add_controller(thumb)
+
+        # A pen's plain barrel button (row 135). CAPTURE, and its OWN
+        # controller: it has to run BEFORE the drag gesture, because pressed
+        # ahead of the tip — how a hand holds a pen — the barrel would
+        # otherwise claim the drag and the tip's press would never produce a
+        # drag-begin at all. The thumb's controller above stays bubble-phase
+        # on purpose; button 10 reaches no gesture, so it never needed this.
+        barrel = Gtk.EventControllerLegacy()
+        barrel.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        barrel.connect("event", self._on_barrel_event)
+        self.add_controller(barrel)
         # Sheet scroll-zoom (Ctrl+scroll, and scroll-while-thumb-held). This
         # MUST live here — capture phase, on an ancestor of the ScrolledWindow.
         # GtkScrolledWindow installs its OWN capture-phase scroll controller
@@ -9192,6 +9362,14 @@ class TextPageView(Gtk.Overlay):
             self.set_cursor(Gdk.Cursor.new_from_name("ew-resize")
                             if self._on_paper_edge(x, y) else None)
 
+    def _on_barrel_event(self, ctrl, event):
+        """Track (and swallow) a pen's plain barrel button — see track_barrel."""
+        if event is None:   # PyGObject sometimes fails to marshal the arg
+            event = ctrl.get_current_event()
+        if event is None:
+            return False
+        return track_barrel(self, event)
+
     def _on_thumb_event(self, ctrl, event):
         if event is None:   # PyGObject sometimes fails to marshal the arg
             event = ctrl.get_current_event()
@@ -9506,7 +9684,9 @@ class TextPageView(Gtk.Overlay):
         what makes it the only path: with the caret in hand the overlay is not
         even targetable, so a handler down there would never see the press."""
         state = self._chord_state(gesture)
-        btn = gesture.get_current_button()
+        btn = button_for_event(gesture.get_current_event(),
+                               gesture.get_current_button(),
+                               self._barrel_held)
         ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
         shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
         alt = bool(state & Gdk.ModifierType.ALT_MASK)
@@ -15155,7 +15335,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     BUTTON_COLORS = {"left": None,                  # None = the theme accent
                      "right": (0.83, 0.34, 0.17),
                      "middle": (0.23, 0.60, 0.36),
-                     "thumb": (0.79, 0.60, 0.12)}
+                     "thumb": (0.79, 0.60, 0.12),
+                     "finger": (0.55, 0.35, 0.85)}
 
     def _add_binding_strip(self, button, tool):
         """Paint the binding stripe under a tool's glyph.
@@ -15212,10 +15393,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _attach_binding_click(self, button, tool):
         """Click a tool with the mouse button you want it on, and it goes
-        there. Plain unmodified LEFT is the exception: it stays the ordinary
-        "put this on the left button" toggle, so nothing about picking a tool
-        changed. Everything else — any other button, or left under modifiers —
-        binds that chord and is swallowed, so the plain pick never fires.
+        there — including a FINGER and the pen's eraser barrel, which are
+        button identities like any other (row 135). Plain unmodified LEFT is
+        the exception: it stays the ordinary "put this on the left button"
+        toggle, so nothing about picking a tool changed, and a pen TIP tap
+        goes down that path because a tip press is a left press. Everything
+        else — any other button, or left under modifiers — binds that chord
+        and is swallowed, so the plain pick never fires.
+
+        A finger tap therefore rebinds the FINGER, not the tip. That is not a
+        trap: `pan` is in the bar, so a finger that was given the pen is one
+        finger-tap on `pan` away from panning again. And two-finger zoom/pan
+        never depends on the table at all — it lives on `GestureZoom`, which
+        also discards any stroke the first finger began (`_on_pinch_begin`).
 
         **CLAIMING THE PRESS DOES NOT SWALLOW THE CLICK.** `GtkButton`'s own
         `GtkGestureClick` is in the CAPTURE phase too (probe it with
@@ -15238,21 +15428,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
 
         def _pressed(gesture, _n, _x, _y):
-            btn = gesture.get_current_button()
             state = gesture.get_current_event_state()
             held_ctrl, held_shift, held_alt = self._held_mods
-            ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK) or held_ctrl
-            shift = bool(state & Gdk.ModifierType.SHIFT_MASK) or held_shift
-            alt = bool(state & Gdk.ModifierType.ALT_MASK) or held_alt
-            self._binding_press = False
-            if btn == BTN_LEFT and not (ctrl or shift or alt):
+            chord, swallow = toolbar_binding_for(
+                gesture.get_current_event(),
+                gesture.get_current_button(),
+                bool(state & Gdk.ModifierType.CONTROL_MASK) or held_ctrl,
+                bool(state & Gdk.ModifierType.SHIFT_MASK) or held_shift,
+                bool(state & Gdk.ModifierType.ALT_MASK) or held_alt)
+            self._binding_press = swallow
+            if chord is None:
                 return          # the plain pick: let the toggle have it
-            # only LEFT produces a `clicked` to swallow — the Button's gesture
-            # is primary-only, so flagging any other button would eat the next
-            # plain pick instead of this one
-            self._binding_press = (btn == BTN_LEFT)
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-            self._bind_chord(chord_id(btn, ctrl, shift, alt), tool)
+            self._bind_chord(chord, tool)
 
         click.connect("pressed", _pressed)
         button.add_controller(click)
