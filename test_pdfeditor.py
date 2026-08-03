@@ -5,6 +5,7 @@ Run with:  /usr/bin/python3 test_pdfeditor.py
 """
 import os
 import sys
+import random
 import math
 import re
 import base64
@@ -927,29 +928,91 @@ class TestGridDivider(unittest.TestCase):
 # ── stroke smoothing ───────────────────────────────────────────────────────────
 
 class TestStrokeSmoothing(unittest.TestCase):
-    def test_zero_strength_is_identity(self):
-        pts = [(0, 0), (1, 5), (2, 0), (3, 5)]
-        self.assertEqual(PDFCanvas._smooth_points(pts, 0.0), pts)
+    @staticmethod
+    def _circle(n, r=6.0):
+        return [(r * math.cos(2 * math.pi * i / n),
+                 r * math.sin(2 * math.pi * i / n)) for i in range(n)]
 
-    def test_too_few_points_unchanged(self):
-        self.assertEqual(PDFCanvas._smooth_points([(0, 0), (4, 4)], 1.0),
-                         [(0, 0), (4, 4)])
+    @staticmethod
+    def _mean_radius(pts):
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        return sum(math.hypot(p[0] - cx, p[1] - cy) for p in pts) / len(pts)
+
+    def test_a_fast_loop_keeps_its_size(self):
+        """Row 139, the whole point. The old Laplacian smoother shrank a loop by
+        roughly 1 - 2f(1 - cos(2pi/N)) per pass, so the FEWER samples a stroke
+        had — i.e. the faster it was written — the more of it was eaten: ~2%
+        over a slow "o", but ~19% over a fast one. Taubin's inflate pass has to
+        hold the radius at every sampling rate, or handwriting shrinks with
+        speed again."""
+        for n in (12, 20, 40):
+            with self.subTest(samples=n):
+                out, _prof = sidemark.finish_ink_stroke(
+                    self._circle(n), None, 0.5, flat=True)
+                self.assertAlmostEqual(self._mean_radius(out), 6.0, delta=0.25)
+
+    def test_resampling_passes_through_the_pen_samples(self):
+        """Interpolation must not MOVE the line: every point the pen reported
+        stays on the curve, which is what separates filling the gaps from
+        smoothing them away."""
+        raw = [(i * 3.0, 4 * math.sin(i * 0.7)) for i in range(10)]
+        out, _ = sidemark.finish_ink_stroke(raw, None, 0.0, flat=True)
+        for r in raw:
+            near = min(math.hypot(o[0] - r[0], o[1] - r[1]) for o in out)
+            self.assertLess(near, sidemark.INK_RESAMPLE_SPACING)
+
+    def test_a_sparse_stroke_gains_points_and_a_dense_one_loses_them(self):
+        """One arc-length walk does both jobs: it fills a fast stroke's gaps
+        and thins the cluster a slow one leaves behind, so what reaches the
+        denoiser no longer depends on how fast you wrote."""
+        sparse = [(0.0, 0.0), (20.0, 0.0), (40.0, 0.0), (60.0, 0.0)]
+        dense = [(i * 0.05, 0.0) for i in range(1201)]
+        out_s, _ = sidemark.finish_ink_stroke(sparse, None, 0.0, flat=True)
+        out_d, _ = sidemark.finish_ink_stroke(dense, None, 0.0, flat=True)
+        self.assertGreater(len(out_s), len(sparse))
+        self.assertLess(len(out_d), len(dense))
+        # ...and they land at the same density, having drawn the same line
+        self.assertAlmostEqual(len(out_s), len(out_d), delta=3)
 
     def test_endpoints_preserved(self):
         pts = [(0, 0), (1, 9), (2, 0), (3, 9), (4, 0)]
-        out = PDFCanvas._smooth_points(pts, 1.0)
+        out, _ = sidemark.finish_ink_stroke(pts, None, 1.0)
         self.assertEqual(out[0], (0.0, 0.0))
         self.assertEqual(out[-1], (4.0, 0.0))
-        self.assertEqual(len(out), len(pts))
 
     def test_smoothing_reduces_jitter(self):
-        # a zigzag: interior points should move toward their neighbours' mean,
-        # so total deviation from the straight baseline shrinks
-        pts = [(0, 0), (1, 10), (2, -10), (3, 10), (4, 0)]
-        out = PDFCanvas._smooth_points(pts, 1.0)
-        raw_dev = sum(abs(y) for _, y in pts)
-        new_dev = sum(abs(y) for _, y in out)
-        self.assertLess(new_dev, raw_dev)
+        """Denoising is measured against the curve the hand MEANT to draw —
+        a smooth arc with per-sample digitiser jitter on top — because that is
+        the only thing the slider is for. Note a big zigzag is NOT jitter: once
+        resampled it is a long-wavelength shape, and Taubin preserving it is
+        the same property that keeps a fast "o" round."""
+        random.seed(7)
+        curve = lambda x: 10 * math.sin(x / 6.0)
+        truth = [(x * 0.05, curve(x * 0.05)) for x in range(1200)]
+        samples = [(i * 1.5, curve(i * 1.5)) for i in range(40)]
+        noisy = [(x + random.gauss(0, 0.35), y + random.gauss(0, 0.35))
+                 for x, y in samples]
+
+        def off_curve(pts):
+            """Mean distance from `pts` to the true arc."""
+            total = 0.0
+            for p in pts:
+                best = min(sidemark._point_segment_distance(p[0], p[1], a[0], a[1],
+                                                   b[0], b[1])
+                           for a, b in zip(truth, truth[1:]))
+                total += best
+            return total / len(pts)
+
+        rough, _ = sidemark.finish_ink_stroke(noisy, None, 0.0, flat=True)
+        smooth, _ = sidemark.finish_ink_stroke(noisy, None, 1.0, flat=True)
+        self.assertLess(off_curve(smooth), off_curve(rough))
+        self.assertLess(off_curve(smooth), off_curve(noisy))
+
+    def test_too_few_points_unchanged(self):
+        out, prof = sidemark.finish_ink_stroke([(0, 0), (4, 4)], None, 1.0)
+        self.assertEqual(out, [(0, 0), (4, 4)])
+        self.assertIsNone(prof)
 
     def test_commit_smooths_freehand_stroke(self):
         c = PDFCanvas()
@@ -962,13 +1025,280 @@ class TestStrokeSmoothing(unittest.TestCase):
         self.assertNotEqual(committed, raw)          # was smoothed
         self.assertEqual(committed[0], (0.0, 0.0))   # endpoints kept
 
-    def test_commit_does_not_smooth_when_disabled(self):
+    def test_resampling_runs_even_with_smoothing_off(self):
+        """The slider is the DENOISER. Interpolation is a different job and
+        always runs — turning it off with the slider would only bring back the
+        facets on a fast stroke, which is the bug, not a setting."""
         c = PDFCanvas()
         c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
         c.smoothing = 0.0
-        c.current_stroke = [(0, 0), (1, 10), (2, -10), (3, 10), (4, 0)]
+        c.current_stroke = [(0, 0), (20, 10), (40, -10), (60, 10), (80, 0)]
         c._on_drag_end(None, 0, 0)
-        self.assertEqual(c.strokes[-1]["pts"], [(0, 0), (1, 10), (2, -10), (3, 10), (4, 0)])
+        self.assertGreater(len(c.strokes[-1]["pts"]), 5)
+
+    # ── the pipeline scales to the writing (row 139) ──────────────────────
+
+    def test_small_writing_survives_as_well_as_large(self):
+        """Every length in the pipeline is really "a fraction of a letter", and
+        only looked like a constant because it was tuned on one size. With a
+        FIXED spacing the smoothing radius is a small share of big writing and
+        a large share of small writing, so small writing was the only thing
+        being averaged into mush. Fidelity must now be scale-INVARIANT."""
+        for r in (1.5, 3.0, 6.0, 20.0):
+            with self.subTest(radius=r):
+                n = 12   # a fast, sparsely sampled loop at every size
+                loop = [(r * math.cos(2 * math.pi * i / n),
+                         r * math.sin(2 * math.pi * i / n)) for i in range(n)]
+                out, _ = sidemark.finish_ink_stroke(loop, None, 0.5, flat=True)
+                self.assertAlmostEqual(self._mean_radius(out) / r, 1.0,
+                                       delta=0.03)
+
+    def test_a_short_mark_is_not_all_taper(self):
+        """The dot on an "i". A ramp of fixed length is the WHOLE of a short
+        stroke — at 2.5 units per end anything under 5 units long never reached
+        full width, so i-dots came out at about half thickness. The ramp has to
+        be a fraction of the mark, not of the page."""
+        for length in (1.5, 3.0, 8.0):
+            with self.subTest(length=length):
+                pts = [(i * length / 8.0, 0.0) for i in range(9)]
+                _out, prof = sidemark.finish_ink_stroke(pts, None, 0.5)
+                self.assertGreaterEqual(max(prof), 1.0)
+
+    def test_a_dot_is_wider_than_the_line(self):
+        """A real nib pools ink where it is set down without travelling, and
+        at exactly the stroke width the dot on an "i" reads as a speck beside
+        its own stem. Shorter must mean wider, fading out by INK_DOT_LEN."""
+        widths = []
+        for length in (0.0, 1.5, 3.0, 8.0):
+            n = 1 if length == 0 else 9
+            pts = [(i * length / max(n - 1, 1), 0.0) for i in range(n)]
+            _out, prof = sidemark.finish_ink_stroke(pts, None, 0.5)
+            widths.append(max(prof) if prof else 1.0)
+        self.assertGreater(widths[0], 2.0)              # a tap is a fat dot
+        self.assertEqual(widths, sorted(widths, reverse=True))   # monotone
+        self.assertAlmostEqual(widths[-1], 1.0, delta=0.01)      # faded out
+
+    def test_the_highlighter_is_never_dotted_or_tapered(self):
+        """It is a marker, not a nib: one width end to end, at every length."""
+        for length in (0.0, 2.0, 30.0):
+            with self.subTest(length=length):
+                n = 1 if length == 0 else 9
+                pts = [(i * length / max(n - 1, 1), 0.0) for i in range(n)]
+                _out, prof = sidemark.finish_ink_stroke(pts, None, 0.5,
+                                                        flat=True)
+                self.assertIsNone(prof)
+
+    def test_feature_size_is_the_short_side(self):
+        """For a run of cursive the short side is the x-height — the size of
+        what must survive — while the diagonal is only how long the word is."""
+        word = [(0.0, 0.0), (60.0, 0.0), (60.0, 9.0), (0.0, 9.0)]
+        self.assertAlmostEqual(sidemark.ink_feature_size(word), 9.0, delta=0.01)
+        # a straight line has no short side at all and must not measure zero
+        line = [(0.0, 0.0), (50.0, 0.0)]
+        self.assertGreater(sidemark.ink_feature_size(line), 0.0)
+
+    def test_prediction_is_damped_across_frames(self):
+        """The estimate is rebuilt every motion event, so consecutive guesses
+        disagree by more than the pen moved and the tip jitters — the one thing
+        a lead is meant to cure. Damping the OFFSET keeps the anchor exact."""
+        c = PDFCanvas()
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c.predict_ms = 40.0
+        c.current_stroke = [(0.0, 0.0), (10.0, 0.0)]
+        steady = [(0.0, 0.0, 0.0), (10.0, 0.0, 10.0), (20.0, 0.0, 20.0)]
+        c._recent_samples = steady
+        first = c._predicted_tip()
+        # now one wild sample arrives; the damped tip must not chase it fully
+        c._recent_samples = steady + [(20.0, 90.0, 30.0)]
+        jerked = c._predicted_tip()
+        raw = sidemark.predict_point(c._recent_samples, 40.0)
+        self.assertLess(abs(jerked[1] - first[1]), abs(raw[1] - first[1]))
+
+    def test_capture_is_off_unless_asked_for(self):
+        """The diagnostic must cost nothing, and must never eat a stroke."""
+        self.assertIsNone(sidemark.CAPTURE_INK_PATH)
+        sidemark.capture_raw_stroke([(0, 0), (1, 1)], None)   # no-op, no raise
+
+    # ── page backgrounds (row 139) ────────────────────────────────────────
+
+    def test_ruling_is_drawn_into_the_page_content(self):
+        """The ruling has to be part of the PAGE, not painted under it at
+        render time: a background you write on is one you hand in, so it must
+        print, export and open ruled anywhere else."""
+        import fitz
+        for kind in ("lines", "squares", "dots"):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as d:
+                    path = os.path.join(d, f"{kind}.pdf")
+                    surf = cairo.PDFSurface(path, 595, 842)
+                    ctx = cairo.Context(surf)
+                    sidemark.draw_page_background(ctx, 595, 842, kind)
+                    ctx.show_page()
+                    surf.finish()
+                    doc = fitz.open(path)
+                    try:
+                        # cairo emits the whole ruling as ONE path object, so
+                        # it is the items inside it that must be counted
+                        items = sum(len(d.get("items", []))
+                                    for d in doc[0].get_drawings())
+                        self.assertGreater(
+                            items, 10, f"{kind} left no marks on the page")
+                    finally:
+                        doc.close()
+
+    def test_plain_really_is_blank(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "plain.pdf")
+            surf = cairo.PDFSurface(path, 595, 842)
+            ctx = cairo.Context(surf)
+            sidemark.draw_page_background(ctx, 595, 842, "plain")
+            ctx.show_page()
+            surf.finish()
+            import fitz
+            doc = fitz.open(path)
+            try:
+                self.assertEqual(doc[0].get_drawings(), [])
+            finally:
+                doc.close()
+
+    def test_ruling_keeps_a_margin_and_ignores_junk(self):
+        """An unknown name must leave the page alone rather than raise: the
+        value comes from settings.json, which a person can hand-edit."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "j.pdf")
+            surf = cairo.PDFSurface(path, 595, 842)
+            ctx = cairo.Context(surf)
+            sidemark.draw_page_background(ctx, 595, 842, "not-a-ruling")
+            sidemark.draw_page_background(ctx, 10, 10, "squares")  # tiny page
+            ctx.show_page()
+            surf.finish()
+            import fitz
+            doc = fitz.open(path)
+            try:
+                self.assertEqual(doc[0].get_drawings(), [])
+            finally:
+                doc.close()
+
+    # ── the smear trim is asymmetric on purpose (row 139) ─────────────────
+
+    def test_smear_trim_cuts_the_tail_only(self):
+        """The two ends are opposite problems. The END is a real smear — the
+        pen unloads before leaving the glass and trails into the next letter.
+        The START is already CLIPPED by the digitiser's own contact threshold,
+        so the first sample arrives carrying real pressure and the ink before
+        it was never captured; trimming there would eat the same edge twice."""
+        pts = [(float(i), 0.0) for i in range(6)]
+        press = [0.05, 0.6, 0.9, 0.8, 0.04, 0.02]
+        got_pts, got_press = sidemark.trim_light_tail(pts, press, 0.2)
+        self.assertEqual(got_pts, pts[:4])            # tail gone
+        self.assertEqual(got_press[0], 0.05)          # light START kept
+
+    def test_smear_trim_keeps_a_dip_in_the_middle(self):
+        """A pressure dip mid-stroke is the pen still writing, so the trim
+        stops at the first sample above the threshold instead of filtering."""
+        pts = [(float(i), 0.0) for i in range(5)]
+        press = [0.9, 0.05, 0.9, 0.8, 0.7]
+        got_pts, _ = sidemark.trim_light_tail(pts, press, 0.2)
+        self.assertEqual(got_pts, pts)
+
+    def test_smear_trim_is_off_by_default(self):
+        self.assertEqual(PDFCanvas().min_pressure, 0.0)
+        pts = [(float(i), 0.0) for i in range(4)]
+        press = [0.9, 0.9, 0.01, 0.01]
+        self.assertEqual(sidemark.trim_light_tail(pts, press, 0.0)[0], pts)
+
+    # ── latency: hover lead-in and prediction (row 139) ───────────────────
+
+    def test_hover_lead_in_recovers_the_run_up(self):
+        """A stylus is tracked while it hovers, so the positions from just
+        before the digitiser admitted contact are REAL ink that was otherwise
+        lost — this is the "captured too late" fix, and it guesses nothing."""
+        trail = [(10.0, 10.0, 1000.0), (12.0, 12.0, 1020.0),
+                 (14.0, 14.0, 1040.0)]
+        got = sidemark.hover_lead_in(trail, 16.0, 16.0, 1050.0)
+        self.assertEqual(got, [(10.0, 10.0), (12.0, 12.0), (14.0, 14.0)])
+
+    def test_hover_lead_in_stops_at_a_jump(self):
+        """The pen swooping in from elsewhere must not draw its approach: the
+        walk back stops at the first gap, so only an unbroken recent run
+        counts as lead-in."""
+        trail = [(500.0, 500.0, 1000.0),   # across the page — must not appear
+                 (12.0, 12.0, 1020.0), (14.0, 14.0, 1040.0)]
+        got = sidemark.hover_lead_in(trail, 16.0, 16.0, 1050.0)
+        self.assertEqual(got, [(12.0, 12.0), (14.0, 14.0)])
+
+    def test_hover_lead_in_stops_at_stale_samples(self):
+        trail = [(10.0, 10.0, 100.0),      # far too old
+                 (14.0, 14.0, 1040.0)]
+        got = sidemark.hover_lead_in(trail, 16.0, 16.0, 1050.0)
+        self.assertEqual(got, [(14.0, 14.0)])
+
+    def test_prediction_leads_along_recent_velocity(self):
+        samples = [(0.0, 0.0, 0.0), (10.0, 0.0, 10.0), (20.0, 0.0, 20.0)]
+        self.assertEqual(sidemark.predict_point(samples, 10.0), (30.0, 0.0))
+        self.assertIsNone(sidemark.predict_point(samples, 0.0))
+        self.assertIsNone(sidemark.predict_point(samples[:1], 10.0))
+
+    def test_prediction_follows_a_curve_not_its_tangent(self):
+        """Straight extrapolation is wrong exactly where the lead shows most:
+        on the curve of an "o" the velocity points along the TANGENT, so a
+        linear guess leaves the letter and is yanked back on the next sample.
+        Measured over a traced circle, the arc must beat the tangent by a wide
+        margin at every lead worth offering."""
+        R, omega, dt = 6.0, 2 * math.pi / 200.0, 8.0
+        at = lambda t: (R * math.cos(omega * t), R * math.sin(omega * t))
+
+        def tangent(samples, lead):
+            (x0, y0, t0), (x1, y1, t1) = samples[0], samples[-1]
+            span = t1 - t0
+            return (x1 + (x1 - x0) / span * lead,
+                    y1 + (y1 - y0) / span * lead)
+
+        for lead in (8.0, 24.0, 40.0):
+            with self.subTest(lead_ms=lead):
+                arc_err = tan_err = 0.0
+                trials = range(20, 60)
+                for k in trials:
+                    t = k * dt
+                    samples = [(*at(t - (4 - i) * dt), t - (4 - i) * dt)
+                               for i in range(5)]
+                    truth = at(t + lead)
+                    arc_err += math.dist(sidemark.predict_point(samples, lead),
+                                         truth)
+                    tan_err += math.dist(tangent(samples, lead), truth)
+                self.assertLess(arc_err, tan_err / 3.0)
+
+    def test_prediction_bend_is_clamped(self):
+        """A noisy curvature estimate must not let the tip spiral."""
+        # samples turning viciously — a full reversal each step
+        samples = [(0.0, 0.0, 0.0), (5.0, 0.0, 5.0), (5.0, 5.0, 10.0),
+                   (0.0, 5.0, 15.0), (0.0, 0.0, 20.0)]
+        got = sidemark.predict_point(samples, sidemark.PREDICT_MAX_MS)
+        self.assertIsNotNone(got)
+        self.assertLessEqual(math.dist(got, samples[-1][:2]),
+                             sidemark.PREDICT_MAX_PX + 1e-6)
+
+    def test_prediction_is_distance_clamped(self):
+        """A wrong guess that stays small is invisible; a wrong guess that is
+        large is worse than the lag it was hiding."""
+        samples = [(0.0, 0.0, 0.0), (9000.0, 0.0, 1.0)]
+        px, _py = sidemark.predict_point(samples, 40.0)
+        self.assertLessEqual(px - 9000.0, sidemark.PREDICT_MAX_PX + 1e-6)
+
+    def test_the_predicted_tip_never_reaches_the_document(self):
+        """Prediction is a guess, so it lives on screen only. The commit path
+        reads current_stroke, which the predicted point is never added to."""
+        c = PDFCanvas()
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c.predict_ms = 40.0
+        c.current_stroke = [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)]
+        c._recent_samples = [(0.0, 0.0, 0.0), (10.0, 0.0, 10.0),
+                             (20.0, 0.0, 20.0)]
+        live, _prof = c._live_stroke()
+        self.assertEqual(len(live), 4)               # shown with the lead
+        self.assertEqual(len(c.current_stroke), 3)   # stored without it
+        c._on_drag_end(None, 0, 0)
+        self.assertLessEqual(max(x for x, _y in c.strokes[-1]["pts"]), 20.0)
 
     def test_snapped_line_is_not_smoothed(self):
         c = PDFCanvas()
@@ -1800,6 +2130,64 @@ class TestLinkedNotesInWindow(unittest.TestCase):
             self.assertFalse(win._can_link_notes())
             win._link_notes_to_previous()          # must be a no-op, not a crash
             self.assertEqual(win.notes_model.links(), set())
+
+        self._run_in_window(3, body)
+
+    def test_ctrl_z_reverses_a_link_including_the_merge(self):
+        """Linking a page that HAS notes appends them into the run's body — the
+        one outcome you cannot see coming from a checkbox — so undo has to put
+        the split back, not merely clear a flag."""
+        def body(win):
+            self._write_note(win, "first page")
+            win._go_to_page(1)
+            self._write_note(win, "second page")
+            win._link_notes_to_previous()
+            self.assertEqual(win.notes_model.own_text(0),
+                             "first page\n\nsecond page")
+            self.assertEqual(win.notes_model.own_text(1), "")
+
+            win._global_undo()
+            self.assertEqual(win.notes_model.links(), set())
+            self.assertEqual(win.notes_model.own_text(0), "first page")
+            self.assertEqual(win.notes_model.own_text(1), "second page")
+            self.assertEqual(win._notes_view.get_source_text(), "second page")
+            self.assertFalse(win._notes_link_check.get_active())
+
+            win._global_redo()
+            self.assertEqual(win.notes_model.links(), {1})
+            self.assertEqual(win.notes_model.own_text(0),
+                             "first page\n\nsecond page")
+            self.assertTrue(win._notes_link_check.get_active())
+
+        self._run_in_window(2, body)
+
+    def test_ctrl_z_reverses_an_unlink(self):
+        def body(win):
+            self._write_note(win, "shared")
+            win._go_to_page(1)
+            win._link_notes_to_previous()          # cascades over 1 and 2
+            win._unlink_notes_from_previous()
+            self.assertEqual(win.notes_model.links(), set())
+            win._global_undo()
+            self.assertEqual(win.notes_model.links(), {1, 2})
+            self.assertEqual(win._notes_view.get_source_text(), "shared")
+
+        self._run_in_window(3, body)
+
+    def test_a_link_undo_is_dropped_when_the_document_is_repaged(self):
+        """A link op snapshots the model by page index; after an insert those
+        keys name pages that have moved, so the op must go rather than replay
+        onto the wrong slides."""
+        def body(win):
+            self._write_note(win, "shared")
+            win._go_to_page(1)
+            win._link_notes_to_previous()
+            self.assertTrue(any(op[0] == "links" for op in win._undo_timeline))
+            win._add_blank_page()
+            self.assertFalse(any(op[0] == "links" for op in win._undo_timeline))
+            links = win.notes_model.links()
+            win._global_undo()                      # the typing burst, not links
+            self.assertEqual(win.notes_model.links(), links)
 
         self._run_in_window(3, body)
 
@@ -2859,6 +3247,89 @@ class TestLatexFormatting(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertEqual(m.group(3), 'ab')   # stops before space
 
+    def test_script_re_breaks_at_punctuation(self):
+        """`\\S+` swallowed everything up to the space, so a comma, a bracket or
+        an operator landed in the subscript."""
+        from sidemark import MarkdownNotesView
+        m = MarkdownNotesView._SCRIPT_RE.search('a_i, b_j')
+        self.assertEqual(m.group(3), 'i')        # not "i,"
+        self.assertEqual(
+            MarkdownNotesView._SCRIPT_RE.search('f(x_n)').group(3), 'n')
+
+    def test_script_re_finds_adjacent_scripts(self):
+        """A base can carry both — each script ends where the next begins."""
+        from sidemark import MarkdownNotesView
+        found = [(m.group(1), m.group(3))
+                 for m in MarkdownNotesView._SCRIPT_RE.finditer('a_i^2')]
+        self.assertEqual(found, [('_', 'i'), ('^', '2')])
+        found = [(m.group(1), m.group(3))
+                 for m in MarkdownNotesView._SCRIPT_RE.finditer('a^t_i')]
+        self.assertEqual(found, [('^', 't'), ('_', 'i')])
+
+    def test_script_re_keeps_a_leading_sign(self):
+        from sidemark import MarkdownNotesView
+        self.assertEqual(
+            MarkdownNotesView._SCRIPT_RE.search('x^-1').group(3), '-1')
+
+    def test_le_and_ge_shorthands(self):
+        v = self._view()
+        self.assertEqual(v._apply_symbol_subs(r'a \le b \ge c'), 'a ≤ b ≥ c')
+        self.assertEqual(v._apply_symbol_subs(r'a \leq b \geq c'), 'a ≤ b ≥ c')
+
+    def test_a_commands_terminating_space_is_eaten(self):
+        """`\\alpha x` has to be written with the space (`\\alphax` is another
+        command), so rendering it would leave a hole inside "αx". A second
+        space is a real one."""
+        v = self._view()
+        self.assertEqual(v._apply_symbol_subs(r'\alpha x'), 'αx')
+        self.assertEqual(v._apply_symbol_subs(r'\alpha  x'), 'α x')
+        self.assertEqual(v._apply_symbol_subs(r'\alpha'), 'α')
+        # only a LETTER could have continued the command, so only there was the
+        # space forced on you — an operator keeps its spacing
+        self.assertEqual(v._apply_symbol_subs(r'\alpha + \beta'), 'α + β')
+        self.assertEqual(v._apply_symbol_subs(r'\alpha = 1'), 'α = 1')
+        # an unknown command keeps its space — nothing was substituted
+        self.assertEqual(v._apply_symbol_subs(r'\unknown x'), r'\unknown x')
+
+    def test_a_scripts_terminating_space_is_eaten(self):
+        from sidemark import _notes_to_pango_markup
+        self.assertEqual(_notes_to_pango_markup('a_i b'), 'a<sub>i</sub>b')
+        self.assertEqual(_notes_to_pango_markup('a_i  b'), 'a<sub>i</sub> b')
+        self.assertEqual(_notes_to_pango_markup('a_i + b'),
+                         'a<sub>i</sub> + b')
+        # a brace terminates by itself, so the space after it is a real one
+        self.assertEqual(_notes_to_pango_markup('a_{i} b'),
+                         'a<sub>i</sub> b')
+
+    def test_script_space_is_hidden_not_deleted(self):
+        """Hiding keeps the source intact — the saved Markdown still has the
+        space, so the file round-trips through any other editor."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('a_i b\nother line')
+        buf.place_cursor(buf.get_iter_at_line(1)[1])
+        v._rehighlight()
+        it = buf.get_iter_at_offset(3)               # the space after "a_i"
+        self.assertTrue(it.has_tag(v._t["hide"]))
+        self.assertEqual(v.get_source_text().split('\n')[0], 'a_i b')
+
+    def test_underscores_do_not_italicise(self):
+        """`_` is subscript syntax here, but the GtkSource markdown language
+        still emphasises everything between two of them. Our noitalic tag
+        outranks its syntax tags, and `*italic*` still wins over ours."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('a_i and b_j plus *slanted* text\nother line')
+        buf.place_cursor(buf.get_iter_at_line(1)[1])
+        v._rehighlight()
+        line = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        mid = line.index('and') + 1
+        it = buf.get_iter_at_offset(mid)
+        self.assertTrue(it.has_tag(v._t["noitalic"]))
+        self.assertFalse(it.has_tag(v._t["italic"]))
+        it = buf.get_iter_at_offset(line.index('slanted') + 1)
+        self.assertTrue(it.has_tag(v._t["italic"]))
+
     def test_symbol_buffer_substitution(self):
         v = self._view()
         buf = v.get_buffer()
@@ -2944,7 +3415,9 @@ class TestLatexFormatting(unittest.TestCase):
         END — the caret jumps and the selection bound is left parked there."""
         v = self._view()
         buf = v.get_buffer()
-        buf.set_text('other\n' + r'a \alpha b tail')
+        # two spaces after the command: one terminated it and is eaten, the
+        # other is a real space, so the line still renders as "a α b tail"
+        buf.set_text('other\n' + r'a \alpha  b tail')
         buf.place_cursor(buf.get_iter_at_line(0)[1])   # line 1 renders to α
         v._rehighlight()
         # a click lands after the (now one-character) glyph, on "b"
@@ -2953,7 +3426,7 @@ class TestLatexFormatting(unittest.TestCase):
         it = buf.get_iter_at_mark(buf.get_insert())
         self.assertEqual(it.get_line(), 1)
         # the caret stays on the same character, now past the restored \alpha
-        self.assertEqual(it.get_line_offset(), 9)
+        self.assertEqual(it.get_line_offset(), 10)
         self.assertFalse(buf.get_has_selection())
 
     def test_rerender_leaves_no_selection_bound_behind(self):
@@ -2963,15 +3436,15 @@ class TestLatexFormatting(unittest.TestCase):
         bound at the line end, that innocent motion becomes a selection."""
         v = self._view()
         buf = v.get_buffer()
-        buf.set_text('other\n' + r'a \alpha b tail')
+        buf.set_text('other\n' + r'a \alpha  b tail')
         buf.place_cursor(buf.get_iter_at_line(0)[1])
         v._rehighlight()
         click = buf.get_iter_at_line_offset(1, 4)[1]
         buf.place_cursor(click)                    # the press
         v._rehighlight()                           # un-renders the line
         # GTK's drag-update: the insert mark alone follows the pointer, which
-        # after the restore is one column further along (\alpha is 6 chars)
-        buf.move_mark(buf.get_insert(), buf.get_iter_at_line_offset(1, 9)[1])
+        # after the restore is further along (\alpha is 6 chars)
+        buf.move_mark(buf.get_insert(), buf.get_iter_at_line_offset(1, 10)[1])
         self.assertFalse(buf.get_has_selection())
 
     def test_rerender_keeps_a_live_selection(self):
@@ -2980,11 +3453,11 @@ class TestLatexFormatting(unittest.TestCase):
         just like the caret, and it is on a non-cursor line that renders."""
         v = self._view()
         buf = v.get_buffer()
-        buf.set_text('plain\n' + r'\alpha tail')
+        buf.set_text('plain\n' + r'\alpha  tail')
         # caret on line 0 (so line 1 renders), selection running back to
-        # just after the symbol on line 1
+        # just after the symbol on line 1 (one of the two spaces is eaten)
         buf.select_range(buf.get_iter_at_line_offset(0, 0)[1],
-                         buf.get_iter_at_line_offset(1, 7)[1])
+                         buf.get_iter_at_line_offset(1, 8)[1])
         v._rehighlight()
         bounds = buf.get_selection_bounds()
         self.assertTrue(bounds)
@@ -11608,14 +12081,17 @@ class TestTextPageLasso(unittest.TestCase):
                 tp._cancel_straight_timer()   # the cursor never rested
                 tp._on_press_end(g, 40.0, 0.0)
                 st = tp.strokes[0]
-                expect = PDFCanvas._smooth_points(raw, tp.get_smoothing())
+                expect, _prof = sidemark.finish_ink_stroke(
+                    raw, None, tp.get_smoothing())
                 got = tp._stroke_overlay_pts(st)
                 self.assertEqual(len(got), len(expect))
                 for (gx, gy), (ex, ey) in zip(got, expect):
                     self.assertAlmostEqual(gx, ex, delta=2.0)
                     self.assertAlmostEqual(gy, ey, delta=2.0)
-                # the zigzag's middle spike is measurably flattened
-                self.assertLess(abs(got[1][1] - got[2][1]), 25.0)
+                # the zigzag's spikes are measurably flattened: its peaks no
+                # longer reach as far as the raw ±15 they were drawn with
+                ys = [y for _x, y in got]
+                self.assertLess(max(ys) - min(ys), 30.0)
 
             self._run_in_window(body)
 

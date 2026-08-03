@@ -23,6 +23,20 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 - `MarkdownNotesView` — the live-Markdown editor (math substitution `\alpha`→α,
   `x^2` scripts; source text stays intact — display-only rendering). `code`
   spans and `[[wiki links]]` render verbatim (no LaTeX/scripts/bold inside).
+  - **The maths grammar wins over Markdown's**: `_` is a SUBSCRIPT here, so the
+    GtkSource language's `_emphasis_` is cancelled line by line with a
+    `noitalic` tag and only `*italic*` puts the slant back. Its syntax tags sit
+    at priority 0, so any tag of ours outranks them — but priority is the order
+    tags are ADDED to the table, which is why `noitalic` is created *before*
+    `italic`.
+  - **An unbraced script ends at the first non-alphanumeric** (`a_i, b_j`), and
+    a **terminating space is eaten on render**: you are forced to type it
+    (`\alphax` is another command, `a_ib` subscripts "ib"), so showing it puts
+    a hole inside "αx". Two spaces is how you ask for one. Narrowed twice, both
+    times to avoid eating a space nobody was forced to type — only before an
+    alphanumeric, and for symbols only for the letter-like ones
+    (`_MD_LETTER_SYMBOLS`): `A \mapsto B` is a relation, and "A ↦B" glues an
+    operator to its operand.
 - `TextPageView` — text-first mode: an A4-styled Markdown sheet (a
   `MarkdownNotesView` as white paper) you can draw on. Ink lives in a
   `<name>-ink.json` sidecar.
@@ -127,6 +141,111 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     `"select"` is an alias of `"text"` — one I-beam button serves both modes.
   - Chord routing merges window-tracked held modifiers (`_chord_state`) so
     keyboard+touch works; see ideas.csv rows 115 and 132.
+- **The ink pipeline (row 139)** — what the pen writes goes through THREE jobs
+  on commit, and the whole design is that they stay apart. Conflating two of
+  them is what made fast handwriting shrink. `finish_ink_stroke()` is the one
+  entry point and also holds the policy (a snapped shape and the highlighter
+  opt out); both canvases call it, nothing else does the steps by hand.
+  1. **`resample_ink` INTERPOLATES** — centripetal Catmull-Rom, walked at fixed
+     arc length. Catmull-Rom because it *interpolates*: the curve passes
+     through every point the pen reported, so filling a gap can never move the
+     line off where you drew it. The walk also thins a slow stroke's clusters,
+     so spacing stops depending on pen speed. **It always runs** — the
+     "Smoothing" slider is the denoiser only, and turning interpolation off
+     would just bring back the facets on a fast stroke.
+  2. **`taubin_smooth` DENOISES** — λ shrink alternating with a μ inflate pass.
+     It replaced a plain Laplacian, which is a *diffusion* and so destroys
+     curvature: a loop of N samples lost `1 − 2f(1 − cos(2π/N))` of its radius
+     per pass, i.e. −19% at 12 samples but −2% at 40, so the damage grew with
+     how fast you wrote. **The Laplacian must be the MIDPOINT form**
+     `c + f·((a+b)/2 − c)`, never `c + f·(a+b−2c)`: the 2× difference puts the
+     eigenvalues in [0,2] instead of [0,4], and Taubin's λ/μ are only a
+     low-pass filter on the former — with the doubled form the μ pass
+     *amplifies* Nyquist. It passes the circle test while broken. λ is capped
+     at 0.5 by stability, so `INK_SMOOTH_PAIRS` is the only knob that deepens
+     the stopband. **A big zigzag is not jitter** — resampled it is a
+     long-wavelength shape, and preserving it is the same property that keeps a
+     fast "o" round, so test denoising against a smooth arc plus per-sample
+     noise, never a zigzag.
+  - **Every length here SCALES with the writing** (`ink_feature_size`,
+    `adaptive_spacing`). They are all really "a fraction of a letter" and only
+    looked like constants because they were tuned at one size: a fixed spacing
+    is a fixed smoothing radius, which is a small share of large writing and a
+    quarter of an x-height when writing small — so small writing was the only
+    thing being averaged into mush. The measure is the **short side** of the
+    bounding box (a cursive run's x-height is what must survive; its diagonal
+    is just how long the word is), with a deliberately *small* diagonal
+    fallback — at 0.15 it would win above ~6.6:1, which ordinary cursive
+    exceeds, and the measure would then grow with word length.
+  3. **`width_profile` SHAPES** it. The end taper is capped at
+     `INK_TAPER_FRAC` of the stroke as well as `INK_TAPER_LEN`: a ramp of fixed
+     length is the *whole* of a short mark, which is why the dot on an "i" once
+     came out at half width. A stroke's **`press` list is not raw
+     pressure**: it is the finished per-point width factor in 0..1 with the end
+     taper already folded in, painted as `width * factor`. One concept, not
+     two — it lets a mouse stroke taper without a second flag, and makes "has a
+     profile" mean exactly "is freehand" at render time. *ceiling: the taper is
+     baked at commit, so changing `INK_TAPER_*` does not restyle existing ink.*
+  - **`draw_ink_stroke` is THE ink painter** — all seven painters route through
+    it (page render, live stroke, presenter mirror, both copy-render PNGs, both
+    lasso glows, the text-page PDF export). With a profile it builds a closed
+    OUTLINE and fills it once; per-segment strokes would double-darken where
+    they overlap. `grow=` is how the lasso glow haloes a tapered stroke instead
+    of wrapping a flat sausage round a thin tip.
+  - **Pressure persists in the annot's `/Contents`** (`INK_PROFILE_TAG`),
+    because a PDF ink annotation has ONE width — the old row 26 blocker.
+    Sidemark reloads the taper; other readers see constant-width ink. Splitting
+    a stroke into per-width-band annots was rejected: it costs the lasso, the
+    eraser and the control points. Text sheet: a `press` key in the sidecar.
+    Both guarded by a LENGTH match, so a mismatch loses the taper rather than
+    shifting every width along the stroke.
+  - **The smear trim is ASYMMETRIC, and that is the point.** `trim_light_tail`
+    cuts the falling edge only. The two ends are opposite problems: the END is
+    a real smear (the pen unloads before leaving the glass and trails into the
+    next letter), while the START is already CLIPPED — the digitiser reports no
+    contact until its own threshold is crossed, so the first sample already
+    carries real pressure and the ink before it was never captured. A symmetric
+    gate makes "the stroke starts too late" strictly worse. Never re-add a live
+    per-sample gate.
+  - **Latency: one recovery and one guess, kept apart.** `hover_lead_in` is
+    free REAL data — a stylus is tracked in proximity, so the positions from
+    just before contact are the ink that was otherwise lost; it walks backwards
+    and stops at the first gap, or a pen swooping in from across the page draws
+    its approach. `predict_point` is a GUESS and is confined to the screen:
+    `_live_stroke()` adds the predicted tip, the commit path reads
+    `current_stroke` which never contains it, so a bad guess flickers for one
+    frame and can never reach the file. It extrapolates along an **arc**, not a
+    tangent — out of the curve of an "o" a linear guess leaves the letter and
+    is yanked back (8.6× the error at 40 ms). The guess is also damped across
+    frames (`PREDICT_SMOOTH`), because it is rebuilt from scratch every motion
+    event and consecutive guesses disagree by more than the pen moved; the
+    **offset** is what gets damped, never the anchor, or the lag comes back.
+    Both default OFF. Under a stylus the POINTER is hidden for drawing tools
+    (`_hide_pointer`) — an arrow trailing the nib is what gives the lag away —
+    but never under a mouse, where the pointer is all the hand has.
+  - **Tune it on real ink, not on synthetic curves.**
+    `SIDEMARK_CAPTURE_INK=<path>` appends every finished stroke's RAW samples
+    (pre-interpolation) to a JSON-lines file, and `extras/ink_replay.py`
+    replays, measures, sweeps and re-renders them. Its key statistic is
+    **sample spacing ÷ feature size**: above ~0.25 the hardware is
+    undersampling the writing and interpolation is carrying the result (write
+    bigger); below ~0.06 the pen is oversampling and any roughness left is
+    tremor, so denoising is the lever. That ratio is how to answer "is this
+    fixable in software or is the hardware just too coarse?" — measure, don't
+    guess. **It has been measured** (41 real strokes, kept in `notes/`): this
+    panel gives ~3 samples per x-height writing small and ~27 writing large, so
+    small writing is an INFORMATION limit, not a filter problem, and the
+    Smoothing slider is correctly near-inert there. Never answer a complaint
+    about small writing by strengthening the denoiser — at that density there
+    is no redundancy, so anything it removes is shape, not noise. (Writing
+    physically bigger helps; zooming in does not — the digitiser samples in
+    physical space, so letter and spacing shrink together.)
+- **Page backgrounds (row 139)** — `draw_page_background` rules a blank page
+  (plain/lines/squares/dots) into the page CONTENT at creation: a background
+  you write on is one you hand in, so it must print and export. *ceiling: fixed
+  at creation — re-ruling later needs the row 118 optional-content machinery to
+  know which pages are ours, and you can just make the page again.* PDF-only so
+  far (the text sheet was offered and declined).
 - **Modes**: a tab is either a PDF or a text-first page, tracked by
   `doc_mode` (`"pdf"` | `"text"`) on the session
   (`_enter_text_mode`/`_leave_text_mode`; `_text_mode` survives as a
@@ -191,6 +310,11 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   (`link()` would append it into the run — the one outcome you cannot see
   coming from a checkbox); `unlink_forward` breaks the run at that page and
   every page after it. One tick covers a run of slides, one untick undoes it.
+  **Ctrl+Z reaches it**, as a `("links", snapshot)` op on the shared
+  `_undo_timeline` — a whole-model `snapshot()`/`restore()`, because linking
+  MERGES two bodies and no page/text pair describes that. A snapshot is keyed
+  by page index, so any re-paging (insert/delete/reorder) DROPS the link ops
+  (`_drop_link_timeline_ops`) rather than replaying them onto moved slides.
 - **Bookmarks (row 134)** — a page can be marked, and the marks live in the
   SAME sidecar marker as the row-129 link flag: `<!-- page:13 bookmark -->`,
   `bookmark="Eigenvalues"` when renamed, composing with ` continued`. A name is
@@ -635,7 +759,8 @@ when something lands, fold its invariants upward and delete it from here rather
 than writing a line about having finished it. The chronology lives in
 `ideas.csv` and git.
 
-**In flight — all four are code-verified and need a pass in the real app:**
+**In flight — code-verified, needing a pass in the real app. The whole list is
+one validation session; `notes/validation-session.md` is its checklist.**
 
 - **Row 135 (stylus, touch and palm).** The whole feature is gestures, so
   none of it is verified: the pen tip drawing, the eraser barrel erasing, the
@@ -655,14 +780,6 @@ than writing a line about having finished it. The chronology lives in
   battery with `extras/input_probe.py` before touching code; the question is
   whether libinput's ~110 ms `TOUCH_END` still arrives when plugged in.
 
-- **Rows 125–127 (the lasso keeps its loop; circle to lasso; shape
-  recognition and control points).** Unit-tested on both canvases
-  (`TestLassoSelect`'s row-125/126/127 blocks, `TestShapeRecognition`,
-  `TestTextPageLasso`). The 500 ms hold is confirmed by hand; everything else
-  is a gesture and so unverified — whether the chip and the control points are
-  big enough to hit with a pen first time, and whether an auto-selected shape
-  ever gets in the way.
-
 - **Row 123 (merge import).** What needs real hardware: the drops themselves
   (several PDFs on the window → "Merge…"; several on the page thumbnails →
   chapters at the gap), the `.pptx` path through LibreOffice, and the chapter
@@ -674,6 +791,15 @@ than writing a line about having finished it. The chronology lives in
   PDF grid-divider commit/undo/redo are unit-tested (`TestShapeRecognition`,
   `TestGridDivider`); the dwell gestures need the app. Hand the user a
   checklist.
+- **Row 139's ink FEEL is parked, not finished** — the pipeline itself is
+  settled (see "The ink pipeline" above), but four values have never been
+  judged by hand: the Smear trim (measurement says start at 15–25),
+  `INK_DOT_BOOST` (2.1, asked for bigger twice), whether the pointer really
+  hides for a whole stroke, and prediction now that it is damped. The
+  pen-popover settings are session-scoped and will want persisting once values
+  are chosen. Measurements and the reasoning are in `ideas.csv` row 139 and
+  `notes/ink-quality-plan.md`. **Deliberately NOT built, needs the user's
+  call:** stroke-onset recovery — it invents ink that was never measured.
 
 **Loose ends, roughly in order of how ready they are:**
 

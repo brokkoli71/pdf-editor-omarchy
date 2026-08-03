@@ -339,6 +339,704 @@ def erase_radius(width):
     return width / 2.0 + ERASE_SLACK_PX
 
 
+# ── the freehand ink pipeline ─────────────────────────────────────────────────
+#
+# What the pen writes goes through three steps on commit, and the whole point
+# of this section is that they are three DIFFERENT jobs. Conflating two of them
+# is what made fast handwriting shrink (row 139), so keep them apart:
+#
+#   1. resample_ink()  — INTERPOLATE. A digitiser samples position at a fixed
+#      rate, so the faster you write the fewer points you get: a quick "o"
+#      arrives as a 12-gon and you can see its corners. The gaps are filled
+#      along a CENTRIPETAL Catmull-Rom spline, chosen because it INTERPOLATES —
+#      the curve passes through every point the pen actually reported, so
+#      filling a gap can never move the line off where you drew it. (Uniform
+#      Catmull-Rom loops out past a sharp corner; the centripetal knot spacing
+#      is exactly what prevents that.) The walk is at fixed ARC LENGTH, so one
+#      call also thins the clusters a slow stroke leaves behind, and hands the
+#      next step a polyline whose spacing no longer depends on pen speed.
+#
+#   2. taubin_smooth() — DENOISE. Removes hand tremor, and it must be Taubin (a
+#      shrinking λ pass alternating with an inflating μ pass), NOT the plain
+#      Laplacian it replaced. Laplacian is a diffusion, and diffusion destroys
+#      curvature: for a loop of N samples each pass scales the radius by about
+#      1 − 2f(1 − cos(2π/N)) — ~2% over a stroke at 40 samples, but ~24% at 12.
+#      So the same slider that tidied slow writing quietly ate a quarter of
+#      every fast "o", and the damage grew with how fast you wrote. Taubin's μ
+#      pass puts back at low frequencies exactly what λ took, and leaves the
+#      tremor gone. Because step 1 fixed the spacing, a fixed pass count here
+#      is a fixed smoothing radius ON THE PAGE, whatever the pen speed.
+#
+#   3. width_profile() — SHAPE. Folds pen pressure and the stroke's end taper
+#      into one per-point width factor. See draw_ink_stroke for the painting.
+
+INK_RESAMPLE_SPACING = 1.0   # document units between points after resampling,
+                             # for a stroke of ordinary size. Both substrates
+                             # are calibrated so a default pen is 2.0 units
+                             # wide, so this is half a nib either way.
+                             # ADAPTIVE — see ink_feature_size: a fixed spacing
+                             # is a fixed smoothing radius, which is a small
+                             # fraction of big writing and a large fraction of
+                             # small writing, so small writing was the only
+                             # thing being mangled.
+INK_SPACING_FRAC = 1 / 40.0  # spacing as a fraction of the stroke's feature size
+INK_SPACING_MIN = 0.12
+INK_SPACING_MAX = 2.0
+INK_MAX_POINTS = 3000        # hard ceiling per stroke — a page-long scribble
+                             # widens its own spacing rather than growing
+                             # without bound.
+INK_SMOOTH_PAIRS = 20        # λ/μ pairs applied by taubin_smooth. λ is capped
+                             # at 0.5 by stability, so the pass COUNT is the
+                             # only knob that deepens the stopband; measured on
+                             # a jittered arc, 6 pairs removed 20% of the noise
+                             # and 20 removed 26%, past which it flattens out.
+                             # The cost of more is a passband ripple that makes
+                             # a loop grow — +0.5% at 20, +2% at 70 — which is
+                             # the right direction to err in, but not far.
+TAUBIN_MU_RATIO = 1.06       # μ = -ratio·λ. Being slightly GREATER than 1 is
+                             # what makes the second pass inflate a shade more
+                             # than the first shrank, which is the whole trick.
+
+
+# Set SIDEMARK_CAPTURE_INK=<path> to append every finished stroke's RAW samples
+# to a JSON-lines file: the points as the digitiser gave them, their pressures,
+# and the settings in force. It exists so ink tuning can be argued from what
+# this hardware and this hand actually produce instead of from a synthetic
+# curve — write a page, then replay the file offline.
+CAPTURE_INK_PATH = os.environ.get("SIDEMARK_CAPTURE_INK")
+
+
+def capture_raw_stroke(pts, press, **meta):
+    """Append one raw stroke to the capture file, if capturing is on."""
+    if not CAPTURE_INK_PATH:
+        return
+    try:
+        rec = {"pts": [[round(x, 3), round(y, 3)] for x, y in pts],
+               "press": [round(p, 4) for p in (press or [])],
+               "t": time.time(), **meta}
+        with open(CAPTURE_INK_PATH, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except OSError as exc:
+        # a diagnostic must never cost the user their stroke
+        logger.warning(f"ink capture failed: {exc}")
+
+
+def ink_feature_size(pts):
+    """How big are the marks in this stroke, in document units.
+
+    Every length in the pipeline is scaled by this, because all of them are
+    really "a fraction of a letter" and only looked like constants because the
+    writing they were tuned on was one size. Written small, a fixed 1.0-unit
+    spacing and the ~1.2-unit smoothing radius that follows from it are a
+    quarter of an x-height, so the loops of small cursive were being averaged
+    into mush while the same settings barely touched large writing.
+
+    The measure is the SMALLER side of the bounding box, not its diagonal: for
+    a run of cursive the small side is the x-height, which is the size of the
+    features that must survive, while the diagonal is just how long the word
+    is. A degenerate box (a straight line has no height) falls back to a
+    fraction of the diagonal so the result is never zero.
+
+    That fraction is deliberately SMALL. It has to rescue a genuinely
+    degenerate shape without taking over from the short side on a merely long
+    one: at 0.15 it would win above about 6.6:1, which an ordinary run of
+    cursive exceeds — and the measure would then grow with how long the WORD
+    is, which is the exact opposite of what it is for."""
+    if len(pts) < 2:
+        return 0.0
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    w, h = max(xs) - min(xs), max(ys) - min(ys)
+    return max(min(w, h), math.hypot(w, h) * 0.05)
+
+
+def adaptive_spacing(pts, base=INK_RESAMPLE_SPACING):
+    """Resample spacing for this stroke — and, because a fixed pass count over
+    a fixed spacing is a fixed smoothing radius, this is what makes the DENOISE
+    scale with the writing too. One number, both effects."""
+    size = ink_feature_size(pts)
+    if size <= 0:
+        return base
+    return max(INK_SPACING_MIN, min(INK_SPACING_MAX, size * INK_SPACING_FRAC))
+
+
+def _dedupe_points(pts, eps=1e-6):
+    """Drop consecutive samples that land on the same spot. A digitiser repeats
+    its last position while the pen rests, and a zero-length segment has no
+    tangent — which would make the spline and the stroke outline both blow up."""
+    out = []
+    for p in pts:
+        if not out or math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > eps:
+            out.append(p)
+    return out
+
+
+def _cr_segment(p0, p1, p2, p3, n):
+    """`n` points along the centripetal Catmull-Rom segment p1→p2, starting at
+    p1 and stopping before p2. Points are (x, y, w) triples — the third
+    component (pressure) is interpolated by the same weights, so a width
+    profile survives resampling with no separate pass.
+
+    Barry–Goldman pyramid form, with knots spaced by sqrt(chord) — that
+    exponent (alpha = 0.5) IS "centripetal"."""
+    t0 = 0.0
+    t1 = t0 + max(math.hypot(p1[0] - p0[0], p1[1] - p0[1]), 1e-9) ** 0.5
+    t2 = t1 + max(math.hypot(p2[0] - p1[0], p2[1] - p1[1]), 1e-9) ** 0.5
+    t3 = t2 + max(math.hypot(p3[0] - p2[0], p3[1] - p2[1]), 1e-9) ** 0.5
+
+    def mix(a, b, u):
+        return (a[0] + (b[0] - a[0]) * u,
+                a[1] + (b[1] - a[1]) * u,
+                a[2] + (b[2] - a[2]) * u)
+
+    out = []
+    for i in range(n):
+        t = t1 + (t2 - t1) * (i / n)
+        a1 = mix(p0, p1, (t - t0) / (t1 - t0))
+        a2 = mix(p1, p2, (t - t1) / (t2 - t1))
+        a3 = mix(p2, p3, (t - t2) / (t3 - t2))
+        b1 = mix(a1, a2, (t - t0) / (t2 - t0))
+        b2 = mix(a2, a3, (t - t1) / (t3 - t1))
+        out.append(mix(b1, b2, (t - t1) / (t2 - t1)))
+    return out
+
+
+def _walk_arc_length(dense, spacing):
+    """Re-space a dense polyline at a fixed arc length. The pen's real first
+    and last points always survive — a stroke must start and end where you
+    put it, however the middle is re-spaced."""
+    out = [dense[0]]
+    acc = 0.0
+    a = dense[0]
+    for b in dense[1:]:
+        seg = math.hypot(b[0] - a[0], b[1] - a[1])
+        while acc + seg >= spacing and seg > 1e-12:
+            u = (spacing - acc) / seg
+            a = (a[0] + (b[0] - a[0]) * u,
+                 a[1] + (b[1] - a[1]) * u,
+                 a[2] + (b[2] - a[2]) * u)
+            out.append(a)
+            seg = math.hypot(b[0] - a[0], b[1] - a[1])
+            acc = 0.0
+        acc += seg
+        a = b
+    last = dense[-1]
+    if math.hypot(out[-1][0] - last[0], out[-1][1] - last[1]) > 1e-9:
+        out.append(last)
+    return out
+
+
+def resample_ink(pts, spacing=INK_RESAMPLE_SPACING, max_points=INK_MAX_POINTS):
+    """Fill the gaps a fast stroke leaves and even out the spacing.
+
+    `pts` are (x, y, w) triples. Returns triples at a uniform arc-length
+    spacing along the centripetal Catmull-Rom spline through them."""
+    pts = _dedupe_points(pts)
+    if len(pts) < 3:
+        return list(pts)
+    # phantom end points, mirrored through the real ones, so the first and last
+    # segments get the same treatment as the interior ones
+    pad = ([(2 * pts[0][0] - pts[1][0], 2 * pts[0][1] - pts[1][1], pts[0][2])]
+           + list(pts)
+           + [(2 * pts[-1][0] - pts[-2][0], 2 * pts[-1][1] - pts[-2][1],
+               pts[-1][2])])
+    total = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                for a, b in zip(pts, pts[1:]))
+    if total <= 0:
+        return list(pts)
+    # honour the ceiling by coarsening, never by truncating the stroke
+    spacing = max(spacing, total / max_points)
+    dense = []
+    for i in range(len(pad) - 3):
+        p0, p1, p2, p3 = pad[i], pad[i + 1], pad[i + 2], pad[i + 3]
+        chord = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+        # subdivide finer than the target spacing: the walk below re-spaces
+        # exactly, and it can only be as accurate as the curve it walks
+        n = max(1, min(64, int(math.ceil(chord / (spacing * 0.5)))))
+        dense.extend(_cr_segment(p0, p1, p2, p3, n))
+    dense.append(pad[-2])
+    return _walk_arc_length(dense, spacing)
+
+
+def _laplacian_pass(pts, factor):
+    """One weighted pass toward each interior point's neighbour MIDPOINT. A
+    negative factor pushes away, which is how Taubin's second pass undoes the
+    first one's shrinkage. Endpoints are fixed; the third component (the width
+    profile) is carried through untouched.
+
+    It must be the midpoint — `(a + b)/2 - c` — and not `a + b - 2c`. The two
+    differ by a factor of two, which puts the operator's eigenvalues in [0, 2]
+    instead of [0, 4], and Taubin's λ/μ are only a low-pass filter on the
+    former: with the doubled form the μ pass AMPLIFIES the highest frequency
+    instead of restoring it, so smoothing a zigzag made it worse. The pair is
+    stable because λ = 0.5 zeroes the transfer function at the Nyquist end
+    before μ ever multiplies it back up."""
+    out = [pts[0]]
+    for i in range(1, len(pts) - 1):
+        a, c, b = pts[i - 1], pts[i], pts[i + 1]
+        out.append((c[0] + factor * ((a[0] + b[0]) / 2 - c[0]),
+                    c[1] + factor * ((a[1] + b[1]) / 2 - c[1]),
+                    c[2]))
+    out.append(pts[-1])
+    return out
+
+
+def taubin_smooth(pts, strength, pairs=INK_SMOOTH_PAIRS,
+                  mu_ratio=TAUBIN_MU_RATIO):
+    """Remove tremor WITHOUT shrinking the shape. `strength` 0..1 scales λ.
+
+    Each pair is a λ pass (shrink, smoothing) followed by a μ = -ratio·λ pass
+    (inflate). High-frequency wobble is attenuated by both; low-frequency
+    shape — the size of a letter, the radius of an "o" — is restored by the
+    second. This is the whole reason a fast "o" keeps its size."""
+    if strength <= 0 or len(pts) < 3:
+        return list(pts)
+    lam = 0.5 * min(strength, 1.0)   # 0.5 is Taubin's own upper bound here
+    mu = -mu_ratio * lam
+    cur = list(pts)
+    for _ in range(pairs):
+        cur = _laplacian_pass(cur, lam)
+        cur = _laplacian_pass(cur, mu)
+    return cur
+
+
+# ── pressure and the width profile ────────────────────────────────────────────
+#
+# A stroke's `press` list is not raw pressure: it is the finished per-point
+# WIDTH FACTOR in 0..1, with the end taper already folded in, and the painted
+# width is simply `width * factor`. One concept instead of two, which is what
+# lets a mouse-drawn stroke taper without a second flag beside it, and what
+# makes "has a profile" mean exactly "is freehand" at render time — a snapped
+# rectangle or an imported annotation has none and stays flat.
+# ceiling: the taper is baked at commit, so changing INK_TAPER_* does not
+# restyle existing ink — re-derive it in draw_ink_stroke if that ever matters.
+
+# ── latency: the hover lead-in and the predicted tip ──────────────────────────
+#
+# Two different attacks on "the stroke does not appear where my pen is", and
+# they are worth telling apart because only one of them invents anything.
+#
+# The LEAD-IN is free real data. A stylus is tracked while it hovers, so the
+# app already knows where the pen was in the milliseconds before the digitiser
+# admitted contact — which is exactly the ink that "gets captured too late" was
+# missing. Prepending it recovers real positions; nothing is guessed.
+#
+# The PREDICTION is a guess, and is therefore confined to the stroke still in
+# flight: it extends the LIVE polyline toward where the pen is heading, and is
+# dropped at commit. A bad guess flickers for one frame and can never reach the
+# file. This is the only lever there is on latency proper — the report rate is
+# the hardware's.
+
+HOVER_TRAIL_MS = 250.0       # how much hover history is worth keeping at all
+HOVER_LEAD_MS = 70.0         # how much of it may become a stroke's lead-in
+HOVER_LEAD_MAX_STEP = 30.0   # px between consecutive hover samples that still
+                             # counts as "the same approach". A bigger jump is
+                             # the pen arriving from somewhere else, and walking
+                             # back through it would draw a line across the page.
+PREDICT_MAX_MS = 120.0       # ceiling on the lead time offered. Deliberately
+                             # well past anything sane: the useful setting is
+                             # only findable by feel, and the top of the range
+                             # is where you SEE what the guess is doing (the
+                             # tip runs ahead and snaps back on every turn),
+                             # which is what teaches you where the edge is.
+PREDICT_MAX_PX = 140.0       # ceiling on how far a prediction may reach, so a
+                             # single jittery sample cannot fling the tip. It
+                             # has to scale with the lead above, or the long
+                             # end of the slider would silently do nothing.
+
+
+def hover_lead_in(trail, x, y, now, lead_ms=HOVER_LEAD_MS,
+                  max_step=HOVER_LEAD_MAX_STEP):
+    """The tail of the hover trail that plausibly belongs to a stroke starting
+    at (x, y) — in forward order, excluding the press point itself.
+
+    Walks BACKWARDS from the press and stops at the first sample that is too
+    old or too far from the one after it. Stopping on the gap is what keeps a
+    pen that swooped in from the other side of the page from drawing its
+    approach: only an unbroken, recent, short-stepped run is lead-in."""
+    out = []
+    px, py = x, y
+    for sx, sy, t in reversed(trail):
+        if now - t > lead_ms:
+            break
+        if math.hypot(sx - px, sy - py) > max_step:
+            break
+        out.append((sx, sy))
+        px, py = sx, sy
+    out.reverse()
+    return out
+
+
+PREDICT_MAX_TURN = math.pi / 2   # most a prediction may bend within its lead
+PREDICT_SMOOTH = 0.3   # EMA weight on each new guess. The estimate is rebuilt
+                       # from scratch every motion event, so consecutive guesses
+                       # disagree by more than the pen actually moved and the
+                       # tip JITTERS — the one thing a lead is supposed to cure.
+                       # Smoothing the OFFSET and not the point is what makes
+                       # this safe: the anchor still tracks the pen exactly, so
+                       # the lag being hidden is not re-introduced.
+
+
+def predict_point(samples, lead_ms, max_px=PREDICT_MAX_PX):
+    """Where the pen is heading `lead_ms` beyond its last sample, or None.
+
+    The pen is carried forward along an ARC, not a straight line: heading and
+    turn rate are both estimated from the recent window, and the lead is
+    integrated as constant-speed circular motion. Straight extrapolation is
+    wrong exactly where the lead is most visible — coming out of the curve of
+    an "o" the velocity points along the TANGENT, so a linear guess leaves the
+    letter and has to be yanked back on the next sample, which reads as the tip
+    stuttering. An arc keeps turning with the hand.
+
+    Speed and turn rate are averaged over the window rather than taken from the
+    last pair, which at these intervals is mostly noise. Two clamps keep a bad
+    guess cheap: the bend within one lead (a noisy curvature estimate must not
+    spiral) and the distance travelled — a wrong guess that stays small is
+    invisible, while a large one is worse than the lag it was hiding."""
+    if lead_ms <= 0 or len(samples) < 2:
+        return None
+    steps = []
+    for (x0, y0, t0), (x1, y1, t1) in zip(samples, samples[1:]):
+        dt = t1 - t0
+        dist = math.hypot(x1 - x0, y1 - y0)
+        if dt > 0 and dist > 1e-9:
+            steps.append((math.atan2(y1 - y0, x1 - x0), dist / dt, dt))
+    if not steps:
+        return None
+    x1, y1 = samples[-1][0], samples[-1][1]
+    speed = sum(s for _a, s, _d in steps) / len(steps)
+    theta = steps[-1][0]
+
+    # turn rate: the mean change in heading per ms, each difference wrapped
+    # into (-pi, pi] so passing due-west does not read as a full reversal
+    omega = 0.0
+    if len(steps) >= 2:
+        turn = span = 0.0
+        for (a, _s0, _d0), (b, _s1, dt) in zip(steps, steps[1:]):
+            turn += (b - a + math.pi) % (2 * math.pi) - math.pi
+            span += dt
+        if span > 0:
+            omega = turn / span
+    bend = omega * lead_ms
+    if abs(bend) > PREDICT_MAX_TURN:
+        bend = math.copysign(PREDICT_MAX_TURN, bend)
+        omega = bend / lead_ms
+
+    if abs(bend) < 1e-6:
+        dx, dy = speed * lead_ms * math.cos(theta), speed * lead_ms * math.sin(theta)
+    else:
+        r = speed / omega          # signed turn radius
+        dx = r * (math.sin(theta + bend) - math.sin(theta))
+        dy = r * (math.cos(theta) - math.cos(theta + bend))
+    d = math.hypot(dx, dy)
+    if d > max_px:
+        dx, dy = dx * max_px / d, dy * max_px / d
+    return (x1 + dx, y1 + dy)
+
+
+# ── page backgrounds for blank pages ──────────────────────────────────────────
+#
+# Ruling to write straighter on. It is drawn into the page CONTENT when the
+# page is made, not painted under it at render time: a background you write on
+# has to be a background you hand in, so it must export, print and survive
+# being opened anywhere else. The cost of that choice is that it is fixed at
+# creation — changing it later would mean marking which pages are ours, which
+# is the optional-content machinery row 118 warns about, and it is not worth it
+# to re-rule a page you can simply make again.
+
+PAGE_BACKGROUNDS = ("plain", "lines", "squares", "dots")
+PAGE_BG_SPACING = 20.0        # PDF units between rulings (~7 mm on A4)
+PAGE_BG_RGB = (0.72, 0.76, 0.82)
+PAGE_BG_MARGIN = 28.0         # unruled border, so ruling never touches the edge
+
+
+def draw_page_background(ctx, width, height, kind, spacing=PAGE_BG_SPACING):
+    """Rule a blank page. `ctx` is a cairo context in PDF units.
+
+    THE one painter for this, so a page made from the menu, from `--new` and
+    from a future "insert blank page" can never come out ruled differently."""
+    if kind not in PAGE_BACKGROUNDS or kind == "plain" or spacing <= 0:
+        return
+    x0, y0 = PAGE_BG_MARGIN, PAGE_BG_MARGIN
+    x1, y1 = width - PAGE_BG_MARGIN, height - PAGE_BG_MARGIN
+    if x1 <= x0 or y1 <= y0:
+        return
+    ctx.save()
+    ctx.set_source_rgb(*PAGE_BG_RGB)
+    if kind == "dots":
+        r = 0.6
+        y = y0
+        while y <= y1 + 1e-9:
+            x = x0
+            while x <= x1 + 1e-9:
+                ctx.new_sub_path()
+                ctx.arc(x, y, r, 0, 2 * math.pi)
+                x += spacing
+            y += spacing
+        ctx.fill()
+    else:
+        ctx.set_line_width(0.4)
+        y = y0
+        while y <= y1 + 1e-9:
+            ctx.move_to(x0, y)
+            ctx.line_to(x1, y)
+            y += spacing
+        if kind == "squares":
+            x = x0
+            while x <= x1 + 1e-9:
+                ctx.move_to(x, y0)
+                ctx.line_to(x, y1)
+                x += spacing
+        ctx.stroke()
+    ctx.restore()
+
+
+def trim_light_tail(pts, press, min_pressure):
+    """Drop the feather-light TAIL of a stroke — and only the tail.
+
+    A minimum-pressure gate has to be asymmetric, because the two things it
+    could act on are opposite problems sitting at opposite ends of the stroke:
+
+      - The END is a real skid. The pen unloads before it leaves the glass, so
+        the last millimetres are a light smear that runs on toward the next
+        letter. That smear is what closes up the gaps between letters, and
+        cutting it is the whole point of the setting.
+
+      - The START is already CLIPPED, not smeared. The digitiser reports no
+        contact at all until its own hardware threshold is crossed, so the
+        first sample of a quick stroke already arrives carrying real pressure
+        and the ink before it was never captured. Gating the start would trim
+        the same edge the hardware is already eating, and the complaint it
+        causes ("the stroke begins too late") would get strictly worse.
+
+    So: rising edge untouched, falling edge trimmed. The trim also stops at the
+    first point at or above the threshold rather than filtering the whole
+    stroke, because a dip in the MIDDLE is the pen still writing."""
+    if not press or min_pressure <= 0 or len(pts) != len(press):
+        return pts, press
+    end = len(pts)
+    while end > 2 and press[end - 1] < min_pressure:
+        end -= 1
+    return pts[:end], press[:end]
+
+
+INK_PRESS_FLOOR = 0.35   # width factor at the lightest touch, as a fraction of
+                         # the pen's nominal width (which is its width at FULL
+                         # pressure). Zero would give an invisible hairline.
+INK_PRESS_GAMMA = 0.5    # pressure→width curve. People write far lighter than
+                         # they think: measured strokes sat around 0.3, which
+                         # linearly would be a permanently thin pen.
+INK_TAPER_LEN = 2.5      # longest the entry/exit ramp may be, in document
+                         # units of arc length — about one nib width.
+INK_TAPER_FRAC = 0.18    # ...but never more than this share of the stroke, per
+                         # end. A FIXED ramp is the whole of a short stroke:
+                         # at 2.5 units each end, anything under 5 units long
+                         # was pure ramp and never reached full width, which is
+                         # why the dot on an "i" came out at half thickness.
+                         # The ramp has to be a fraction of the mark, not of
+                         # the page.
+INK_TAPER_MIN = 0.4      # width factor at the very tip of a stroke
+INK_DOT_LEN = 5.0        # arc length under which a mark is really a DOT
+INK_DOT_BOOST = 2.1      # ...and a dot has to be WIDER than the line the same
+                         # pen draws, or it disappears. A real nib pools ink
+                         # where it is set down and lifted without travelling;
+                         # at exactly the stroke width, the dot on an "i" reads
+                         # as a speck next to the stem beside it.
+
+
+def dot_boost(total_len):
+    """Width multiplier for a short mark, fading to 1.0 at INK_DOT_LEN."""
+    if total_len >= INK_DOT_LEN:
+        return 1.0
+    u = max(0.0, total_len) / INK_DOT_LEN
+    return INK_DOT_BOOST + (1.0 - INK_DOT_BOOST) * u
+
+
+def width_profile(pts, press=None, taper=True, dot=True,
+                  taper_len=INK_TAPER_LEN, taper_min=INK_TAPER_MIN):
+    """The per-point width factor for a freehand stroke: pen pressure (if the
+    device reported any) shaped by INK_PRESS_GAMMA, multiplied by an entry and
+    exit ramp. Returns a list as long as `pts`."""
+    n = len(pts)
+    if n == 0:
+        return []
+    if press:
+        prof = [INK_PRESS_FLOOR + (1.0 - INK_PRESS_FLOOR)
+                * max(0.0, min(1.0, p)) ** INK_PRESS_GAMMA for p in press]
+    else:
+        prof = [1.0] * n
+    # arc length from each end, so the ramp is a distance ON THE PAGE and not a
+    # point count — a fast stroke has fewer points over the same millimetres
+    fwd, acc = [], 0.0
+    for i, p in enumerate(pts):
+        if i:
+            acc += math.hypot(p[0] - pts[i - 1][0], p[1] - pts[i - 1][1])
+        fwd.append(acc)
+    total = acc
+    if taper and n >= 2 and taper_len > 0 and total > 0:
+        # ...and never more than a share of the stroke itself, or a short mark
+        # is nothing but ramp (see INK_TAPER_FRAC)
+        taper_len = min(taper_len, total * INK_TAPER_FRAC)
+        for i in range(n):
+            d = min(fwd[i], total - fwd[i])
+            if d < taper_len:
+                u = d / taper_len
+                prof[i] *= taper_min + (1.0 - taper_min) * u
+    # applied LAST and independently of the taper, so it survives a stroke too
+    # short to have a meaningful ramp — which is every dot. It needs its own
+    # flag rather than riding on `taper`, because the one caller that wants a
+    # dot without a ramp is the too-short-to-resample path, i.e. dots
+    # themselves; a MARKER wants neither.
+    boost = dot_boost(total) if dot else 1.0
+    if boost != 1.0:
+        prof = [p * boost for p in prof]
+    return prof
+
+
+def finish_ink_stroke(pts, press, strength, was_straight=False, flat=False,
+                      min_pressure=0.0, spacing=None):
+    """The whole commit pipeline, and THE decision about what gets it.
+
+    Both canvases route every finished stroke through here, so the two can
+    never drift on what counts as handwriting. `pts` are (x, y) pairs and
+    `press` the matching raw pressure list (None/empty from a mouse).
+
+    A SNAPPED stroke (`was_straight`) is geometry the dwell already settled —
+    resampling or tapering it would undo that decision — and a FLAT one (the
+    highlighter) is a marker, not a nib, so it keeps one width end to end.
+    Everything else is handwriting and gets interpolated, denoised and shaped.
+
+    Returns (pts, profile); profile is None when the stroke should paint flat.
+    """
+    capture_raw_stroke(pts, press, straight=was_straight, flat=flat,
+                       smoothing=strength, min_pressure=min_pressure)
+    if was_straight:
+        return list(pts), None
+    if len(pts) < 3:
+        # a tap, or a flick of two samples: too short to resample, but this is
+        # exactly the case that must still read as a DOT
+        if flat:
+            return list(pts), None
+        prof = width_profile(pts, press, taper=False, dot=True)
+        return list(pts), (prof if any(abs(v - 1.0) > 1e-6 for v in prof)
+                           else None)
+    # NB `flat` drops pressure and the taper — it does NOT skip the pipeline.
+    # A highlighter still has to be interpolated and denoised; it is a marker,
+    # which means one WIDTH end to end, not a stroke left as raw samples.
+    press = [] if flat else (press or [])
+    pts, press = trim_light_tail(pts, press, min_pressure)
+    taper = not flat
+    if spacing is None:
+        spacing = adaptive_spacing(pts)
+    trip = [(float(x), float(y),
+             float(press[i]) if i < len(press) else 1.0)
+            for i, (x, y) in enumerate(pts)]
+    trip = resample_ink(trip, spacing)
+    trip = taubin_smooth(trip, strength)
+    out = [(t[0], t[1]) for t in trip]
+    prof = width_profile(out, [t[2] for t in trip] if press else None,
+                         taper=taper, dot=not flat)
+    if prof and all(abs(v - 1.0) < 1e-6 for v in prof):
+        prof = None          # nothing to say — let it paint flat
+    return out, prof
+
+
+INK_PROFILE_TAG = "sidemark:press="   # marks OUR use of an annotation's
+                                     # /Contents, so a note somebody actually
+                                     # typed on an ink annotation is never
+                                     # mistaken for a width profile
+
+
+def _ink_profile_from_annot(annot):
+    """The width profile stashed on an ink annotation by _write_ink_annotations,
+    or None. Anything unparseable is simply not a profile — a foreign PDF may
+    have any text at all in there, and ink that loses its taper is a far better
+    failure than ink that refuses to load."""
+    try:
+        content = (annot.info or {}).get("content") or ""
+    except Exception:
+        return None
+    if not content.startswith(INK_PROFILE_TAG):
+        return None
+    try:
+        return [float(v) for v in
+                content[len(INK_PROFILE_TAG):].split(",") if v]
+    except ValueError:
+        return None
+
+
+def draw_ink_stroke(ctx, pts, width, profile=None, grow=0.0):
+    """Paint one ink stroke onto `ctx`, in whatever units `pts` are in.
+
+    `grow` widens the result by a constant, which is what the lasso's glow is:
+    it must be the same SHAPE as the stroke it haloes, so a tapered stroke
+    cannot be given a flat halo without the two visibly disagreeing at the tip.
+
+    THE painter for ink — every surface routes through it, so a pen stroke
+    cannot look different in the page, the presenter mirror, the lasso glow or
+    a copied PNG. With no `profile` this is the plain constant-width polyline
+    ink has always been, so shapes, imported annotations and the highlighter
+    are untouched. With one, the stroke is built as a closed OUTLINE (offset to
+    each side by half the local width, capped with a half-circle at each end)
+    and filled in one go: filling separate per-segment strokes instead would
+    double-darken wherever they overlap, which a translucent pen would show."""
+    if len(pts) < 2:
+        if pts:
+            r = (width * (profile[0] if profile else 1.0) + grow) / 2
+            ctx.new_sub_path()
+            ctx.arc(pts[0][0], pts[0][1], max(r, 1e-3), 0, 2 * math.pi)
+            ctx.fill()
+        return
+    if not profile:
+        ctx.set_line_width(width + grow)
+        ctx.move_to(*pts[0])
+        for p in pts[1:]:
+            ctx.line_to(*p)
+        ctx.stroke()
+        return
+
+    # unit normal at each point: the perpendicular of the averaged incoming and
+    # outgoing tangents, so an offset corner stays put instead of flaring
+    n = len(pts)
+    normals = []
+    for i in range(n):
+        tx = ty = 0.0
+        legs = []
+        if i:
+            legs.append((pts[i - 1], pts[i]))
+        if i < n - 1:
+            legs.append((pts[i], pts[i + 1]))
+        for a, b in legs:
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            d = math.hypot(dx, dy)
+            if d > 1e-12:
+                tx += dx / d
+                ty += dy / d
+        d = math.hypot(tx, ty)
+        if d < 1e-12:
+            tx, ty, d = 1.0, 0.0, 1.0
+        normals.append((-ty / d, tx / d))
+
+    half = [(width * max(profile[i] if i < len(profile) else 1.0, 0.02)
+             + grow) / 2 for i in range(n)]
+    ctx.move_to(pts[0][0] + normals[0][0] * half[0],
+                pts[0][1] + normals[0][1] * half[0])
+    for i in range(1, n):
+        ctx.line_to(pts[i][0] + normals[i][0] * half[i],
+                    pts[i][1] + normals[i][1] * half[i])
+    # round cap at the end: from the left offset round to the right one, the
+    # short way — through the direction the pen was travelling
+    a0 = math.atan2(normals[-1][1], normals[-1][0])
+    ctx.arc_negative(pts[-1][0], pts[-1][1], half[-1], a0, a0 - math.pi)
+    for i in range(n - 2, -1, -1):
+        ctx.line_to(pts[i][0] - normals[i][0] * half[i],
+                    pts[i][1] - normals[i][1] * half[i])
+    a0 = math.atan2(-normals[0][1], -normals[0][0])
+    ctx.arc_negative(pts[0][0], pts[0][1], half[0], a0, a0 - math.pi)
+    ctx.close_path()
+    ctx.fill()
+
+
 # ── shape recognition (the extended dwell) ─────────────────────────────────────
 # The straight-line snap (hold still mid-stroke → the stroke becomes a line) is
 # generalised here: on the same dwell, a closed loop is recognised as a clean
@@ -1138,6 +1836,32 @@ def log_press(surface, chord, tool, note=""):
         print(msg, file=sys.stderr, flush=True)
 
 
+def pressure_for_event(event):
+    """How hard the pen is pressing, 0..1 — or None when this is not a stylus.
+
+    Read from the event's PRESSURE axis, which row 135 measured as real on this
+    class of panel (0.05..0.99, smooth, and already meaningful at the very
+    first BUTTON_PRESS, so there is no stroke-start ramp to work around). A
+    mouse and a fingertip have no such axis and get None, which is what makes
+    "did the device report pressure" a question the ink pipeline can ask.
+
+    Sibling of button_for_event: same job, same place — turn one physical
+    event into something the rest of the app can reason about without knowing
+    what hardware produced it."""
+    if event is None or event.get_device_tool() is None:
+        return None          # a mouse or a touch: the axis is absent or noise
+    try:
+        ok, val = event.get_axis(Gdk.AxisUse.PRESSURE)
+        if not ok or val is None:
+            return None
+        return max(0.0, min(1.0, float(val)))
+    except (AttributeError, TypeError, ValueError):
+        # a stylus whose driver exposes no pressure axis at all. "No pressure"
+        # is the honest answer, and it is the same one a mouse gives, so every
+        # caller already handles it.
+        return None
+
+
 def button_for_event(event, button, barrel_held=False):
     """THE mapping from a physical input to a BUTTON IDENTITY (row 135).
 
@@ -1711,8 +2435,33 @@ class PDFCanvas(Gtk.DrawingArea):
 
         self.pen_color = (0.05, 0.05, 0.8)   # RGB — stroke alpha lives in "opacity"
         self.pen_width = 2.0
-        # freehand smoothing strength 0..1 (Laplacian passes applied on commit)
+        # freehand denoise strength 0..1 (Taubin λ/μ passes applied on commit).
+        # NB this is the DENOISE only: the resampling that fills a fast
+        # stroke's gaps always runs, because that is interpolation, not
+        # smoothing, and turning it off would only bring the facets back.
         self.smoothing = 0.5
+        # raw stylus pressure for the stroke in flight, one entry per point of
+        # current_stroke. Trusted only while the two lengths agree, so a reset
+        # that forgets this list degrades to "no pressure" instead of shifting
+        # every width along the stroke.
+        self.current_press = []
+        self._press_now = None    # pressure of the event being handled, if any
+        # recent hovering stylus positions, (x, y, t_ms) in SCREEN coords — the
+        # ink a stroke was already drawing before the digitiser reported contact
+        self._hover_trail = []
+        # the last few samples of the stroke in flight, for predict_point
+        self._recent_samples = []
+        # prototypes (row 139): recover a stroke's start from the hover trail,
+        # and lead the live stroke ahead of the pen by this many milliseconds.
+        # Both default OFF — the lead-in did not help in the hand, and neither
+        # earns its surprise until the user has chosen it.
+        self.hover_lead = False
+        self.predict_ms = 0.0
+        self._predict_offset = None   # damped lead, reset per stroke
+        # a touch lighter than this is not ink: it is the pen skating as you
+        # land or lift. 0 disables the gate (and is the default — a threshold
+        # that eats the start of a stroke is worse than a feathered end).
+        self.min_pressure = 0.0
         # extended dwell → shape recognition: "shapes" (line + rectangle +
         # ellipse + grid divider), "lines" (line only, the classic straight
         # snap) or "off" (never snap). See recognize_shape / the pen popover.
@@ -2045,14 +2794,21 @@ class PDFCanvas(Gtk.DrawingArea):
                 width = annot.border.get("width", 2.0)
                 # fitz reports -1.0 (or 1.0) when the PDF CA key is unset
                 opacity = annot.opacity if 0 < annot.opacity < 1 else 1.0
+                prof = _ink_profile_from_annot(annot)
                 for polyline in annot.vertices:
                     if polyline:
-                        self.all_strokes.setdefault(i, []).append({
+                        st = {
                             "pts":   [tuple(pt) for pt in polyline],
                             "color": color,
                             "width": width,
                             "opacity": opacity,
-                        })
+                        }
+                        # one annotation, one polyline for our own ink, so a
+                        # length match is also what confirms this profile
+                        # belongs to this polyline
+                        if prof and len(prof) == len(st["pts"]):
+                            st["press"] = prof
+                        self.all_strokes.setdefault(i, []).append(st)
                         total_annots += 1
         logger.info(f"load: {path} — {self.n_pages} pages, {total_annots} strokes loaded")
         self._load_page(0)
@@ -2144,6 +2900,88 @@ class PDFCanvas(Gtk.DrawingArea):
             self.bindings.bind("left", "text")
         elif self.tool == "text":
             self.bindings.bind("left", "pen")
+
+    @staticmethod
+    def _now_ms():
+        return GLib.get_monotonic_time() / 1000.0
+
+    def _record_hover(self, ctrl, x, y):
+        """Remember where a HOVERING stylus is, in screen coords.
+
+        Only a stylus: a mouse pointer is always somewhere, and treating its
+        resting position as the run-up to a stroke would prepend a phantom
+        lead-in to every click."""
+        ev = ctrl.get_current_event() if ctrl is not None else None
+        if ev is None or ev.get_device_tool() is None:
+            return
+        now = self._now_ms()
+        self._hover_trail.append((x, y, now))
+        if len(self._hover_trail) > 64:
+            self._hover_trail = [s for s in self._hover_trail
+                                 if now - s[2] <= HOVER_TRAIL_MS][-64:]
+
+    # velocity is estimated across this many samples: one pair is mostly noise
+    PREDICT_WINDOW = 5
+
+    def _note_sample(self, x, y):
+        """Record a stroke sample's screen position and time, for prediction."""
+        self._recent_samples.append((x, y, self._now_ms()))
+        del self._recent_samples[:-self.PREDICT_WINDOW]
+
+    def _predicted_tip(self):
+        """The predicted tip, damped across frames — see PREDICT_SMOOTH."""
+        raw = predict_point(self._recent_samples, self.predict_ms)
+        if raw is None:
+            self._predict_offset = None
+            return None
+        ax, ay = self._recent_samples[-1][0], self._recent_samples[-1][1]
+        off = (raw[0] - ax, raw[1] - ay)
+        prev = self._predict_offset
+        if prev is not None:
+            off = (prev[0] + (off[0] - prev[0]) * PREDICT_SMOOTH,
+                   prev[1] + (off[1] - prev[1]) * PREDICT_SMOOTH)
+        self._predict_offset = off
+        return (ax + off[0], ay + off[1])
+
+    def _live_stroke(self):
+        """(points, profile) for the stroke still in flight.
+
+        The profile is derived from the raw samples rather than the finished
+        pipeline — resampling on every motion event would cost more than it
+        could possibly show. The predicted tip is added HERE and nowhere else,
+        which is what confines a guess to the screen: the commit path reads
+        current_stroke, which never contains it."""
+        pts = self.current_stroke
+        if len(pts) < 2:
+            return pts, None
+        lead = self._predicted_tip()
+        if lead is not None:
+            pts = pts + [self._screen_to_doc(*lead)]
+        if self._flat_tool():
+            return pts, None
+        press = self._stroke_pressure(self.current_stroke)
+        if press and len(pts) > len(self.current_stroke):
+            press = list(press) + [press[-1]]   # the tip inherits the pressure
+        prof = width_profile(pts, press)
+        return pts, (None if all(abs(v - 1.0) < 1e-6 for v in prof) else prof)
+
+    def _stroke_pressure(self, pts):
+        """The pressure list for the stroke in flight, if it still matches it.
+        Length is the guard: a reset that forgot the pressure list loses
+        pressure rather than mis-aligning every width along the stroke."""
+        return (self.current_press
+                if len(self.current_press) == len(pts) else None)
+
+    def _flat_tool(self):
+        """Is the tool in hand one that paints a constant width? Each surface
+        answers for itself; everything else about the profile is shared."""
+        return bool(self.highlighter or self._temp_highlighter)
+
+    def _finish_stroke(self, pts, was_straight):
+        return finish_ink_stroke(
+            pts, self._stroke_pressure(pts), self.smoothing,
+            was_straight=was_straight, flat=self._flat_tool(),
+            min_pressure=self.min_pressure)
 
     def _pen_attrs(self):
         """(color, width, opacity) of the active drawing tool. ``_temp_highlighter``
@@ -2367,37 +3205,33 @@ class PDFCanvas(Gtk.DrawingArea):
         to_draw = self.strokes[:]
         if self.current_stroke:
             color, width, opacity = self._pen_attrs()
-            to_draw.append({"pts": self.current_stroke,
+            live_pts, live_prof = self._live_stroke()
+            to_draw.append({"pts": live_pts,
                              "color": color,
                              "width": width,
-                             "opacity": opacity})
+                             "opacity": opacity,
+                             "press": live_prof})
         # mirror canvas: also draw the editor's stroke still being laid down
         src = self.live_stroke_src
         if (src is not None and src.current_stroke
                 and src.current_page_idx == self.current_page_idx):
             color, width, opacity = src._pen_attrs()
-            to_draw.append({"pts": src.current_stroke,
+            src_pts, src_prof = src._live_stroke()
+            to_draw.append({"pts": src_pts,
                             "color": color,
                             "width": width,
-                            "opacity": opacity})
+                            "opacity": opacity,
+                            "press": src_prof})
 
         ctx.save()
         ctx.translate(self.offset_x, self.offset_y)
         ctx.scale(self.scale, self.scale)
         for stroke in to_draw:
-            pts = stroke["pts"]
             r, g, b = stroke["color"]
             ctx.set_source_rgba(r, g, b, stroke.get("opacity", 1.0))
-            ctx.set_line_width(stroke["width"])   # PDF units — scales with zoom
-            if len(pts) < 2:
-                if pts:
-                    ctx.arc(pts[0][0], pts[0][1], stroke["width"] / 2, 0, 2 * math.pi)
-                    ctx.fill()
-                continue
-            ctx.move_to(*pts[0])
-            for pt in pts[1:]:
-                ctx.line_to(*pt)
-            ctx.stroke()
+            # widths are PDF units — they scale with the zoom above
+            draw_ink_stroke(ctx, stroke["pts"], stroke["width"],
+                            stroke.get("press"))
         ctx.restore()
 
         if self._snap_label:
@@ -2768,15 +3602,8 @@ class PDFCanvas(Gtk.DrawingArea):
         ctx.set_line_cap(cairo.LINE_CAP_ROUND)
         ctx.set_line_join(cairo.LINE_JOIN_ROUND)
         for st in self._selected_strokes:
-            pts = st["pts"]
-            if len(pts) < 2:
-                continue
             ctx.set_source_rgba(*st["color"], st.get("opacity", 1.0))
-            ctx.set_line_width(st["width"])
-            ctx.move_to(*pts[0])
-            for p in pts[1:]:
-                ctx.line_to(*p)
-            ctx.stroke()
+            draw_ink_stroke(ctx, st["pts"], st["width"], st.get("press"))
         surf.flush()
         buf = io.BytesIO()
         surf.write_to_png(buf)
@@ -2984,6 +3811,7 @@ class PDFCanvas(Gtk.DrawingArea):
         return False
 
     def _on_motion(self, _ctrl, x, y):
+        self._record_hover(_ctrl, x, y)
         if self._thumb_gesture is not None:
             sx, sy = (self._thumb_gesture.get_start_point()[1],
                       self._thumb_gesture.get_start_point()[2])
@@ -3271,9 +4099,34 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _default_cursor(self):
         """Cursor that matches the active tool while idle (no drag in flight)."""
+        if self._hide_pointer():
+            return Gdk.Cursor.new_from_name("none", None)
         name = {"text": "text", "pan": "grab", "lasso": "crosshair",
                 "zoom": "crosshair", "anchor": "crosshair"}.get(self.tool)
         return Gdk.Cursor.new_from_name(name, None) if name else None
+
+    def _hide_pointer(self):
+        """Should the pointer be invisible right now?
+
+        Exactly while a stroke is being laid down. During a stroke the ink IS
+        the feedback and an arrow lagging behind the nib is the one thing that
+        gives the lag away — it is what a predicted lead is trying to hide. The
+        moment the pen lifts the pointer is useful again, so it comes back.
+
+        Tying this to the STROKE rather than to the selected tool is what makes
+        it safe with a mouse: the pointer can only vanish while a button is
+        already held, so it can never go missing while you are looking for it.
+        (An earlier version asked whether the device was a stylus, and the
+        pointer simply stayed visible — a hovering pen does not reliably
+        deliver motion events, so the flag was never set. A predicate whose
+        evidence can be missing is a feature that silently does nothing.)"""
+        return bool(self.current_stroke)
+
+    def _apply_cursor(self):
+        """Put the right cursor up now. Called where the answer CHANGES and no
+        pointer motion is guaranteed to follow — a press and a release both
+        change it, and neither is a motion event."""
+        self.set_cursor(self._default_cursor())
 
     def link_hover_active(self):
         """Links light up exactly when a click would FOLLOW one: when the left
@@ -3333,6 +4186,10 @@ class PDFCanvas(Gtk.DrawingArea):
         btn = button_for_event(gesture.get_current_event(),
                                gesture.get_current_button(),
                                self._barrel_held)
+        # the pressure of the event being routed, kept on the canvas so the
+        # tool code below (and _on_drag_update) can read it without every one
+        # of them having to be handed the gesture
+        self._press_now = pressure_for_event(gesture.get_current_event())
         state = self._chord_state(gesture)
         ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
         shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
@@ -3436,7 +4293,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self._cancel_straight_timer()
             self._straight_mode = False
             self._snap_kind = self._snap_label = None
-            self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
+            self._start_stroke(start_x, start_y)
             return
 
         # ── the plain press of a drawing / selecting tool ────────────────────
@@ -3488,8 +4345,34 @@ class PDFCanvas(Gtk.DrawingArea):
         self._cancel_straight_timer()
         self._straight_mode = False
         self._snap_kind = self._snap_label = None
-        self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
+        self._start_stroke(start_x, start_y)
         self._arm_circle_lasso(start_x, start_y)
+
+    _screen_to_doc = _screen_to_pdf
+
+    def _start_stroke(self, start_x, start_y):
+        """Open a fresh stroke at a screen point, with its pressure list and
+        whatever lead-in the hover trail can give it."""
+        self._recent_samples = []
+        self._predict_offset = None
+        lead = self._lead_in_points(start_x, start_y)
+        self.current_stroke = ([self._screen_to_pdf(*p) for p in lead]
+                               + [self._screen_to_pdf(start_x, start_y)])
+        self._apply_cursor()          # the nib is the cursor now
+        if self._press_now is None:
+            self.current_press = []
+        else:
+            # the recovered run-up was drawn below the digitiser's contact
+            # threshold, so it is genuinely the lightest part of the stroke and
+            # the taper should treat it that way
+            self.current_press = [0.0] * len(lead) + [self._press_now]
+
+    def _lead_in_points(self, start_x, start_y):
+        """The hover positions immediately before this press, if any."""
+        if not self.hover_lead or self._flat_tool():
+            return []
+        return hover_lead_in(self._hover_trail, start_x, start_y,
+                             self._now_ms())
 
     # ── circle to lasso (row 126) ───────────────────────────────────────────
 
@@ -3718,6 +4601,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._loop_orig = list(self._selection_loop)
 
     def _on_drag_update(self, gesture, offset_x, offset_y):
+        self._press_now = pressure_for_event(gesture.get_current_event())
         if self._post_pinch:
             # the finger left over from a pinch pans the page (never draws);
             # latch the offset at hand-off so the page doesn't jump
@@ -3894,6 +4778,9 @@ class PDFCanvas(Gtk.DrawingArea):
                 # or Ctrl+Z, to change your mind)
             else:
                 self.current_stroke.append(pt)
+                if self._press_now is not None:
+                    self.current_press.append(self._press_now)
+                self._note_sample(sx + offset_x, sy + offset_y)
                 # re-arm on every motion → the snap fires once the cursor rests
                 self._arm_straight_timer()
             if self.on_live_draw:
@@ -4075,11 +4962,8 @@ class PDFCanvas(Gtk.DrawingArea):
                 if (max(xs) - min(xs) < slop and max(ys) - min(ys) < slop):
                     self.current_stroke = []   # a tap that only dismissed
             if self.current_stroke:
-                pts = self.current_stroke
-                # smooth freehand ink on commit; a snapped straight line/shape
-                # and tiny strokes (dots) are left exactly as drawn
-                if not was_straight and len(pts) > 2:
-                    pts = self._smooth_points(pts, self.smoothing)
+                pts, prof = self._finish_stroke(self.current_stroke,
+                                                was_straight)
                 color, width, opacity = self._pen_attrs()
                 stroke = {
                     "pts": pts,
@@ -4087,6 +4971,8 @@ class PDFCanvas(Gtk.DrawingArea):
                     "width": width,
                     "opacity": opacity,
                 }
+                if prof:
+                    stroke["press"] = prof
                 if self._snap_kind in ("vdiv", "hdiv"):
                     # a grid divider re-spaces its rectangle's dividers evenly,
                     # itself included — one undo entry for the whole gesture
@@ -4115,6 +5001,7 @@ class PDFCanvas(Gtk.DrawingArea):
             if self.on_live_draw:
                 self.on_live_draw()   # drop the live stroke from the mirror
         self._temp_highlighter = False
+        self._apply_cursor()          # the pen lifted — give the pointer back
         self.queue_draw()
 
     def _arm_straight_timer(self):
@@ -4128,26 +5015,6 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._straight_timer is not None:
             GLib.source_remove(self._straight_timer)
             self._straight_timer = None
-
-    @staticmethod
-    def _smooth_points(pts, strength, passes=4):
-        """Clean up a freehand polyline with Laplacian (moving-average)
-        smoothing. ``strength`` 0..1 scales how far each interior point is
-        pulled toward the midpoint of its neighbours; endpoints stay fixed so
-        the stroke keeps its start and end. Returns a new list of (x, y)."""
-        if strength <= 0 or len(pts) < 3:
-            return list(pts)
-        factor = 0.5 * min(strength, 1.0)
-        cur = [(float(x), float(y)) for x, y in pts]
-        for _ in range(passes):
-            nxt = [cur[0]]
-            for i in range(1, len(cur) - 1):
-                x = cur[i][0] + factor * (cur[i - 1][0] + cur[i + 1][0] - 2 * cur[i][0])
-                y = cur[i][1] + factor * (cur[i - 1][1] + cur[i + 1][1] - 2 * cur[i][1])
-                nxt.append((x, y))
-            nxt.append(cur[-1])
-            cur = nxt
-        return cur
 
     def _snap_to_shape(self):
         """Fired when the cursor has rested mid-stroke (the extended dwell):
@@ -5057,17 +5924,8 @@ class PDFCanvas(Gtk.DrawingArea):
                 # a translucent glow wider than the stroke, so its real colour
                 # still shows through the centre
                 ctx.set_source_rgba(ar, ag, ab, 0.35)
-                ctx.set_line_width(s["width"] + 7.0 / self.scale)
-                if len(pts) < 2:
-                    if pts:
-                        ctx.arc(pts[0][0], pts[0][1],
-                                s["width"] / 2 + 3.5 / self.scale, 0, 2 * math.pi)
-                        ctx.fill()
-                    continue
-                ctx.move_to(*pts[0])
-                for pt in pts[1:]:
-                    ctx.line_to(*pt)
-                ctx.stroke()
+                draw_ink_stroke(ctx, pts, s["width"], s.get("press"),
+                                grow=7.0 / self.scale)
             ctx.restore()
             # dashed bounding box (screen space for crisp 1px lines)
             bbox = self._selection_bbox()
@@ -5409,6 +6267,20 @@ class PDFCanvas(Gtk.DrawingArea):
                 annot.set_border(width=stroke["width"])
                 if stroke.get("opacity", 1.0) < 1.0:
                     annot.set_opacity(stroke["opacity"])
+                prof = stroke.get("press")
+                if prof and len(prof) == len(pts):
+                    # A PDF ink annotation has ONE width — that is the whole
+                    # reason variable-width ink was blocked (row 26). The
+                    # profile therefore rides in /Contents, a free text field
+                    # that survives a round-trip untouched, and `width` stays
+                    # the stroke's width at full pressure. So Sidemark reloads
+                    # the taper exactly, and every other PDF reader shows the
+                    # same ink at a constant width — a graceful degradation
+                    # rather than the alternative, which was splitting one
+                    # stroke into a handful of annotations and losing the
+                    # lasso, the eraser and the control points along with it.
+                    annot.set_info(content=INK_PROFILE_TAG
+                                   + ",".join(f"{p:.2f}" for p in prof))
                 annot.update()
                 total_written += 1
         return total_written
@@ -6802,14 +7674,45 @@ _MD_SYMBOLS = {
     r'\Xi': 'Ξ', r'\Pi': 'Π', r'\Sigma': 'Σ', r'\Phi': 'Φ',
     r'\Psi': 'Ψ', r'\Omega': 'Ω',
     r'\infty': '∞', r'\approx': '≈', r'\neq': '≠',
-    r'\leq': '≤', r'\geq': '≥', r'\pm': '±', r'\times': '×',
+    r'\leq': '≤', r'\geq': '≥', r'\le': '≤', r'\ge': '≥',
+    r'\pm': '±', r'\times': '×',
     r'\div': '÷', r'\cdot': '·', r'\to': '→', r'\gets': '←', r'\mapsto': '↦',
     r'\in': '∈', r'\notin': '∉', r'\subset': '⊂', r'\supset': '⊃',
     r'\cup': '∪', r'\cap': '∩', r'\emptyset': '∅',
     r'\forall': '∀', r'\exists': '∃',
     r'\partial': '∂', r'\nabla': '∇',
 }
-_MD_SYMBOL_RE = re.compile(r'\\([A-Za-z]+)')
+# A space before a LETTER is a TERMINATOR, not a gap: you have to write
+# `\alpha x` because `\alphax` is a different command, so rendering it puts a
+# hole in the middle of "αx". Exactly one such space is eaten with the command
+# it ended — a second one is a real space and survives. Two things narrow it,
+# and both are about not eating a space nobody was forced to type: the
+# lookahead (nothing but a letter could have continued the command, so
+# `\alpha + \beta` keeps its spacing — a second space is in it so that typing
+# two is how you ask for one), and the letter-like set below.
+_MD_SYMBOL_RE = re.compile(r'\\([A-Za-z]+)( (?=[A-Za-z ]))?')
+
+# Which symbols are VARIABLES rather than operators — the only ones whose
+# terminating space is eaten. `\alpha x` is one term "αx", but `A \mapsto B` is
+# a relation between two, and "A ↦B" would read as the arrow being glued to its
+# right operand. Same distinction LaTeX makes when it spaces an operator.
+_MD_LETTER_SYMBOLS = {
+    'alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta',
+    'iota', 'kappa', 'lambda', 'mu', 'nu', 'xi', 'pi', 'rho', 'sigma', 'tau',
+    'upsilon', 'phi', 'chi', 'psi', 'omega',
+    'Gamma', 'Delta', 'Theta', 'Lambda', 'Xi', 'Pi', 'Sigma', 'Phi', 'Psi',
+    'Omega', 'infty', 'partial', 'nabla', 'emptyset',
+}
+
+
+def _sub_symbol(m):
+    """One \\command → its glyph, eating the space that terminated it when that
+    space only separated a variable from the next letter."""
+    sym = _MD_SYMBOLS.get('\\' + m.group(1))
+    if sym is None:
+        return m.group(0)                # unknown command — leave it alone
+    space = m.group(2) or ''
+    return sym if space and m.group(1) in _MD_LETTER_SYMBOLS else sym + space
 
 # LaTeX accents over a base symbol, rendered with Unicode combining marks:
 # \hat{x} → x̂, \bar{x} → x̄, \tilde{x} → x̃, \vec{x} → x⃗ (and \dot / \ddot).
@@ -6937,8 +7840,7 @@ def _symbolize(text):
     """Replace LaTeX-style \\commands with their Unicode symbols (display only),
     leaving the contents of `code` spans and [[wiki links]] untouched."""
     def sub_seg(seg):
-        seg = _MD_SYMBOL_RE.sub(
-            lambda m: _MD_SYMBOLS.get('\\' + m.group(1), m.group(0)), seg)
+        seg = _MD_SYMBOL_RE.sub(_sub_symbol, seg)
         # Accents run after symbol substitution so \hat{\alpha} → α̂ (the inner
         # \alpha is already α by the time the accent is placed on it).
         return _apply_accents(seg)
@@ -6952,7 +7854,18 @@ def _symbolize(text):
 # avoid matching across ** markers or newlines.
 _MD_INLINE_RE = re.compile(r'\*\*(.+?)\*\*|\*([^*\n]+?)\*|`([^`\n]+?)`')
 # Super/subscript: ^{content} or ^x  /  _{content} or _x
-_MD_SCRIPT_RE = re.compile(r'(\^|_)(?:\{([^}]*)\}|(\S+))')
+# An unbraced script runs to the first NON-alphanumeric character (a leading
+# sign is part of it, so `x^-1` reads as an exponent). `\S+` used to swallow
+# everything up to the space, which made `a_i, b_j` subscript "i," and — worse —
+# ate the `^`/`_` that starts the NEXT script, so `x_i^2` never superscripted.
+# The stop set deliberately includes `^` and `_` themselves: adjacent scripts
+# (`a_i^2`, `a^t_i`) are two matches, each ending where the other begins.
+# Group 4 is the terminating space of an UNBRACED script — the one before an
+# alphanumeric, which is the only place a space was forced on you (`a_ib` would
+# subscript "ib"), eaten on render for the same reason a command's is. A brace
+# terminates by itself, so the braced form never claims one.
+_MD_SCRIPT_RE = re.compile(
+    r'(\^|_)(?:\{([^}]*)\}|([+-]?[A-Za-z0-9]+)( (?=[A-Za-z0-9 ]))?)')
 
 
 def _notes_to_pango_markup(text):
@@ -7814,6 +8727,20 @@ class NotesModel:
         so the shared body stays stored exactly once."""
         self._notes[self.run_start(idx)] = text
 
+    def snapshot(self):
+        """The whole model, copied — undo's record of a LINK change.
+
+        Linking merges two bodies into one (`link()` appends), so there is no
+        page-and-text pair that describes the change: reversing it means
+        putting the split back. Bookmarks ride along because a snapshot that
+        restored less than it captured would silently drop one."""
+        return (dict(self._notes), set(self._links), dict(self._bookmarks))
+
+    def restore(self, snap):
+        notes, links, bookmarks = snap
+        self._notes, self._links = dict(notes), set(links)
+        self._bookmarks = dict(bookmarks)
+
     def load(self, path):
         # the parse lives at module level (parse_note_sections): merging notes
         # needs the "were there page markers?" answer this loader throws away —
@@ -7971,6 +8898,14 @@ class MarkdownNotesView(GtkSource.View):
             "h2":          tag("h2",          weight=700, scale=1.25),
             "h3":          tag("h3",          weight=600, scale=1.1),
             "bold":        tag("bold",        weight=700),
+            # Underscores mean SUBSCRIPT here, not emphasis — but the GtkSource
+            # markdown language still italicises `_i and b_` as a span. Its
+            # syntax tags sit at priority 0, so any tag of ours outranks them:
+            # every line gets "noitalic" and only *our* `*italic*` runs put the
+            # slant back. That is why this is created BEFORE "italic" — tag
+            # priority is the order tags are ADDED to the table, not the order
+            # they are applied, so "italic" must come second to win.
+            "noitalic":    tag("noitalic",    style=0),   # Pango.Style.NORMAL
             "italic":      tag("italic",      style=2),   # Pango.Style.ITALIC
             "code":        tag("code",        family="monospace",
                                background="#2d2d2d" if is_dark else "#f0f0f0",
@@ -8757,6 +9692,12 @@ class MarkdownNotesView(GtkSource.View):
             if not on_cursor:
                 apply("hide", a, b)
 
+        # Emphasis is OURS to decide: kill the syntax highlighter's slant across
+        # the whole line first (it italicises anything between two underscores,
+        # which here are subscripts), and let the `*italic*` pass below put it
+        # back where it belongs.
+        apply("noitalic", 0, len(text))
+
         # Heading
         m = re.match(r'^(#{1,3}) ', text)
         if m:
@@ -8807,9 +9748,11 @@ class MarkdownNotesView(GtkSource.View):
                     apply("hide", a, a + 2)  # hide ^{ or _{
                     apply(tag_name, a + 2, b - 1)
                     apply("hide", b - 1, b)  # hide }
-                else:                        # single char: ^x or _x
+                else:                        # unbraced: ^x or _x
                     apply("hide", a, a + 1)  # hide ^ or _
-                    apply(tag_name, a + 1, b)
+                    end = b - len(m.group(4) or '')
+                    apply(tag_name, a + 1, end)
+                    apply("hide", end, b)    # the space that ended it
 
 
 def _ink_path_for(md_path):
@@ -8871,6 +9814,11 @@ class TextPageView(Gtk.Overlay):
         #  "texture", "rotate"}
         self.images = []
         self.current_stroke = []  # overlay coords while a stroke is in flight
+        self.current_press = []   # its stylus pressure, one entry per point
+        self._press_now = None    # pressure of the event being handled, if any
+        self._hover_trail = []    # hovering stylus positions (overlay coords)
+        self._recent_samples = []  # last few stroke samples, for prediction
+        self._predict_offset = None   # damped lead, reset per stroke
         # Shift+drag rubber-bands a region to zoom to; a Shift+click (no rect)
         # fits the paper to the window — both PDF-canvas parity (#106 item 5).
         self._zoom_selecting = False
@@ -8891,6 +9839,9 @@ class TextPageView(Gtk.Overlay):
         # same way (parity: both modes obey the one pen-settings popover)
         self.get_smoothing = lambda: 0.5
         self.get_shape_snap = lambda: "shapes"
+        self.get_min_pressure = lambda: 0.0
+        self.get_hover_lead = lambda: False
+        self.get_predict_ms = lambda: 0.0
         self.accent = lambda: (0.52, 0.70, 0.30)
         # GoodNotes-style straight-line snap, same as the PDF canvas: holding
         # still mid-stroke recognises a line / rectangle / ellipse / grid
@@ -9433,6 +10384,7 @@ class TextPageView(Gtk.Overlay):
     def _on_sheet_motion(self, _ctrl, x, y):
         self._mouse_xy = (x, y)
         self._pointer_in = True
+        self._record_hover(_ctrl, x, y)
         if self._thumb_gesture is not None:
             sx, sy = (self._thumb_gesture.get_start_point()[1],
                       self._thumb_gesture.get_start_point()[2])
@@ -9443,6 +10395,8 @@ class TextPageView(Gtk.Overlay):
         if not self._resizing_width and self.tool == "text":
             self.set_cursor(Gdk.Cursor.new_from_name("ew-resize")
                             if self._on_paper_edge(x, y) else None)
+        elif not self._resizing_width:
+            self._apply_cursor()
 
     def _on_barrel_event(self, ctrl, event):
         """Track (and swallow) a pen's plain barrel button — see track_barrel."""
@@ -9879,6 +10833,7 @@ class TextPageView(Gtk.Overlay):
     def _on_ink_begin(self, gesture, x, y):
         self._zoom_cancelled = False
         self._ink_ignoring = False
+        self._press_now = pressure_for_event(gesture.get_current_event())
         if self.tool == "zoom":
             # a zoom-to-region rubber-band; a drag that never grows into a rect
             # falls back to fit-width on release
@@ -9901,7 +10856,15 @@ class TextPageView(Gtk.Overlay):
             self._cancel_straight_timer()
             self._straight_mode = False
             self._snap_kind = self._snap_label = None
-            self.current_stroke = [(x, y)]
+            self._recent_samples = []
+            self._predict_offset = None
+            lead = self._lead_in_points(x, y)
+            self.current_stroke = list(lead) + [(x, y)]
+            self._apply_cursor()      # the nib is the cursor now
+            if self._press_now is None:
+                self.current_press = []
+            else:
+                self.current_press = [0.0] * len(lead) + [self._press_now]
             self._arm_circle_lasso(x, y)
         self.ink.queue_draw()
 
@@ -9922,6 +10885,7 @@ class TextPageView(Gtk.Overlay):
         self.ink.queue_draw()
 
     def _on_ink_update(self, gesture, dx, dy):
+        self._press_now = pressure_for_event(gesture.get_current_event())
         if self._zoom_cancelled:   # right-click aborted this drag
             return
         if self._ink_ignoring:
@@ -9983,6 +10947,9 @@ class TextPageView(Gtk.Overlay):
                 # a recognised rectangle/ellipse/divider is frozen until release
             else:
                 self.current_stroke.append((x, y))
+                if self._press_now is not None:
+                    self.current_press.append(self._press_now)
+                self._note_sample(x, y)
                 # re-arm on every motion → the snap fires once the cursor rests
                 self._arm_straight_timer()
         else:
@@ -10065,15 +11032,11 @@ class TextPageView(Gtk.Overlay):
             self._lasso_orig = []
             self._lasso_img_orig = []
         elif self.current_stroke:
-            pts = self.current_stroke
-            # smooth freehand ink on commit (same recipe as the PDF canvas);
-            # a snapped straight line/shape and dots are left exactly as drawn
-            if not was_straight and len(pts) > 2:
-                pts = PDFCanvas._smooth_points(pts, self.get_smoothing())
+            pts, prof = self._finish_stroke(self.current_stroke, was_straight)
             if self._snap_kind in ("vdiv", "hdiv"):
                 self._finish_grid_divider(pts)
             else:
-                self._commit_stroke(pts)
+                self._commit_stroke(pts, prof)
                 if was_straight and self.strokes:
                     # the dwell recognised it: hand it back selected and BOXED,
                     # adjustable with the pen still in hand (row 127)
@@ -10081,6 +11044,7 @@ class TextPageView(Gtk.Overlay):
                     self._selection_boxed = True
                     self._selection_auto = True
             self.current_stroke = []
+            self._apply_cursor()      # the pen lifted — give the pointer back
             self._snap_kind = self._snap_label = None
             self._live_snap_shapes = []
             self._curve_snap_cache = []
@@ -10252,7 +11216,62 @@ class TextPageView(Gtk.Overlay):
             add_op = self._undo_ops.pop()
             self._undo_ops.append(("group", [add_op, ("reshape", entries)]))
 
-    def _commit_stroke(self, pts_overlay):
+    # the pressure gate and the pressure list are pure state logic with no
+    # substrate in them, so the sheet borrows the canvas's rather than
+    # restating the rule (the row 116 lesson)
+    _stroke_pressure = PDFCanvas._stroke_pressure
+    _live_stroke = PDFCanvas._live_stroke
+    _predicted_tip = PDFCanvas._predicted_tip
+    _hide_pointer = PDFCanvas._hide_pointer
+
+    def _apply_cursor(self):
+        """Hide/restore the pointer around a stroke (PDF-canvas parity).
+
+        Set on the INK OVERLAY as well as on the sheet: a drawing tool makes
+        the overlay the event target, so its cursor is the one on screen and
+        setting only the parent's changes nothing."""
+        cur = (Gdk.Cursor.new_from_name("none", None)
+               if self._hide_pointer() else None)
+        self.set_cursor(cur)
+        self.ink.set_cursor(cur)
+    _lead_in_points = PDFCanvas._lead_in_points
+    _record_hover = PDFCanvas._record_hover
+    _note_sample = PDFCanvas._note_sample
+    # staticmethod(): reading PDFCanvas._now_ms in a class body unwraps the
+    # descriptor into a plain function, which would then be handed self
+    _now_ms = staticmethod(PDFCanvas._now_ms)
+    PREDICT_WINDOW = PDFCanvas.PREDICT_WINDOW
+
+    # the sheet draws in overlay coordinates, so its "screen" already IS its
+    # document space — the conversion the PDF canvas needs is the identity here
+    @staticmethod
+    def _screen_to_doc(x, y):
+        return (x, y)
+
+    @property
+    def min_pressure(self):
+        return self.get_min_pressure()
+
+    @property
+    def hover_lead(self):
+        return self.get_hover_lead()
+
+    @property
+    def predict_ms(self):
+        return self.get_predict_ms()
+
+    def _flat_tool(self):
+        return self.tool == "highlighter"
+
+    def _finish_stroke(self, pts, was_straight):
+        """The sheet's adapter onto the shared pipeline — same decision, read
+        from the sheet's own settings (which live on the session, not here)."""
+        return finish_ink_stroke(
+            pts, self._stroke_pressure(pts), self.get_smoothing(),
+            was_straight=was_straight, flat=self._flat_tool(),
+            min_pressure=self.min_pressure)
+
+    def _commit_stroke(self, pts_overlay, profile=None):
         if len(pts_overlay) < 2:
             return
         buf_pts = [self._overlay_to_buffer(x, y) for x, y in pts_overlay]
@@ -10278,6 +11297,10 @@ class TextPageView(Gtk.Overlay):
             "opacity": opacity,
             "font_px": self.font_px,
         }
+        if profile:
+            # unitless width factors, so they survive the font_px rescale that
+            # every other stored number on this sheet has to go through
+            stroke["press"] = profile
         self.strokes.append(stroke)
         self._undo_ops.append(("add", [stroke]))
         self._redo_ops.clear()
@@ -11006,16 +12029,10 @@ class TextPageView(Gtk.Overlay):
         ctx.set_line_cap(cairo.LINE_CAP_ROUND)
         ctx.set_line_join(cairo.LINE_JOIN_ROUND)
         for st in self._selected:
-            pts = self._stroke_overlay_pts(st)
-            if len(pts) < 2:
-                continue
             ctx.set_source_rgba(*st["color"], st["opacity"])
-            ctx.set_line_width(st["width"] * self.font_px
-                               / max(st["font_px"], 1))
-            ctx.move_to(*pts[0])
-            for p in pts[1:]:
-                ctx.line_to(*p)
-            ctx.stroke()
+            draw_ink_stroke(ctx, self._stroke_overlay_pts(st),
+                            st["width"] * self.font_px / max(st["font_px"], 1),
+                            st.get("press"))
         surf.flush()
         buf = io.BytesIO()
         surf.write_to_png(buf)
@@ -11279,28 +12296,19 @@ class TextPageView(Gtk.Overlay):
         # top of the TextView, so anything drawn here would cover the words.
         for st in self.strokes:
             pts = drag.get(id(st)) or self._stroke_overlay_pts(st)
-            if len(pts) < 2:
-                continue
             f = self.font_px / max(st["font_px"], 1)
             if id(st) in drag:
                 f *= wf   # width scales live with the resize drag
             ctx.set_source_rgba(*st["color"], st["opacity"])
-            ctx.set_line_width(st["width"] * f)
-            ctx.move_to(*pts[0])
-            for p in pts[1:]:
-                ctx.line_to(*p)
-            ctx.stroke()
+            draw_ink_stroke(ctx, pts, st["width"] * f, st.get("press"))
         if len(self.current_stroke) >= 2:
             color, width, opacity = self.pen_style(self.tool == "highlighter")
             ctx.set_source_rgba(*color, opacity)
             # * zoom: the pen is a DOCUMENT width (PDF-canvas parity), so it
             # draws thicker as you zoom in — and the live stroke matches what
             # _commit_stroke will store, so nothing jumps on release
-            ctx.set_line_width(width * self.zoom)
-            ctx.move_to(*self.current_stroke[0])
-            for p in self.current_stroke[1:]:
-                ctx.line_to(*p)
-            ctx.stroke()
+            live_pts, live_prof = self._live_stroke()
+            draw_ink_stroke(ctx, live_pts, width * self.zoom, live_prof)
         if self._snap_label:
             draw_snap_label(ctx, self._snap_at[0], self._snap_at[1],
                             self._snap_label, self.accent())
@@ -11321,17 +12329,8 @@ class TextPageView(Gtk.Overlay):
                 # a translucent glow wider than the stroke, so its real
                 # colour still shows through the centre
                 ctx.set_source_rgba(ar, ag, ab, 0.35)
-                ctx.set_line_width(st["width"] * f + 7.0)
-                if len(pts) < 2:
-                    if pts:
-                        ctx.arc(pts[0][0], pts[0][1],
-                                st["width"] * f / 2 + 3.5, 0, 2 * math.pi)
-                        ctx.fill()
-                    continue
-                ctx.move_to(*pts[0])
-                for p in pts[1:]:
-                    ctx.line_to(*p)
-                ctx.stroke()
+                draw_ink_stroke(ctx, pts, st["width"] * f, st.get("press"),
+                                grow=7.0)
         # Dashed box + handles around the WHOLE selection. This must come from
         # _selection_bbox() — the same box _lasso_handle_at and
         # _point_in_selection use — or the frame drifts from what a grab
@@ -11436,7 +12435,7 @@ class TextPageView(Gtk.Overlay):
             it = buf.get_iter_at_mark(st["mark"])
             line = it.get_line()
             src = src_lines[line] if line < len(src_lines) else ""
-            out.append({
+            rec = {
                 "line": line,
                 "ch": it.get_line_offset(),
                 "hash": self._line_hash(src),
@@ -11445,7 +12444,12 @@ class TextPageView(Gtk.Overlay):
                 "width": st["width"],
                 "opacity": st["opacity"],
                 "font_px": st["font_px"],
-            })
+            }
+            if st.get("press"):
+                # the width profile is unitless, so unlike every other number
+                # here it needs no font_px rescale on the way back in
+                rec["press"] = [round(p, 2) for p in st["press"]]
+            out.append(rec)
         images = []
         for im in self.images:
             it = buf.get_iter_at_mark(im["mark"])
@@ -11506,14 +12510,21 @@ class TextPageView(Gtk.Overlay):
         src_lines = self.view.get_source_text().split("\n")
         hashes = [self._line_hash(t) for t in src_lines]
         for rec in data.get("strokes", []):
-            self.strokes.append({
+            st = {
                 "mark": self._anchor_from_record(rec, hashes),
                 "pts": [(p[0], p[1]) for p in rec.get("pts", [])],
                 "color": tuple(rec.get("color", (0.05, 0.05, 0.8)))[:3],
                 "width": float(rec.get("width", 2.0)),
                 "opacity": float(rec.get("opacity", 1.0)),
                 "font_px": float(rec.get("font_px", 13)),
-            })
+            }
+            press = rec.get("press")
+            if press and len(press) == len(st["pts"]):
+                # length is the guard again: a profile that no longer matches
+                # its points would shift every width along the stroke, so a
+                # hand-edited or truncated sidecar loses the taper, not the ink
+                st["press"] = [float(p) for p in press]
+            self.strokes.append(st)
         for rec in data.get("images", []):
             try:
                 png = base64.b64decode(rec.get("png", ""))
@@ -11896,6 +12907,31 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         _menu_item("New text page",
                    lambda: (menu_pop.popdown(), self._on_new_text_page()),
                    "A blank Markdown page you can write and draw on (Ctrl+Alt+N)")
+
+        # What "New" makes. It sits here rather than in a settings dialog
+        # because it only ever means anything at the moment a page is created —
+        # the ruling is baked into that page and cannot be changed afterwards.
+        bg_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        bg_row.set_margin_start(8)
+        bg_row.set_margin_end(8)
+        bg_row.set_margin_top(2)
+        bg_row.set_margin_bottom(2)
+        bg_label = Gtk.Label(label="Ruling", xalign=0)
+        bg_label.add_css_class("dim-label")
+        bg_row.append(bg_label)
+        self._bg_dropdown = Gtk.DropDown.new_from_strings(
+            ["Plain", "Lines", "Squares", "Dots"])
+        saved = _load_settings().get("page_background", "plain")
+        self._bg_dropdown.set_selected(
+            PAGE_BACKGROUNDS.index(saved) if saved in PAGE_BACKGROUNDS else 0)
+        self._bg_dropdown.set_hexpand(True)
+        self._bg_dropdown.set_tooltip_text(
+            "Ruling drawn on new blank pages, to write straighter. It becomes "
+            "part of the page, so it prints and exports — and is fixed once "
+            "the page is made.")
+        self._bg_dropdown.connect("notify::selected", self._on_page_bg_changed)
+        bg_row.append(self._bg_dropdown)
+        menu_box.append(bg_row)
         _menu_item("Save", lambda: (menu_pop.popdown(), self._on_save()),
                    "Save the document and its notes (Ctrl+S)")
         # PDF-only actions — hidden while a text-first page is active
@@ -12331,6 +13367,53 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "How much freehand strokes are smoothed when you lift the pen")
         self._smooth_scale.connect("value-changed", self._on_smoothing_changed)
         popover_box.append(self._smooth_scale)
+
+        smear_label = Gtk.Label(label="Smear trim", xalign=0)
+        smear_label.add_css_class("dim-label")
+        smear_label.set_margin_top(6)
+        popover_box.append(smear_label)
+
+        self._smear_scale = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0, 50, 5)
+        self._smear_scale.set_value(self.canvas.min_pressure * 100)
+        self._smear_scale.set_draw_value(True)
+        self._smear_scale.set_size_request(200, -1)
+        self._smear_scale.set_tooltip_text(
+            "Cut the light smear a pen leaves as it lifts, so letters end "
+            "cleanly instead of trailing into the next one. Only the END of a "
+            "stroke is trimmed — the start is already clipped by the screen "
+            "itself, and trimming that too would lose real ink.")
+        self._smear_scale.connect("value-changed", self._on_smear_changed)
+        popover_box.append(self._smear_scale)
+
+        # ── latency prototypes (row 139) ──────────────────────────────────
+        # Both are here to be FELT and judged, not configured: they change how
+        # the pen behaves under the hand, which no amount of measuring settles.
+        lag_label = Gtk.Label(label="Predict ahead", xalign=0)
+        lag_label.add_css_class("dim-label")
+        lag_label.set_margin_top(6)
+        popover_box.append(lag_label)
+
+        self._predict_scale = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0, PREDICT_MAX_MS, 5)
+        self._predict_scale.set_value(self.canvas.predict_ms)
+        self._predict_scale.set_draw_value(True)
+        self._predict_scale.set_size_request(200, -1)
+        self._predict_scale.set_tooltip_text(
+            "Draw the live stroke this many milliseconds ahead of the pen, "
+            "guessing from its recent speed. Hides some of the hardware's lag; "
+            "too much overshoots on sharp turns. Never affects the saved ink.")
+        self._predict_scale.connect("value-changed", self._on_predict_changed)
+        popover_box.append(self._predict_scale)
+
+        self._hover_lead_check = Gtk.CheckButton(label="Lead-in from hover")
+        self._hover_lead_check.set_active(self.canvas.hover_lead)
+        self._hover_lead_check.set_tooltip_text(
+            "Recover the start of a stroke from where the pen was hovering "
+            "just before it touched down, which the screen tracks anyway. "
+            "These are real positions, not a guess.")
+        self._hover_lead_check.connect("toggled", self._on_hover_lead_toggled)
+        popover_box.append(self._hover_lead_check)
 
         shape_label = Gtk.Label(label="Shape snap", xalign=0)
         shape_label.add_css_class("dim-label")
@@ -12852,6 +13935,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             else (s.canvas.pen_color, s.canvas.pen_width, 1.0))
         tp.get_smoothing = lambda s=s: s.canvas.smoothing
         tp.get_shape_snap = lambda s=s: s.canvas.shape_snap
+        tp.get_min_pressure = lambda s=s: s.canvas.min_pressure
+        tp.get_hover_lead = lambda s=s: s.canvas.hover_lead
+        tp.get_predict_ms = lambda s=s: s.canvas.predict_ms
         tp.accent = lambda s=s: s.canvas.zoom_accent
         # Ctrl+scroll / Ctrl+= on the sheet zooms the whole paper (text, ink
         # and margins together), not the persistent notes-font setting
@@ -13531,6 +14617,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("notes", op[1] + 1) + op[2:] if op[0] == "notes" and op[1] >= idx else op
             for op in self._redo_timeline
         ]
+        self._drop_link_timeline_ops()
         self.canvas.add_blank_page()
         self._populate_toc()
         self._mark_dirty()
@@ -13555,6 +14642,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             for op in self._redo_timeline
             if not (op[0] == "notes" and op[1] == idx)
         ]
+        self._drop_link_timeline_ops()
         self.canvas.delete_current_page()
         self._populate_toc()
         self._mark_dirty()
@@ -13598,6 +14686,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("notes", old_to_new[op[1]]) + op[2:] if op[0] == "notes" else op
             for op in self._redo_timeline
         ]
+        self._drop_link_timeline_ops()
         apply_to_canvas()
         self._populate_toc()
         self._mark_dirty()
@@ -14118,9 +15207,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if not self._can_link_notes() or idx <= 0:
             return
         self._commit_note()
+        before = self.notes_model.snapshot()
         linked = self.notes_model.link_forward(idx, self.canvas.n_pages)
         if not linked:
             return
+        self._push_links_undo(before)
         self._restore_note()
         self._populate_toc()      # the page strip carries the run marker too
         self._mark_dirty()
@@ -14140,8 +15231,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if not self.notes_model.is_linked(idx):
             return
         self._commit_note()
+        before = self.notes_model.snapshot()
         start = self.notes_model.run_start(idx)
         freed = self.notes_model.unlink_forward(idx)
+        self._push_links_undo(before)
         self._restore_note()
         self._populate_toc()
         self._mark_dirty()
@@ -14160,10 +15253,43 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         the run — and they are re-linked in order, because a later page can
         only continue one already back in the run."""
         self._commit_note()
+        before = self.notes_model.snapshot()
         for idx in sorted(pages):
             self.notes_model.link(idx)
+        self._push_links_undo(before)
         self._restore_note()
         self._populate_toc()
+        self._mark_dirty()
+
+    def _drop_link_timeline_ops(self):
+        """Forget recorded link changes when the document is RE-PAGED.
+
+        A link op carries a snapshot of the whole model, keyed by page index;
+        after an insert, a delete or a reorder those keys describe pages that
+        have moved, so replaying one would put notes back on the wrong slides.
+        Dropping it costs one undo step and is the same "degrade to unlinked
+        rather than guess" rule the model's re-keying follows (row 129)."""
+        self._undo_timeline = [op for op in self._undo_timeline
+                               if op[0] != "links"]
+        self._redo_timeline = [op for op in self._redo_timeline
+                               if op[0] != "links"]
+
+    def _push_links_undo(self, before):
+        """Record a link change on the shared timeline, so Ctrl+Z reaches it in
+        the same chronological order as a stroke or a typing burst. The toast's
+        own Undo button stays — it is the discoverable one — and both walk the
+        same path, because a second way to reverse the same act is how the two
+        come to disagree."""
+        self._undo_timeline.append(("links", before))
+        self._redo_timeline.clear()
+
+    def _apply_links_snapshot(self, snap):
+        """Put a whole notes model back and re-show the current page from it —
+        undo/redo of a link is one restore, not a page-by-page replay."""
+        self.notes_model.restore(snap)
+        self._restore_note()
+        self._populate_toc()
+        self._update_notes_link_ui()
         self._mark_dirty()
 
     def _on_notes_link_toggled(self, check):
@@ -14339,6 +15465,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 self._text_page.undo_ink()
             self._redo_timeline.append(("ink",))
             return
+        if op[0] == "links":
+            self._redo_timeline.append(("links", self.notes_model.snapshot()))
+            self._apply_links_snapshot(op[1])
+            return
         _, page, before = op
         if page != self.canvas.current_page_idx:
             self._go_to_page(page)
@@ -14359,6 +15489,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             if self._text_page is not None:
                 self._text_page.redo_ink()
             self._undo_timeline.append(("ink",))
+            return
+        if op[0] == "links":
+            self._undo_timeline.append(("links", self.notes_model.snapshot()))
+            self._apply_links_snapshot(op[1])
             return
         _, page, before, after = op
         self._set_notes_text(page, after)
@@ -14985,6 +16119,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             if op[0] == "notes" and op[1] >= at else op
             for op in self._redo_timeline
         ]
+        self._drop_link_timeline_ops()
         return self.canvas.insert_pdf_pages(at, path)
 
     # ── merge import: several documents → one, a chapter each (row 123) ───────
@@ -16320,6 +17455,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _on_smoothing_changed(self, scale):
         self.canvas.smoothing = scale.get_value() / 100.0
 
+    def _on_page_bg_changed(self, dd, _param=None):
+        _save_setting("page_background", PAGE_BACKGROUNDS[dd.get_selected()])
+
+    def _on_smear_changed(self, scale):
+        self.canvas.min_pressure = scale.get_value() / 100.0
+
+    def _on_predict_changed(self, scale):
+        self.canvas.predict_ms = scale.get_value()
+
+    def _on_hover_lead_toggled(self, check):
+        self.canvas.hover_lead = check.get_active()
+
     def _on_shape_snap_changed(self, dd, _param=None):
         self.canvas.shape_snap = ("off", "lines", "shapes")[dd.get_selected()]
 
@@ -16702,12 +17849,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._new_tab()
         self._create_blank()
 
-    def _create_blank(self):
-        """Open a blank A4 page — user will be prompted for a name on first save."""
+    def _create_blank(self, background=None):
+        """Open a blank A4 page — user will be prompted for a name on first save.
+
+        The ruling is baked into the page here and never again, so a page's
+        background is decided once, when it is made (see draw_page_background)."""
         fd, tmp = tempfile.mkstemp(suffix=".pdf", prefix="sidemark_blank_")
         os.close(fd)
         surf = cairo.PDFSurface(tmp, 595, 842)
-        cairo.Context(surf).show_page()
+        ctx = cairo.Context(surf)
+        if background is None:
+            background = _load_settings().get("page_background", "plain")
+        draw_page_background(ctx, 595, 842, background)
+        ctx.show_page()
         surf.finish()
         self._do_open_file(tmp)
         self._path = tmp           # track temp file so canvas.save() works
@@ -16922,15 +18076,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ctx.set_line_cap(cairo.LINE_CAP_ROUND)
             ctx.set_line_join(cairo.LINE_JOIN_ROUND)
             for pts, st in strokes:
-                if len(pts) < 2:
-                    continue
                 f = tp.font_px / max(st["font_px"], 1)
                 ctx.set_source_rgba(*st["color"], st["opacity"])
-                ctx.set_line_width(st["width"] * f)
-                ctx.move_to(*pts[0])
-                for p in pts[1:]:
-                    ctx.line_to(*p)
-                ctx.stroke()
+                draw_ink_stroke(ctx, pts, st["width"] * f, st.get("press"))
             ctx.restore()
             ctx.show_page()
         surf.finish()
