@@ -205,6 +205,7 @@ Renders automatically on lines where the cursor isn't; move the cursor to a line
 | `\infty` `\approx` `\neq` `\leq` `\geq` | ∞ ≈ ≠ ≤ ≥ |
 | `\in` `\notin` `\subset` `\cup` `\cap` `\emptyset` | ∈ ∉ ⊂ ∪ ∩ ∅ |
 | `\forall` `\exists` `\partial` `\nabla` `\to` | ∀ ∃ ∂ ∇ → |
+| `\R` `\N` `\Q` `\Z` `\C` | number sets ℝ ℕ ℚ ℤ ℂ (also spelled `\realnum`, `\natnum`, `\ratnum`, `\intnum`, `\compnum`) |
 | `\hat{x}` `\bar{x}` `\tilde{x}` `\vec{x}` | accents x̂ x̄ x̃ x⃗ (also `\dot` / `\ddot`; braces optional: `\hat x`) |
 
 Inside an inline `` `code` `` span nothing above is applied — the text renders verbatim (so `` `snake_case` ``, `` `2^10` `` or `` `\alpha` `` stay literal), matching how a Markdown viewer treats code.
@@ -240,6 +241,7 @@ plain `[[…]]` text, so links round-trip through Obsidian.
 | Key | Action |
 |-----|--------|
 | `Ctrl+O` | Open file (in a new tab) |
+| `Ctrl+Shift+O` | Open recent |
 | `Ctrl+N` | New blank PDF (in a new tab) |
 | `Ctrl+Alt+N` | New text page — endless Markdown paper you can draw on |
 | Drawing on a text page | The pen, highlighter, eraser, lasso, pan and zoom tools all work on the paper exactly as they do on a PDF, and every mouse button is rebindable the same way — switching modes needs no relearning |

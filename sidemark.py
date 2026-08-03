@@ -788,7 +788,7 @@ def draw_page_background(ctx, width, height, kind, spacing=PAGE_BG_SPACING):
     """Rule a blank page. `ctx` is a cairo context in PDF units.
 
     THE one painter for this, so a page made from the menu, from `--new` and
-    from a future "insert blank page" can never come out ruled differently."""
+    from "add blank page" can never come out ruled differently."""
     if kind not in PAGE_BACKGROUNDS or kind == "plain" or spacing <= 0:
         return
     x0, y0 = PAGE_BG_MARGIN, PAGE_BG_MARGIN
@@ -823,6 +823,25 @@ def draw_page_background(ctx, width, height, kind, spacing=PAGE_BG_SPACING):
                 x += spacing
         ctx.stroke()
     ctx.restore()
+
+
+def blank_pdf_file(width=595.0, height=842.0, kind=None):
+    """A one-page PDF of the given size, ruled per `kind`, in a temp file.
+
+    Every blank page in the app comes from here — the menu's New, `--new`, row
+    130's edge pull and "add blank page" mid-document — so a page added to a
+    document is ruled exactly like the one the document started with. `kind`
+    defaults to the saved Ruling setting."""
+    if kind is None:
+        kind = _load_settings().get("page_background", "plain")
+    fd, tmp = tempfile.mkstemp(suffix=".pdf", prefix="sidemark_blank_")
+    os.close(fd)
+    surf = cairo.PDFSurface(tmp, width, height)
+    ctx = cairo.Context(surf)
+    draw_page_background(ctx, width, height, kind)
+    ctx.show_page()
+    surf.finish()
+    return tmp
 
 
 def trim_light_tail(pts, press, min_pressure):
@@ -6583,11 +6602,25 @@ class PDFCanvas(Gtk.DrawingArea):
         # out of the live document so the canvas doesn't paint it twice
         self._detach_image_layer()
 
-    def add_blank_page(self):
-        """Insert a blank page with the same dimensions as the current page, after it."""
+    def add_blank_page(self, background=None):
+        """Insert a blank page with the same dimensions as the current page, after it.
+
+        It carries the same ruling as a page made by New (the saved setting), so
+        a document you started on squared paper stays squared as it grows. The
+        ruling is page CONTENT, so it has to be drawn by cairo and merged in —
+        `insert_page` alone can only make an empty one."""
         idx = self.current_page_idx + 1
         pw, ph = self.page_width, self.page_height
-        self.document.insert_page(idx, width=pw, height=ph)
+        src = blank_pdf_file(pw, ph, background)
+        try:
+            with fitz.open(src) as blank:
+                self.document.insert_pdf(blank, from_page=0, to_page=0,
+                                         start_at=idx)
+        finally:
+            try:
+                os.unlink(src)
+            except OSError:
+                pass
         # Shift all stroke, image and anchor entries at or beyond the insertion
         # point up by one
         self.all_strokes = {
@@ -7808,6 +7841,16 @@ _MD_SYMBOLS = {
     r'\cup': '∪', r'\cap': '∩', r'\emptyset': '∅',
     r'\forall': '∀', r'\exists': '∃',
     r'\partial': '∂', r'\nabla': '∇',
+    # Number sets, double-struck. Both spellings of each: the single letter is
+    # what you reach for mid-sentence, the long name is what you can still find
+    # when `\R` has slipped your mind. They are the only single-LETTER commands
+    # in the table, and they are safe because the command runs to the first
+    # non-letter: `\Real` is not `\R` followed by "eal".
+    r'\R': 'ℝ', r'\realnum': 'ℝ',
+    r'\N': 'ℕ', r'\natnum': 'ℕ',
+    r'\Q': 'ℚ', r'\ratnum': 'ℚ',
+    r'\Z': 'ℤ', r'\intnum': 'ℤ',
+    r'\C': 'ℂ', r'\compnum': 'ℂ',
 }
 # A space before a LETTER is a TERMINATOR, not a gap: you have to write
 # `\alpha x` because `\alphax` is a different command, so rendering it puts a
@@ -13212,6 +13255,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         menu_pop = Gtk.Popover()
         menu_btn.set_popover(menu_pop)
+        self._menu_btn = menu_btn
         self._menu_pop = menu_pop
         self._menu_stack = Gtk.Stack()
         self._menu_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
@@ -13255,7 +13299,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                    "Open a PDF, PowerPoint, or text/Markdown file (Ctrl+O)")
         self._recent_menu_item = _menu_item(
             "Open recent", lambda: self._show_menu_page("recent"),
-            "Reopen a recently used file")
+            "Reopen a recently used file (Ctrl+Shift+O)")
         _menu_item("New", lambda: (menu_pop.popdown(), self._on_new_pdf(None)),
                    "Start a new blank document (Ctrl+N)")
         _menu_item("New text page",
@@ -13280,9 +13324,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             PAGE_BACKGROUNDS.index(saved) if saved in PAGE_BACKGROUNDS else 0)
         self._bg_dropdown.set_hexpand(True)
         self._bg_dropdown.set_tooltip_text(
-            "Ruling drawn on new blank pages, to write straighter. It becomes "
-            "part of the page, so it prints and exports — and is fixed once "
-            "the page is made.")
+            "Ruling drawn on blank pages — a new document, and every page you "
+            "add to one. It becomes part of the page, so it prints and "
+            "exports, and is fixed once that page is made.")
         self._bg_dropdown.connect("notify::selected", self._on_page_bg_changed)
         bg_row.append(self._bg_dropdown)
         menu_box.append(bg_row)
@@ -14681,6 +14725,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Escape",        "Step back out of the last zoom-to-region"),
             ("File",          None),
             ("Ctrl+O",        "Open file…"),
+            ("Ctrl+Shift+O",  "Open recent…"),
             ("Ctrl+N",        "New blank PDF"),
             ("Ctrl+Alt+N",    "New text page (write and draw on endless paper)"),
             ("Text page",     None),
@@ -14969,6 +15014,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             else "Add bookmark")
         self._bookmark_menu_toggle.set_sensitive(self._can_bookmark())
         self._refresh_bookmark_lists()
+
+    def _show_recent_files(self):
+        """Ctrl+Shift+O — the recent list, without going via the ☰ button.
+
+        The menu resets itself to the main page on "show", so the popup has to
+        come FIRST and the page be chosen after it; doing it the other way round
+        lands you on the main menu."""
+        self._menu_btn.popup()
+        self._show_menu_page("recent")
 
     def _show_menu_page(self, name):
         """Switch the ☰ menu to a sub-page in place (recent / shortcuts) — keeps
@@ -18570,16 +18624,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         The ruling is baked into the page here and never again, so a page's
         background is decided once, when it is made (see draw_page_background)."""
-        fd, tmp = tempfile.mkstemp(suffix=".pdf", prefix="sidemark_blank_")
-        os.close(fd)
-        surf = cairo.PDFSurface(tmp, 595, 842)
-        ctx = cairo.Context(surf)
-        if background is None:
-            background = _load_settings().get("page_background", "plain")
-        draw_page_background(ctx, 595, 842, background)
-        ctx.show_page()
-        surf.finish()
-        return tmp
+        return blank_pdf_file(595, 842, background)
 
     def _create_blank(self, background=None):
         """Open a blank A4 page — user will be prompted for a name on first save."""
@@ -19481,6 +19526,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 return True
             if keyval == Gdk.KEY_s:
                 self._on_save()
+                return True
+            if keyval == Gdk.KEY_O and (state & Gdk.ModifierType.SHIFT_MASK):
+                self._show_recent_files()
                 return True
             if keyval == Gdk.KEY_o:
                 self._on_open(None)

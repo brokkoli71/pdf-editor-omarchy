@@ -269,12 +269,17 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     is no redundancy, so anything it removes is shape, not noise. (Writing
     physically bigger helps; zooming in does not — the digitiser samples in
     physical space, so letter and spacing shrink together.)
-- **Page backgrounds (row 139)** — `draw_page_background` rules a blank page
-  (plain/lines/squares/dots) into the page CONTENT at creation: a background
-  you write on is one you hand in, so it must print and export. *ceiling: fixed
-  at creation — re-ruling later needs the row 118 optional-content machinery to
-  know which pages are ours, and you can just make the page again.* PDF-only so
-  far (the text sheet was offered and declined).
+- **Page backgrounds (rows 139 + 140)** — `draw_page_background` rules a blank
+  page (plain/lines/squares/dots) into the page CONTENT at creation: a
+  background you write on is one you hand in, so it must print and export.
+  `blank_pdf_file()` is THE blank page — New, `--new`, row 130's edge pull and
+  `add_blank_page` all come from it, so a document does not go plain at page 2.
+  Note `insert_page` cannot do this at all (it makes an *empty* page and the
+  ruling is content), which is why an added page is built by cairo at the
+  current page's size and merged with `insert_pdf`. *ceiling: fixed at creation
+  — re-ruling later needs the row 118 optional-content machinery to know which
+  pages are ours, and you can just make the page again.* PDF-only so far (the
+  text sheet was offered and declined).
 - **The divider is the way BETWEEN the modes (row 130)** — drag the notes
   panel to full width and the notes become the sheet; pull in from the sheet's
   LEFT edge and a page comes in beside it. It is a **VIEW state, never a

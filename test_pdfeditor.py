@@ -2994,6 +2994,26 @@ class TestPageInsertDelete(unittest.TestCase):
     def _stroke(tag):
         return {"pts": [(tag, tag), (tag + 1, tag + 1)], "color": (0, 0, 1), "width": 2}
 
+    def test_added_page_carries_the_ruling(self):
+        """A document does not stop being squared paper at page 1. The added
+        page is ruled like one made by New, at the CURRENT page's size."""
+        canvas = self._canvas_with_pdf()
+        canvas.go_to_page(0)
+        pw, ph = canvas.page_width, canvas.page_height
+        canvas.add_blank_page(background="squares")
+        page = canvas.document[1]
+        items = sum(len(d.get("items", [])) for d in page.get_drawings())
+        self.assertGreater(items, 10, "the added page came out unruled")
+        self.assertAlmostEqual(page.rect.width, pw, places=1)
+        self.assertAlmostEqual(page.rect.height, ph, places=1)
+
+    def test_added_page_is_blank_when_ruling_is_plain(self):
+        canvas = self._canvas_with_pdf()
+        canvas.go_to_page(0)
+        canvas.add_blank_page(background="plain")
+        self.assertEqual(canvas.document[1].get_drawings(), [])
+        self.assertEqual(canvas.n_pages, 4)
+
     def test_insert_shifts_strokes_and_anchors(self):
         canvas = self._canvas_with_pdf()
         canvas.all_strokes = {0: [self._stroke(0)], 1: [self._stroke(1)], 2: [self._stroke(2)]}
@@ -3627,6 +3647,25 @@ class TestLatexFormatting(unittest.TestCase):
     def test_symbol_sub_unknown_unchanged(self):
         v = self._view()
         self.assertEqual(v._apply_symbol_subs(r'\frac'), r'\frac')
+
+    def test_number_sets_have_a_short_and_a_long_name(self):
+        v = self._view()
+        for short, long, glyph in ((r'\R', r'\realnum', 'ℝ'),
+                                   (r'\N', r'\natnum', 'ℕ'),
+                                   (r'\Q', r'\ratnum', 'ℚ'),
+                                   (r'\Z', r'\intnum', 'ℤ'),
+                                   (r'\C', r'\compnum', 'ℂ')):
+            with self.subTest(glyph=glyph):
+                self.assertEqual(v._apply_symbol_subs(short), glyph)
+                self.assertEqual(v._apply_symbol_subs(long), glyph)
+
+    def test_a_single_letter_command_still_ends_at_a_non_letter(self):
+        """`\\R` must not eat into a longer word: a command runs to the first
+        non-letter, so `\\Real` is unknown rather than "ℝeal"."""
+        v = self._view()
+        self.assertEqual(v._apply_symbol_subs(r'\Real'), r'\Real')
+        # a space before a backslash was never forced on you, so it survives
+        self.assertEqual(v._apply_symbol_subs(r'f: \R \to \R'), 'f: ℝ → ℝ')
 
     def test_symbol_sub_no_backslash_unchanged(self):
         v = self._view()
@@ -10143,6 +10182,38 @@ class TestRecentFiles(unittest.TestCase):
                     child = child.get_next_sibling()
                 if len(rows) != 1:
                     raise AssertionError(f"expected 1 recent row, got {len(rows)}")
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_ctrl_shift_o_lands_on_the_recent_page(self):
+        """The shortcut has to open the menu AND leave it on the recent list —
+        the menu resets to "main" on show, so the order of the two matters."""
+        errors = []
+        pdf = os.path.join(self._tmp.name, "shortcut.pdf")
+        make_pdf(pdf)
+        app = Adw.Application(application_id="test.sidemark.recentkey")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                win._do_open_file(pdf)
+                win._show_recent_files()
+                if win._menu_stack.get_visible_child_name() != "recent":
+                    raise AssertionError("shortcut did not land on the recent page")
+                # Ctrl+Shift+O must reach it; plain Ctrl+O is still the file chooser
+                handled = win._on_key(
+                    None, Gdk.KEY_O, 0,
+                    Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)
+                if not handled:
+                    raise AssertionError("Ctrl+Shift+O was not handled")
             except Exception as e:
                 errors.append(e)
             finally:
