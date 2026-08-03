@@ -11,6 +11,7 @@ import logging
 import atexit
 import traceback
 import hashlib
+import difflib
 import io
 import json
 import shutil
@@ -12755,6 +12756,24 @@ class TextPageView(Gtk.Overlay):
         it.forward_chars(min(int(rec.get("ch", 0)), it.get_chars_in_line()))
         return buf.create_mark(None, it, True)
 
+    @staticmethod
+    def line_map(old_lines, new_lines):
+        """old line index → new line index, from a block diff of the two texts.
+
+        Position, not content: it is the only thing that can tell two identical
+        blank lines apart, and blank lines are where most ink lives."""
+        sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+        out = {}
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                for k in range(i2 - i1):
+                    out[i1 + k] = j1 + k
+            elif tag == "replace" and j2 > j1:
+                # rewritten in place: keep it in the same block, clamped
+                for k in range(i1, i2):
+                    out[k] = min(j1 + (k - i1), j2 - 1)
+        return out
+
     def anchor_records(self):
         """Where each stroke and image is anchored, as the sidecar records it —
         line, column and the line's hash. Paired with `reanchor`, this carries
@@ -12771,19 +12790,29 @@ class TextPageView(Gtk.Overlay):
                     "hash": self._line_hash(src[line] if line < len(src) else "")}
         return [rec(o) for o in list(self.strokes) + list(self.images)]
 
-    def reanchor(self, records):
+    def reanchor(self, records, line_map=None):
         """Re-attach the existing objects after the buffer's text was replaced.
 
         `set_text` does not delete marks, it collapses them onto offset 0 — so
-        without this every drawing ends up in a heap at the top of the page."""
+        without this every drawing ends up in a heap at the top of the page.
+
+        `line_map` (old line → new line) is what makes this EXACT, and it is
+        not optional in practice: most ink sits on BLANK lines, which all hash
+        alike, so the sidecar's "nearest line with the same hash" rule can only
+        guess between them — and guessing per stroke tears one drawing apart
+        along a two-line shift. A caller that knows both texts (we replaced it,
+        so we do) can say precisely where each line went."""
         objs = list(self.strokes) + list(self.images)
         if len(records) != len(objs):
             return              # the caller and the sheet disagree: leave it
         buf = self.view.get_buffer()
-        hashes = [self._line_hash(t)
-                  for t in self.view.get_source_text().split("\n")]
+        src_lines = self.view.get_source_text().split("\n")
+        hashes = [self._line_hash(t) for t in src_lines]
         for obj, rec in zip(objs, records):
             old = obj["mark"]
+            mapped = (line_map or {}).get(rec.get("line"))
+            if mapped is not None and 0 <= mapped < len(src_lines):
+                rec = dict(rec, line=mapped, hash=hashes[mapped])
             obj["mark"] = self._anchor_from_record(rec, hashes)
             buf.delete_mark(old)
         self._images_changed()
@@ -15757,11 +15786,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if tp is not None and tp.view.get_buffer() is not buf:
             tp = None
         carry = tp.anchor_records() if tp is not None else None
+        old_lines = tp.view.get_source_text().split("\n") if carry else None
         buf.begin_irreversible_action()
         buf.set_text(text)
         buf.end_irreversible_action()
         if carry:
-            tp.reanchor(carry)
+            tp.reanchor(carry,
+                        TextPageView.line_map(old_lines, text.split("\n")))
 
     def _restore_note(self):
         self._suppress_dirty = True

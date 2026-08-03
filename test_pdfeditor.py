@@ -2456,6 +2456,84 @@ class TestSheetInkSurvivesModeSwitches(unittest.TestCase):
             raise AssertionError(errors[0])
 
 
+class TestSheetLineMap(unittest.TestCase):
+    """Most ink sits on BLANK lines, which all hash alike — so re-anchoring by
+    "nearest line with the same hash" can only guess between them, and guessing
+    per stroke tears one drawing apart along a shift."""
+
+    def test_blank_lines_are_told_apart_by_position(self):
+        from sidemark import TextPageView
+        old = ["intro", "", "", "", "end"]
+        new = ["<!-- page:0 -->", "", "intro", "", "", "", "end"]
+        m = TextPageView.line_map(old, new)
+        self.assertEqual(m[0], 2)                     # "intro"
+        self.assertEqual([m[i] for i in (1, 2, 3)], [3, 4, 5])
+        self.assertEqual(m[4], 6)                     # "end"
+
+    def test_a_deleted_line_simply_has_no_mapping(self):
+        from sidemark import TextPageView
+        m = TextPageView.line_map(["a", "gone", "b"], ["a", "b"])
+        self.assertEqual(m[0], 0)
+        self.assertEqual(m[2], 1)
+
+
+class TestSheetInkRidesTheTextShift(unittest.TestCase):
+    """The whole drawing must move as ONE — a per-stroke guess shears it."""
+
+    def test_strokes_on_blank_lines_move_together(self):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.inkshift")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    md = os.path.join(d, "note.md")
+                    with open(md, "w", encoding="utf-8") as f:
+                        # a drawing living in a run of blank lines, which is
+                        # exactly how a sketch on a text page is stored
+                        f.write("a heading\n\n\n\n\n\nthe end\n")
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(md)
+                    tp = win._active_session._text_page
+                    buf = tp.view.get_buffer()
+                    win._set_tool_mode("pen")
+                    # anchor three strokes by hand on three DIFFERENT blank
+                    # lines, the way one sketch spans several
+                    for line in (2, 3, 4):
+                        ok, it = buf.get_iter_at_line(line)
+                        tp.strokes.append({
+                            "mark": buf.create_mark(None, it, True),
+                            "pts": [(10.0, 0.0), (20.0, 5.0)],
+                            "color": (0, 0, 0), "width": 2.0,
+                            "opacity": 1.0, "font_px": tp.font_px,
+                        })
+                    before = [buf.get_iter_at_mark(st["mark"]).get_line()
+                              for st in tp.strokes]
+
+                    win._pull_page_in()          # text -> pdf
+                    win._enter_full_notes_view()  # -> back to the sheet
+
+                    after = [buf.get_iter_at_mark(st["mark"]).get_line()
+                             for st in tp.strokes]
+                    deltas = {b - a for a, b in zip(before, after)}
+                    self.assertEqual(len(deltas), 1, (before, after))
+                    # …and they are still between the same two paragraphs
+                    src = tp.view.get_source_text().split("\n")
+                    for line in after:
+                        self.assertEqual(src[line].strip(), "")
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+
+
 class TestEdgePullOnATextPage(unittest.TestCase):
     """The mirror on a text-first page: the document GAINS a blank page."""
 

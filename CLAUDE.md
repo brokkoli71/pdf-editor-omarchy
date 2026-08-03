@@ -319,12 +319,23 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     anchors each stroke and image to a `GtkTextMark`, and `set_text` deletes
     every mark in the buffer — so the drawings land in a heap at offset 0. The
     switch changes the text (a PDF's sheet has the page markers, a text page's
-    does not), so it cannot be avoided; `_set_buffer_text` carries the ink
-    across with the sidecar's own line+hash re-matching. It re-anchors the SAME
-    objects (`anchor_records`/`reanchor`) rather than reloading them:
-    `load_ink` rebuilds the dicts and clears the ink undo stack, so routing
-    this through it makes every Ctrl+Z after a page load do nothing. Every path
-    that replaces a notes buffer wholesale must go through `_set_buffer_text`.
+    does not), so it cannot be avoided; `_set_buffer_text` carries the anchors
+    across. Two things about how, both learned from real ink:
+    - It re-anchors the SAME objects (`anchor_records`/`reanchor`) rather than
+      reloading them: `load_ink` rebuilds the dicts and clears the ink undo
+      stack, so routing this through it makes every Ctrl+Z after a page load
+      do nothing.
+    - It passes a **`line_map`** (a `difflib` block diff of the two texts), and
+      that is not optional. Most ink sits on BLANK lines, which all hash alike,
+      so the sidecar's "nearest line with the same hash" rule can only guess
+      between them — and it guesses PER STROKE, so a two-line shift moved the
+      strokes of one drawing by different amounts and tore it apart. Measured
+      on 29 real strokes: 23 changed paragraph and the vertical shift ranged
+      over 161 px; with the map, one rigid translation and none changed.
+      (The hash rule stays as the fallback — it is what handles a file edited
+      outside Sidemark, where there is no old text to diff against.)
+    Every path that replaces a notes buffer wholesale must go through
+    `_set_buffer_text`.
 - **HTML comments are hidden by default** (`MarkdownNotesView.show_comments`,
   the ☰ switch, persisted as `show_comments`). Not a special case for ours: a
   Markdown viewer renders no comment, and Sidemark's own per-page bookkeeping
