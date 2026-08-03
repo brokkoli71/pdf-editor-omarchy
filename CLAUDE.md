@@ -310,6 +310,16 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   - The view is remembered per document in `recent.json` beside the reading
     position (`_recent_full_notes`), for the same reason: it is a view state
     about a document, and a sidecar must not appear because you looked at one.
+  - **Replacing the sheet's text destroys every ink anchor.** A text page
+    anchors each stroke and image to a `GtkTextMark`, and `set_text` deletes
+    every mark in the buffer — so the drawings land in a heap at offset 0. The
+    switch changes the text (a PDF's sheet has the page markers, a text page's
+    does not), so it cannot be avoided; `_set_buffer_text` carries the ink
+    across with the sidecar's own line+hash re-matching. It re-anchors the SAME
+    objects (`anchor_records`/`reanchor`) rather than reloading them:
+    `load_ink` rebuilds the dicts and clears the ink undo stack, so routing
+    this through it makes every Ctrl+Z after a page load do nothing. Every path
+    that replaces a notes buffer wholesale must go through `_set_buffer_text`.
 - **HTML comments are hidden by default** (`MarkdownNotesView.show_comments`,
   the ☰ switch, persisted as `show_comments`). Not a special case for ours: a
   Markdown viewer renders no comment, and Sidemark's own per-page bookkeeping

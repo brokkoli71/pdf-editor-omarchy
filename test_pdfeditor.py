@@ -2366,6 +2366,69 @@ class TestModeGestures(unittest.TestCase):
         self._run_in_window(2, body)
 
 
+class TestSheetInkSurvivesModeSwitches(unittest.TestCase):
+    """A text page anchors every stroke to a GtkTextMark, and `set_text`
+    deletes every mark in the buffer — so replacing the sheet's text on a mode
+    switch used to drop the whole drawing onto offset 0, in a heap at the top
+    of the page."""
+
+    MD = "# Title\n\nfirst paragraph line\n\nsecond paragraph line\n"
+
+    def test_ink_keeps_its_paragraph_across_text_pdf_text(self):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.sheetink")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    md = os.path.join(d, "note.md")
+                    with open(md, "w", encoding="utf-8") as f:
+                        f.write(self.MD)
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(md)
+                    tp = win._active_session._text_page
+                    win._set_tool_mode("pen")
+                    tp._commit_stroke([(300.0, 100.0 + i * 3) for i in range(5)])
+                    self.assertEqual(len(tp.strokes), 1)
+                    buf = tp.view.get_buffer()
+
+                    def anchor_line():
+                        it = buf.get_iter_at_mark(tp.strokes[0]["mark"])
+                        le = it.copy()
+                        if not le.ends_line():
+                            le.forward_to_line_end()
+                        ls = it.copy()
+                        ls.set_line_offset(0)
+                        return buf.get_text(ls, le, True)
+
+                    before = anchor_line()
+
+                    # text → pdf (the page comes in) → text (back to the sheet)
+                    win._pull_page_in()
+                    self.assertFalse(win._text_mode)
+                    win._enter_full_notes_view()
+                    self.assertTrue(win._text_mode)
+
+                    # the sheet's text is NOT the same text any more — it has
+                    # the page markers now — so the stroke has to find its
+                    # paragraph by content, not by offset
+                    self.assertEqual(len(tp.strokes), 1)
+                    self.assertEqual(anchor_line(), before)
+                    it = buf.get_iter_at_mark(tp.strokes[0]["mark"])
+                    self.assertGreater(it.get_line(), 0)   # not heaped at the top
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+
+
 class TestEdgePullOnATextPage(unittest.TestCase):
     """The mirror on a text-first page: the document GAINS a blank page."""
 

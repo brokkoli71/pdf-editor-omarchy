@@ -12755,6 +12755,39 @@ class TextPageView(Gtk.Overlay):
         it.forward_chars(min(int(rec.get("ch", 0)), it.get_chars_in_line()))
         return buf.create_mark(None, it, True)
 
+    def anchor_records(self):
+        """Where each stroke and image is anchored, as the sidecar records it —
+        line, column and the line's hash. Paired with `reanchor`, this carries
+        the SAME objects across a wholesale text replacement, which `load_ink`
+        cannot: rebuilding them makes new dicts, and the ink undo stack points
+        at the old ones."""
+        buf = self.view.get_buffer()
+        src = self.view.get_source_text().split("\n")
+
+        def rec(obj):
+            it = buf.get_iter_at_mark(obj["mark"])
+            line = it.get_line()
+            return {"line": line, "ch": it.get_line_offset(),
+                    "hash": self._line_hash(src[line] if line < len(src) else "")}
+        return [rec(o) for o in list(self.strokes) + list(self.images)]
+
+    def reanchor(self, records):
+        """Re-attach the existing objects after the buffer's text was replaced.
+
+        `set_text` does not delete marks, it collapses them onto offset 0 — so
+        without this every drawing ends up in a heap at the top of the page."""
+        objs = list(self.strokes) + list(self.images)
+        if len(records) != len(objs):
+            return              # the caller and the sheet disagree: leave it
+        buf = self.view.get_buffer()
+        hashes = [self._line_hash(t)
+                  for t in self.view.get_source_text().split("\n")]
+        for obj, rec in zip(objs, records):
+            old = obj["mark"]
+            obj["mark"] = self._anchor_from_record(rec, hashes)
+            buf.delete_mark(old)
+        self._images_changed()
+
     def load_ink(self, data):
         buf = self.view.get_buffer()
         for st in self.strokes:
@@ -15666,6 +15699,30 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         s.notes_model.set(s.canvas.current_page_idx, text)
 
+    def _set_buffer_text(self, buf, text):
+        """Replace a notes buffer's whole text, carrying the SHEET's ink across.
+
+        `set_text` deletes everything in the buffer, and a text page anchors
+        every stroke and image to a `GtkTextMark` inside it — so a plain
+        replacement collapses all of them onto offset 0 and the drawings land
+        in a heap at the top of the page. The way across is the sidecar's own
+        re-matching: strokes carry their line's hash, so they find their
+        paragraph again even though the text is not the same text (going from
+        a PDF's sheet and back adds the page markers).
+
+        The objects themselves are kept — only their anchors are recomputed —
+        because the ink undo stack points at those very dicts, and rebuilding
+        them would make every Ctrl+Z that follows a page load do nothing."""
+        tp = self._text_page if self._text_mode else None
+        if tp is not None and tp.view.get_buffer() is not buf:
+            tp = None
+        carry = tp.anchor_records() if tp is not None else None
+        buf.begin_irreversible_action()
+        buf.set_text(text)
+        buf.end_irreversible_action()
+        if carry:
+            tp.reanchor(carry)
+
     def _restore_note(self):
         self._suppress_dirty = True
         text = (self.notes_model.to_text() if self._full_notes_view()
@@ -15684,9 +15741,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._last_anchor_mark = None   # set_text would strand the mark at offset 0
         # Programmatic page loads must not enter the undo history — otherwise
         # Ctrl+Z in the notes view could resurrect another page's text here
-        buf.begin_irreversible_action()
-        buf.set_text(text)
-        buf.end_irreversible_action()
+        self._set_buffer_text(buf, text)
         self._notes_view.reset_render_state()
         self._suppress_dirty = False
         # a page switch ends any typing burst; future bursts diff against this text
@@ -15930,9 +15985,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         buf = self._notes_view.get_buffer()
         self._suppress_dirty = True
         self._last_anchor_mark = None
-        buf.begin_irreversible_action()
-        buf.set_text(text)
-        buf.end_irreversible_action()
+        self._set_buffer_text(buf, text)
         self._notes_view.reset_render_state()
         self._suppress_dirty = False
         self._notes_burst_open = False
