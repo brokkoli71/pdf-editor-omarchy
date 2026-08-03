@@ -3920,10 +3920,141 @@ class TestLatexFormatting(unittest.TestCase):
         self.assertFalse(v._line_originals)
         self.assertEqual(v.get_source_text(), 'brand new')
 
+    # ── row 141: only the caret's own expression falls back to source ────────
+
+    def test_click_beside_a_symbol_leaves_the_line_rendered(self):
+        """The complaint: the whole line used to un-render under the click, so
+        every symbol on it moved and the caret ended up beside the character
+        you aimed at."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('other\n' + r'\alpha and \beta here')
+        buf.place_cursor(buf.get_iter_at_line(0)[1])
+        v._rehighlight()
+        line = self._line_text(buf, 1)
+        # the space that terminated each command is eaten with it
+        self.assertEqual(line, 'αand βhere')
+        # click inside "here", which touches neither command
+        buf.place_cursor(buf.get_iter_at_line_offset(1, 8)[1])
+        v._rehighlight()
+        self.assertEqual(self._line_text(buf, 1), line)   # nothing moved
+        self.assertEqual(
+            buf.get_iter_at_mark(buf.get_insert()).get_line_offset(), 8)
+        self.assertEqual(v.get_source_text(),
+                         'other\n' + r'\alpha and \beta here')
+
+    def test_only_the_touched_expression_opens(self):
+        """Clicking a symbol shows its \\command — and only its own."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('other\n' + r'\alpha and \beta here')
+        buf.place_cursor(buf.get_iter_at_line(0)[1])
+        v._rehighlight()
+        # "αand βhere" — the β is at offset 5
+        buf.place_cursor(buf.get_iter_at_line_offset(1, 5)[1])
+        v._rehighlight()
+        self.assertEqual(self._line_text(buf, 1), r'αand \beta here')
+        self.assertEqual(
+            buf.get_iter_at_mark(buf.get_insert()).get_line_offset(), 5)
+        self.assertEqual(v.get_source_text(),
+                         'other\n' + r'\alpha and \beta here')
+
+    def test_leaving_a_line_renders_its_open_expression_again(self):
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('other\n' + r'\alpha and \beta here')
+        buf.place_cursor(buf.get_iter_at_line_offset(1, 0)[1])
+        v._rehighlight()
+        self.assertEqual(self._line_text(buf, 1), r'\alpha and βhere')
+        buf.place_cursor(buf.get_iter_at_line(0)[1])
+        v._rehighlight()
+        self.assertEqual(self._line_text(buf, 1), 'αand βhere')
+
+    def test_editing_a_rendered_symbol_edits_the_command(self):
+        """An edit CAN land on rendered text (a backspace at the start of the
+        open expression). It must be spliced onto the source, not freeze the
+        rest of the line's symbols as literal glyphs in the .md."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('other\n' + r'\alpha \beta x')
+        buf.place_cursor(buf.get_iter_at_line(0)[1])
+        v._rehighlight()
+        self.assertEqual(self._line_text(buf, 1), 'α βx')
+        # delete the rendered α — the whole \alpha goes with it, and \beta
+        # survives as a command rather than as a bare glyph
+        s = buf.get_iter_at_line_offset(1, 0)[1]
+        e = buf.get_iter_at_line_offset(1, 1)[1]
+        buf.delete(s, e)
+        self.assertEqual(v.get_source_text(), 'other\n' + r' \beta x')
+
+    def test_typing_a_command_renders_it_once_the_caret_moves_on(self):
+        """Typed character by character: the command stays source while it is
+        being written, and the glyph appears as soon as the caret is past it.
+        The line's source must survive every one of those re-renders."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('')
+        typed = ''
+        for ch in r'f: \R \to \R':
+            buf.insert_at_cursor(ch)
+            v._rehighlight()
+            typed += ch
+            self.assertEqual(v.get_source_text(), typed)
+        # the caret is still against the last command, so only that one is open
+        self.assertEqual(self._line_text(buf, 0), r'f: ℝ → \R')
+        self.assertEqual(v.get_source_text(), r'f: \R \to \R')
+        # walk left off it and it renders; the source never changes
+        for i in range(9, -1, -1):
+            buf.place_cursor(buf.get_iter_at_line_offset(
+                0, min(i, len(self._line_text(buf, 0))))[1])
+            v._rehighlight()
+            self.assertEqual(v.get_source_text(), r'f: \R \to \R')
+        # off every command now, so the line reads as maths…
+        self.assertEqual(self._line_text(buf, 0), 'f: ℝ → ℝ')
+        # …and clicking the first ℝ opens that one alone
+        buf.place_cursor(buf.get_iter_at_line_offset(0, 3)[1])
+        v._rehighlight()
+        self.assertEqual(self._line_text(buf, 0), r'f: \R → ℝ')
+
+    def test_a_selection_still_opens_the_whole_line(self):
+        """Two ends, two expressions — a selection that changed shape as it
+        grew would be worse than a line that settles once."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('other\n' + r'\alpha and \beta here')
+        buf.place_cursor(buf.get_iter_at_line(0)[1])
+        v._rehighlight()
+        buf.select_range(buf.get_iter_at_line_offset(1, 0)[1],
+                         buf.get_iter_at_line_offset(1, 7)[1])
+        v._rehighlight()
+        self.assertEqual(self._line_text(buf, 1), r'\alpha and \beta here')
+
+    def test_script_under_the_caret_shows_its_marker(self):
+        """The same rule for the tag-rendered constructs: only the script the
+        caret is inside shows its `^`/`_`."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('x^2 and y^3')
+        buf.place_cursor(buf.get_iter_at_line_offset(0, 2)[1])
+        v._rehighlight()
+        hide = v._t["hide"]
+        # the caret's own script keeps its marker visible…
+        self.assertFalse(buf.get_iter_at_line_offset(0, 1)[1].has_tag(hide))
+        # …the other one is still rendered
+        self.assertTrue(buf.get_iter_at_line_offset(0, 9)[1].has_tag(hide))
+
+    @staticmethod
+    def _line_text(buf, ln):
+        ls = buf.get_iter_at_line(ln)[1]
+        le = ls.copy()
+        if not le.ends_line():
+            le.forward_to_line_end()
+        return buf.get_text(ls, le, True)
+
     # ── row 128: re-rendering a line must not move the caret or the bound ─────
 
     def test_restoring_cursor_line_keeps_the_caret(self):
-        """Clicking onto a rendered line un-renders it (α → \\alpha), which
+        """Clicking ON a symbol un-renders that expression (α → \\alpha), which
         deletes and re-inserts the whole line. Both marks live inside that
         range, so without care they ride the insert's right gravity to the line
         END — the caret jumps and the selection bound is left parked there."""
@@ -3934,13 +4065,13 @@ class TestLatexFormatting(unittest.TestCase):
         buf.set_text('other\n' + r'a \alpha  b tail')
         buf.place_cursor(buf.get_iter_at_line(0)[1])   # line 1 renders to α
         v._rehighlight()
-        # a click lands after the (now one-character) glyph, on "b"
-        buf.place_cursor(buf.get_iter_at_line_offset(1, 4)[1])
-        v._rehighlight()                               # un-renders line 1
+        # the click lands on the glyph itself
+        buf.place_cursor(buf.get_iter_at_line_offset(1, 2)[1])
+        v._rehighlight()                               # opens \alpha up again
         it = buf.get_iter_at_mark(buf.get_insert())
         self.assertEqual(it.get_line(), 1)
-        # the caret stays on the same character, now past the restored \alpha
-        self.assertEqual(it.get_line_offset(), 10)
+        # the caret is on the command the glyph came from, not shoved along it
+        self.assertEqual(it.get_line_offset(), 2)
         self.assertFalse(buf.get_has_selection())
 
     def test_rerender_leaves_no_selection_bound_behind(self):
@@ -3953,13 +4084,16 @@ class TestLatexFormatting(unittest.TestCase):
         buf.set_text('other\n' + r'a \alpha  b tail')
         buf.place_cursor(buf.get_iter_at_line(0)[1])
         v._rehighlight()
-        click = buf.get_iter_at_line_offset(1, 4)[1]
-        buf.place_cursor(click)                    # the press
-        v._rehighlight()                           # un-renders the line
-        # GTK's drag-update: the insert mark alone follows the pointer, which
-        # after the restore is further along (\alpha is 6 chars)
-        buf.move_mark(buf.get_insert(), buf.get_iter_at_line_offset(1, 10)[1])
+        click = buf.get_iter_at_line_offset(1, 2)[1]
+        buf.place_cursor(click)                    # the press, on the glyph
+        v._rehighlight()                           # opens the expression
         self.assertFalse(buf.get_has_selection())
+        # GTK's drag-update: the insert mark alone follows the pointer. It may
+        # move a character — a press jitters — but the bound is beside it, so
+        # that is a one-character selection and not a run to the line end.
+        buf.move_mark(buf.get_insert(), buf.get_iter_at_line_offset(1, 3)[1])
+        s, e = buf.get_selection_bounds()
+        self.assertEqual(e.get_line_offset() - s.get_line_offset(), 1)
 
     def test_rerender_keeps_a_live_selection(self):
         """A selection whose BOUND sits on a line that gets rendered keeps that

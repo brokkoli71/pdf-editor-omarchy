@@ -7888,14 +7888,16 @@ _MD_ACCENT_RE = re.compile(
     r'\\(' + '|'.join(_MD_ACCENTS) + r')\s*(?:\{([^}]*)\}|(\S))')
 
 
+def _sub_accent(m):
+    mark = _MD_ACCENTS[m.group(1)]
+    base = m.group(2) if m.group(2) is not None else (m.group(3) or '')
+    if not base:
+        return mark
+    return base[0] + mark + base[1:]
+
+
 def _apply_accents(text):
-    def sub(m):
-        mark = _MD_ACCENTS[m.group(1)]
-        base = m.group(2) if m.group(2) is not None else (m.group(3) or '')
-        if not base:
-            return mark
-        return base[0] + mark + base[1:]
-    return _MD_ACCENT_RE.sub(sub, text)
+    return _MD_ACCENT_RE.sub(_sub_accent, text)
 
 
 # Two kinds of span render verbatim — no LaTeX symbols, super/subscripts or
@@ -8001,16 +8003,85 @@ def _link_candidates(query, files, current_page=None, base_dir=None):
     return out
 
 
+def _sub_mapped(rx, repl, text):
+    """`rx.sub(repl, text)`, plus an index map back to `text`.
+
+    The map has one entry per output character and a final entry for the end,
+    so `imap[i]` is where output character `i` came from. Every character of a
+    replacement points at the START of what it replaced — a glyph is one place
+    in the source, not a range — which keeps the map non-decreasing and makes
+    both directions (source→rendered, rendered→source) a plain lookup."""
+    out, imap, pos = [], [], 0
+    for m in rx.finditer(text):
+        for i in range(pos, m.start()):
+            out.append(text[i])
+            imap.append(i)
+        rep = repl(m)
+        if rep == m.group(0):        # nothing was substituted — stay verbatim
+            for i in range(m.start(), m.end()):
+                out.append(text[i])
+                imap.append(i)
+        else:
+            for ch in rep:
+                out.append(ch)
+                imap.append(m.start())
+        pos = m.end()
+    for i in range(pos, len(text)):
+        out.append(text[i])
+        imap.append(i)
+    imap.append(len(text))
+    return "".join(out), imap
+
+
+def _symbolize_map(text, protect=None):
+    """`_symbolize`, and the index map from the rendered text back to `text`.
+
+    The map is what makes a click land on the SYMBOL you aimed at instead of
+    the column you happened to hit, and what lets an edit made on rendered text
+    be spliced back onto the \\commands it came from rather than freezing the
+    line as glyphs.
+
+    `protect` is a (start, end) span of the source to leave verbatim — the
+    expression the caret is sitting in. Splitting there is safe because a
+    protected span is always a \\command match, and a match only ever occurs in
+    a 'text' run: any code span or link that opens before the span also closes
+    before it."""
+    if protect is not None:
+        a, b = protect
+        a = max(0, min(a, len(text)))
+        b = max(a, min(b, len(text)))
+        head, hmap = _symbolize_map(text[:a])
+        tail, tmap = _symbolize_map(text[b:])
+        imap = hmap[:-1] + list(range(a, b)) + [b + i for i in tmap]
+        return head + text[a:b] + tail, imap
+    out, imap, pos = [], [], 0
+    for seg, kind in _split_markup(text):
+        if kind == 'text':
+            sym, smap = _sub_mapped(_MD_SYMBOL_RE, _sub_symbol, seg)
+            # Accents run after symbol substitution so \hat{\alpha} → α̂ (the
+            # inner \alpha is already α by the time the accent is placed on
+            # it), so the two maps compose: rendered → symbolised → source.
+            acc, amap = _sub_mapped(_MD_ACCENT_RE, _sub_accent, sym)
+            out.append(acc)
+            imap.extend(pos + smap[i] for i in amap[:-1])
+        else:
+            out.append(seg)
+            imap.extend(range(pos, pos + len(seg)))
+        pos += len(seg)
+    imap.append(len(text))
+    return "".join(out), imap
+
+
+# Anything that renders as something other than itself. Used to decide whether
+# moving the caret along a line can change what is rendered on it — a line of
+# plain prose cannot, so it costs no rehighlight.
+_MD_RENDERABLE_RE = re.compile(r'[\\^_*`#]|\[\[|<!--')
+
+
 def _symbolize(text):
     """Replace LaTeX-style \\commands with their Unicode symbols (display only),
     leaving the contents of `code` spans and [[wiki links]] untouched."""
-    def sub_seg(seg):
-        seg = _MD_SYMBOL_RE.sub(_sub_symbol, seg)
-        # Accents run after symbol substitution so \hat{\alpha} → α̂ (the inner
-        # \alpha is already α by the time the accent is placed on it).
-        return _apply_accents(seg)
-    return "".join(sub_seg(seg) if kind == 'text' else seg
-                   for seg, kind in _split_markup(text))
+    return _symbolize_map(text)[0]
 
 
 # Shared inline-Markdown / script regexes (used by the notes editor's TextTag
@@ -9187,7 +9258,10 @@ class MarkdownNotesView(GtkSource.View):
         self._cursor_line = 0
         self._rehighlight_id = None
         self._in_highlight = False
-        self._line_originals: dict[int, str] = {}
+        # line → (source, what we rendered, index map, protected span or None).
+        # The map is what puts a caret on the symbol it was aimed at; the span
+        # is the expression left as source because the caret is in it.
+        self._line_originals: dict[int, tuple] = {}
         buf.connect("notify::cursor-position", self._on_cursor_moved)
         buf.connect("changed", self._on_changed)
         # keep _line_originals keyed correctly when whole lines are added/removed,
@@ -9740,9 +9814,24 @@ class MarkdownNotesView(GtkSource.View):
 
     def _on_cursor_moved(self, buf, _):
         self._update_link_popup()
-        line = buf.get_iter_at_mark(buf.get_insert()).get_line()
+        it = buf.get_iter_at_mark(buf.get_insert())
+        line = it.get_line()
         if line != self._cursor_line:
             self._cursor_line = line
+            self._schedule()
+            return
+        # Moving WITHIN a line matters too now that only the expression under
+        # the caret opens up: stepping off a symbol re-renders it. Gated on the
+        # line holding something renderable, so walking a line of prose does
+        # not re-run the whole buffer's highlighting on every keypress.
+        if line in self._line_originals:
+            self._schedule()
+            return
+        ls = buf.get_iter_at_line(line)[1]
+        le = ls.copy()
+        if not le.ends_line():
+            le.forward_to_line_end()
+        if _MD_RENDERABLE_RE.search(buf.get_text(ls, le, True)):
             self._schedule()
 
     def _on_changed(self, _buf):
@@ -9785,13 +9874,65 @@ class MarkdownNotesView(GtkSource.View):
             # markers (#, **, `) under an invisible tag — excluding them here
             # silently stripped the markers from every saved note (data loss)
             cur = buf.get_text(ls, le, True)
-            orig = self._line_originals.get(ln)
-            # only trust the stored source if it still renders to this line
-            if orig is not None and _symbolize(orig) == cur:
-                out.append(orig)
-            else:
-                out.append(cur)
+            out.append(self._line_source(ln, cur)[0])
         return "\n".join(out)
+
+    def _line_source(self, ln, cur, col=None):
+        """The Markdown source behind a rendered line, and where column `col`
+        of it sits in that source. Returns (source, source_col).
+
+        `cur` is what the buffer holds now, which need not be what we rendered:
+        the caret's own line is only PARTLY rendered, so an edit can land on a
+        glyph. Rather than throwing the stored source away — which would freeze
+        every other symbol on the line as a literal glyph in the .md — the edit
+        is spliced onto the source through the render's index map, so editing a
+        rendered symbol edits the \\command it came from."""
+        rec = self._line_originals.get(ln)
+        if rec is None:
+            return cur, col
+        orig, rend, imap = rec[0], rec[1], rec[2]
+        if col is not None:
+            col = max(0, min(col, len(cur)))
+        if cur == rend:
+            return orig, None if col is None else imap[col]
+        p = 0
+        while p < len(rend) and p < len(cur) and rend[p] == cur[p]:
+            p += 1
+        s = 0
+        while (s < len(rend) - p and s < len(cur) - p
+               and rend[len(rend) - 1 - s] == cur[len(cur) - 1 - s]):
+            s += 1
+        head, mid = orig[:imap[p]], cur[p:len(cur) - s]
+        src = head + mid + orig[imap[len(rend) - s]:]
+        if col is None:
+            return src, None
+        if col <= p:
+            return src, imap[col]
+        if col >= len(cur) - s:
+            return src, len(head) + len(mid) + (col - (len(cur) - s))
+        return src, len(head) + (col - p)
+
+    @staticmethod
+    def _rendered_col(imap, src_col):
+        """Where source column `src_col` lands in the text `imap` describes —
+        the first rendered position that is not still before it."""
+        for i, at in enumerate(imap):
+            if at >= src_col:
+                return i
+        return len(imap) - 1
+
+    @staticmethod
+    def _caret_expression(src, col):
+        """The \\command the caret is touching, as a (start, end) span of `src`,
+        or None. Touching runs from just before the backslash to just after the
+        last letter: a caret against a symbol is a caret about to edit it, and a
+        glyph that re-rendered under it would move the text out from under the
+        next keystroke."""
+        for rx in (_MD_ACCENT_RE, _MD_SYMBOL_RE):
+            for m in rx.finditer(src):
+                if m.start() <= col <= m.end():
+                    return m.start(), m.end()
+        return None
 
     def _on_insert_text(self, _buf, location, text, _len):
         # a real edit that adds whole lines shifts every substituted line below
@@ -9846,7 +9987,13 @@ class MarkdownNotesView(GtkSource.View):
             return col + len(new) - len(old)
         return min(col, len(new))
 
-    def _buf_replace_line(self, buf, ln, new_text):
+    def _buf_replace_line(self, buf, ln, new_text, cols=None):
+        """Rewrite line `ln`, carrying the caret and selection bound across.
+
+        `cols` is where the two marks belong in `new_text` ((insert, bound),
+        either entry None for "not on this line"). The render path knows that
+        exactly, from the index map; without it the columns are guessed from
+        the common prefix and suffix, which is all an arbitrary rewrite has."""
         ok, ls = buf.get_iter_at_line(ln)
         if not ok:
             return
@@ -9862,12 +10009,17 @@ class MarkdownNotesView(GtkSource.View):
         # drag-update runs) moves `insert` alone — which is how a plain click
         # turned into a selection spanning the rest of the line. Carry both
         # marks across by hand; a mark on any other line rides the edit fine.
+        given = cols
         cols = []
-        for mark in (buf.get_insert(), buf.get_selection_bound()):
+        for i, mark in enumerate((buf.get_insert(), buf.get_selection_bound())):
             it = buf.get_iter_at_mark(mark)
-            cols.append(self._remap_column(it.get_line_offset(),
-                                           old_text, new_text)
-                        if it.get_line() == ln else None)
+            if it.get_line() != ln:
+                cols.append(None)
+            elif given is not None and given[i] is not None:
+                cols.append(given[i])
+            else:
+                cols.append(self._remap_column(it.get_line_offset(),
+                                               old_text, new_text))
         self._in_highlight = True
         try:
             buf.delete(ls, le)
@@ -9884,26 +10036,47 @@ class MarkdownNotesView(GtkSource.View):
         finally:
             self._in_highlight = False
 
-    def _restore_line(self, buf, ln):
-        original = self._line_originals.pop(ln, None)
-        if original is None:
-            return
-        ok, ls = buf.get_iter_at_line(ln)
-        if not ok:
-            return
-        le = ls.copy()
-        if not le.ends_line():
-            le.forward_to_line_end()
-        if buf.get_text(ls, le, True) != original:
-            self._buf_replace_line(buf, ln, original)
+    def _render_cursor_line(self, buf, ln, cur):
+        """The caret's line, rendered with just its OWN expression left as
+        source. Returns the text now on the line.
+
+        Un-rendering the whole line was one keystroke's worth of simpler and
+        moved every symbol on it out from under the pointer: the click landed
+        on ℝ and the caret ended up wherever "\\realnum" had pushed that column
+        to. Only the expression the caret touches steps back into source now —
+        it has to, since that is the text about to be edited — and the caret is
+        placed through the index map rather than guessed from the shift, so a
+        click lands on the symbol you aimed at either way.
+
+        A SELECTION still un-renders the whole line: its two ends are two
+        expressions, and a selection that changed shape as it grew would be
+        worse than a line that settles once."""
+        ins = buf.get_iter_at_mark(buf.get_insert())
+        bound = buf.get_iter_at_mark(buf.get_selection_bound())
+        src, col = self._line_source(ln, cur, ins.get_line_offset())
+        bound_col = None
+        if bound.get_line() == ln:
+            bound_col = self._line_source(ln, cur, bound.get_line_offset())[1]
+        if bound_col is not None and bound_col != col:
+            protect = (0, len(src))                     # a selection: all source
+        else:
+            protect = self._caret_expression(src, col)
+        rend, imap = _symbolize_map(src, protect)
+        if rend != cur:
+            cols = (self._rendered_col(imap, col),
+                    None if bound_col is None
+                    else self._rendered_col(imap, bound_col))
+            self._buf_replace_line(buf, ln, rend, cols=cols)
+        if rend != src:
+            self._line_originals[ln] = (src, rend, imap, protect)
+        else:
+            self._line_originals.pop(ln, None)
+        return rend
 
     def _rehighlight(self):
         self._rehighlight_id = None
         buf = self.get_buffer()
         self._cursor_line = buf.get_iter_at_mark(buf.get_insert()).get_line()
-
-        # Restore cursor line before clearing tags so its text is editable
-        self._restore_line(buf, self._cursor_line)
 
         s, e = buf.get_start_iter(), buf.get_end_iter()
         for tg in self._t.values():
@@ -9916,15 +10089,27 @@ class MarkdownNotesView(GtkSource.View):
             le = ls.copy()
             if not le.ends_line():
                 le.forward_to_line_end()
-            text = buf.get_text(ls, le, False)
+            text = buf.get_text(ls, le, True)
+            rec = self._line_originals.get(ln)
 
-            if ln != self._cursor_line and ln not in self._line_originals:
-                subbed = self._apply_symbol_subs(text)
+            if ln == self._cursor_line:
+                text = self._render_cursor_line(buf, ln, text)
+                ls = buf.get_iter_at_line(ln)[1]
+            elif rec is not None and rec[3] is None and text == rec[1]:
+                pass          # fully rendered already and nothing has touched it
+            else:
+                # either never rendered, or the caret has just left it holding
+                # its own expression open
+                src = self._line_source(ln, text)[0]
+                subbed, imap = _symbolize_map(src)
                 if subbed != text:
-                    self._line_originals[ln] = text
                     self._buf_replace_line(buf, ln, subbed)
                     ls = buf.get_iter_at_line(ln)[1]
                     text = subbed
+                if subbed != src:
+                    self._line_originals[ln] = (src, subbed, imap, None)
+                else:
+                    self._line_originals.pop(ln, None)
 
             self._highlight_line(buf, ls, ln, text)
         return False
@@ -9972,8 +10157,23 @@ class MarkdownNotesView(GtkSource.View):
         def apply(name, a, b):
             buf.apply_tag(self._t[name], at(a), at(b))
 
-        def hide(a, b):
-            if not on_cursor:
+        # Only what the caret is TOUCHING steps back into its source form; the
+        # rest of the line stays rendered. A whole line falling back to source
+        # under a click is what shoved the words sideways just as you aimed at
+        # them (row 141). `within` is the construct a marker belongs to — the
+        # `**` of a bold run opens when the caret is anywhere in the run, not
+        # only when it is on the asterisks themselves, so you can still see
+        # what you are editing.
+        caret_col = None
+        if on_cursor:
+            it = buf.get_iter_at_mark(buf.get_insert())
+            caret_col = min(it.get_line_offset(), len(text))
+
+        def caret_in(a, b):
+            return caret_col is not None and a <= caret_col <= b
+
+        def hide(a, b, within=None):
+            if not caret_in(*(within if within is not None else (a, b))):
                 apply("hide", a, b)
 
         # HTML comments: hidden unless the switch says otherwise, and always
@@ -9990,7 +10190,7 @@ class MarkdownNotesView(GtkSource.View):
             elif whole_line:
                 # …and its NEWLINE with it, or a hidden marker still costs a
                 # blank line and the sheet reads as if it were full of gaps
-                hide(0, len(text) + 1)
+                hide(0, len(text) + 1, within=(0, len(text)))
             else:
                 hide(a, b)
         if whole_line and not on_cursor and not self.show_comments:
@@ -10007,7 +10207,7 @@ class MarkdownNotesView(GtkSource.View):
         if m:
             lvl = len(m.group(1))
             apply(["h1", "h2", "h3"][lvl - 1], 0, len(text))
-            hide(0, m.end())
+            hide(0, m.end())     # the "## " itself, opened only from inside it
             return
 
         # [[wiki links]] → styled + clickable; brackets hidden off cursor line.
@@ -10020,8 +10220,8 @@ class MarkdownNotesView(GtkSource.View):
                 continue                     # [[..]] inside `code` is literal
             apply("link", a + 2, b - 2)
             bar = text.find('|', a + 2, b - 2)
-            hide(a, bar + 1 if bar != -1 else a + 2)   # [[  (and `target|`)
-            hide(b - 2, b)                   # ]]
+            hide(a, bar + 1 if bar != -1 else a + 2, within=(a, b))
+            hide(b - 2, b, within=(a, b))    # ]]
 
         # Inline: bold / italic / code (combined regex handles priority)
         for m in self._INLINE.finditer(text):
@@ -10030,36 +10230,37 @@ class MarkdownNotesView(GtkSource.View):
                 continue                     # bold/italic inside `code`/[[link]] literal
             if m.group(1) is not None:       # **bold**
                 apply("bold", a + 2, b - 2)
-                hide(a, a + 2)
-                hide(b - 2, b)
+                hide(a, a + 2, within=(a, b))
+                hide(b - 2, b, within=(a, b))
             elif m.group(2) is not None:     # *italic*
                 apply("italic", a + 1, b - 1)
-                hide(a, a + 1)
-                hide(b - 1, b)
+                hide(a, a + 1, within=(a, b))
+                hide(b - 1, b, within=(a, b))
             else:                            # `code`
                 apply("code", a, b)
-                hide(a, a + 1)
-                hide(b - 1, b)
+                hide(a, a + 1, within=(a, b))
+                hide(b - 1, b, within=(a, b))
 
-        # Super/subscripts: ^{ab} ^x  _{ab} _x  — only rendered off cursor line.
+        # Super/subscripts: ^{ab} ^x  _{ab} _x — rendered except the one the
+        # caret is inside, which shows its `^`/`_` so it can be edited.
         # A chained script (`a_i_j`, `a_i^2`) is a script OF the one before it,
         # so it is placed relative to that one and shrinks again — see
         # script_style. Depth 1 resolves to the plain sub/superscript tags.
-        if not on_cursor:
-            for m, chain in iter_scripts(text):
-                a, b = m.start(), m.end()
-                if protected(a, b):
-                    continue                 # ^/_ inside `code`/[[link]] stays literal
-                tag_name = self._script_tag(chain)
-                if m.group(2) is not None:   # braced: ^{content}
-                    apply("hide", a, a + 2)  # hide ^{ or _{
-                    apply(tag_name, a + 2, b - 1)
-                    apply("hide", b - 1, b)  # hide }
-                else:                        # unbraced: ^x or _x
-                    apply("hide", a, a + 1)  # hide ^ or _
-                    end = script_body_end(m)
-                    apply(tag_name, a + 1, end)
-                    apply("hide", end, b)    # the space that ended it
+        for m, chain in iter_scripts(text):
+            a, b = m.start(), m.end()
+            if protected(a, b) or caret_in(a, b):
+                continue     # ^/_ inside `code`/[[link]] stays literal, and so
+                             # does the script the caret is sitting in
+            tag_name = self._script_tag(chain)
+            if m.group(2) is not None:       # braced: ^{content}
+                apply("hide", a, a + 2)      # hide ^{ or _{
+                apply(tag_name, a + 2, b - 1)
+                apply("hide", b - 1, b)      # hide }
+            else:                            # unbraced: ^x or _x
+                apply("hide", a, a + 1)      # hide ^ or _
+                end = script_body_end(m)
+                apply(tag_name, a + 1, end)
+                apply("hide", end, b)        # the space that ended it
 
 
 def _ink_path_for(md_path):

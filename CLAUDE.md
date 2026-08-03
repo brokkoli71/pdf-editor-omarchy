@@ -23,6 +23,20 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 - `MarkdownNotesView` — the live-Markdown editor (math substitution `\alpha`→α,
   `x^2` scripts; source text stays intact — display-only rendering). `code`
   spans and `[[wiki links]]` render verbatim (no LaTeX/scripts/bold inside).
+  - **Only what the caret TOUCHES falls back to source (row 141)** — the
+    `\command` under it, the script it is inside, the bold run it is in; the
+    rest of the line stays rendered. A whole line reverting under a click moved
+    every symbol on it just as you aimed at one. `_symbolize_map` is what makes
+    that safe in both directions: it returns an index map beside the rendered
+    text, so the caret is PLACED through the map (a click lands on the symbol,
+    not on the column it pushed) and an edit that does land on a glyph is
+    SPLICED back onto the source through it (`_line_source`) instead of
+    freezing the line's other symbols as literal glyphs in the `.md`. A
+    selection still opens the whole line — two ends are two expressions, and a
+    selection that changed shape as it grew is worse than a line that settles
+    once. `_line_originals[ln]` is `(source, rendered, index map, open span)`;
+    the open span is why a line the caret has just left gets re-rendered
+    instead of being trusted as already done.
   - **The maths grammar wins over Markdown's**: `_` is a SUBSCRIPT here, so the
     GtkSource language's `_emphasis_` is cancelled line by line with a
     `noitalic` tag and only `*italic*` puts the slant back. Its syntax tags sit
