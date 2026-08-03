@@ -289,16 +289,24 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     parses the sheet back (`set_from_text`), `_restore_note` fills it
     (`to_text`), and `_on_save`'s verbatim text-page branch is gated on `not
     _path` or a PDF's notes would be flattened onto page 0.
-  - **Commit on RELEASE, never mid-drag** (`_on_paned_event` watches for
-    BUTTON_RELEASE through an `EventControllerLegacy`, so the paned keeps its
-    own drag). And "full width" is the divider's **leftmost travel**, not
-    position 0: the canvas cannot shrink below its minimum
-    (`set_shrink_start_child(False)`), so a test against zero makes the
-    gesture unreachable on every window.
-  - The edge pull claims only PAST its threshold, so a short drag near the
-    margin is still an ordinary text selection. On a text-first page it makes
-    an **untitled temp PDF** (`_blank_pdf_file`, shared with `New`/`--new`) —
-    an accidental pull litters nothing beside the `.md`.
+  - **The paned STAYS in text mode**, with the page side collapsed to zero and
+    the sheet in the notes' slot (`_sheet_box`) — so the page *slides* in and
+    out and the handle itself says there is something to pull. That needs
+    `set_shrink_start_child(True)`: with shrink off the handle stops at the
+    canvas's minimum and the gesture is unreachable on every window.
+  - **Quiet time stands in for letting go.** GtkPaned has no "drag finished",
+    and the obvious substitute is a trap: `EventControllerLegacy` hands
+    PyGObject a **NULL event** for some events, so reading
+    `event.get_event_type()` crashes on the first move and the gesture never
+    fires at all. `_on_pane_position` debounces instead (`PANE_SETTLE_MS`), and
+    three things must gate it or it fires on its own: our OWN moves
+    (`_mark_pane_programmatic` — an animation walks through the position that
+    means the opposite switch), a window that is not mapped or is still being
+    laid out, and a session whose tab has since closed. Miss the second and a
+    headless test loop makes blank PDFs until it dies.
+  - On a text-first page the pull makes an **untitled temp PDF**
+    (`_blank_pdf_file`, shared with `New`/`--new`) — an accidental pull litters
+    nothing beside the `.md`.
   - The view is remembered per document in `recent.json` beside the reading
     position (`_recent_full_notes`), for the same reason: it is a view state
     about a document, and a sidecar must not appear because you looked at one.

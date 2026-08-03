@@ -2311,19 +2311,49 @@ class TestModeGestures(unittest.TestCase):
 
         self._run_in_window(2, body)
 
-    def test_the_divider_is_full_width_at_its_leftmost_not_at_zero(self):
-        """The canvas side cannot shrink below its own minimum, so the handle
-        never reaches 0 — testing for zero would make the gesture unreachable
-        on every window."""
+    def test_the_page_side_can_collapse_to_nothing(self):
+        """With shrink off the handle stops at the canvas's own minimum and the
+        gesture is unreachable on every window — the collapse IS the gesture."""
+        def body(win):
+            s = win._active_session
+            self.assertTrue(s._paned.get_shrink_start_child())
+            # and the sheet shares that side of the divider, so the page slides
+            # rather than pops
+            self.assertIs(s._text_page.get_parent() if s._text_page else
+                          s._sheet_box, s._sheet_box)
+
+        self._run_in_window(2, body)
+
+    def test_the_divider_settling_at_each_end_switches_the_view(self):
+        """GtkPaned has no "drag finished", so quiet time stands in for letting
+        go — and the mirror gesture is the same handle going back."""
         def body(win):
             s = win._active_session
             win._set_notes_shown(True)
-            floor = s._paned.get_start_child().measure(
-                Gtk.Orientation.HORIZONTAL, -1)[0]
-            s._paned.set_position(floor + 4)
-            self.assertTrue(win._divider_is_at_full_width(s))
-            s._paned.set_position(floor + 400)
-            self.assertFalse(win._divider_is_at_full_width(s))
+            s._pane_settling = False
+            s._paned.set_position(4)
+            win._on_pane_settled(s)
+            self.assertTrue(win._text_mode)
+            self.assertTrue(win._full_notes_view())
+            # the page is still THERE, collapsed — pulling it back out returns
+            s._pane_settling = False
+            s._paned.set_position(300)
+            win._on_pane_settled(s)
+            self.assertFalse(win._text_mode)
+
+        self._run_in_window(2, body)
+
+    def test_our_own_moves_are_not_read_as_a_gesture(self):
+        """Sliding the page in animates through every position on the way,
+        including the one that means the opposite switch."""
+        def body(win):
+            s = win._active_session
+            win._enter_full_notes_view()
+            self.assertTrue(s._pane_settling)
+            s._paned.set_position(500)          # mid-animation value
+            win._on_pane_position(s)
+            self.assertIsNone(s._pane_watch_id)  # no gesture armed
+            self.assertTrue(win._text_mode)
 
         self._run_in_window(2, body)
 
@@ -7747,8 +7777,10 @@ class TestNotesSearch(unittest.TestCase):
 
                 win._show_search()
                 self.assertTrue(win._search_revealer.get_reveal_child())
-                # the bar is not inside the hidden PDF column
-                self.assertFalse(win._paned.get_visible())
+                # the bar is not inside the PDF column — which stays in the
+                # tree now (row 130: its handle is how a page comes back), so
+                # the ancestor walk below is what the test really rests on
+                self.assertFalse(win._notes_box.get_visible())
                 parent = win._search_revealer.get_parent()
                 while parent is not None:
                     self.assertIsNot(parent, win._paned)
@@ -10776,7 +10808,10 @@ class TestTextFirstMode(unittest.TestCase):
                 self._open_md(win, d)
                 s = win._active_session
                 self.assertTrue(s._text_mode)
-                self.assertFalse(s._paned.get_visible())
+                # the paned STAYS, collapsed to nothing: the handle is how a
+                # page comes back (row 130), so it must not disappear
+                self.assertTrue(s._paned.get_visible())
+                self.assertFalse(s._notes_box.get_visible())
                 self.assertTrue(s._text_page.get_visible())
                 # the sheet's editor IS the notes view now
                 self.assertIs(win._notes_view, s._text_page.view)

@@ -12858,7 +12858,7 @@ class DocumentSession:
         "_thumb_idle_id", "_current_thumb_row", "_thumb_centred_page",
         "_drag_export_dir",
         "_has_toc", "_toc_thumbs", "_drop_indicator_row", "_text_mode",
-        "_edge_pull_armed", "_edge_pull_done",
+        "_pane_settling", "_pane_watch_id", "_pane_settle_id",
     )
     WIDGETS = (
         "canvas", "_notes_view", "_panel_notes_view", "_notes_box",
@@ -12866,6 +12866,7 @@ class DocumentSession:
         "_search_revealer", "_search_entry", "_search_label", "_paned",
         "_toc_list", "_toc_scroll", "_toc_revealer", "_toc_switch",
         "_toc_seg_outline", "_toc_seg_pages", "content", "_body", "_text_page",
+        "_sheet_box",
     )
 
     def __init__(self):
@@ -14137,14 +14138,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         s._paned.set_start_child(canvas_box)
         s._paned.set_resize_start_child(True)
-        s._paned.set_shrink_start_child(False)
-        s._paned.set_end_child(s._notes_box)
+        # the page side MAY collapse to nothing — that collapse IS row 130's
+        # gesture, and with shrink off the handle stops at the canvas's minimum
+        # and the gesture is unreachable on every window
+        s._paned.set_shrink_start_child(True)
+        # the sheet shares the notes' side of the divider, so a text page is the
+        # notes panel grown to full width — the same widget in the same slot,
+        # which is what makes the page slide in and out instead of appearing
+        s._sheet_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        s._sheet_box.append(s._notes_box)
+        s._paned.set_end_child(s._sheet_box)
         s._paned.set_resize_end_child(True)
         s._paned.set_shrink_end_child(True)
         s._paned.set_hexpand(True)
-        s._edge_pull_armed = False
-        s._edge_pull_done = False
-        s.win._attach_mode_gestures(s)
+        s._pane_settling = False
+        s._pane_watch_id = None
+        s._pane_settle_id = None
+        s._paned.connect("notify::position",
+                         lambda *a, s=s: s.win._on_pane_position(s))
 
         # ── outline (TOC) sidebar ─────────────────────────────────────────────
         s._toc_list = Gtk.ListBox()
@@ -14257,31 +14268,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                                         s.canvas._shift_held,
                                         s.canvas._alt_held)
         tp.set_visible(False)
-        # row 130's other half: a pull in from the sheet's LEFT edge brings a
-        # page in. Capture phase, because with the caret the TextView owns the
-        # press — but it claims only once the pull is past the threshold, so a
-        # short drag near the margin is still an ordinary text selection.
-        edge = Gtk.GestureDrag()
-        edge.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        edge.connect("drag-begin", self._on_edge_pull_begin, s)
-        edge.connect("drag-update", self._on_edge_pull_update, s)
-        tp.add_controller(edge)
-        s._body.append(tp)
+        tp.set_vexpand(True)
+        s._sheet_box.append(tp)
         s._text_page = tp
         return tp
-
-    def _on_edge_pull_begin(self, gesture, x, _y, s):
-        s._edge_pull_armed = x <= self.MODE_EDGE_GRAB
-        s._edge_pull_done = False
-
-    def _on_edge_pull_update(self, gesture, dx, dy, s):
-        if not getattr(s, "_edge_pull_armed", False) or s._edge_pull_done:
-            return
-        if dx < self.MODE_EDGE_PULL or abs(dy) > dx:
-            return          # still a drag along the text, not a pull inwards
-        s._edge_pull_done = True
-        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-        self._pull_page_in(s)
 
     # ── row 130: the divider IS the way between the modes ────────────────────
     #
@@ -14291,43 +14281,81 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     # its notes are still per page, and nothing is written to disk either way —
     # so a drag that crosses the line and comes back leaves no trace, which an
     # accidental-drag-shaped gesture has to.
-    FULL_NOTES_SLACK = 32      # px past the divider's leftmost travel
-    MODE_EDGE_GRAB = 24        # px from the sheet's left edge that arms the pull
-    MODE_EDGE_PULL = 90        # px of pull before a page comes in
+    FULL_NOTES_EDGE = 24       # px: the page side this narrow is "gone"
+    MODE_PAGE_BACK = 90        # px of page pulled back out before it returns
+    PANE_SETTLE_MS = 320       # quiet time that stands in for "let go"
 
-    def _attach_mode_gestures(self, s):
-        """Watch the divider for a full-width drop, and the sheet's left edge
-        for a pull. Both are observers: the paned keeps its own drag (we only
-        read the position when the button comes UP, so nothing commits mid-drag),
-        and the edge pull claims only once it is past the threshold."""
-        watch = Gtk.EventControllerLegacy()
-        watch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        watch.connect("event", self._on_paned_event, s)
-        s._paned.add_controller(watch)
+    def _pane_session_alive(self, s):
+        """A timer that outlives its tab is a crash waiting for the next tick:
+        these fire hundreds of ms after a move, and a tab can be closed in
+        between."""
+        return s is not None and s.win is self and s in self._sessions
 
-    def _on_paned_event(self, _ctrl, event, s):
-        if event.get_event_type() == Gdk.EventType.BUTTON_RELEASE:
-            # after the paned has settled on its final position
-            GLib.idle_add(self._maybe_enter_full_notes, s)
-        return False
+    def _on_pane_position(self, s):
+        """The divider moved. Decide when it STOPS.
 
-    def _divider_is_at_full_width(self, s):
-        """True when the divider sits as far left as it goes.
+        GtkPaned gives no "drag finished", and the obvious substitute — reading
+        raw events off an `EventControllerLegacy` — hands PyGObject a NULL event
+        for some of them, which is a crash on the first move rather than a
+        gesture. So the trigger is quiet time: the position settling at an
+        extreme is what "let go there" means, and it is reversible either way,
+        since the mirror gesture is the same handle going back."""
+        if (s._pane_settling or not self._pane_session_alive(s)
+                or not s._paned.get_visible()):
+            return
+        # a window that is not on screen yet is still being laid out, and its
+        # divider moving is GTK settling, not a hand
+        if not self.get_mapped() or s._paned.get_width() < 200:
+            return
+        if s._pane_watch_id is not None:
+            GLib.source_remove(s._pane_watch_id)
+        s._pane_watch_id = GLib.timeout_add(
+            self.PANE_SETTLE_MS, self._on_pane_settled, s)
 
-        Not "position == 0": the canvas side cannot shrink below its own
-        minimum (`set_shrink_start_child(False)`), so the leftmost the handle
-        ever gets is that minimum — comparing against zero would make the
-        gesture unreachable on every window."""
-        if not s._paned.get_visible() or not s._notes_box.get_visible():
-            return False
-        start = s._paned.get_start_child()
-        floor = start.measure(Gtk.Orientation.HORIZONTAL, -1)[0] if start else 0
-        return s._paned.get_position() <= floor + self.FULL_NOTES_SLACK
-
-    def _maybe_enter_full_notes(self, s):
-        if self._divider_is_at_full_width(s):
+    def _on_pane_settled(self, s):
+        s._pane_watch_id = None
+        if not self._pane_session_alive(s):
+            return GLib.SOURCE_REMOVE
+        pos = s._paned.get_position()
+        if s._text_mode:
+            # the page is still there behind the sheet, collapsed — pulling the
+            # handle back out is how it comes back
+            if pos >= self.MODE_PAGE_BACK:
+                self._pull_page_in(s)
+        elif pos <= self.FULL_NOTES_EDGE and s._notes_box.get_visible():
             self._enter_full_notes_view(s)
         return GLib.SOURCE_REMOVE
+
+    def _mark_pane_programmatic(self, s=None):
+        """Say "the next position changes are MINE" — for 400 ms, which covers
+        the 250 ms animation and the allocation that follows it."""
+        s = s or self._active_session
+        if s is None:
+            return
+        s._pane_settling = True
+        if s._pane_watch_id is not None:
+            GLib.source_remove(s._pane_watch_id)
+            s._pane_watch_id = None
+
+        def done():
+            s._pane_settling = False
+            s._pane_settle_id = None
+            return GLib.SOURCE_REMOVE
+        if s._pane_settle_id is not None:
+            GLib.source_remove(s._pane_settle_id)
+        s._pane_settle_id = GLib.timeout_add(400, done)
+
+    def _settle_pane_at(self, s, pos):
+        """Move the divider ourselves without the watcher reading it as a
+        gesture — an animation passes through every value on the way, including
+        the one that would trigger the opposite switch."""
+        self._mark_pane_programmatic(s)
+        frm = s._paned.get_position()
+        if s is self._active_session and abs(frm - pos) > 4 and self.get_mapped():
+            self._animate_pane(frm, pos)
+        else:
+            s._paned.set_position(pos)
+        self._mark_pane_programmatic(s)   # …and for 400 ms after it lands
 
     def _enter_full_notes_view(self, s=None, remember=True):
         """Show a PDF's notes as one sheet — the whole sidecar, markers and
@@ -14336,17 +14364,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if s is None or s._text_mode or not s._path:
             return False
         self._commit_note_for(s)
-        # park the divider where it was, so coming back looks like it did
+        # remember where the divider stood, so the page comes back where it was
         w = self.get_width() or 1280
-        if not (100 < s._saved_pane_pos < w - 150):
-            s._saved_pane_pos = int(w * 0.62)
-        s._paned.set_position(s._saved_pane_pos)
+        pos = s._paned.get_position()
+        if 100 < pos < w - 150:
+            s._saved_pane_pos = pos
         self._enter_text_mode(s)
         if s is self._active_session:
             self._restore_note()          # fills the sheet from the model
         if remember and not s._is_untitled:
             _remember_recent_full_notes(s._path, True)
-        toast = Adw.Toast.new("Notes as one page — drag in from the left edge "
+        toast = Adw.Toast.new("Notes as one page — drag the left edge back out "
                               "to bring the pages back")
         toast.set_button_label("Back")
         toast.connect("button-clicked", lambda *_: self._leave_full_notes_view(s))
@@ -14414,9 +14442,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         tp = self._ensure_text_page(s)
         s._text_mode = True
         s._notes_view = tp.view
-        s._paned.set_visible(False)
+        # the paned STAYS: the page side collapses to nothing instead of
+        # disappearing, so the handle is still there to pull it back out and
+        # the page slides rather than pops (row 130)
+        s._notes_box.set_visible(False)
         s._toc_revealer.set_reveal_child(False)
         tp.set_visible(True)
+        self._settle_pane_at(s, 0)
         if s is self._active_session:
             self._update_header_for_mode()
             # deliberately NOT rebinding the left button to the caret: the
@@ -14436,6 +14468,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if s._text_page is not None:
             s._text_page.set_visible(False)
         s._paned.set_visible(True)
+        s._notes_box.set_visible(True)
+        w = self.get_width() or 1280
+        if not (100 < s._saved_pane_pos < w - 150):
+            s._saved_pane_pos = int(w * 0.62)
+        self._settle_pane_at(s, s._saved_pane_pos)
         if s is self._active_session:
             self._update_header_for_mode()
 
@@ -17826,6 +17863,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._notes_toggle.handler_block(self._notes_toggled_id)
         self._notes_toggle.set_active(shown)
         self._notes_toggle.handler_unblock(self._notes_toggled_id)
+        if self._text_mode:
+            return          # the sheet owns that side of the divider
         self._notes_box.set_visible(shown)
         if shown:
             w = self.get_width() or 1280
@@ -17833,6 +17872,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             if not (100 < pos < w - 150):
                 pos = int(w * 0.62)
                 self._saved_pane_pos = pos
+            self._mark_pane_programmatic()
             self._paned.set_position(pos)
 
     def _choose_notes_file(self):
@@ -17916,6 +17956,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._animate_pane(pos, w, hide_after=True)
 
     def _animate_pane(self, frm, to, hide_after=False):
+        # an animation walks through every position between the two, including
+        # the ones that mean "switch modes" — see _on_pane_position
+        self._mark_pane_programmatic()
         if self._pane_anim is not None:
             self._pane_anim.pause()
         target = Adw.CallbackAnimationTarget.new(
