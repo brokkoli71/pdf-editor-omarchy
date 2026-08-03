@@ -7860,7 +7860,20 @@ _MD_SYMBOLS = {
 # Nothing but a letter could have continued the command, so `\alpha + \beta`
 # keeps its spacing — and a second space is in the lookahead, so typing two is
 # how you ask for one.
+# END OF LINE counts as "a letter could have followed": you have just typed
+# `\beta ` and the next character is the one you are about to type, so leaving
+# that space showing parks the caret a gap away from the glyph and then closes
+# the gap the moment you type — the caret jumping backwards as you write.
 _MD_SYMBOL_RE = re.compile(r'\\([A-Za-z]+)( (?=[A-Za-z ]))?')
+# …and only at the END OF THE LINE, which is not the end of every string this
+# runs on: it is applied per `code`/link-delimited segment, and a segment that
+# ends mid-line is followed by something that was not typed as a terminator.
+_MD_SYMBOL_END_RE = re.compile(r'\\([A-Za-z]+)( (?=[A-Za-z ]|$))?', re.M)
+# The command WITHOUT its terminating space. This is the span the caret has to
+# be in for the expression to stay open: the space is not part of what you are
+# writing any more, so the caret standing after it means you are done and the
+# glyph belongs on screen.
+_MD_COMMAND_RE = re.compile(r'\\[A-Za-z]+')
 
 
 def _sub_symbol(m):
@@ -8033,7 +8046,7 @@ def _sub_mapped(rx, repl, text):
     return "".join(out), imap
 
 
-def _symbolize_map(text, protect=None):
+def _symbolize_map(text, protect=None, at_end=True):
     """`_symbolize`, and the index map from the rendered text back to `text`.
 
     The map is what makes a click land on the SYMBOL you aimed at instead of
@@ -8050,14 +8063,17 @@ def _symbolize_map(text, protect=None):
         a, b = protect
         a = max(0, min(a, len(text)))
         b = max(a, min(b, len(text)))
-        head, hmap = _symbolize_map(text[:a])
-        tail, tmap = _symbolize_map(text[b:])
+        head, hmap = _symbolize_map(text[:a], at_end=False)
+        tail, tmap = _symbolize_map(text[b:], at_end=at_end)
         imap = hmap[:-1] + list(range(a, b)) + [b + i for i in tmap]
         return head + text[a:b] + tail, imap
     out, imap, pos = [], [], 0
-    for seg, kind in _split_markup(text):
+    segs = _split_markup(text)
+    for n, (seg, kind) in enumerate(segs):
         if kind == 'text':
-            sym, smap = _sub_mapped(_MD_SYMBOL_RE, _sub_symbol, seg)
+            last = at_end and n == len(segs) - 1
+            sym, smap = _sub_mapped(
+                _MD_SYMBOL_END_RE if last else _MD_SYMBOL_RE, _sub_symbol, seg)
             # Accents run after symbol substitution so \hat{\alpha} → α̂ (the
             # inner \alpha is already α by the time the accent is placed on
             # it), so the two maps compose: rendered → symbolised → source.
@@ -8078,10 +8094,14 @@ def _symbolize_map(text, protect=None):
 _MD_RENDERABLE_RE = re.compile(r'[\\^_*`#]|\[\[|<!--')
 
 
-def _symbolize(text):
+def _symbolize(text, at_end=True):
     """Replace LaTeX-style \\commands with their Unicode symbols (display only),
-    leaving the contents of `code` spans and [[wiki links]] untouched."""
-    return _symbolize_map(text)[0]
+    leaving the contents of `code` spans and [[wiki links]] untouched.
+
+    `at_end=False` says this string is a FRAGMENT of a line: a command at its
+    end was not terminated by the end of a line, so its trailing space is a
+    real one."""
+    return _symbolize_map(text, at_end=at_end)[0]
 
 
 # Shared inline-Markdown / script regexes (used by the notes editor's TextTag
@@ -8182,7 +8202,8 @@ def _notes_to_pango_markup(text):
         return f"<tt>{m.group(3)}</tt>"
 
     parts = []
-    for seg, kind in _split_markup(text):
+    segs = _split_markup(text)
+    for n, (seg, kind) in enumerate(segs):
         if kind == 'code':               # `code` → verbatim monospace
             parts.append(f"<tt>{GLib.markup_escape_text(seg[1:-1])}</tt>")
             continue
@@ -8192,7 +8213,7 @@ def _notes_to_pango_markup(text):
             continue
         # symbols first, then escape, then scripts, then bold/italic. The
         # segment has no backticks, so _inline only ever sees bold/italic here.
-        s = GLib.markup_escape_text(_symbolize(seg))
+        s = GLib.markup_escape_text(_symbolize(seg, at_end=(n == len(segs) - 1)))
         s = _scripts(s)
         parts.append(_MD_INLINE_RE.sub(_inline, s))
     return "".join(parts)
@@ -9262,6 +9283,7 @@ class MarkdownNotesView(GtkSource.View):
         # The map is what puts a caret on the symbol it was aimed at; the span
         # is the expression left as source because the caret is in it.
         self._line_originals: dict[int, tuple] = {}
+        self._marked_lines = None       # the line range a selection covers
         buf.connect("notify::cursor-position", self._on_cursor_moved)
         buf.connect("changed", self._on_changed)
         # keep _line_originals keyed correctly when whole lines are added/removed,
@@ -9285,6 +9307,7 @@ class MarkdownNotesView(GtkSource.View):
         # Ctrl+click follows a [[wiki link]]; hover over one shows a hand cursor
         click = Gtk.GestureClick(button=Gdk.BUTTON_PRIMARY)
         click.connect("released", self._on_link_click)
+        click.connect("pressed", self._on_click_pressed)
         self.add_controller(click)
         motion = Gtk.EventControllerMotion()
         motion.connect("motion", self._on_link_motion)
@@ -9356,6 +9379,46 @@ class MarkdownNotesView(GtkSource.View):
             if m.start() <= off < m.end():
                 return _parse_note_link(m.group(1))
         return None
+
+    @staticmethod
+    def paragraph_bounds(buf, ln):
+        """The blank-line-delimited block around line `ln`, as (start, end).
+
+        A blank line is its own paragraph, so triple-clicking one selects it
+        rather than swallowing the block above or below."""
+        def blank(i):
+            ok, ls = buf.get_iter_at_line(i)
+            if not ok:
+                return True
+            le = ls.copy()
+            if not le.ends_line():
+                le.forward_to_line_end()
+            return not buf.get_text(ls, le, True).strip()
+
+        first = last = ln
+        if not blank(ln):
+            while first > 0 and not blank(first - 1):
+                first -= 1
+            n = buf.get_line_count()
+            while last < n - 1 and not blank(last + 1):
+                last += 1
+        start = buf.get_iter_at_line(first)[1]
+        end = buf.get_iter_at_line(last)[1]
+        if not end.ends_line():
+            end.forward_to_line_end()
+        return start, end
+
+    def _on_click_pressed(self, _gesture, n_press, _x, _y):
+        """Triple-click selects the PARAGRAPH. GtkTextView selects the logical
+        line, which on a wrapped Markdown sheet is a fragment of what looks
+        like one — a paragraph is what you were pointing at. Bubble phase, so
+        this runs after the view has made its own line selection and replaces
+        it."""
+        if n_press != 3:
+            return
+        buf = self.get_buffer()
+        ln = buf.get_iter_at_mark(buf.get_insert()).get_line()
+        buf.select_range(*self.paragraph_bounds(buf, ln))
 
     def _on_link_click(self, gesture, _n_press, x, y):
         # Ctrl+click follows the link; a plain click edits as usual
@@ -9824,6 +9887,9 @@ class MarkdownNotesView(GtkSource.View):
         # the caret opens up: stepping off a symbol re-renders it. Gated on the
         # line holding something renderable, so walking a line of prose does
         # not re-run the whole buffer's highlighting on every keypress.
+        if self._marked_lines is not None:
+            self._schedule()      # a selection was open — it may have gone
+            return
         if line in self._line_originals:
             self._schedule()
             return
@@ -9928,7 +9994,7 @@ class MarkdownNotesView(GtkSource.View):
         last letter: a caret against a symbol is a caret about to edit it, and a
         glyph that re-rendered under it would move the text out from under the
         next keystroke."""
-        for rx in (_MD_ACCENT_RE, _MD_SYMBOL_RE):
+        for rx in (_MD_ACCENT_RE, _MD_COMMAND_RE):
             for m in rx.finditer(src):
                 if m.start() <= col <= m.end():
                     return m.start(), m.end()
@@ -10036,9 +10102,9 @@ class MarkdownNotesView(GtkSource.View):
         finally:
             self._in_highlight = False
 
-    def _render_cursor_line(self, buf, ln, cur):
-        """The caret's line, rendered with just its OWN expression left as
-        source. Returns the text now on the line.
+    def _render_open_line(self, buf, ln, cur, whole=False):
+        """A line the caret or the selection is on, with the part being worked
+        on left as source. Returns the text now on the line.
 
         Un-rendering the whole line was one keystroke's worth of simpler and
         moved every symbol on it out from under the pointer: the click landed
@@ -10048,25 +10114,31 @@ class MarkdownNotesView(GtkSource.View):
         placed through the index map rather than guessed from the shift, so a
         click lands on the symbol you aimed at either way.
 
-        A SELECTION still un-renders the whole line: its two ends are two
-        expressions, and a selection that changed shape as it grew would be
-        worse than a line that settles once."""
-        ins = buf.get_iter_at_mark(buf.get_insert())
-        bound = buf.get_iter_at_mark(buf.get_selection_bound())
-        src, col = self._line_source(ln, cur, ins.get_line_offset())
-        bound_col = None
-        if bound.get_line() == ln:
-            bound_col = self._line_source(ln, cur, bound.get_line_offset())[1]
-        if bound_col is not None and bound_col != col:
-            protect = (0, len(src))                     # a selection: all source
+        `whole` is a SELECTION: everything marked shows its source, on every
+        line it covers. What you have selected is what you are about to cut,
+        copy or replace, so it is all "being worked on" — and a selection whose
+        text re-shaped itself as it grew would be worse than a line that
+        settles once."""
+        cols, src = [], None
+        for mark in (buf.get_insert(), buf.get_selection_bound()):
+            it = buf.get_iter_at_mark(mark)
+            if it.get_line() != ln:
+                cols.append(None)
+            else:
+                src, col = self._line_source(ln, cur, it.get_line_offset())
+                cols.append(col)
+        if src is None:
+            src = self._line_source(ln, cur)[0]
+        if whole:
+            protect = (0, len(src))
         else:
-            protect = self._caret_expression(src, col)
+            protect = self._caret_expression(
+                src, cols[0] if cols[0] is not None else cols[1])
         rend, imap = _symbolize_map(src, protect)
         if rend != cur:
-            cols = (self._rendered_col(imap, col),
-                    None if bound_col is None
-                    else self._rendered_col(imap, bound_col))
-            self._buf_replace_line(buf, ln, rend, cols=cols)
+            self._buf_replace_line(buf, ln, rend, cols=tuple(
+                None if c is None else self._rendered_col(imap, c)
+                for c in cols))
         if rend != src:
             self._line_originals[ln] = (src, rend, imap, protect)
         else:
@@ -10077,6 +10149,13 @@ class MarkdownNotesView(GtkSource.View):
         self._rehighlight_id = None
         buf = self.get_buffer()
         self._cursor_line = buf.get_iter_at_mark(buf.get_insert()).get_line()
+        # every line the selection touches shows its source, not just the two
+        # ends — a marked run is marked all the way through
+        marked = None
+        if buf.get_has_selection():
+            a, b = buf.get_selection_bounds()
+            marked = (a.get_line(), b.get_line())
+        self._marked_lines = marked
 
         s, e = buf.get_start_iter(), buf.get_end_iter()
         for tg in self._t.values():
@@ -10092,8 +10171,11 @@ class MarkdownNotesView(GtkSource.View):
             text = buf.get_text(ls, le, True)
             rec = self._line_originals.get(ln)
 
-            if ln == self._cursor_line:
-                text = self._render_cursor_line(buf, ln, text)
+            if marked is not None and marked[0] <= ln <= marked[1]:
+                text = self._render_open_line(buf, ln, text, whole=True)
+                ls = buf.get_iter_at_line(ln)[1]
+            elif ln == self._cursor_line:
+                text = self._render_open_line(buf, ln, text)
                 ls = buf.get_iter_at_line(ln)[1]
             elif rec is not None and rec[3] is None and text == rec[1]:
                 pass          # fully rendered already and nothing has touched it
@@ -10164,13 +10246,16 @@ class MarkdownNotesView(GtkSource.View):
         # `**` of a bold run opens when the caret is anywhere in the run, not
         # only when it is on the asterisks themselves, so you can still see
         # what you are editing.
+        marked = self._marked_lines
+        all_open = marked is not None and marked[0] <= ln <= marked[1]
         caret_col = None
-        if on_cursor:
+        if on_cursor and not all_open:
             it = buf.get_iter_at_mark(buf.get_insert())
             caret_col = min(it.get_line_offset(), len(text))
 
         def caret_in(a, b):
-            return caret_col is not None and a <= caret_col <= b
+            # a marked line is open all the way through
+            return all_open or (caret_col is not None and a <= caret_col <= b)
 
         def hide(a, b, within=None):
             if not caret_in(*(within if within is not None else (a, b))):

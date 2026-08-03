@@ -31,12 +31,17 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     text, so the caret is PLACED through the map (a click lands on the symbol,
     not on the column it pushed) and an edit that does land on a glyph is
     SPLICED back onto the source through it (`_line_source`) instead of
-    freezing the line's other symbols as literal glyphs in the `.md`. A
-    selection still opens the whole line — two ends are two expressions, and a
-    selection that changed shape as it grew is worse than a line that settles
-    once. `_line_originals[ln]` is `(source, rendered, index map, open span)`;
-    the open span is why a line the caret has just left gets re-rendered
-    instead of being trusted as already done.
+    freezing the line's other symbols as literal glyphs in the `.md`.
+    Everything MARKED shows its source, on every line the selection covers —
+    what you have selected is what you are about to cut or replace, and a
+    selection whose text re-shaped itself as it grew is worse than lines that
+    settle once. `_line_originals[ln]` is `(source, rendered, index map, open
+    span)`; the open span is why a line the caret has just left gets
+    re-rendered instead of being trusted as already done.
+  - **Triple-click selects the PARAGRAPH** (`paragraph_bounds`), not
+    GtkTextView's logical line — on a wrapped sheet a logical line is a
+    fragment of what looks like one. Bubble phase, so it runs after the view's
+    own line selection and replaces it.
   - **The maths grammar wins over Markdown's**: `_` is a SUBSCRIPT here, so the
     GtkSource language's `_emphasis_` is cancelled line by line with a
     `noitalic` tag and only `*italic*` puts the slant back. Its syntax tags sit
@@ -48,7 +53,14 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     (`\alphax` is another command, `a_ib` subscripts "ib"), so showing it puts
     a hole inside "αx". Two spaces is how you ask for one. Narrowed once, to
     avoid eating a space nobody was forced to type: only before an
-    alphanumeric, so `\alpha + \beta` keeps its spacing. There is **no
+    alphanumeric, so `\alpha + \beta` keeps its spacing. The **end of the LINE
+    counts as an alphanumeric** (`_MD_SYMBOL_END_RE`): the next character is
+    the one you are about to type, and leaving that space showing parks the
+    caret a gap away from the glyph, then closes the gap as you type — the
+    caret appearing to jump backwards. It is the end of the line, not the end
+    of the string it runs on: rendering goes segment by segment
+    (`_symbolize(seg, at_end=…)`), and a segment ending mid-line is followed by
+    something that terminated nothing. There is **no
     per-symbol exception** — an operator's space is eaten too (`\cdot a` is
     "·a"), because half the table behaving differently is not a rule anyone can
     hold while writing.

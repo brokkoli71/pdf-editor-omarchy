@@ -4016,6 +4016,70 @@ class TestLatexFormatting(unittest.TestCase):
         v._rehighlight()
         self.assertEqual(self._line_text(buf, 0), r'f: \R → ℝ')
 
+    def test_a_selection_opens_every_line_it_covers(self):
+        """Everything marked shows its source — the middle of a multi-line
+        selection is as much "about to be replaced" as its two ends."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('\n'.join([r'\alpha one', r'\beta two',
+                                r'\gamma three', r'\delta four']))
+        buf.place_cursor(buf.get_iter_at_line(3)[1])
+        v._rehighlight()
+        self.assertEqual(self._line_text(buf, 1), 'βtwo')
+        buf.select_range(buf.get_iter_at_line_offset(0, 3)[1],
+                         buf.get_iter_at_line_offset(2, 2)[1])
+        v._rehighlight()
+        for ln, want in ((0, r'\alpha one'), (1, r'\beta two'),
+                         (2, r'\gamma three')):
+            self.assertEqual(self._line_text(buf, ln), want)
+        self.assertEqual(self._line_text(buf, 3), 'δfour')   # outside it
+        # dropping the selection renders them all again
+        buf.place_cursor(buf.get_iter_at_line(3)[1])
+        v._rehighlight()
+        self.assertEqual(self._line_text(buf, 0), 'αone')
+        self.assertEqual(self._line_text(buf, 2), 'γthree')
+
+    def test_a_trailing_space_is_eaten_at_the_end_of_the_line(self):
+        """Typing `\\beta ` renders it, and the caret belongs against the glyph:
+        the space is the one that terminated the command, and showing it puts
+        a gap there that vanishes again the moment the next letter is typed."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('')
+        for ch in r'\beta ':
+            buf.insert_at_cursor(ch)
+            v._rehighlight()
+        self.assertEqual(self._line_text(buf, 0), 'β')
+        self.assertEqual(
+            buf.get_iter_at_mark(buf.get_insert()).get_line_offset(), 1)
+        self.assertEqual(v.get_source_text(), '\\beta ')
+        # and typing on leaves no gap either
+        buf.insert_at_cursor('x')
+        v._rehighlight()
+        self.assertEqual(self._line_text(buf, 0), 'βx')
+        self.assertEqual(v.get_source_text(), r'\beta x')
+
+    def test_a_mid_line_segment_end_is_not_a_line_end(self):
+        """The rule is about the end of the LINE. Rendering runs per code/link
+        segment, and a segment that ends mid-line is followed by text that
+        never terminated anything."""
+        self.assertEqual(sidemark._symbolize(r'\alpha `x` b'), 'α `x` b')
+        self.assertEqual(sidemark._symbolize(r'\alpha '), 'α')
+
+    def test_triple_click_selects_the_paragraph(self):
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('first para line one\nstill the first para\n\n'
+                     'second para\n')
+        s, e = v.paragraph_bounds(buf, 1)
+        self.assertEqual(buf.get_text(s, e, False),
+                         'first para line one\nstill the first para')
+        s, e = v.paragraph_bounds(buf, 3)
+        self.assertEqual(buf.get_text(s, e, False), 'second para')
+        # a blank line is its own paragraph rather than joining a neighbour
+        s, e = v.paragraph_bounds(buf, 2)
+        self.assertEqual(buf.get_text(s, e, False), '')
+
     def test_a_selection_still_opens_the_whole_line(self):
         """Two ends, two expressions — a selection that changed shape as it
         grew would be worse than a line that settles once."""
@@ -4096,22 +4160,24 @@ class TestLatexFormatting(unittest.TestCase):
         self.assertEqual(e.get_line_offset() - s.get_line_offset(), 1)
 
     def test_rerender_keeps_a_live_selection(self):
-        """A selection whose BOUND sits on a line that gets rendered keeps that
-        end where the user put it — the bound is carried across the replace
-        just like the caret, and it is on a non-cursor line that renders."""
+        """A selection ending part-way into a marked line keeps that end where
+        the user put it: the line shows its source, and the bound is carried
+        across the replace just like the caret."""
         v = self._view()
         buf = v.get_buffer()
         buf.set_text('plain\n' + r'\alpha  tail')
-        # caret on line 0 (so line 1 renders), selection running back to
-        # just after the symbol on line 1 (one of the two spaces is eaten)
         buf.select_range(buf.get_iter_at_line_offset(0, 0)[1],
                          buf.get_iter_at_line_offset(1, 8)[1])
         v._rehighlight()
         bounds = buf.get_selection_bounds()
         self.assertTrue(bounds)
-        # line 1 now reads "α tail"; the bound stays after "α ", not at the end
         self.assertEqual(buf.get_text(bounds[0], bounds[1], False),
-                         'plain\nα ')
+                         'plain\n' + r'\alpha  ')
+        # let the selection go and the line renders again, source intact
+        buf.place_cursor(buf.get_iter_at_line(0)[1])
+        v._rehighlight()
+        self.assertEqual(self._line_text(buf, 1), 'α tail')
+        self.assertEqual(v.get_source_text(), 'plain\n' + r'\alpha  tail')
 
     def test_remap_column_maps_around_the_changed_span(self):
         v = self._view()
