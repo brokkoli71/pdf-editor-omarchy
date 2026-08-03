@@ -13056,6 +13056,31 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             .text-surround, .text-surround > viewport {{
                 background-color: {surround_hex};
             }}
+            /* the page's edge, while it is collapsed behind the sheet (row
+               130). It is the only way back to the pages, and at the default
+               handle width it is a few pixels hard against the window edge —
+               so it is widened and given a grip you can see, which is also
+               what says there is something there at all. */
+            paned.page-edge > separator {{
+                min-width: 16px;
+                background-color: {surround_hex};
+                background-image: linear-gradient(
+                    to right,
+                    alpha({fg_hex}, 0) 0%, alpha({fg_hex}, 0) 30%,
+                    alpha({fg_hex}, 0.28) 30%, alpha({fg_hex}, 0.28) 45%,
+                    alpha({fg_hex}, 0) 45%, alpha({fg_hex}, 0) 100%);
+                background-repeat: no-repeat;
+                background-position: center;
+                background-size: 100% 42px;
+            }}
+            paned.page-edge > separator:hover {{
+                background-image: linear-gradient(
+                    to right,
+                    alpha({acc_hex}, 0) 0%, alpha({acc_hex}, 0) 25%,
+                    alpha({acc_hex}, 0.85) 25%, alpha({acc_hex}, 0.85) 50%,
+                    alpha({acc_hex}, 0) 50%, alpha({acc_hex}, 0) 100%);
+                background-size: 100% 64px;
+            }}
             .shortcut-key {{
                 font-family: monospace;
                 font-size: 12px;
@@ -14481,6 +14506,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._notes_box.set_visible(False)
         s._toc_revealer.set_reveal_child(False)
         tp.set_visible(True)
+        # the handle is now the ONLY way back to the pages, and it is sitting
+        # hard against the window edge — so it wears a wider, visible grip
+        s._paned.set_wide_handle(True)
+        s._paned.add_css_class("page-edge")
+        s._paned.set_cursor(Gdk.Cursor.new_from_name("col-resize"))
         self._settle_pane_at(s, 0)
         if s is self._active_session:
             self._update_header_for_mode()
@@ -14502,6 +14532,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             s._text_page.set_visible(False)
         s._paned.set_visible(True)
         s._notes_box.set_visible(True)
+        s._paned.set_wide_handle(False)
+        s._paned.remove_css_class("page-edge")
+        s._paned.set_cursor(None)
         w = self.get_width() or 1280
         if not (100 < s._saved_pane_pos < w - 150):
             s._saved_pane_pos = int(w * 0.62)
@@ -15119,7 +15152,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if width < 200:
             return GLib.SOURCE_CONTINUE
         self._saved_pane_pos = int(width * 0.62)
-        self._paned.set_position(self._saved_pane_pos)
+        # …but do not APPLY it on a text page: this fires from a realize-time
+        # idle, i.e. after the mode is already set, and the sheet's whole point
+        # is that the page side is collapsed. Applying it here put the default
+        # split back and left the sheet in a corner. The value is still
+        # remembered, which is where the page lands when it comes back.
+        if not self._text_mode:
+            self._mark_pane_programmatic()
+            self._paned.set_position(self._saved_pane_pos)
         return GLib.SOURCE_REMOVE
 
     def _add_blank_page(self):

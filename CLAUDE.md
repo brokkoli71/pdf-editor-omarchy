@@ -293,7 +293,12 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     the sheet in the notes' slot (`_sheet_box`) — so the page *slides* in and
     out and the handle itself says there is something to pull. That needs
     `set_shrink_start_child(True)`: with shrink off the handle stops at the
-    canvas's minimum and the gesture is unreachable on every window.
+    canvas's minimum and the gesture is unreachable on every window. The
+    collapsed handle is the ONLY way back, so it wears a wide, visible grip
+    (`page-edge`) — at the default width it is a few pixels hard against the
+    window edge. And `_init_pane_position`, a realize-time idle that applies
+    the default 62% split, must SKIP a text page: it fires after the mode is
+    set, so applying it put the pages back and left the sheet in a corner.
   - **Quiet time stands in for letting go.** GtkPaned has no "drag finished",
     and the obvious substitute is a trap: `EventControllerLegacy` hands
     PyGObject a **NULL event** for some events, so reading

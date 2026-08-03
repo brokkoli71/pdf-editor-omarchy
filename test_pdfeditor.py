@@ -2357,6 +2357,33 @@ class TestModeGestures(unittest.TestCase):
 
         self._run_in_window(2, body)
 
+    def test_the_collapsed_edge_is_grabbable(self):
+        """It is the only way back to the pages, and at the default handle
+        width it is a few pixels hard against the window edge."""
+        def body(win):
+            s = win._active_session
+            win._enter_full_notes_view()
+            self.assertTrue(s._paned.get_wide_handle())
+            self.assertIn("page-edge", s._paned.get_css_classes())
+            win._leave_full_notes_view()
+            self.assertNotIn("page-edge", s._paned.get_css_classes())
+            self.assertFalse(s._paned.get_wide_handle())
+
+        self._run_in_window(2, body)
+
+    def test_the_page_side_stays_collapsed_after_realize(self):
+        """A realize-time idle sets the default 62% split — it fires AFTER the
+        mode is set, and applying it there put the pages back and left the
+        sheet in a corner."""
+        def body(win):
+            s = win._active_session
+            win._enter_full_notes_view()
+            win._init_pane_position()
+            self.assertEqual(s._paned.get_position(), 0)
+            self.assertGreater(s._saved_pane_pos, 100)   # still remembered
+
+        self._run_in_window(2, body)
+
     def test_the_edge_pull_brings_the_pages_back(self):
         def body(win):
             win._enter_full_notes_view()
