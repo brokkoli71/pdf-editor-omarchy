@@ -41,6 +41,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Bookmarks** — mark a page with the bookmark button (or `Ctrl+B`) and hold the button for a list of every mark to jump to; rename any of them. Sidemark also reopens each document on the page you last read
 - **Date / time snippets** — type `/date`, `/time`, or `/now` then Space to expand
 - **Choose where notes live** — each PDF gets a `<filename>-notes.md` sidecar, created only once you actually write something; pick **Notes file…** from the ☰ menu to point several PDFs at one shared Markdown file (remembered per PDF)
+- **Slide between the two modes** — drag the notes divider all the way left and your notes become one full sheet you can write on; pull in from that sheet's left edge and the pages come back. Nothing is converted or written, so an accidental drag costs nothing, and each document reopens in the view you left it in
 - **Text-first mode** — open a bare `.md` (or **New text page**, `Ctrl+Alt+N`) and the window becomes one endless A4 sheet of live Markdown you can **draw on** with the same pen, highlighter, eraser and lasso — shape snap, smoothing, move/resize/duplicate included (ink rides along with the text you anchor it to). Drag the paper's side edge to set the sheet width — handy on a half-screen window — and it's remembered per document. The file stays **pure Markdown** — ink lives in a `<name>-ink.json` sidecar — and **Export as PDF** renders text and ink to A4 pages. Launching Sidemark without a file opens a persistent scratchpad page
 
 ### Navigation

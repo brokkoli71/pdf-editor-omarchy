@@ -111,6 +111,39 @@ def _recent_page(path):
     return 0
 
 
+def _recent_full_notes(path):
+    """Was this document last left showing its notes as one sheet (row 130)?
+
+    Same home as the reading position, for the same reason: it is a VIEW state
+    about a document, and putting it in the sidecar would drop a .md beside a
+    PDF you only glanced at."""
+    path = os.path.abspath(path)
+    for it in _load_recent():
+        if it.get("path") == path:
+            return bool(it.get("full_notes"))
+    return False
+
+
+def _remember_recent_full_notes(path, on):
+    """Record the view state WITHOUT re-ordering the list — see
+    `_remember_recent_page`: changing a view is not opening a file."""
+    path = os.path.abspath(path)
+    items = _load_recent()
+    for it in items:
+        if it.get("path") == path:
+            if bool(it.get("full_notes")) == bool(on):
+                return
+            it["full_notes"] = bool(on)
+            break
+    else:
+        return
+    os.makedirs(os.path.dirname(RECENT_PATH), exist_ok=True)
+    tmp = RECENT_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f)
+    os.replace(tmp, RECENT_PATH)
+
+
 def _remember_recent_page(path, page):
     """Record the reading position WITHOUT re-ordering the list — turning a
     page is not opening a file, and letting it bump the entry to the top would
@@ -7827,6 +7860,9 @@ def _apply_accents(text):
 # lookbehind leaves the ![[embed]] line NotesModel writes alone. _split_markup
 # chops a line into (segment, kind) runs — kind is 'text', 'code' or 'link' —
 # so the display transforms below can treat each appropriately.
+# An HTML comment, on one line — the shape Sidemark writes its own markers in
+# (`<!-- page:13-40 continued -->`) and the shape a Markdown viewer drops.
+_MD_COMMENT_RE = re.compile(r'<!--.*?-->')
 _MD_CODE_SPAN_RE = re.compile(r'`[^`\n]+?`')
 _MD_LINK_RE = re.compile(r'(?<!\!)\[\[([^\[\]\n]+?)\]\]')
 _MD_SPAN_RE = re.compile(_MD_CODE_SPAN_RE.pattern + '|' + _MD_LINK_RE.pattern)
@@ -8954,7 +8990,12 @@ class NotesModel:
                            for k, v in self._bookmarks.items()}
         self._normalize()   # a torn-off page may now own text behind a link
 
-    def save(self, path):
+    def to_text(self):
+        """The sidecar's whole text — the sectioned form `save` writes.
+
+        Split out of `save` because the full-notes view (row 130) shows this
+        exact text as one sheet: what you edit there is the file, markers and
+        all, which is the only way one buffer can hold a per-page model."""
         sections = []
         pages = sorted(set(self._notes) | self._links | set(self._bookmarks))
         i = 0
@@ -8988,9 +9029,22 @@ class NotesModel:
                             + (f"\n\n{body}" if body else ""))
         body = "\n\n".join(sections) + "\n" if sections else ""
         embed = f"![[{self.pdf_name}]]\n\n" if self.pdf_name else ""
+        return embed + body
+
+    def set_from_text(self, raw):
+        """Replace the whole model from a sidecar's text — the way back from
+        the full-notes view, where the sheet IS the file. Text with no page
+        markers at all becomes page 0's notes, exactly as `load` treats an
+        externally authored file."""
+        parsed = parse_note_sections(raw)
+        self._notes, self._links = parsed.sections, set(parsed.linked)
+        self._bookmarks = dict(parsed.bookmarks)
+        self._normalize()
+
+    def save(self, path):
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            f.write(embed + body)
+            f.write(self.to_text())
         os.replace(tmp, path)
 
 
@@ -9012,6 +9066,15 @@ class MarkdownNotesView(GtkSource.View):
     # Inline-Markdown / script regexes (module-level; shared with callout markup)
     _INLINE = _MD_INLINE_RE
     _SCRIPT_RE = _MD_SCRIPT_RE
+
+    # An HTML comment is not prose: Markdown viewers do not render one, and
+    # Sidemark keeps its own per-page bookkeeping in them, so on a sheet showing
+    # a whole sidecar they would be most of what is on screen. Hidden by
+    # default, revealed on the cursor line like every other marker — the file
+    # is never touched either way. Class-level, because the setting is one
+    # answer for every view in every window (the ☰ switch writes it).
+    show_comments = False
+    _MD_COMMENT_RE = _MD_COMMENT_RE
 
     # Symbol substitution table (module-level; shared with export rendering)
     _SYMBOLS = _MD_SYMBOLS
@@ -9069,6 +9132,8 @@ class MarkdownNotesView(GtkSource.View):
                                background="#2d2d2d" if is_dark else "#f0f0f0",
                                foreground="#e06c75" if is_dark else "#c0392b"),
             "hide":        tag("hide",        invisible=True),
+            "comment":      tag("comment",     foreground="#7f8c8d",
+                                style=2),      # Pango.Style.ITALIC
             "superscript": tag("superscript", rise=4000,  scale=0.65),
             "subscript":   tag("subscript",   rise=-2000, scale=0.65),
             "link":        tag("link",        underline=1,   # Pango.Underline.SINGLE
@@ -9855,7 +9920,7 @@ class MarkdownNotesView(GtkSource.View):
 
         def protected(a, b):
             return any(cs <= a and b <= ce
-                       for cs, ce in code_ranges + link_ranges)
+                       for cs, ce in code_ranges + link_ranges + comment_ranges)
 
         def at(n):
             it = ls.copy(); it.forward_chars(n); return it
@@ -9866,6 +9931,26 @@ class MarkdownNotesView(GtkSource.View):
         def hide(a, b):
             if not on_cursor:
                 apply("hide", a, b)
+
+        # HTML comments: hidden unless the switch says otherwise, and always
+        # visible on the cursor line so an edit is never blind. A comment is
+        # rendered as NOTHING else — the markers inside ours would otherwise
+        # be read as maths.
+        comment_ranges = [(m.start(), m.end())
+                          for m in self._MD_COMMENT_RE.finditer(text)]
+        whole_line = (len(comment_ranges) == 1
+                      and comment_ranges[0] == (0, len(text)))
+        for a, b in comment_ranges:
+            if self.show_comments:
+                apply("comment", a, b)
+            elif whole_line:
+                # …and its NEWLINE with it, or a hidden marker still costs a
+                # blank line and the sheet reads as if it were full of gaps
+                hide(0, len(text) + 1)
+            else:
+                hide(a, b)
+        if whole_line and not on_cursor and not self.show_comments:
+            return              # nothing else on this line to render
 
         # Emphasis is OURS to decide: kill the syntax highlighter's slant across
         # the whole line first (it italicises anything between two underscores,
@@ -12773,6 +12858,7 @@ class DocumentSession:
         "_thumb_idle_id", "_current_thumb_row", "_thumb_centred_page",
         "_drag_export_dir",
         "_has_toc", "_toc_thumbs", "_drop_indicator_row", "_text_mode",
+        "_edge_pull_armed", "_edge_pull_done",
     )
     WIDGETS = (
         "canvas", "_notes_view", "_panel_notes_view", "_notes_box",
@@ -13112,6 +13198,32 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._bg_dropdown.connect("notify::selected", self._on_page_bg_changed)
         bg_row.append(self._bg_dropdown)
         menu_box.append(bg_row)
+        # HTML comments are Sidemark's own bookkeeping as often as they are
+        # yours (`<!-- page:13-40 continued -->`), and on a sheet showing a whole
+        # sidecar they are most of what is on screen. Hidden by default; the
+        # switch lives in the menu because it is a preference, not a verb.
+        cm_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        cm_row.set_margin_start(8)
+        cm_row.set_margin_end(8)
+        cm_row.set_margin_top(2)
+        cm_row.set_margin_bottom(2)
+        cm_label = Gtk.Label(label="Show comments", xalign=0)
+        cm_label.add_css_class("dim-label")
+        cm_label.set_hexpand(True)
+        cm_row.append(cm_label)
+        self._comments_switch = Gtk.Switch()
+        self._comments_switch.set_valign(Gtk.Align.CENTER)
+        MarkdownNotesView.show_comments = bool(
+            _load_settings().get("show_comments", False))
+        self._comments_switch.set_active(MarkdownNotesView.show_comments)
+        self._comments_switch.set_tooltip_text(
+            "Show HTML comments (<!-- … -->) in the text — including the page "
+            "markers Sidemark keeps its bookmarks and linked notes in. They "
+            "stay in the file either way, and the line under the caret always "
+            "shows them.")
+        self._comments_switch.connect("notify::active", self._on_comments_toggled)
+        cm_row.append(self._comments_switch)
+        menu_box.append(cm_row)
         _menu_item("Save", lambda: (menu_pop.popdown(), self._on_save()),
                    "Save the document and its notes (Ctrl+S)")
         # PDF-only actions — hidden while a text-first page is active
@@ -14030,6 +14142,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._paned.set_resize_end_child(True)
         s._paned.set_shrink_end_child(True)
         s._paned.set_hexpand(True)
+        s._edge_pull_armed = False
+        s._edge_pull_done = False
+        s.win._attach_mode_gestures(s)
 
         # ── outline (TOC) sidebar ─────────────────────────────────────────────
         s._toc_list = Gtk.ListBox()
@@ -14142,9 +14257,154 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                                         s.canvas._shift_held,
                                         s.canvas._alt_held)
         tp.set_visible(False)
+        # row 130's other half: a pull in from the sheet's LEFT edge brings a
+        # page in. Capture phase, because with the caret the TextView owns the
+        # press — but it claims only once the pull is past the threshold, so a
+        # short drag near the margin is still an ordinary text selection.
+        edge = Gtk.GestureDrag()
+        edge.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        edge.connect("drag-begin", self._on_edge_pull_begin, s)
+        edge.connect("drag-update", self._on_edge_pull_update, s)
+        tp.add_controller(edge)
         s._body.append(tp)
         s._text_page = tp
         return tp
+
+    def _on_edge_pull_begin(self, gesture, x, _y, s):
+        s._edge_pull_armed = x <= self.MODE_EDGE_GRAB
+        s._edge_pull_done = False
+
+    def _on_edge_pull_update(self, gesture, dx, dy, s):
+        if not getattr(s, "_edge_pull_armed", False) or s._edge_pull_done:
+            return
+        if dx < self.MODE_EDGE_PULL or abs(dy) > dx:
+            return          # still a drag along the text, not a pull inwards
+        s._edge_pull_done = True
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self._pull_page_in(s)
+
+    # ── row 130: the divider IS the way between the modes ────────────────────
+    #
+    # Drag the notes panel to full width and the notes become the sheet; drag in
+    # from the LEFT edge of a sheet and a blank page comes in beside it. It is a
+    # VIEW state, never a conversion: the PDF is still there behind the sheet,
+    # its notes are still per page, and nothing is written to disk either way —
+    # so a drag that crosses the line and comes back leaves no trace, which an
+    # accidental-drag-shaped gesture has to.
+    FULL_NOTES_SLACK = 32      # px past the divider's leftmost travel
+    MODE_EDGE_GRAB = 24        # px from the sheet's left edge that arms the pull
+    MODE_EDGE_PULL = 90        # px of pull before a page comes in
+
+    def _attach_mode_gestures(self, s):
+        """Watch the divider for a full-width drop, and the sheet's left edge
+        for a pull. Both are observers: the paned keeps its own drag (we only
+        read the position when the button comes UP, so nothing commits mid-drag),
+        and the edge pull claims only once it is past the threshold."""
+        watch = Gtk.EventControllerLegacy()
+        watch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        watch.connect("event", self._on_paned_event, s)
+        s._paned.add_controller(watch)
+
+    def _on_paned_event(self, _ctrl, event, s):
+        if event.get_event_type() == Gdk.EventType.BUTTON_RELEASE:
+            # after the paned has settled on its final position
+            GLib.idle_add(self._maybe_enter_full_notes, s)
+        return False
+
+    def _divider_is_at_full_width(self, s):
+        """True when the divider sits as far left as it goes.
+
+        Not "position == 0": the canvas side cannot shrink below its own
+        minimum (`set_shrink_start_child(False)`), so the leftmost the handle
+        ever gets is that minimum — comparing against zero would make the
+        gesture unreachable on every window."""
+        if not s._paned.get_visible() or not s._notes_box.get_visible():
+            return False
+        start = s._paned.get_start_child()
+        floor = start.measure(Gtk.Orientation.HORIZONTAL, -1)[0] if start else 0
+        return s._paned.get_position() <= floor + self.FULL_NOTES_SLACK
+
+    def _maybe_enter_full_notes(self, s):
+        if self._divider_is_at_full_width(s):
+            self._enter_full_notes_view(s)
+        return GLib.SOURCE_REMOVE
+
+    def _enter_full_notes_view(self, s=None, remember=True):
+        """Show a PDF's notes as one sheet — the whole sidecar, markers and
+        all, which is the only way one buffer can hold a per-page model."""
+        s = s or self._active_session
+        if s is None or s._text_mode or not s._path:
+            return False
+        self._commit_note_for(s)
+        # park the divider where it was, so coming back looks like it did
+        w = self.get_width() or 1280
+        if not (100 < s._saved_pane_pos < w - 150):
+            s._saved_pane_pos = int(w * 0.62)
+        s._paned.set_position(s._saved_pane_pos)
+        self._enter_text_mode(s)
+        if s is self._active_session:
+            self._restore_note()          # fills the sheet from the model
+        if remember and not s._is_untitled:
+            _remember_recent_full_notes(s._path, True)
+        toast = Adw.Toast.new("Notes as one page — drag in from the left edge "
+                              "to bring the pages back")
+        toast.set_button_label("Back")
+        toast.connect("button-clicked", lambda *_: self._leave_full_notes_view(s))
+        toast.set_timeout(5)
+        self.toast_overlay.add_toast(toast)
+        return True
+
+    def _leave_full_notes_view(self, s=None):
+        """The mirror: the pages come back and the notes return to the panel."""
+        s = s or self._active_session
+        if not self._full_notes_view(s):
+            return False
+        self._commit_note_for(s)          # sheet → model, parsed back per page
+        self._leave_text_mode(s)
+        if s is self._active_session:
+            self._set_notes_shown(True)
+            self._restore_note()
+            self._populate_toc()
+        if not s._is_untitled:
+            _remember_recent_full_notes(s._path, False)
+        return True
+
+    def _pull_page_in(self, s=None):
+        """The left-edge pull. On a PDF's notes sheet it brings the pages back;
+        on a text-first page the document GAINS a blank page — an untitled temp
+        PDF, so an accidental pull litters nothing next to the .md and is
+        undone by dragging the divider back out."""
+        s = s or self._active_session
+        if not s._text_mode:
+            return False
+        if s._path:
+            return self._leave_full_notes_view(s)
+        self._commit_note_for(s)
+        text = s.notes_model.to_text() if s.notes_model.has_content() else \
+            s.notes_model.get(0)
+        md = s._notes_path
+        tmp = self._blank_pdf_file()
+        self._leave_text_mode(s)
+        s.canvas.load(tmp)
+        s._path = tmp
+        s._is_untitled = True
+        s.notes_model = NotesModel()
+        s.notes_model.set_from_text(text)
+        if md:
+            # the .md keeps being the notes file; it gains page markers the
+            # first time this is saved, because it now describes pages
+            s._notes_path = None
+            s._active_notes_path = md
+        if s is self._active_session:
+            self._populate_toc()
+            self._set_notes_shown(True)
+            self._restore_note()
+            self._update_header_for_mode()
+        self._mark_dirty()
+        toast = Adw.Toast.new("Blank page added — it is saved when you save")
+        toast.set_timeout(3)
+        self.toast_overlay.add_toast(toast)
+        return True
 
     def _enter_text_mode(self, s=None):
         """Switch a session's UI to the text-first page: no sidebars, the sheet
@@ -15344,6 +15604,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._link_hint_shown = True
             self._toast("Jumped to link — press Alt+Left to go back")
 
+    def _full_notes_view(self, s=None):
+        """True while a PDF is being shown as one Markdown sheet (row 130).
+
+        The distinction is the same one the whole codebase uses: a text-first
+        page has NO `_path`. Here there is one, so the sheet is a VIEW of the
+        document's sidecar — the whole file, markers and all — not a page's
+        notes, and the two paths that move text between buffer and model have
+        to say which they mean."""
+        s = s or self._active_session
+        return bool(s is not None and s._text_mode and s._path)
+
     def _commit_note(self):
         self._commit_note_for(self._active_session)
 
@@ -15351,11 +15622,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if not s._path and not s._notes_path and not s._is_untitled:
             return
         text = s._notes_view.get_source_text()
+        if self._full_notes_view(s):
+            # the sheet holds the entire sidecar: parse it back, or one page's
+            # notes would swallow the whole file
+            s.notes_model.set_from_text(text)
+            return
         s.notes_model.set(s.canvas.current_page_idx, text)
 
     def _restore_note(self):
         self._suppress_dirty = True
-        text = self.notes_model.get(self.canvas.current_page_idx)
+        text = (self.notes_model.to_text() if self._full_notes_view()
+                else self.notes_model.get(self.canvas.current_page_idx))
         buf = self._notes_view.get_buffer()
         if buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True) == text:
             # Turning the page INSIDE a linked run (row 129) shows the same body,
@@ -17707,6 +17984,20 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _on_page_bg_changed(self, dd, _param=None):
         _save_setting("page_background", PAGE_BACKGROUNDS[dd.get_selected()])
 
+    def _on_comments_toggled(self, sw, _param=None):
+        on = sw.get_active()
+        _save_setting("show_comments", on)
+        MarkdownNotesView.show_comments = on
+        # every view in every tab, not just the one in front: the setting is
+        # about how Markdown reads, and a tab that kept the old answer would
+        # look like the switch had not worked
+        for s in self._sessions:
+            for view in (s._panel_notes_view,
+                         s._text_page.view if s._text_page else None):
+                if view is not None:
+                    view.reset_render_state()
+                    view._rehighlight()
+
     def _on_smear_changed(self, scale):
         self.canvas.min_pressure = scale.get_value() / 100.0
 
@@ -18044,6 +18335,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._remember_recent(path)
         self._restoring_page = False
         self._restore_reading_page(path)
+        # …and in the view it was left in (row 130): a document you were
+        # reading as one sheet opens as one sheet
+        if _recent_full_notes(path):
+            self._enter_full_notes_view(remember=False)
         self._update_bookmark_ui()
         self._maybe_offer_recovery(path)
         self._maybe_offer_ocr(path)
@@ -18101,8 +18396,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._new_tab()
         self._create_blank()
 
-    def _create_blank(self, background=None):
-        """Open a blank A4 page — user will be prompted for a name on first save.
+    def _blank_pdf_file(self, background=None):
+        """A one-page A4 PDF in a temp file — the blank page every entry point
+        starts from (the menu, `--new`, row 130's edge pull). It is untitled
+        until a save names it, so making one litters nothing.
 
         The ruling is baked into the page here and never again, so a page's
         background is decided once, when it is made (see draw_page_background)."""
@@ -18115,6 +18412,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         draw_page_background(ctx, 595, 842, background)
         ctx.show_page()
         surf.finish()
+        return tmp
+
+    def _create_blank(self, background=None):
+        """Open a blank A4 page — user will be prompted for a name on first save."""
+        tmp = self._blank_pdf_file(background)
         self._do_open_file(tmp)
         self._path = tmp           # track temp file so canvas.save() works
         self._is_untitled = True
@@ -18943,9 +19245,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # lazy-create: don't bring an empty sidecar into existence just
             # because the PDF was saved — only write notes once there's content
             # (or the file already exists, so edits/clears still persist)
-            if self._text_mode:
+            if self._text_mode and not self._path:
                 # text-first page: the .md is the document, written verbatim —
-                # no page markers, so it stays pure Markdown
+                # no page markers, so it stays pure Markdown. A PDF shown as one
+                # sheet (row 130) is NOT this case — it has a `_path`, its model
+                # is still per-page, and it saves sectioned like any PDF.
                 if notes_file:
                     tmp_file = notes_file + ".tmp"
                     with open(tmp_file, "w", encoding="utf-8") as f:

@@ -275,6 +275,41 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   at creation — re-ruling later needs the row 118 optional-content machinery to
   know which pages are ours, and you can just make the page again.* PDF-only so
   far (the text sheet was offered and declined).
+- **The divider is the way BETWEEN the modes (row 130)** — drag the notes
+  panel to full width and the notes become the sheet; pull in from the sheet's
+  LEFT edge and a page comes in beside it. It is a **VIEW state, never a
+  conversion**: the PDF is still there behind the sheet, its notes are still
+  per page, nothing is written either way, so a drag that crosses the line and
+  comes back leaves no trace — which an accidental-drag-shaped gesture has to.
+  - **`_full_notes_view()` is the whole distinction**, and it is the rule the
+    codebase already had: a text-first page has NO `_path`. With one, the sheet
+    is a view of the sidecar — **the whole file, markers and all**, the only
+    way one buffer can hold a per-page model. The two paths that move text
+    between buffer and model must say which they mean: `_commit_note_for`
+    parses the sheet back (`set_from_text`), `_restore_note` fills it
+    (`to_text`), and `_on_save`'s verbatim text-page branch is gated on `not
+    _path` or a PDF's notes would be flattened onto page 0.
+  - **Commit on RELEASE, never mid-drag** (`_on_paned_event` watches for
+    BUTTON_RELEASE through an `EventControllerLegacy`, so the paned keeps its
+    own drag). And "full width" is the divider's **leftmost travel**, not
+    position 0: the canvas cannot shrink below its minimum
+    (`set_shrink_start_child(False)`), so a test against zero makes the
+    gesture unreachable on every window.
+  - The edge pull claims only PAST its threshold, so a short drag near the
+    margin is still an ordinary text selection. On a text-first page it makes
+    an **untitled temp PDF** (`_blank_pdf_file`, shared with `New`/`--new`) —
+    an accidental pull litters nothing beside the `.md`.
+  - The view is remembered per document in `recent.json` beside the reading
+    position (`_recent_full_notes`), for the same reason: it is a view state
+    about a document, and a sidecar must not appear because you looked at one.
+- **HTML comments are hidden by default** (`MarkdownNotesView.show_comments`,
+  the ☰ switch, persisted as `show_comments`). Not a special case for ours: a
+  Markdown viewer renders no comment, and Sidemark's own per-page bookkeeping
+  lives in them — on a sheet showing a whole sidecar they would be most of what
+  is on screen. A whole-line comment hides its NEWLINE too, or a hidden marker
+  still costs a blank line. Revealed on the cursor line like every other
+  marker, rendered as nothing else (a marker is full of things that would read
+  as maths), and never removed from the file.
 - **Modes**: a tab is either a PDF or a text-first page, tracked by
   `doc_mode` (`"pdf"` | `"text"`) on the session
   (`_enter_text_mode`/`_leave_text_mode`; `_text_mode` survives as a
@@ -846,10 +881,6 @@ one validation session; `notes/validation-session.md` is its checklist.**
 
 **Loose ends, roughly in order of how ready they are:**
 
-- **Row 130 (gestures between the modes)** — drag the notes panel to full
-  width → text-first; drag in from the left edge → a blank PDF beside the text.
-  Settle first whether it is a view state or a real file conversion (ink lives
-  in different substrates), and make an accidental drag leave no trace.
 - **Row 119 (crop)** — the last piece of the image feature. Its design is
   settled in row 118 and must not be re-litigated: a field on the model applied
   at render, never a destructive re-encode, landing ONCE for both modes.

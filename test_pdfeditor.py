@@ -2226,6 +2226,221 @@ class TestLinkedNotesInWindow(unittest.TestCase):
         self._run_in_window(3, body)
 
 
+class TestModeGestures(unittest.TestCase):
+    """Row 130 — the notes divider is the way between the two modes. A VIEW
+    state, never a conversion: the PDF is still there behind the sheet, its
+    notes are still per page, and nothing is written to disk either way."""
+
+    def _run_in_window(self, pages, body, md=None):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.modegestures")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "deck.pdf")
+                    make_pdf(pdf, n_pages=pages)
+                    if md is not None:
+                        with open(notes_path_for(pdf), "w") as f:
+                            f.write(md)
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    body(win)
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+
+    def test_the_sheet_shows_the_whole_sidecar_and_the_way_back_parses_it(self):
+        """One buffer cannot hold a per-page model any other way — so the sheet
+        IS the file, markers and all, and coming back re-parses it."""
+        md = ("<!-- page:0 -->\n\nfirst page note\n\n"
+              "<!-- page:1 -->\n\nsecond page note\n")
+
+        def body(win):
+            self.assertTrue(win._enter_full_notes_view())
+            self.assertTrue(win._text_mode)
+            self.assertTrue(win._full_notes_view())
+            sheet = win._notes_view.get_source_text()
+            self.assertIn("first page note", sheet)
+            self.assertIn("second page note", sheet)
+            self.assertIn("<!-- page:1 -->", sheet)
+
+            # edit the sheet: it is the file, so the model must take it back
+            win._notes_view.get_buffer().set_text(
+                "<!-- page:0 -->\n\nedited first\n\n"
+                "<!-- page:1 -->\n\nsecond page note\n")
+            self.assertTrue(win._leave_full_notes_view())
+            self.assertFalse(win._text_mode)
+            self.assertEqual(win.notes_model.own_text(0), "edited first")
+            self.assertEqual(win.notes_model.own_text(1), "second page note")
+            # and the panel is back on the page's own notes, not the whole file
+            self.assertEqual(win._notes_view.get_source_text(), "edited first")
+
+        self._run_in_window(2, body, md=md)
+
+    def test_a_pdf_in_the_sheet_view_still_saves_per_page(self):
+        """The distinction the whole codebase uses: a text-first page has no
+        `_path`. This one has, so it is a VIEW and saves sectioned."""
+        md = "<!-- page:0 -->\n\nkept\n"
+
+        def body(win):
+            win._enter_full_notes_view()
+            win._on_save(None)
+            raw = open(win._current_notes_path()).read()
+            self.assertIn("<!-- page:0 -->", raw)
+            self.assertIn("kept", raw)
+            self.assertTrue(win._path.endswith(".pdf"))
+
+        self._run_in_window(2, body, md=md)
+
+    def test_the_view_is_remembered_per_document(self):
+        def body(win):
+            path = win._path
+            win._enter_full_notes_view()
+            self.assertTrue(sidemark._recent_full_notes(path))
+            win._leave_full_notes_view()
+            self.assertFalse(sidemark._recent_full_notes(path))
+
+        self._run_in_window(2, body)
+
+    def test_the_divider_is_full_width_at_its_leftmost_not_at_zero(self):
+        """The canvas side cannot shrink below its own minimum, so the handle
+        never reaches 0 — testing for zero would make the gesture unreachable
+        on every window."""
+        def body(win):
+            s = win._active_session
+            win._set_notes_shown(True)
+            floor = s._paned.get_start_child().measure(
+                Gtk.Orientation.HORIZONTAL, -1)[0]
+            s._paned.set_position(floor + 4)
+            self.assertTrue(win._divider_is_at_full_width(s))
+            s._paned.set_position(floor + 400)
+            self.assertFalse(win._divider_is_at_full_width(s))
+
+        self._run_in_window(2, body)
+
+    def test_the_edge_pull_brings_the_pages_back(self):
+        def body(win):
+            win._enter_full_notes_view()
+            self.assertTrue(win._pull_page_in())
+            self.assertFalse(win._text_mode)
+
+        self._run_in_window(2, body)
+
+
+class TestEdgePullOnATextPage(unittest.TestCase):
+    """The mirror on a text-first page: the document GAINS a blank page."""
+
+    def test_a_text_page_gains_an_untitled_blank_pdf(self):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.edgepull")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    md = os.path.join(d, "note.md")
+                    with open(md, "w") as f:
+                        f.write("a thought\n")
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(md)
+                    self.assertTrue(win._text_mode)
+                    self.assertTrue(win._pull_page_in())
+                    self.assertFalse(win._text_mode)
+                    self.assertEqual(win.canvas.n_pages, 1)
+                    # an UNTITLED temp page: nothing is littered beside the .md
+                    self.assertTrue(win._is_untitled)
+                    self.assertFalse(os.path.exists(
+                        os.path.join(d, "note.pdf")))
+                    # the writing survives, as the page's notes
+                    self.assertEqual(win.notes_model.get(0), "a thought")
+                    # …and the .md is still where the notes are written
+                    self.assertEqual(win._current_notes_path(), md)
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+
+
+class TestCommentVisibility(unittest.TestCase):
+    """An HTML comment is not prose — a Markdown viewer drops one, and
+    Sidemark keeps its own per-page bookkeeping in them."""
+
+    def _view(self):
+        from sidemark import MarkdownNotesView
+        v = MarkdownNotesView()
+        MarkdownNotesView.show_comments = False
+        return v
+
+    def test_a_comment_is_hidden_off_the_cursor_line(self):
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text("<!-- page:3 continued -->\nprose here")
+        buf.place_cursor(buf.get_iter_at_line(1)[1])
+        v._rehighlight()
+        it = buf.get_iter_at_offset(4)
+        self.assertTrue(it.has_tag(v._t["hide"]))
+        # the source is untouched — hiding is a rendering, not an edit
+        self.assertIn("<!-- page:3 continued -->", v.get_source_text())
+
+    def test_the_cursor_line_always_shows_it(self):
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text("<!-- note to self -->\nprose here")
+        buf.place_cursor(buf.get_iter_at_line(0)[1])
+        v._rehighlight()
+        it = buf.get_iter_at_offset(4)
+        self.assertFalse(it.has_tag(v._t["hide"]))
+
+    def test_the_switch_shows_every_comment(self):
+        from sidemark import MarkdownNotesView
+        v = self._view()
+        MarkdownNotesView.show_comments = True
+        try:
+            buf = v.get_buffer()
+            buf.set_text("<!-- mine -->\nprose here")
+            buf.place_cursor(buf.get_iter_at_line(1)[1])
+            v._rehighlight()
+            it = buf.get_iter_at_offset(4)
+            self.assertFalse(it.has_tag(v._t["hide"]))
+            self.assertTrue(it.has_tag(v._t["comment"]))
+        finally:
+            MarkdownNotesView.show_comments = False
+
+    def test_a_comment_renders_as_nothing_else(self):
+        """`<!-- page:13-40 continued -->` is full of things that would
+        otherwise read as maths."""
+        from sidemark import MarkdownNotesView
+        v = self._view()
+        MarkdownNotesView.show_comments = True
+        try:
+            buf = v.get_buffer()
+            buf.set_text("<!-- a_i and *this* -->\nprose")
+            buf.place_cursor(buf.get_iter_at_line(1)[1])
+            v._rehighlight()
+            line = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+            it = buf.get_iter_at_offset(line.index("this"))
+            self.assertFalse(it.has_tag(v._t["italic"]))
+            it = buf.get_iter_at_offset(line.index("a_i") + 2)
+            self.assertFalse(it.has_tag(v._t["subscript"]))
+        finally:
+            MarkdownNotesView.show_comments = False
+
+
 class TestLinkedNotesExport(unittest.TestCase):
     def test_a_run_prints_once_not_once_per_page(self):
         """`_export_pdf_with_notes` must read own_text: a resolving get() would
