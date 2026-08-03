@@ -1816,6 +1816,28 @@ DEFAULT_BINDINGS = {
     "finger": "pan",
 }
 
+# The TEXT page's table. Same defaults unless there is a reason — the two modes
+# are one app, so a chord you learned on a PDF must not mean something else on
+# a sheet. The reasons here are the mode itself: a text page is for TYPING, so
+# the left button is the caret rather than the pen, and Shift+left extends a
+# selection (on a PDF that chord is zoom-to-region, which needs no caret).
+# Alt+left then carries the pen, because the pen must stay reachable without
+# rebinding — and it is the old grammar's rule anyway: Alt escapes to the OTHER
+# mode's home tool.
+TEXT_BINDING_OVERRIDES = {
+    "left": "text",
+    "shift+left": "text",
+    "alt+left": "pen",
+}
+DEFAULT_TEXT_BINDINGS = {**DEFAULT_BINDINGS, **TEXT_BINDING_OVERRIDES}
+# One table PER MODE, not one for both (row 132 shipped with a single table and
+# it did not survive contact with the text page: the mode you are in is exactly
+# what "what should the left button do?" depends on). The MODEL stays unified —
+# one class, one file, one popover, the same chord ids — so a binding learned
+# in one mode still reads the same in the other.
+DEFAULT_TABLES = {"pdf": DEFAULT_BINDINGS, "text": DEFAULT_TEXT_BINDINGS}
+BINDING_MODES = tuple(DEFAULT_TABLES)
+
 
 INPUT_DEBUG = bool(os.environ.get("SIDEMARK_INPUT_DEBUG"))
 
@@ -1997,85 +2019,130 @@ class _SyntheticDrag:
 
 
 class Bindings:
-    """The mutable button table, persisted in settings.json under
-    `button_bindings`. Unknown tools are dropped on load rather than kept —
-    a binding nothing can execute would silently swallow the press."""
+    """The mutable button tables — ONE PER DOCUMENT MODE — persisted in
+    settings.json under `button_bindings`. Unknown tools are dropped on load
+    rather than kept: a binding nothing can execute would silently swallow the
+    press.
 
-    def __init__(self, table=None):
-        self._table = dict(DEFAULT_BINDINGS if table is None else table)
+    `mode` is the table the UI acts on: the toolbar, its badges and tooltips,
+    the popover and the binding surface all read and write the table of the
+    document you are looking at. The window keeps it in step with the active
+    tab. Everything that ROUTES a press passes its own mode explicitly instead,
+    because a canvas knows what it is and must never depend on which tab the
+    chrome thinks is in front."""
+
+    def __init__(self, tables=None, mode="pdf"):
+        tables = tables or {}
+        self._tables = {m: dict(tables.get(m) or DEFAULT_TABLES[m])
+                        for m in BINDING_MODES}
+        self.mode = mode if mode in self._tables else "pdf"
+
+    @property
+    def _table(self):
+        """The active mode's table — what an unqualified read or write means."""
+        return self._tables[self.mode]
+
+    def table_for(self, mode):
+        return self._tables.get(mode or self.mode, self._tables["pdf"])
 
     # ── reading ──────────────────────────────────────────────────────────────
 
     def tool_for(self, button, ctrl=False, shift=False, alt=False, mode="pdf"):
         """The tool this chord runs in this document mode, or None."""
-        tool = self._table.get(chord_id(button, ctrl, shift, alt))
+        tool = self.table_for(mode).get(chord_id(button, ctrl, shift, alt))
         if tool is None:
             return None
         tool = canonical_tool(tool)
         return tool if tool_in_mode(tool, mode) else None
 
-    def tool_for_chord(self, chord):
+    def tool_for_chord(self, chord, mode=None):
         """The tool bound to a chord id, ignoring document mode."""
-        tool = self._table.get(chord)
+        tool = self.table_for(mode).get(chord)
         return canonical_tool(tool) if tool else None
 
     def chords_for(self, tool, mode=None):
         """Every chord bound to a tool, in a stable order (plain buttons before
         modified ones) — this is what the tooltips and the badges are built
-        from, so they can never disagree with what the mouse does."""
+        from, so they can never disagree with what the mouse does. `mode` also
+        picks the TABLE, so the bar describes the document in front of you."""
         tool = canonical_tool(tool)
-        found = [c for c, t in self._table.items() if canonical_tool(t) == tool]
+        table = self.table_for(mode)
+        found = [c for c, t in table.items() if canonical_tool(t) == tool]
         if mode is not None and not tool_in_mode(tool, mode):
             return []
         return sorted(found, key=lambda c: (c.count("+"), c))
 
-    def plain_buttons_for(self, tool):
+    def plain_buttons_for(self, tool, mode=None):
         """The UNMODIFIED buttons a tool owns — the ones that earn a badge.
         Modified chords deliberately get none, or every button in the bar
         wears a constellation; they live in the tooltip instead."""
-        return [c for c in self.chords_for(tool) if "+" not in c]
+        table = self.table_for(mode)
+        tool = canonical_tool(tool)
+        return sorted((c for c, t in table.items()
+                       if canonical_tool(t) == tool and "+" not in c),
+                      key=lambda c: (c.count("+"), c))
 
-    def items(self):
+    def items(self, mode=None):
         """(chord, tool) pairs, plain buttons first — the popover's list."""
-        return [(c, self._table[c])
-                for c in sorted(self._table, key=lambda c: (c.count("+"), c))]
+        table = self.table_for(mode)
+        return [(c, table[c])
+                for c in sorted(table, key=lambda c: (c.count("+"), c))]
 
     # ── writing ──────────────────────────────────────────────────────────────
 
-    def bind(self, chord, tool):
-        """Bind a chord, returning the tool it took it from (None if free).
-        A chord maps to exactly ONE tool, so binding MOVES it — that is what
-        the toast reports, and why there is no silent double-binding."""
+    def bind(self, chord, tool, mode=None):
+        """Bind a chord in one mode's table, returning the tool it took it from
+        (None if free). A chord maps to exactly ONE tool per mode, so binding
+        MOVES it — that is what the toast reports, and why there is no silent
+        double-binding."""
+        table = self.table_for(mode)
         tool = canonical_tool(tool)
-        previous = self._table.get(chord)
-        self._table[chord] = tool
+        previous = table.get(chord)
+        table[chord] = tool
         return canonical_tool(previous) if previous else None
 
-    def clear(self, chord):
-        return self._table.pop(chord, None)
+    def clear(self, chord, mode=None):
+        return self.table_for(mode).pop(chord, None)
 
-    def reset(self):
-        self._table = dict(DEFAULT_BINDINGS)
+    def reset(self, mode=None):
+        """Back to the defaults — of the active mode only. The other mode's
+        table is a different question and nobody asked it."""
+        m = mode or self.mode
+        self._tables[m] = dict(DEFAULT_TABLES[m])
 
-    def replace(self, table):
-        """Swap the whole table (undoing a reset)."""
-        self._table = dict(table)
+    def replace(self, table, mode=None):
+        """Swap one mode's whole table (undoing a reset)."""
+        self._tables[mode or self.mode] = dict(table)
 
     # ── persistence ──────────────────────────────────────────────────────────
 
     def to_json(self):
-        return dict(self._table)
+        return {m: dict(t) for m, t in self._tables.items()}
+
+    @classmethod
+    def _clean(cls, data):
+        table = {}
+        for chord, tool in (data or {}).items():
+            tool = canonical_tool(tool) if isinstance(tool, str) else None
+            if tool in TOOL_MODES and isinstance(chord, str):
+                table[chord] = tool
+        return table
 
     @classmethod
     def from_json(cls, data):
         if not isinstance(data, dict):
             return cls()
-        table = {}
-        for chord, tool in data.items():
-            tool = canonical_tool(tool) if isinstance(tool, str) else None
-            if tool in TOOL_MODES and isinstance(chord, str):
-                table[chord] = tool
-        return cls(table)
+        if data and all(isinstance(v, str) for v in data.values()):
+            # a table written before the split: it was the table for BOTH
+            # modes, so it stays the PDF one and seeds the text one, with the
+            # text overrides on top. Migrating it wholesale would leave the
+            # sheet with the pen on the left button, which is the one thing
+            # per-mode tables exist to fix.
+            flat = cls._clean(data)
+            return cls({"pdf": flat,
+                        "text": {**flat, **TEXT_BINDING_OVERRIDES}})
+        return cls({m: cls._clean(data.get(m)) if isinstance(data.get(m), dict)
+                    else None for m in BINDING_MODES})
 
     @classmethod
     def load(cls):
@@ -2098,17 +2165,29 @@ class Bindings:
         saved = settings.get("button_bindings")
         bindings = cls.from_json(saved)
         seen = settings.get("button_defaults_seeded")
-        if not isinstance(seen, list):
+        if isinstance(seen, list):
+            # written before the tables were split: that list described the one
+            # table there was, so it counts as seen for both
+            seen = {m: list(seen) for m in BINDING_MODES}
+        if not isinstance(seen, dict):
             # First run under this scheme. A table already on disk predates
             # the list, so everything in it counts as seen; a fresh install
             # has just taken the defaults wholesale and is seeded by them.
-            seen = list(saved.keys()) if isinstance(saved, dict) else []
-        fresh = [c for c in DEFAULT_BINDINGS if c not in seen]
-        if fresh:
+            flat = list(saved.keys()) if isinstance(saved, dict) else []
+            seen = {m: (list(saved[m]) if isinstance(saved, dict)
+                        and isinstance(saved.get(m), dict) else flat)
+                    for m in BINDING_MODES}
+        dirty = False
+        for m in BINDING_MODES:
+            known = seen.get(m) or []
+            fresh = [c for c in DEFAULT_TABLES[m] if c not in known]
             for chord in fresh:
-                bindings._table.setdefault(chord, DEFAULT_BINDINGS[chord])
-            _save_setting("button_defaults_seeded",
-                          sorted(set(seen) | set(DEFAULT_BINDINGS)))
+                bindings._tables[m].setdefault(chord, DEFAULT_TABLES[m][chord])
+            if fresh:
+                seen[m] = sorted(set(known) | set(DEFAULT_TABLES[m]))
+                dirty = True
+        if dirty:
+            _save_setting("button_defaults_seeded", seen)
             bindings.save()
         return bindings
 
@@ -2871,7 +2950,7 @@ class PDFCanvas(Gtk.DrawingArea):
 
     @tool.setter
     def tool(self, value):
-        self.bindings.bind("left", value)
+        self.bindings.bind("left", value, mode=self.doc_mode)
 
     @property
     def doc_mode(self):
@@ -2886,9 +2965,9 @@ class PDFCanvas(Gtk.DrawingArea):
         # kept so the pen popover can flip the left button to the highlighter
         # and back without knowing about the table
         if on:
-            self.bindings.bind("left", "highlighter")
+            self.bindings.bind("left", "highlighter", mode=self.doc_mode)
         elif self.tool == "highlighter":
-            self.bindings.bind("left", "pen")
+            self.bindings.bind("left", "pen", mode=self.doc_mode)
 
     @property
     def select_mode(self):
@@ -2897,9 +2976,9 @@ class PDFCanvas(Gtk.DrawingArea):
     @select_mode.setter
     def select_mode(self, on):
         if on:
-            self.bindings.bind("left", "text")
+            self.bindings.bind("left", "text", mode=self.doc_mode)
         elif self.tool == "text":
-            self.bindings.bind("left", "pen")
+            self.bindings.bind("left", "pen", mode=self.doc_mode)
 
     @staticmethod
     def _now_ms():
@@ -6945,8 +7024,17 @@ class NoteSections(NamedTuple):
 # that it is bookmarked, `bookmark="Eigenvalues"` that the bookmark was renamed.
 # They compose (`<!-- page:13 continued bookmark -->`) and old files still parse,
 # because "no attributes" has always been the ordinary case.
+#
+# A marker can also name a RANGE — `<!-- page:13-40 continued -->` — which is
+# how a long run is written: 28 identical one-line markers said one fact, and
+# the fact is about the run, not about each page. The reader expands a range
+# onto every page in it, so the per-page form keeps working and a file written
+# by an older Sidemark (or by hand) needs no migration. The writer only
+# coalesces pages that carry NOTHING but `continued`: a bookmark is a property
+# of one page, so it breaks the range and gets its own marker.
 _MARKER_ATTRS_RE = r'(?:\s+continued|\s+bookmark(?:="[^"\n]*")?)*'
-_PAGE_MARKER_RE = r'<!--\s*page:(\d+)(' + _MARKER_ATTRS_RE + r')\s*-->'
+_PAGE_MARKER_RE = (r'<!--\s*page:(\d+)(?:-(\d+))?('
+                   + _MARKER_ATTRS_RE + r')\s*-->')
 
 
 def _esc_marker(text):
@@ -6981,17 +7069,22 @@ def parse_note_sections(raw):
         text = raw.strip()
         return NoteSections({0: text} if text else {}, set(), False, {})
     sections, linked, bookmarks = {}, set(), {}
-    # re.split yields [prefix, page, attrs, body, page, attrs, body...] — one
-    # group per marker capture, so the stride is 3, not 2.
-    for i in range(1, len(parts), 3):
+    # re.split yields [prefix, page, end, attrs, body, ...] — one group per
+    # marker capture, so the stride is 4, not 2.
+    for i in range(1, len(parts), 4):
         idx = int(parts[i])
-        content = parts[i + 2].strip() if i + 2 < len(parts) else ""
-        attrs = parts[i + 1] or ""
+        last = int(parts[i + 1]) if parts[i + 1] else idx
+        content = parts[i + 3].strip() if i + 3 < len(parts) else ""
+        attrs = parts[i + 2] or ""
+        # a range applies its attributes to every page in it; a body (which a
+        # range never has when we wrote it) stays with the first page
+        span = range(idx, max(last, idx) + 1)
         if re.search(r'\bcontinued\b', attrs):
-            linked.add(idx)
+            linked.update(span)
         bm = re.search(r'\bbookmark\b(?:="([^"\n]*)")?', attrs)
         if bm:
-            bookmarks[idx] = _unesc_marker(bm.group(1) or "")
+            for p in span:
+                bookmarks[p] = _unesc_marker(bm.group(1) or "")
         if content:
             sections[idx] = content
     return NoteSections(sections, linked, True, bookmarks)
@@ -7685,34 +7778,26 @@ _MD_SYMBOLS = {
 # A space before a LETTER is a TERMINATOR, not a gap: you have to write
 # `\alpha x` because `\alphax` is a different command, so rendering it puts a
 # hole in the middle of "αx". Exactly one such space is eaten with the command
-# it ended — a second one is a real space and survives. Two things narrow it,
-# and both are about not eating a space nobody was forced to type: the
-# lookahead (nothing but a letter could have continued the command, so
-# `\alpha + \beta` keeps its spacing — a second space is in it so that typing
-# two is how you ask for one), and the letter-like set below.
+# it ended — a second one is a real space and survives. One thing narrows it,
+# and it is about not eating a space nobody was forced to type: the lookahead.
+# Nothing but a letter could have continued the command, so `\alpha + \beta`
+# keeps its spacing — and a second space is in the lookahead, so typing two is
+# how you ask for one.
 _MD_SYMBOL_RE = re.compile(r'\\([A-Za-z]+)( (?=[A-Za-z ]))?')
-
-# Which symbols are VARIABLES rather than operators — the only ones whose
-# terminating space is eaten. `\alpha x` is one term "αx", but `A \mapsto B` is
-# a relation between two, and "A ↦B" would read as the arrow being glued to its
-# right operand. Same distinction LaTeX makes when it spaces an operator.
-_MD_LETTER_SYMBOLS = {
-    'alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta',
-    'iota', 'kappa', 'lambda', 'mu', 'nu', 'xi', 'pi', 'rho', 'sigma', 'tau',
-    'upsilon', 'phi', 'chi', 'psi', 'omega',
-    'Gamma', 'Delta', 'Theta', 'Lambda', 'Xi', 'Pi', 'Sigma', 'Phi', 'Psi',
-    'Omega', 'infty', 'partial', 'nabla', 'emptyset',
-}
 
 
 def _sub_symbol(m):
-    """One \\command → its glyph, eating the space that terminated it when that
-    space only separated a variable from the next letter."""
+    """One \\command → its glyph, eating the space that terminated it.
+
+    EVERY symbol, operators included: `\\cdot a` is "·a" and `a \\le b` is
+    "a ≤b". An operator was once given its LaTeX-style spacing back, and that
+    was wrong — you never chose that space either, and half the table behaving
+    differently from the other half is not a rule anybody can hold in their
+    head while writing."""
     sym = _MD_SYMBOLS.get('\\' + m.group(1))
     if sym is None:
         return m.group(0)                # unknown command — leave it alone
-    space = m.group(2) or ''
-    return sym if space and m.group(1) in _MD_LETTER_SYMBOLS else sym + space
+    return sym
 
 # LaTeX accents over a base symbol, rendered with Unicode combining marks:
 # \hat{x} → x̂, \bar{x} → x̄, \tilde{x} → x̃, \vec{x} → x⃗ (and \dot / \ddot).
@@ -7867,6 +7952,53 @@ _MD_INLINE_RE = re.compile(r'\*\*(.+?)\*\*|\*([^*\n]+?)\*|`([^`\n]+?)`')
 _MD_SCRIPT_RE = re.compile(
     r'(\^|_)(?:\{([^}]*)\}|([+-]?[A-Za-z0-9]+)( (?=[A-Za-z0-9 ]))?)')
 
+# A script that starts exactly where the previous one's content ended is a
+# script OF that script — `a_i_j` is "j indexing i", not two indices of `a`
+# side by side, and `a_i^2` puts the 2 above the i. Anything between them (a
+# space, another character) ends the chain, which is also how you write two
+# scripts of the same base: `a_i {}^2`, or braces.
+MAX_SCRIPT_DEPTH = 3          # beyond this the glyphs are unreadable anyway
+SCRIPT_SCALE = 0.65           # each level shrinks by this much
+SCRIPT_BASE_RISE = {'sup': 4000, 'sub': -2000}   # Pango units, level 1
+
+
+def script_body_end(m):
+    """Where a script's content ends — the match end without the space it ate.
+    The next script nests only if it begins exactly here."""
+    return m.end() - len(m.group(4) or '')
+
+
+def iter_scripts(text):
+    """Yield `(match, chain)` for every ^/_ script, where `chain` is the kinds
+    ('sub'/'sup') from the outermost enclosing script down to this one. A
+    top-level script has a chain of length 1."""
+    chain, prev_end = [], None
+    for m in _MD_SCRIPT_RE.finditer(text):
+        kind = 'sup' if m.group(1) == '^' else 'sub'
+        if prev_end is not None and m.start() == prev_end and \
+                len(chain) < MAX_SCRIPT_DEPTH:
+            chain = chain + [kind]
+        else:
+            chain = [kind]
+        prev_end = script_body_end(m)
+        yield m, tuple(chain)
+
+
+def script_style(chain):
+    """(rise in Pango units, font scale) for a nesting chain. Each level is
+    placed relative to the one it sits on and shrinks with it, so the `2` of
+    `a_i^2` lands at the top of the i rather than at the top of the a."""
+    rise, scale = 0.0, 1.0
+    for kind in chain:
+        rise += SCRIPT_BASE_RISE[kind] * scale
+        scale *= SCRIPT_SCALE
+    return int(round(rise)), scale
+
+
+def script_content(m):
+    """The text a script renders — braced or not."""
+    return m.group(2) if m.group(2) is not None else m.group(3)
+
 
 def _notes_to_pango_markup(text):
     """One paragraph of notes source → Pango markup for callout rendering:
@@ -7874,10 +8006,22 @@ def _notes_to_pango_markup(text):
     *italic* / `code` become the matching tags. Inside a `code` span nothing
     else is rendered — the text is shown verbatim. Markers themselves are
     dropped (like the editor hides them off the cursor line)."""
-    def _script(m):
-        content = m.group(2) if m.group(2) is not None else m.group(3)
-        tag = "sup" if m.group(1) == '^' else "sub"
-        return f"<{tag}>{content}</{tag}>"
+    def _scripts(s):
+        """Nested `<sub>`/`<sup>`, which is what makes the j of `a_i_j` smaller
+        than the i. A tag is opened with its content and closed only once the
+        chain ends, so an inner script is emitted INSIDE its outer one."""
+        out, pos, open_tags = [], 0, []
+        for m, chain in iter_scripts(s):
+            if len(chain) == 1:          # a new chain: close the old one first
+                out.append("".join(reversed(open_tags)))
+                open_tags.clear()
+                out.append(s[pos:m.start()])     # the gap belongs outside
+            out.append(f"<{chain[-1]}>{script_content(m)}")
+            open_tags.append(f"</{chain[-1]}>")
+            pos = m.end()                # past the space it ate, if any
+        out.append("".join(reversed(open_tags)))
+        out.append(s[pos:])
+        return "".join(out)
 
     def _inline(m):
         if m.group(1) is not None:
@@ -7898,7 +8042,7 @@ def _notes_to_pango_markup(text):
         # symbols first, then escape, then scripts, then bold/italic. The
         # segment has no backticks, so _inline only ever sees bold/italic here.
         s = GLib.markup_escape_text(_symbolize(seg))
-        s = _MD_SCRIPT_RE.sub(_script, s)
+        s = _scripts(s)
         parts.append(_MD_INLINE_RE.sub(_inline, s))
     return "".join(parts)
 
@@ -8812,21 +8956,35 @@ class NotesModel:
 
     def save(self, path):
         sections = []
-        for idx in sorted(set(self._notes) | self._links | set(self._bookmarks)):
+        pages = sorted(set(self._notes) | self._links | set(self._bookmarks))
+        i = 0
+        while i < len(pages):
+            idx = last = pages[i]
             attrs = ""
             if idx in self._links:
                 attrs += " continued"
+                # coalesce the maximal run of pages carrying nothing BUT
+                # `continued` into one range marker — the fact is about the
+                # run, and a bookmark (a per-page property) ends the range
+                if idx not in self._bookmarks:
+                    while (i + 1 < len(pages) and pages[i + 1] == last + 1
+                           and pages[i + 1] in self._links
+                           and pages[i + 1] not in self._bookmarks):
+                        i += 1
+                        last = pages[i]
             if idx in self._bookmarks:
                 name = self._bookmarks[idx]
                 attrs += f' bookmark="{_esc_marker(name)}"' if name else " bookmark"
             # a linked page's body lives on the run's first page, never here
             body = "" if idx in self._links else self._notes.get(idx, "").strip()
+            i += 1
             if not attrs and not body:
                 continue
             # an EMPTY page is still written out when it carries a marker —
             # a continued page (row 129) or a bookmark is invisible state that
             # exists nowhere else
-            sections.append(f"<!-- page:{idx}{attrs} -->"
+            span = f"{idx}" if last == idx else f"{idx}-{last}"
+            sections.append(f"<!-- page:{span}{attrs} -->"
                             + (f"\n\n{body}" if body else ""))
         body = "\n\n".join(sections) + "\n" if sections else ""
         embed = f"![[{self.pdf_name}]]\n\n" if self.pdf_name else ""
@@ -9662,6 +9820,23 @@ class MarkdownNotesView(GtkSource.View):
             self._highlight_line(buf, ls, ln, text)
         return False
 
+    def _script_tag(self, chain):
+        """The tag name for a script nesting chain, created on first use. Depth
+        1 is the plain "superscript"/"subscript" tag; deeper levels get their
+        own tag, registered in `self._t` so `_rehighlight` clears them like any
+        other."""
+        if len(chain) == 1:
+            return "superscript" if chain[0] == 'sup' else "subscript"
+        rise, scale = script_style(chain)
+        name = f"script_{rise}_{scale:.4f}"
+        if name not in self._t:
+            tg = Gtk.TextTag.new(name)
+            tg.set_property("rise", rise)
+            tg.set_property("scale", scale)
+            self.get_buffer().get_tag_table().add(tg)
+            self._t[name] = tg
+        return name
+
     def _highlight_line(self, buf, ls, ln, text):
         on_cursor = (ln == self._cursor_line)
 
@@ -9737,20 +9912,23 @@ class MarkdownNotesView(GtkSource.View):
                 hide(a, a + 1)
                 hide(b - 1, b)
 
-        # Super/subscripts: ^{ab} ^x  _{ab} _x  — only rendered off cursor line
+        # Super/subscripts: ^{ab} ^x  _{ab} _x  — only rendered off cursor line.
+        # A chained script (`a_i_j`, `a_i^2`) is a script OF the one before it,
+        # so it is placed relative to that one and shrinks again — see
+        # script_style. Depth 1 resolves to the plain sub/superscript tags.
         if not on_cursor:
-            for m in self._SCRIPT_RE.finditer(text):
+            for m, chain in iter_scripts(text):
                 a, b = m.start(), m.end()
                 if protected(a, b):
                     continue                 # ^/_ inside `code`/[[link]] stays literal
-                tag_name = "superscript" if m.group(1) == '^' else "subscript"
+                tag_name = self._script_tag(chain)
                 if m.group(2) is not None:   # braced: ^{content}
                     apply("hide", a, a + 2)  # hide ^{ or _{
                     apply(tag_name, a + 2, b - 1)
                     apply("hide", b - 1, b)  # hide }
                 else:                        # unbraced: ^x or _x
                     apply("hide", a, a + 1)  # hide ^ or _
-                    end = b - len(m.group(4) or '')
+                    end = script_body_end(m)
                     apply(tag_name, a + 1, end)
                     apply("hide", end, b)    # the space that ended it
 
@@ -10109,7 +10287,7 @@ class TextPageView(Gtk.Overlay):
         The ink overlay is NOT made targetable any more: the capture-phase
         press router sees every press above it, so targeting would only take
         the caret's clicks away from the TextView for no gain."""
-        self.bindings.bind("left", canonical_tool(tool))
+        self.bindings.bind("left", canonical_tool(tool), mode="text")
         drawing = self.tool in ("pen", "highlighter", "eraser", "zoom")
         self.ink.set_cursor(
             Gdk.Cursor.new_from_name("crosshair") if drawing else None)
@@ -12592,7 +12770,8 @@ class DocumentSession:
         "_burst_base", "_anchor_line_nos", "_anchor_para_ends", "_search_hits",
         "_note_hits", "_search_matches", "_search_current", "_presenter",
         "_last_anchor_mark", "_link_hint_shown", "_saved_pane_pos", "_pane_anim",
-        "_thumb_idle_id", "_current_thumb_row", "_drag_export_dir",
+        "_thumb_idle_id", "_current_thumb_row", "_thumb_centred_page",
+        "_drag_export_dir",
         "_has_toc", "_toc_thumbs", "_drop_indicator_row", "_text_mode",
     )
     WIDGETS = (
@@ -12627,6 +12806,7 @@ class DocumentSession:
         self._pane_anim = None
         self._thumb_idle_id = None
         self._current_thumb_row = None
+        self._thumb_centred_page = None
         self._drag_export_dir = None
         self._has_toc = False
         self._toc_thumbs = False
@@ -13006,6 +13186,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._toc_thumbs = False
         self._thumb_idle_id = None
         self._current_thumb_row = None   # row carrying the .current-page CSS marker
+        self._thumb_centred_page = None  # page the strip was last scrolled to
         self._drop_indicator_row = None  # row carrying the drop-gap CSS marker
         self._drag_export_dir = None   # lazily created temp dir for drag-exported pages
         self._toc_btn = Gtk.ToggleButton()
@@ -13439,13 +13620,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # panning away from yourself.
         popover_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
         btn_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        btn_label = Gtk.Label(label="Buttons", xalign=0)
+        # …of THIS page type. The tables are per mode, so the heading has to
+        # name the one you are editing or an unchanged-looking list after a tab
+        # switch reads as the bindings having been lost.
+        self._bindings_label = Gtk.Label(label="Buttons", xalign=0)
+        btn_label = self._bindings_label
         btn_label.add_css_class("dim-label")
         btn_label.set_hexpand(True)
         btn_header.append(btn_label)
         reset_btn = Gtk.Button(label="Reset")
         reset_btn.add_css_class("flat")
-        reset_btn.set_tooltip_text("Put every mouse button back to its default tool")
+        reset_btn.set_tooltip_text(
+            "Put every mouse button back to its default tool, for this page type")
         reset_btn.connect("clicked", lambda *_: self._reset_bindings())
         btn_header.append(reset_btn)
         popover_box.append(btn_header)
@@ -14000,6 +14186,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         live depends on the mode (anchor has none on a text page)."""
         mode = (self._active_session.doc_mode if self._active_session
                 else "pdf")
+        # THE place the chrome's table follows the document: the toolbar, its
+        # badges and tooltips, the popover and the binding surface all read the
+        # active mode's table, and this runs on every mode change AND every tab
+        # switch. Routing never reads it — a canvas passes its own mode.
+        self.bindings.mode = mode
         self._refresh_tool_bindings()
         for name, modes in self._MODE_CHROME.items():
             vis = mode in modes
@@ -15638,6 +15829,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         self._toc_revealer.set_reveal_child(btn.get_active())
         if btn.get_active() and self._toc_thumbs:
+            # opening it is exactly when "where am I?" is the question, so this
+            # scrolls unconditionally — through the retry, because the reveal
+            # is an animation and nothing is laid out yet at this instant
+            self._thumb_centred_page = None
             self._select_thumb(self.canvas.current_page_idx)
 
     def _on_toc_row_activated(self, _list, row):
@@ -15665,6 +15860,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._toc_list.unselect_all()
 
     def _populate_toc(self):
+        # a rebuild throws every row away, so remember where the strip was
+        # standing: a bookmark added on page 200 must not send it back to the top
+        keep_scroll = self._toc_scroll.get_vadjustment().get_value()
         if self._thumb_idle_id is not None:
             GLib.source_remove(self._thumb_idle_id)
             self._thumb_idle_id = None
@@ -15692,7 +15890,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # sidebar hugs the thumbnails (margins + row padding)
             self._toc_scroll.set_size_request(self.THUMB_WIDTH + 32, -1)
             if self._toc_revealer.get_reveal_child():
-                self._select_thumb(self.canvas.current_page_idx)
+                # scroll only when the strip is not already showing this page:
+                # a fresh document (or a page turn) should bring it into view,
+                # a mere refresh — a bookmark, a link, a rename — must not move
+                idx = self.canvas.current_page_idx
+                fresh = self._thumb_centred_page != idx
+                self._select_thumb(idx, scroll=fresh)
+                if not fresh:
+                    self._restore_toc_scroll(keep_scroll)
             self._toc_btn.set_tooltip_text(
                 "Toggle outline (Ctrl+T)" if self._has_toc else
                 "Toggle page thumbnails (Ctrl+T) — no outline in this document")
@@ -16529,10 +16734,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             os.replace(pages_pdf, out_path)
         return Gio.File.new_for_path(out_path)
 
-    def _select_thumb(self, idx):
+    def _select_thumb(self, idx, scroll=True):
         """Mark the current page's thumbnail (a CSS class, not the listbox
-        selection — which the user owns for multi-page drag-export) and scroll
-        it into view."""
+        selection — which the user owns for multi-page drag-export) and, unless
+        told otherwise, scroll it into view. `scroll=False` is for a REBUILD of
+        the strip: adding a bookmark repopulates every row, and moving the
+        strip because a mark was added answers a question nobody asked."""
         row = self._toc_list.get_row_at_index(idx)
         if row is None:
             return
@@ -16540,11 +16747,45 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._current_thumb_row.remove_css_class("current-page")
         row.add_css_class("current-page")
         self._current_thumb_row = row
+        if scroll:
+            self._scroll_thumb_into_view(idx)
+
+    def _scroll_thumb_into_view(self, idx, tries=12):
+        """Centre a thumbnail once the strip has actually been laid out.
+
+        Opening the sidebar starts a reveal ANIMATION and repopulating it
+        rebuilds every row, so at the moment we are asked the rows have no
+        allocation: every one of them reports y=0 and the adjustment has
+        nothing to scroll, which is why the strip used to open at page 1 no
+        matter which page you were on. Retry until there is a scroll range —
+        the same "layout needs a live frame clock" trap the tests hit."""
+        row = self._toc_list.get_row_at_index(idx)
+        if row is None:
+            return
+        adj = self._toc_scroll.get_vadjustment()
+        span = adj.get_upper() - adj.get_page_size()
         ok, bounds = row.compute_bounds(self._toc_list)
-        if ok:
-            adj = self._toc_scroll.get_vadjustment()
-            target = bounds.get_y() + bounds.get_height() / 2 - adj.get_page_size() / 2
-            adj.set_value(max(0.0, min(target, adj.get_upper() - adj.get_page_size())))
+        if (not ok or span <= 0) and tries > 0:
+            GLib.timeout_add(
+                40, lambda: self._scroll_thumb_into_view(idx, tries - 1) and False)
+            return
+        if not ok:
+            return
+        target = bounds.get_y() + bounds.get_height() / 2 - adj.get_page_size() / 2
+        adj.set_value(max(0.0, min(target, max(0.0, span))))
+        self._thumb_centred_page = idx
+
+    def _restore_toc_scroll(self, value, tries=12):
+        """Put the strip back where it was after a rebuild. Same layout race as
+        above: the value cannot be set before the rows give the adjustment its
+        range back, or it clamps to 0."""
+        adj = self._toc_scroll.get_vadjustment()
+        span = adj.get_upper() - adj.get_page_size()
+        if span < value and tries > 0:
+            GLib.timeout_add(
+                40, lambda: self._restore_toc_scroll(value, tries - 1) and False)
+            return
+        adj.set_value(max(0.0, min(value, max(0.0, span))))
 
     # which header chrome each doc mode shows (see DocumentSession.doc_mode).
     # Tool buttons ("_mode_*") apply to their popover twins ("_pmode_*")
@@ -16793,6 +17034,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._bindings_list.remove(child)
             child = nxt
         mode = (self._active_session.doc_mode if self._active_session else "pdf")
+        if getattr(self, "_bindings_label", None) is not None:
+            self._bindings_label.set_label(
+                "Buttons on text pages" if mode == "text"
+                else "Buttons on PDF pages")
         for chord, tool in self.bindings.items():
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             text = f"{chord_label(chord)} → {TOOL_LABELS.get(tool, tool)}"
@@ -16828,11 +17073,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self.toast_overlay.add_toast(toast)
 
     def _reset_bindings(self):
-        before = self.bindings.to_json()
+        # one mode's table — the other is a different question and this button
+        # did not ask it
+        mode = self.bindings.mode
+        before = dict(self.bindings.table_for(mode))
         self.bindings.reset()
         self.bindings.save()
         self._refresh_tool_bindings()
-        toast = Adw.Toast.new("Buttons reset to defaults")
+        toast = Adw.Toast.new("Buttons reset to defaults for "
+                              + ("text pages" if mode == "text" else "PDF pages"))
         toast.set_button_label("Undo")
         toast.connect("button-clicked", lambda *_: self._restore_bindings(before))
         toast.set_timeout(5)
@@ -17777,6 +18026,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.notes_model.pdf_name = os.path.basename(path)
         self.notes_model.load(self._active_notes_path)
         self._hide_search()
+        # a different document: whatever the strip was showing says nothing
+        # about this one, so the next populate scrolls to the page we land on
+        self._thumb_centred_page = None
         self._restoring_page = True
         self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
         self._load_pdf_images(path)

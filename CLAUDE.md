@@ -32,11 +32,25 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   - **An unbraced script ends at the first non-alphanumeric** (`a_i, b_j`), and
     a **terminating space is eaten on render**: you are forced to type it
     (`\alphax` is another command, `a_ib` subscripts "ib"), so showing it puts
-    a hole inside "αx". Two spaces is how you ask for one. Narrowed twice, both
-    times to avoid eating a space nobody was forced to type — only before an
-    alphanumeric, and for symbols only for the letter-like ones
-    (`_MD_LETTER_SYMBOLS`): `A \mapsto B` is a relation, and "A ↦B" glues an
-    operator to its operand.
+    a hole inside "αx". Two spaces is how you ask for one. Narrowed once, to
+    avoid eating a space nobody was forced to type: only before an
+    alphanumeric, so `\alpha + \beta` keeps its spacing. There is **no
+    per-symbol exception** — an operator's space is eaten too (`\cdot a` is
+    "·a"), because half the table behaving differently is not a rule anyone can
+    hold while writing.
+  - **A script that abuts the one before it is a script OF it** (`iter_scripts`
+    yields a nesting *chain*): `a_i_j` is j indexing i and `a_i^2` puts the 2 on
+    top of the i, each level placed on the one it sits on and shrunk again
+    (`script_style`). The editor makes a tag per chain on demand; the callout
+    renderer nests `<sub>`/`<sup>`. Anything between the two scripts ends the
+    chain, which is how you still write two scripts of one base.
+  - *ceiling: `\vec{A}` overlaps a capital.* Measured across 9 font families:
+    every one places U+20D7 at x-height whatever the base, and giving the mark
+    its own attribute run (a rise) detaches it from the base and Pango draws a
+    dotted circle. It cannot be fixed through text attributes — only by drawing
+    the glyph ourselves, which a `GtkTextView` cannot do inline. `\bar` and
+    `\hat` are positioned correctly by the fonts, so this is specific to the
+    arrow.
 - `TextPageView` — text-first mode: an A4-styled Markdown sheet (a
   `MarkdownNotesView` as white paper) you can draw on. Ink lives in a
   `<name>-ink.json` sidecar.
@@ -49,14 +63,29 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 - **Button bindings — there is no "active tool" (row 132).** Every mouse
   button, alone or under modifiers, HAS a tool, and pressing it uses that tool:
   left draws, right erases, middle pans, at the same time. `Bindings` is THE
-  table (`DEFAULT_BINDINGS`; persisted in settings.json under
-  `button_bindings`), ONE instance per window shared by every canvas and sheet.
-  Defaults (the user's table, 2026-07-31): left pen, middle lasso, right
+  table — **one per document mode** (`DEFAULT_TABLES`; persisted in
+  settings.json under `button_bindings` as `{"pdf": …, "text": …}`), ONE
+  instance per window shared by every canvas and sheet.
+  PDF defaults (the user's table, 2026-07-31): left pen, middle lasso, right
   eraser, plus four chords — Ctrl+left pan, Ctrl+right text cursor, Shift+left
   zoom-to-region, **Alt+left text cursor** (Alt is how you follow a PDF link,
   and following a link IS the caret's click). The **thumb is unbound** (most
   mice have none). Nothing else is bound out of the box; the rest is the
-  user's to bind. `chord_tool()` is **vestigial** — the old fixed grammar, now
+  user's to bind.
+  - **The MODEL is unified, the tables are not.** One class, one popover, the
+    same chord ids, and a mode's table is the PDF one unless there is a reason
+    (`TEXT_BINDING_OVERRIDES` is the whole list of reasons: a sheet is for
+    TYPING, so left is the caret and Shift+left extends a selection; Alt+left
+    then carries the pen so it stays reachable without rebinding). One table
+    for both modes shipped first and did not survive the text page — what the
+    left button should do is exactly what the mode decides.
+    `bindings.mode` is what the CHROME acts on — toolbar, badges, tooltips,
+    popover, binding surface — and `_update_header_for_mode` keeps it on the
+    active tab. **Routing never reads it**: a canvas passes its own
+    `doc_mode`, or the sheet's press router would follow whichever tab the
+    header thinks is in front. Migration: a saved flat table becomes the PDF
+    one and seeds the text one with the overrides on top; `Reset` resets the
+    mode you are looking at, and the popover heading names it. `chord_tool()` is **vestigial** — the old fixed grammar, now
   with no production callers and only tests referencing it. Do not route
   anything new through it; `Bindings` is the table. It is kept because the
   older modifier chords it encodes are the obvious defaults to *offer* if a
@@ -304,7 +333,12 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   than re-linking two unrelated slides; the load-bearing one is
   `shift_for_delete`, where deleting a run's START hands the body to the next
   page in the run instead of dropping the whole run's text. PDF-only, and the
-  UI is one checkbox in the notes header (`_update_notes_link_ui`). **The tick
+  UI is one checkbox in the notes header (`_update_notes_link_ui`). A run of
+  pages that carries nothing else is written as ONE **range** marker
+  (`<!-- page:13-40 continued -->`) — the fact is about the run, not about each
+  page; the reader expands a range and still accepts the per-page form, so old
+  files need no migration, and a bookmark (a property of ONE page) breaks the
+  range and takes its own marker. **The tick
   CASCADES**: `link_forward` carries the run through every following page that
   has nothing of its own, stopping at the first page that already has notes
   (`link()` would append it into the run — the one outcome you cannot see
@@ -337,6 +371,15 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   change, so `_restoring_page` stops it erasing the position it is about to
   restore, and the write must NOT re-order the list or "recent" comes to mean
   "whatever tab I scrolled in last".
+- **The thumbnail strip scrolls for a REASON, never as a side effect.** Opening
+  it, or turning the page, brings the current page into view; a rebuild
+  (`_populate_toc` runs on every bookmark, link, rename) puts the strip back
+  exactly where it stood — `_thumb_centred_page` is the "is this a new page or
+  the same one?" answer, and a document change clears it. Both paths go through
+  a RETRY (`_scroll_thumb_into_view` / `_restore_toc_scroll`): the reveal is an
+  animation and a rebuild has no allocation yet, so at the instant you are
+  asked every row reports y=0 and the adjustment has nothing to scroll — which
+  is why the strip used to open at page 1 whatever page you were on.
 - Single-instance app (`Gio.Application`, `HANDLES_COMMAND_LINE`): a second
   launch forwards its argv to the primary, which opens the file as a tab in the
   last-used window (`_open_target`/`open_file_in_tab`). For manual testing

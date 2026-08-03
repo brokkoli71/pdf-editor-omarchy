@@ -1601,13 +1601,47 @@ class TestLinkedPageNotes(unittest.TestCase):
             path = os.path.join(d, "n.md")
             self._run().save(path)
             raw = open(path).read()
-            self.assertIn("<!-- page:3 continued -->", raw)
-            self.assertIn("<!-- page:4 continued -->", raw)
+            # a run of pages that carry nothing but `continued` is ONE range
+            # marker — the fact is about the run, not about each page
+            self.assertIn("<!-- page:3-4 continued -->", raw)
             back = NotesModel()
             back.load(path)
             self.assertEqual(back.links(), {3, 4})
             self.assertEqual(back.get(4), "the long thought")
             self.assertEqual(back.own_text(3), "")
+
+    def test_the_per_page_marker_still_reads(self):
+        """A file written by an older Sidemark (or by hand) needs no migration —
+        the range form is what we WRITE, not what we require."""
+        from sidemark import parse_note_sections
+        parsed = parse_note_sections(
+            "<!-- page:2 -->\n\nthe long thought\n\n"
+            "<!-- page:3 continued -->\n\n<!-- page:4 continued -->\n")
+        self.assertEqual(parsed.linked, {3, 4})
+        self.assertEqual(parsed.sections[2], "the long thought")
+
+    def test_a_range_marker_expands_onto_every_page(self):
+        from sidemark import parse_note_sections
+        parsed = parse_note_sections(
+            "<!-- page:2 -->\n\nthe long thought\n\n"
+            "<!-- page:3-6 continued -->\n")
+        self.assertEqual(parsed.linked, {3, 4, 5, 6})
+
+    def test_a_bookmark_inside_a_run_breaks_the_range(self):
+        """A link is a relationship between pages; a bookmark is a property of
+        ONE page, so it cannot ride along inside a range."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "n.md")
+            m = self._run()
+            m.add_bookmark(4, "Proof")
+            m.save(path)
+            raw = open(path).read()
+            self.assertIn("<!-- page:3 continued -->", raw)
+            self.assertIn('<!-- page:4 continued bookmark="Proof" -->', raw)
+            back = NotesModel()
+            back.load(path)
+            self.assertEqual(back.links(), {3, 4})
+            self.assertEqual(back.bookmark_name(4), "Proof")
 
     def test_a_hand_edited_body_under_a_link_is_folded_into_the_run(self):
         """A sidecar edited outside Sidemark can give a continued page a body;
@@ -3273,8 +3307,8 @@ class TestLatexFormatting(unittest.TestCase):
 
     def test_le_and_ge_shorthands(self):
         v = self._view()
-        self.assertEqual(v._apply_symbol_subs(r'a \le b \ge c'), 'a ≤ b ≥ c')
-        self.assertEqual(v._apply_symbol_subs(r'a \leq b \geq c'), 'a ≤ b ≥ c')
+        self.assertEqual(v._apply_symbol_subs(r'a \le b \ge c'), 'a ≤b ≥c')
+        self.assertEqual(v._apply_symbol_subs(r'a \leq b \geq c'), 'a ≤b ≥c')
 
     def test_a_commands_terminating_space_is_eaten(self):
         """`\\alpha x` has to be written with the space (`\\alphax` is another
@@ -3284,10 +3318,12 @@ class TestLatexFormatting(unittest.TestCase):
         self.assertEqual(v._apply_symbol_subs(r'\alpha x'), 'αx')
         self.assertEqual(v._apply_symbol_subs(r'\alpha  x'), 'α x')
         self.assertEqual(v._apply_symbol_subs(r'\alpha'), 'α')
-        # only a LETTER could have continued the command, so only there was the
-        # space forced on you — an operator keeps its spacing
+        # only a LETTER could have continued the command, so only there was a
+        # space forced on you — before an operator it is one you chose
         self.assertEqual(v._apply_symbol_subs(r'\alpha + \beta'), 'α + β')
         self.assertEqual(v._apply_symbol_subs(r'\alpha = 1'), 'α = 1')
+        # ...and there is no exception for operator symbols: `\cdot a` is "·a"
+        self.assertEqual(v._apply_symbol_subs(r'2 \cdot a'), '2 ·a')
         # an unknown command keeps its space — nothing was substituted
         self.assertEqual(v._apply_symbol_subs(r'\unknown x'), r'\unknown x')
 
@@ -3300,6 +3336,31 @@ class TestLatexFormatting(unittest.TestCase):
         # a brace terminates by itself, so the space after it is a real one
         self.assertEqual(_notes_to_pango_markup('a_{i} b'),
                          'a<sub>i</sub> b')
+
+    def test_chained_scripts_nest(self):
+        """`a_i_j` is j indexing i, not two indices of a — so the j is smaller
+        and sits inside. Anything between them ends the chain."""
+        from sidemark import _notes_to_pango_markup, script_style
+        self.assertEqual(_notes_to_pango_markup('a_i_j'),
+                         'a<sub>i<sub>j</sub></sub>')
+        self.assertEqual(_notes_to_pango_markup('a_i^2'),
+                         'a<sub>i<sup>2</sup></sub>')
+        self.assertEqual(_notes_to_pango_markup('a_{i}_{j}'),
+                         'a<sub>i<sub>j</sub></sub>')
+        # a space (eaten or not) ends the chain: two indices of the same base
+        self.assertEqual(_notes_to_pango_markup('x_i b_j'),
+                         'x<sub>i</sub>b<sub>j</sub>')
+        # each level is placed on the one it sits on and shrinks with it
+        r1, s1 = script_style(('sub',))
+        r2, s2 = script_style(('sub', 'sup'))
+        self.assertLess(s2, s1)
+        self.assertGreater(r2, r1)          # the 2 rides on top of the i
+        self.assertLess(script_style(('sub', 'sub'))[0], r1)
+
+    def test_script_nesting_is_capped(self):
+        from sidemark import iter_scripts, MAX_SCRIPT_DEPTH
+        chains = [c for _m, c in iter_scripts('a_b_c_d_e_f')]
+        self.assertEqual(max(len(c) for c in chains), MAX_SCRIPT_DEPTH)
 
     def test_script_space_is_hidden_not_deleted(self):
         """Hiding keeps the source intact — the saved Markdown still has the
@@ -3361,7 +3422,8 @@ class TestLatexFormatting(unittest.TestCase):
 
     def test_mapsto_symbol(self):
         v = self._view()
-        self.assertEqual(v._apply_symbol_subs(r'f: A \mapsto B'), 'f: A ↦ B')
+        # the terminating space is eaten for EVERY symbol, operators included
+        self.assertEqual(v._apply_symbol_subs(r'f: A \mapsto B'), 'f: A ↦B')
 
     # ── source text round-trips \commands, never the rendered glyph ───────────
     def test_get_source_text_keeps_command_after_render(self):
@@ -7663,6 +7725,66 @@ class TestButtonBindings(unittest.TestCase):
     """There is no active tool: every button HAS one, and clicking a tool in
     the bar with a button is what puts it there."""
 
+    def test_each_mode_has_its_own_table(self):
+        """A text page is for TYPING, so the left button is the caret there and
+        the pen on a PDF — the one thing per-mode tables exist for. Everything
+        not stated stays the same in both, because the two modes are one app."""
+        b = Bindings()
+        self.assertEqual(b.tool_for(sidemark.BTN_LEFT, mode="pdf"), "pen")
+        self.assertEqual(b.tool_for(sidemark.BTN_LEFT, mode="text"), "text")
+        # Shift+left marks a region on a sheet; on a PDF it is zoom-to-region
+        self.assertEqual(b.tool_for(sidemark.BTN_LEFT, shift=True, mode="pdf"),
+                         "zoom")
+        self.assertEqual(b.tool_for(sidemark.BTN_LEFT, shift=True, mode="text"),
+                         "text")
+        # the pen stays reachable on a sheet without rebinding anything
+        self.assertEqual(b.tool_for(sidemark.BTN_LEFT, alt=True, mode="text"),
+                         "pen")
+        # everything else is the same table in both modes
+        for chord in ("middle", "right", "ctrl+left", "ctrl+right", "finger"):
+            self.assertEqual(b.tool_for_chord(chord, mode="pdf"),
+                             b.tool_for_chord(chord, mode="text"), chord)
+
+    def test_binding_in_one_mode_leaves_the_other_alone(self):
+        b = Bindings()
+        b.bind("left", "lasso", mode="text")
+        self.assertEqual(b.tool_for(sidemark.BTN_LEFT, mode="text"), "lasso")
+        self.assertEqual(b.tool_for(sidemark.BTN_LEFT, mode="pdf"), "pen")
+        # unqualified reads and writes act on the mode the UI is showing
+        b.mode = "text"
+        self.assertEqual(b.tool_for_chord("left"), "lasso")
+        b.clear("left")
+        self.assertIsNone(b.tool_for_chord("left"))
+        self.assertEqual(b.tool_for_chord("left", mode="pdf"), "pen")
+
+    def test_reset_is_per_mode(self):
+        b = Bindings()
+        b.bind("middle", "pen", mode="pdf")
+        b.bind("middle", "pen", mode="text")
+        b.mode = "text"
+        b.reset()
+        self.assertEqual(b.tool_for_chord("middle", mode="text"), "lasso")
+        self.assertEqual(b.tool_for_chord("middle", mode="pdf"), "pen")
+
+    def test_an_old_flat_table_migrates_to_both_modes(self):
+        """A table written before the split described both modes. It stays the
+        PDF one and seeds the text one — with the text overrides on top, or the
+        sheet would keep the pen on its left button, which is the whole point
+        of the split."""
+        b = Bindings.from_json({"left": "highlighter", "middle": "pan",
+                                "right": "eraser"})
+        self.assertEqual(b.tool_for_chord("left", mode="pdf"), "highlighter")
+        self.assertEqual(b.tool_for_chord("middle", mode="pdf"), "pan")
+        self.assertEqual(b.tool_for_chord("left", mode="text"), "text")
+        self.assertEqual(b.tool_for_chord("middle", mode="text"), "pan")
+
+    def test_tables_round_trip_through_json(self):
+        b = Bindings()
+        b.bind("thumb", "lasso", mode="text")
+        back = Bindings.from_json(b.to_json())
+        self.assertEqual(back.tool_for_chord("thumb", mode="text"), "lasso")
+        self.assertIsNone(back.tool_for_chord("thumb", mode="pdf"))
+
     def test_alt_left_is_the_text_cursor(self):
         """Alt is how you follow a PDF link, and following a link IS the cursor
         tool's click. Left unbound under Alt meant Alt lit the links up and
@@ -10446,10 +10568,12 @@ class TestTextFirstMode(unittest.TestCase):
                 buf = win._notes_view.get_buffer()
                 self.assertIn("first paragraph line", buf.get_text(
                     buf.get_start_iter(), buf.get_end_iter(), True))
-                # row 132: opening a text page does NOT rewrite the shared
-                # binding table, so the left button keeps the tool it had
-                # (the pen by default) and the sheet's ink stays targetable
-                self.assertEqual(win.bindings.tool_for_chord("left"), "pen")
+                # opening a text page rewrites NOTHING — the sheet simply has
+                # its own table, in which the left button is the caret (a text
+                # page is for typing) while the PDF table still says pen
+                self.assertEqual(win.bindings.tool_for_chord("left"), "text")
+                self.assertEqual(
+                    win.bindings.tool_for_chord("left", mode="pdf"), "pen")
                 # the ink overlay is never the event target: the sheet's
                 # capture-phase router sees every press above it (set_tool)
                 self.assertFalse(s._text_page.ink.get_can_target())
@@ -10581,6 +10705,9 @@ class TestTextFirstMode(unittest.TestCase):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
                 win._set_tool_mode("pen")
+                # Shift+left marks text on a sheet by default (its own table),
+                # so this is the zoom chord bound explicitly
+                win.bindings.bind("shift+left", "zoom", mode="text")
                 tp.set_zoom(2.0)
                 gesture = _FakeDrag(100, 100,
                                     state=Gdk.ModifierType.SHIFT_MASK)
@@ -10603,6 +10730,7 @@ class TestTextFirstMode(unittest.TestCase):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
                 win._set_tool_mode("pen")
+                win.bindings.bind("shift+left", "zoom", mode="text")
                 g = _FakeDrag(100, 100, state=Gdk.ModifierType.SHIFT_MASK)
                 tp._on_press_begin(g, 100, 100)
                 self.assertTrue(tp._zoom_selecting)
@@ -11279,14 +11407,15 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertEqual(tp.tool, "text")        # caret restored
                 self.assertEqual(tp.strokes, [])
 
-                # plain Alt is the CARET by default (it is how you follow a
-                # link), so it neither zooms nor draws — Shift is what turns
-                # the chord into the marquee
+                # plain Alt on a SHEET is the pen — the mode's escape to ink,
+                # since its home tool is the caret (on a PDF, where Alt follows
+                # a link, that same chord is the caret). Either way it does not
+                # zoom: Shift is what turns the chord into the marquee.
                 g2 = _FakeDrag(60, 60, state=Gdk.ModifierType.ALT_MASK)
                 tp._on_press_begin(g2, 60.0, 60.0)
                 self.assertFalse(tp._zoom_selecting)
-                self.assertEqual(tp.tool, "text")
-                self.assertEqual(g2.claimed, Gtk.EventSequenceState.DENIED)
+                self.assertEqual(tp.tool, "pen")
+                self.assertEqual(g2.claimed, Gtk.EventSequenceState.CLAIMED)
 
             self._run_in_window(body)
 
@@ -12163,13 +12292,15 @@ class TestTextPageLasso(unittest.TestCase):
                 win.bindings.bind("ctrl+shift+alt+left", "lasso")
                 self.assertEqual(press(lasso_chord),
                                  Gtk.EventSequenceState.CLAIMED)
-                # plain left is the pen by default — also claimed
-                self.assertEqual(press(Gdk.ModifierType(0)),
-                                 Gtk.EventSequenceState.CLAIMED)
-                # …but put the caret on left and the press goes to the TextView
-                tp.set_tool("text")
+                # plain left is the CARET on a text page (its own table), so
+                # the press goes to the TextView
                 self.assertEqual(press(Gdk.ModifierType(0)),
                                  Gtk.EventSequenceState.DENIED)
+                # …put an ink tool on left and the router claims it instead
+                tp.set_tool("pen")
+                self.assertEqual(press(Gdk.ModifierType(0)),
+                                 Gtk.EventSequenceState.CLAIMED)
+                tp.set_tool("text")
                 # an unbound chord is nobody's: denied, never swallowed
                 # (Alt+left is NOT one — it ships as the caret, so the DENY it
                 # earns is the caret's, not an empty table's)
