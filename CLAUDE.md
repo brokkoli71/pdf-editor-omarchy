@@ -38,10 +38,18 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     settle once. `_line_originals[ln]` is `(source, rendered, index map, open
     span)`; the open span is why a line the caret has just left gets
     re-rendered instead of being trusted as already done.
-  - **Triple-click selects the PARAGRAPH** (`paragraph_bounds`), not
-    GtkTextView's logical line — on a wrapped sheet a logical line is a
-    fragment of what looks like one. Bubble phase, so it runs after the view's
-    own line selection and replaces it.
+  - **Triple-click selects the whole LOGICAL line** (`line_bounds`) — one
+    Return's worth of typing, however many rows it wraps onto. GtkTextView's
+    own "line" is the DISPLAY line, a fragment of what looks like one. It is
+    applied from an **idle, after the press** (`_select_clicked_line`), not in
+    the handler: controllers on one widget fire NEWEST FIRST, so the view's own
+    click gesture — installed before ours — runs *after* it and lays its
+    display-line selection on top. A press handler that "does nothing" here is
+    usually running and being overwritten. The idle also **denies the view's
+    internal selection drag**, which by then holds the sequence: that drag
+    re-derives the selection from the pointer at display-line granularity on
+    every motion event, so without the denial the first flicker of the hand
+    snaps the line back to one wrapped row.
   - **The maths grammar wins over Markdown's**: `_` is a SUBSCRIPT here, so the
     GtkSource language's `_emphasis_` is cancelled line by line with a
     `noitalic` tag and only `*italic*` puts the slant back. Its syntax tags sit
@@ -54,13 +62,19 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     a hole inside "αx". Two spaces is how you ask for one. Narrowed once, to
     avoid eating a space nobody was forced to type: only before an
     alphanumeric, so `\alpha + \beta` keeps its spacing. The **end of the LINE
-    counts as an alphanumeric** (`_MD_SYMBOL_END_RE`): the next character is
+    counts as an alphanumeric** (`_MD_SYMBOL_END_RE`, `_MD_SCRIPT_END_RE`):
+    the next character is
     the one you are about to type, and leaving that space showing parks the
     caret a gap away from the glyph, then closes the gap as you type — the
     caret appearing to jump backwards. It is the end of the line, not the end
     of the string it runs on: rendering goes segment by segment
-    (`_symbolize(seg, at_end=…)`), and a segment ending mid-line is followed by
-    something that terminated nothing. There is **no
+    (`_symbolize(seg, at_end=…)`, `iter_scripts(seg, at_end=…)`), and a segment
+    ending mid-line is followed by
+    something that terminated nothing. **Commands and scripts obey one rule**,
+    including the split that makes it work: the space is eaten, but the "is
+    the caret still in this expression?" test uses the expression WITHOUT it
+    (`_MD_COMMAND_RE`, `script_body_end`) — otherwise typing the terminator
+    holds the thing you just finished open under the caret. There is **no
     per-symbol exception** — an operator's space is eaten too (`\cdot a` is
     "·a"), because half the table behaving differently is not a rule anyone can
     hold while writing.
@@ -660,6 +674,14 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   mark that moves with no `mark-set` is riding an edit, and instrumenting the
   real app was the only thing that showed it — every static reading of the
   handlers tested clean.
+  **It is EVERY mark on the line, not just those two.** GtkTextView anchors a
+  live double/triple-click selection drag to a pair of anonymous marks and
+  re-derives the selection between them on each motion event — collapsed by
+  the rewrite, they re-select nothing, so a selection made over rendered maths
+  disappeared a moment later with no signal naming the culprit.
+  `_buf_replace_line` walks the line by COLUMN collecting marks (never with
+  `forward_char`, which reports failure when it lands on the buffer's end
+  iterator — a real position, and the one the last line's marks sit on).
 - **`save()` rebinds `self.document` — anything holding the OLD one is stale.**
   `save()` reopens the file, so every cached PyMuPDF object from before it
   belongs to an orphaned document. `self.page` is the one that bites: the page

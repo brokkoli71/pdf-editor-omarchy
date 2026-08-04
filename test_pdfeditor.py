@@ -4066,19 +4066,99 @@ class TestLatexFormatting(unittest.TestCase):
         self.assertEqual(sidemark._symbolize(r'\alpha `x` b'), 'α `x` b')
         self.assertEqual(sidemark._symbolize(r'\alpha '), 'α')
 
-    def test_triple_click_selects_the_paragraph(self):
+    def test_triple_click_selects_the_whole_logical_line(self):
+        """Everything up to the newline — one Return's worth of typing, however
+        many rows it wraps onto. Not the display line, which is a fragment of
+        what looks like one line, and not the paragraph either."""
         v = self._view()
         buf = v.get_buffer()
-        buf.set_text('first para line one\nstill the first para\n\n'
-                     'second para\n')
-        s, e = v.paragraph_bounds(buf, 1)
+        buf.set_text('one long line that would wrap\nsecond line\n\nafter\n')
+        s, e = v.line_bounds(buf, 0)
         self.assertEqual(buf.get_text(s, e, False),
-                         'first para line one\nstill the first para')
-        s, e = v.paragraph_bounds(buf, 3)
-        self.assertEqual(buf.get_text(s, e, False), 'second para')
-        # a blank line is its own paragraph rather than joining a neighbour
-        s, e = v.paragraph_bounds(buf, 2)
+                         'one long line that would wrap')
+        s, e = v.line_bounds(buf, 1)
+        self.assertEqual(buf.get_text(s, e, False), 'second line')
+        s, e = v.line_bounds(buf, 2)          # a blank line selects nothing
         self.assertEqual(buf.get_text(s, e, False), '')
+
+    def test_triple_click_selection_outlives_the_press(self):
+        """It has to be applied AFTER the press, not during it: the view's own
+        click gesture runs after ours and selects the display line on top of
+        whatever we did, so a selection made inside the handler is the one
+        GTK's answer replaces."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('one long line that would wrap\nsecond line\n')
+        # what the view leaves behind: part of the line, as a display line is
+        buf.select_range(buf.get_iter_at_line_offset(0, 4)[1],
+                         buf.get_iter_at_line_offset(0, 13)[1])
+        v._on_click_pressed(None, 3, 0, 0)
+        self.assertEqual(buf.get_text(*buf.get_selection_bounds(), False),
+                         'long line')          # nothing happened yet
+        # pumped on a deadline, never on ctx.pending() — under a full run the
+        # default context reports nothing pending while the idle is still
+        # waiting, and the test then passes alone and fails in the suite
+        ctx = GLib.MainContext.default()
+        deadline = time.time() + 0.4
+        while time.time() < deadline and \
+                buf.get_text(*buf.get_selection_bounds(), False) == 'long line':
+            ctx.iteration(False)
+        self.assertEqual(buf.get_text(*buf.get_selection_bounds(), False),
+                         'one long line that would wrap')
+
+    def test_a_rewritten_line_carries_every_mark_on_it(self):
+        """Not only the caret and its bound. GtkTextView anchors a live
+        double/triple-click selection drag to anonymous marks on the line and
+        re-derives the selection between them on the next motion event — marks
+        collapsed onto the line start by the rewrite make that an empty
+        selection, i.e. the selection vanishes a moment after you made it."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('plain\n' + r'\alpha and \beta here')
+        start = buf.create_mark(None, buf.get_iter_at_line(1)[1], True)
+        end_it = buf.get_iter_at_line(1)[1]
+        end_it.forward_to_line_end()
+        end = buf.create_mark(None, end_it, True)
+        v._rehighlight()
+        rendered = self._line_text(buf, 1)
+        self.assertNotEqual(rendered, r'\alpha and \beta here')  # it did rewrite
+        self.assertEqual(buf.get_iter_at_mark(start).get_line_offset(), 0)
+        self.assertEqual(buf.get_iter_at_mark(end).get_line(), 1)
+        self.assertEqual(buf.get_iter_at_mark(end).get_line_offset(),
+                         len(rendered))
+
+    def test_a_scripts_terminating_space_is_eaten_at_the_end_of_the_line(self):
+        """`a_i ` is the same bargain as `\\beta `: you are forced to type the
+        space (`a_ib` subscripts "ib"), so showing it parks the caret a gap
+        away from the glyph and closes the gap as you type."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('a_i and b^2 ')
+        buf.place_cursor(buf.get_iter_at_line(0)[1])   # caret out of the way
+        v._rehighlight()
+        hide = v._t["hide"]
+        self.assertTrue(buf.get_iter_at_line_offset(0, 3)[1].has_tag(hide))
+        self.assertTrue(buf.get_iter_at_line_offset(0, 11)[1].has_tag(hide))
+        # a fragment of a line is not the end of one: nothing terminated the
+        # script before `code`, so its space is a real space
+        self.assertEqual(
+            [m.group(0) for m, _c in sidemark.iter_scripts('a_i `x`',
+                                                           at_end=False)],
+            ['_i'])
+
+    def test_typing_the_space_closes_the_script(self):
+        """The caret test uses the script WITHOUT the space it ate — otherwise
+        typing that space keeps `_i ` open under the caret instead of
+        rendering it."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('')
+        for ch in 'a_i ':
+            buf.insert_at_cursor(ch)
+            v._rehighlight()
+        self.assertTrue(buf.get_iter_at_line_offset(0, 1)[1].has_tag(
+            v._t["hide"]))                    # the `_` is hidden: rendered
+        self.assertEqual(v.get_source_text(), 'a_i ')
 
     def test_a_selection_still_opens_the_whole_line(self):
         """Two ends, two expressions — a selection that changed shape as it

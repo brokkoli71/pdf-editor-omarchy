@@ -8122,6 +8122,14 @@ _MD_INLINE_RE = re.compile(r'\*\*(.+?)\*\*|\*([^*\n]+?)\*|`([^`\n]+?)`')
 # terminates by itself, so the braced form never claims one.
 _MD_SCRIPT_RE = re.compile(
     r'(\^|_)(?:\{([^}]*)\}|([+-]?[A-Za-z0-9]+)( (?=[A-Za-z0-9 ]))?)')
+# …and at the END OF THE LINE, exactly as a `\command`'s space is (see
+# _MD_SYMBOL_END_RE): the next character is the one you are about to type, so
+# a space left showing there parks the caret a gap away from the script and
+# closes the gap as you type. Same split for the same reason — the end of a
+# `code`/link SEGMENT is not the end of the line, and nothing terminated a
+# script there.
+_MD_SCRIPT_END_RE = re.compile(
+    r'(\^|_)(?:\{([^}]*)\}|([+-]?[A-Za-z0-9]+)( (?=[A-Za-z0-9 ]|$))?)', re.M)
 
 # A script that starts exactly where the previous one's content ended is a
 # script OF that script — `a_i_j` is "j indexing i", not two indices of `a`
@@ -8139,12 +8147,15 @@ def script_body_end(m):
     return m.end() - len(m.group(4) or '')
 
 
-def iter_scripts(text):
+def iter_scripts(text, at_end=True):
     """Yield `(match, chain)` for every ^/_ script, where `chain` is the kinds
     ('sub'/'sup') from the outermost enclosing script down to this one. A
-    top-level script has a chain of length 1."""
+    top-level script has a chain of length 1.
+
+    `at_end=False` says this string is a FRAGMENT of a line, so a script
+    against its end has not been terminated by anything."""
     chain, prev_end = [], None
-    for m in _MD_SCRIPT_RE.finditer(text):
+    for m in (_MD_SCRIPT_END_RE if at_end else _MD_SCRIPT_RE).finditer(text):
         kind = 'sup' if m.group(1) == '^' else 'sub'
         if prev_end is not None and m.start() == prev_end and \
                 len(chain) < MAX_SCRIPT_DEPTH:
@@ -8177,12 +8188,12 @@ def _notes_to_pango_markup(text):
     *italic* / `code` become the matching tags. Inside a `code` span nothing
     else is rendered — the text is shown verbatim. Markers themselves are
     dropped (like the editor hides them off the cursor line)."""
-    def _scripts(s):
+    def _scripts(s, at_end):
         """Nested `<sub>`/`<sup>`, which is what makes the j of `a_i_j` smaller
         than the i. A tag is opened with its content and closed only once the
         chain ends, so an inner script is emitted INSIDE its outer one."""
         out, pos, open_tags = [], 0, []
-        for m, chain in iter_scripts(s):
+        for m, chain in iter_scripts(s, at_end=at_end):
             if len(chain) == 1:          # a new chain: close the old one first
                 out.append("".join(reversed(open_tags)))
                 open_tags.clear()
@@ -8213,8 +8224,9 @@ def _notes_to_pango_markup(text):
             continue
         # symbols first, then escape, then scripts, then bold/italic. The
         # segment has no backticks, so _inline only ever sees bold/italic here.
-        s = GLib.markup_escape_text(_symbolize(seg, at_end=(n == len(segs) - 1)))
-        s = _scripts(s)
+        last = (n == len(segs) - 1)
+        s = GLib.markup_escape_text(_symbolize(seg, at_end=last))
+        s = _scripts(s, at_end=last)
         parts.append(_MD_INLINE_RE.sub(_inline, s))
     return "".join(parts)
 
@@ -9381,44 +9393,48 @@ class MarkdownNotesView(GtkSource.View):
         return None
 
     @staticmethod
-    def paragraph_bounds(buf, ln):
-        """The blank-line-delimited block around line `ln`, as (start, end).
-
-        A blank line is its own paragraph, so triple-clicking one selects it
-        rather than swallowing the block above or below."""
-        def blank(i):
-            ok, ls = buf.get_iter_at_line(i)
-            if not ok:
-                return True
-            le = ls.copy()
-            if not le.ends_line():
-                le.forward_to_line_end()
-            return not buf.get_text(ls, le, True).strip()
-
-        first = last = ln
-        if not blank(ln):
-            while first > 0 and not blank(first - 1):
-                first -= 1
-            n = buf.get_line_count()
-            while last < n - 1 and not blank(last + 1):
-                last += 1
-        start = buf.get_iter_at_line(first)[1]
-        end = buf.get_iter_at_line(last)[1]
+    def line_bounds(buf, ln):
+        """Line `ln` up to its newline, as (start, end) — everything you typed
+        before pressing Return, however many rows it wraps onto."""
+        start = buf.get_iter_at_line(ln)[1]
+        end = start.copy()
         if not end.ends_line():
             end.forward_to_line_end()
         return start, end
 
     def _on_click_pressed(self, _gesture, n_press, _x, _y):
-        """Triple-click selects the PARAGRAPH. GtkTextView selects the logical
-        line, which on a wrapped Markdown sheet is a fragment of what looks
-        like one — a paragraph is what you were pointing at. Bubble phase, so
-        this runs after the view has made its own line selection and replaces
-        it."""
+        """Triple-click selects the whole LOGICAL line — up to the newline —
+        not the display line GtkTextView takes, which on a wrapped sheet is a
+        fragment of what looks like one line.
+
+        DEFERRED to an idle, because selecting here does not stick: the view's
+        own click gesture runs AFTER ours on this widget (controllers fire
+        newest-first, and the view's were installed before this one), so it
+        makes its display-line selection on top of ours and the press ends
+        with GTK's answer, not ours. Which controller wins is not ours to
+        choose — running after the whole press is."""
         if n_press != 3:
             return
+        GLib.idle_add(self._select_clicked_line)
+
+    def _select_clicked_line(self):
         buf = self.get_buffer()
         ln = buf.get_iter_at_mark(buf.get_insert()).get_line()
-        buf.select_range(*self.paragraph_bounds(buf, ln))
+        buf.select_range(*self.line_bounds(buf, ln))
+        # The press is over but the button is still down, and GtkTextView's
+        # triple-click leaves a selection DRAG running: it re-derives the
+        # selection from the pointer on every motion event, at DISPLAY-line
+        # granularity, so the first flicker of the hand would snap the line
+        # back to the one wrapped row under the pointer. Deny it — by now it
+        # holds the sequence, which is the other reason this cannot run inside
+        # the press. It is the only GestureDrag on the view; ours live on
+        # ancestors.
+        controllers = self.observe_controllers()
+        for i in range(controllers.get_n_items()):
+            c = controllers.get_item(i)
+            if isinstance(c, Gtk.GestureDrag):
+                c.set_state(Gtk.EventSequenceState.DENIED)
+        return False
 
     def _on_link_click(self, gesture, _n_press, x, y):
         # Ctrl+click follows the link; a plain click edits as usual
@@ -10086,11 +10102,33 @@ class MarkdownNotesView(GtkSource.View):
             else:
                 cols.append(self._remap_column(it.get_line_offset(),
                                                old_text, new_text))
+        # EVERY other mark on the line has to be carried the same way, and one
+        # of them is load-bearing: while a double- or triple-click selection
+        # drag is live, GtkTextView anchors it to a pair of anonymous marks on
+        # this line and re-derives the selection between them on every motion
+        # event. The delete collapses both onto the line start, so the next
+        # flicker of the hand re-selects nothing at all — the selection you
+        # just made vanishing a moment later, with no signal saying who took
+        # it. A mark is cheap to carry and impossible to find afterwards.
+        # (walked by column rather than with forward_char, which reports
+        # FAILURE when it lands on the buffer's end iterator — a real position
+        # that holds marks like any other, and the one the last line's marks
+        # sit on.)
+        keep = (buf.get_insert(), buf.get_selection_bound())
+        others = []
+        for col in range(len(old_text) + 1):
+            for m in buf.get_iter_at_line_offset(ln, col)[1].get_marks():
+                if m not in keep:
+                    others.append(
+                        (m, self._remap_column(col, old_text, new_text)))
         self._in_highlight = True
         try:
             buf.delete(ls, le)
             ins = buf.get_iter_at_line(ln)[1]
             buf.insert(ins, new_text)
+            for m, col in others:
+                buf.move_mark(m, buf.get_iter_at_line_offset(
+                    ln, max(0, min(col, len(new_text))))[1])
             if cols[0] is not None or cols[1] is not None:
                 its = [buf.get_iter_at_mark(buf.get_insert()),
                        buf.get_iter_at_mark(buf.get_selection_bound())]
@@ -10333,7 +10371,11 @@ class MarkdownNotesView(GtkSource.View):
         # script_style. Depth 1 resolves to the plain sub/superscript tags.
         for m, chain in iter_scripts(text):
             a, b = m.start(), m.end()
-            if protected(a, b) or caret_in(a, b):
+            # The caret test uses the script WITHOUT the space it ate, for the
+            # reason a command's does: that space is not part of what you are
+            # writing any more, so typing it means you are done and the script
+            # belongs on the line — not `_i ` held open under the caret.
+            if protected(a, b) or caret_in(a, script_body_end(m)):
                 continue     # ^/_ inside `code`/[[link]] stays literal, and so
                              # does the script the caret is sitting in
             tag_name = self._script_tag(chain)
