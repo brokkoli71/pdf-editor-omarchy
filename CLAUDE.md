@@ -996,13 +996,31 @@ never land at all — that call is deferred indefinitely. The one rule that
 stays, because it is free: **do NOT merge/push Deck into `master` without
 asking.**
 
-## Current work & loose ends (2026-07-31)
+## Current work & loose ends (2026-08-10)
 
 Everything shipped is described as behavior in the sections above; this section
 is only *what is in flight* and *what is free to pick up*. Keep it that way —
 when something lands, fold its invariants upward and delete it from here rather
 than writing a line about having finished it. The chronology lives in
 `ideas.csv` and git.
+
+**START HERE (2026-08-10). The branch is two commits of unvalidated work on
+top of an already-unvalidated branch, and the next session is a VALIDATION
+session, not a feature one.** In order:
+
+1. **The live-smoothing A/B** — the "Smooth while drawing" switch in the pen
+   popover, same sentence written each way. This is the only open question on
+   row 143 and it **gates prediction** (row 139), which is deferred behind it
+   by the user's decision: both act on the line near the nib, so judging
+   prediction against the old raw live line would only have to be redone.
+2. **The rest of `notes/validation-session.md`** — the stylus block (row 135,
+   nothing verified, and re-read its warning about the stylus/HDMI mapping
+   first), the merge drops (row 123), the divider gesture (row 130), and
+   rows 140–142.
+
+*Accepted 2026-08-10 and off the list: dot size and shape (rows 143/144),
+pointer hiding. Smear trim was tried at every setting with no felt difference
+— left at its default, and not to be tuned further without a new reason.*
 
 **In flight — code-verified, needing a pass in the real app. The whole list is
 one validation session; `notes/validation-session.md` is its checklist.**
