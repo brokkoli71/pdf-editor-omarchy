@@ -4,14 +4,22 @@
 # real compositor — this mirrors the CI setup in .github/workflows/ci.yml).
 #
 # Usage:
-#   ./run_tests.sh                      # full suite
-#   ./run_tests.sh --fast               # fast tier only (skips window tests —
-#                                       # seconds, not minutes; see conftest.py)
+#   ./run_tests.sh                      # FAST TIER (606 tests, ~18 s) — default
+#   ./run_tests.sh --full               # everything (905 tests, ~140 s)
 #   ./run_tests.sh -k TestCallouts      # any pytest args pass straight through
 #   ./run_tests.sh -x -q test_pdfeditor.py::TestPageInsertAndConfirm
 #
-# Workflow: run --fast (or the tests for the area you touched) after every
-# change, and the full suite once before committing.
+# THE DEFAULT IS THE CHEAP ONE ON PURPOSE. The window tier is 299 of the 905
+# tests and 87% of the runtime (~410 ms each against ~30 ms), so a bare run used
+# to cost 140 s and a warm laptop — and a bare run is what anyone reaches for by
+# reflex. Making the expensive tier need a deliberate flag fixes that at the
+# tool instead of relying on everyone remembering.
+#
+# Workflow: bare ./run_tests.sh (or -k for the area you touched) after every
+# change. You rarely need --full at all: CI runs the whole suite on every push
+# and PR (.github/workflows/ci.yml), so let the runner spend the two minutes.
+# Keep --full for a release, or when you have changed something whose blast
+# radius you genuinely cannot bound.
 #
 # A headless Weston is started once on a private socket and left running for fast
 # repeat runs; `./run_tests.sh --stop` tears it down.
@@ -26,10 +34,27 @@ if [ "${1:-}" = "--stop" ]; then
   exit 0
 fi
 
-TIER=()
-if [ "${1:-}" = "--fast" ]; then
-  shift
-  TIER=(-m "not window")
+# Fast tier unless --full is asked for. --fast is still accepted so old muscle
+# memory and any script that predates the flip keep working — it is now simply
+# what you get anyway.
+TIER=(-m "not window")
+FORCED=""
+case "${1:-}" in
+  --full) shift; TIER=(); FORCED=1 ;;
+  --fast) shift; FORCED=1 ;;
+esac
+
+# ASKING FOR A TEST BY NAME MUST GIVE YOU THAT TEST. Without this, `-k
+# TestMergeImportInWindow` quietly collects nothing at all — the tier filter
+# deselects it — which reads as "my test vanished" and is the worst possible
+# failure for a selector. An explicit selection is already the narrow, cheap
+# path, so it overrides the default tier rather than being filtered by it.
+if [ -z "$FORCED" ]; then
+  for a in "$@"; do
+    case "$a" in
+      -k|--deselect|*::*) TIER=(); break ;;
+    esac
+  done
 fi
 
 if ! command -v weston >/dev/null 2>&1; then

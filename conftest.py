@@ -1,4 +1,4 @@
-"""Auto-tier the test suite so `./run_tests.sh --fast` can skip the slow part.
+"""Auto-tier the test suite so the default `./run_tests.sh` can skip the slow part.
 
 Building a real window (PDFEditorWindow / Adw.Application / PresenterWindow)
 dominates the suite's runtime; pure-logic and single-widget tests run in
@@ -24,7 +24,7 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "window: builds real windows/apps — the slow tier, skipped by "
-        "./run_tests.sh --fast (-m 'not window')")
+        "the default ./run_tests.sh (-m 'not window'); --full runs them)")
 
 
 @pytest.fixture(autouse=True)

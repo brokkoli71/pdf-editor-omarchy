@@ -1074,7 +1074,13 @@ class TestStrokeSmoothing(unittest.TestCase):
             pts = [(i * length / max(n - 1, 1), 0.0) for i in range(n)]
             _out, prof = sidemark.finish_ink_stroke(pts, None, 0.5)
             widths.append(max(prof) if prof else 1.0)
-        self.assertGreater(widths[0], 2.0)              # a tap is a fat dot
+        # RELATIONSHIPS only — the size of a dot is taste and has moved five
+        # times (1.0 → 1.6 → 2.1 → 2.8 → 2.0), so any assertion naming a value
+        # (or echoing the constant, which is the same thing wearing a disguise)
+        # can only fire when somebody changes it ON PURPOSE. What must not break
+        # by accident is that a tap is clearly fatter than the line it sits
+        # beside, and that the boost fades out with length.
+        self.assertGreater(widths[0], widths[-1] * 1.25)
         self.assertEqual(widths, sorted(widths, reverse=True))   # monotone
         self.assertAlmostEqual(widths[-1], 1.0, delta=0.01)      # faded out
 
@@ -1087,6 +1093,155 @@ class TestStrokeSmoothing(unittest.TestCase):
                 _out, prof = sidemark.finish_ink_stroke(pts, None, 0.5,
                                                         flat=True)
                 self.assertIsNone(prof)
+
+    def test_the_live_line_is_the_line_you_are_left_with(self):
+        """The whole point of smoothing in flight: what is under the nib must
+        not re-form when you lift. Only the last stretch may differ, because
+        the smear trim cuts a falling edge that mid-stroke is just where the
+        pen is now."""
+        raw = [(i * 2.0, 5 * math.sin(i * 0.4) + 0.3 * ((i * 7) % 3 - 1))
+               for i in range(40)]
+        live, _ = sidemark.live_ink_stroke(raw, None, 0.5)
+        fin, _ = sidemark.finish_ink_stroke(raw, None, 0.5)
+        body = live[:int(len(live) * 0.85)]
+        for p in body:
+            d = min(sidemark._point_segment_distance(
+                        p[0], p[1], fin[i][0], fin[i][1],
+                        fin[i + 1][0], fin[i + 1][1])
+                    for i in range(len(fin) - 1))
+            self.assertLess(d, 0.05)
+
+    def test_the_live_line_does_not_crawl_behind_the_pen(self):
+        """A denoiser is a global filter, so the fear is that every new sample
+        re-settles the ink already on screen. Measured on real strokes it does
+        not: the settled body moves by a median of 0% of an x-height. Resampling
+        DOES re-index nearly every point as the stroke grows — the samples slide
+        along a path that is not moving — so this has to compare shape, never
+        index-aligned points, or it fails against correct behaviour."""
+        raw = [(i * 2.0, 5 * math.sin(i * 0.4)) for i in range(30)]
+        for n in range(12, len(raw)):
+            a, _ = sidemark.live_ink_stroke(raw[:n], None, 0.5)
+            b, _ = sidemark.live_ink_stroke(raw[:n + 1], None, 0.5)
+            body = a[:int(len(a) * 0.85)]
+            for p in body:
+                d = min(sidemark._point_segment_distance(
+                            p[0], p[1], b[i][0], b[i][1],
+                            b[i + 1][0], b[i + 1][1])
+                        for i in range(len(b) - 1))
+                self.assertLess(d, 0.1, f"body moved when sample {n} arrived")
+
+    def test_a_long_stroke_costs_a_bounded_amount_per_event(self):
+        """The pipeline is O(n) and runs on every motion event, so a page-long
+        scribble must not grow without bound. Past LIVE_SMOOTH_MAX_PTS only the
+        tail is re-shaped — and the head has to be carried through intact, or a
+        long stroke loses its beginning."""
+        raw = [(i * 0.7, 40 * math.sin(i / 60.0)) for i in range(2000)]
+        out, _ = sidemark.live_ink_stroke(raw, None, 0.5)
+        window = sidemark.LIVE_SMOOTH_MAX_PTS
+        head = raw[:len(raw) - window]
+        self.assertEqual(out[:len(head)], head)
+        # and the join is a shared sample, not a blend: the head's last point
+        # is where the re-shaped tail starts
+        self.assertEqual(out[len(head) - 1], head[-1])
+
+    def test_a_snapped_shape_is_not_denoised_in_flight(self):
+        """The dwell has already settled that geometry. Smoothing a recognised
+        rectangle live would round the corners it was just given, and the
+        commit exempts it for the same reason."""
+        canvas = sidemark.PDFCanvas.__new__(sidemark.PDFCanvas)
+        rect = [(0.0, 0.0), (20.0, 0.0), (20.0, 12.0), (0.0, 12.0), (0.0, 0.0)]
+        canvas.current_stroke = list(rect)
+        canvas._straight_mode = True
+        canvas._predicted_tip = lambda: None
+        pts, prof = canvas._live_stroke()
+        self.assertEqual(pts, rect)
+        self.assertIsNone(prof)
+
+    def test_the_predicted_tip_never_bends_the_real_samples(self):
+        """A guess extends the line; it must not drag the ink behind it. The
+        denoiser pins its endpoints, so a tip passed through it would pull the
+        last real samples onto a guess — hence it is appended after."""
+        raw = [(i * 2.0, 5 * math.sin(i * 0.4)) for i in range(20)]
+        plain, _ = sidemark.live_ink_stroke(raw, None, 0.5)
+        led, _ = sidemark.live_ink_stroke(raw, None, 0.5, lead=(999.0, 999.0))
+        self.assertEqual(led[-1], (999.0, 999.0))
+        self.assertEqual(led[:-1], plain)
+
+    def test_a_dot_is_the_same_size_however_many_samples_it_reported(self):
+        """A dot is nothing but ENDPOINTS, so the taper multiplies all of it by
+        taper_min — capping the ramp's LENGTH does not save it. The
+        too-short-to-resample path passes taper=False and escapes, so the same
+        tap of the same pen painted 2.4x differently depending only on whether
+        the digitiser reported two samples or three (measured on 62 real dots).
+        The two paths have to agree."""
+        press = [0.62, 0.66, 0.60]
+        two, _ = sidemark.finish_ink_stroke(
+            [(0.0, 0.0), (0.1, 0.05)], press[:2], 0.5)
+        three, prof3 = sidemark.finish_ink_stroke(
+            [(0.0, 0.0), (0.1, 0.05), (0.2, 0.1)], press, 0.5)
+        _out2, prof2 = sidemark.finish_ink_stroke(
+            [(0.0, 0.0), (0.1, 0.05)], press[:2], 0.5)
+        self.assertIsNotNone(prof2)
+        self.assertIsNotNone(prof3)
+        self.assertAlmostEqual(max(prof2), max(prof3), delta=0.25)
+        # and a dot is still clearly wider than the stroke it sits beside
+        line = [(i * 2.0, 0.0) for i in range(20)]
+        _lo, lprof = sidemark.finish_ink_stroke(line, [0.6] * 20, 0.5)
+        self.assertGreater(max(prof3), max(lprof) * 1.5)
+
+    def test_a_dot_is_round_not_a_teardrop(self):
+        """The last sample of a tap reads ~0 pressure — that is the pen leaving
+        the glass, not the shape of the mark. Per-point, one end of the dot is
+        drawn at the pressure floor and the other at full boost (2.5x apart
+        across 64 real taps), and the outline of a near-zero-length mark with
+        two different radii is a crescent with a bite out of it. A dot has no
+        direction, so it must have no width variation along it."""
+        # a real tap: pressure rises, then the pen lifts
+        out, prof = sidemark.finish_ink_stroke(
+            [(0.0, 0.0), (0.12, 0.05), (0.2, 0.08)], [0.62, 0.66, 0.0], 0.5)
+        self.assertIsNotNone(prof)
+        self.assertAlmostEqual(min(prof), max(prof), delta=1e-6)
+        # the width kept is the one the dot was MADE with, not the lift-off
+        self.assertGreater(max(prof), 1.5)
+
+    def test_an_ordinary_stroke_still_tapers_at_both_ends(self):
+        """The dot exemption must not reach real strokes — a nib lifting still
+        thins out, which is the whole of INK_TAPER_*."""
+        line = [(i * 2.0, 0.0) for i in range(30)]
+        _out, prof = sidemark.finish_ink_stroke(line, [0.6] * 30, 0.5)
+        self.assertLess(prof[0], max(prof) * 0.8)
+        self.assertLess(prof[-1], max(prof) * 0.8)
+
+    def test_live_smoothing_can_be_switched_off_to_be_felt_against(self):
+        """Row 143's toggle. Off, the live line is the raw polyline again — it
+        never moves once drawn, and re-forms on release. The COMMITTED ink is
+        identical either way: the switch is about what you see mid-stroke, so
+        it must never reach the file."""
+        raw = [(i * 2.0, 5 * math.sin(i * 0.4)) for i in range(20)]
+        c = PDFCanvas()
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c.predict_ms = 0.0
+        c.current_stroke = list(raw)
+        c.live_smooth = False
+        off, _ = c._live_stroke()
+        self.assertEqual([tuple(p) for p in off], raw)
+        c.live_smooth = True
+        on, _ = c._live_stroke()
+        self.assertNotEqual([tuple(p) for p in on], raw)
+        # and what lands in the document does not depend on the switch
+        for state in (False, True):
+            c.live_smooth = state
+            c.current_stroke = list(raw)
+            c._on_drag_end(None, 0, 0)
+        self.assertEqual(c.strokes[-2]["pts"], c.strokes[-1]["pts"])
+
+    def test_the_highlighter_is_smoothed_in_flight_but_still_flat(self):
+        """`flat` drops pressure and the taper — it does NOT skip the pipeline,
+        live any more than at commit."""
+        raw = [(i * 2.0, 5 * math.sin(i * 0.4)) for i in range(20)]
+        out, prof = sidemark.live_ink_stroke(raw, None, 0.5, flat=True)
+        self.assertIsNone(prof)
+        self.assertNotEqual(len(out), len(raw))   # it was resampled
 
     def test_feature_size_is_the_short_side(self):
         """For a run of cursive the short side is the x-height — the size of
@@ -1295,7 +1450,9 @@ class TestStrokeSmoothing(unittest.TestCase):
         c._recent_samples = [(0.0, 0.0, 0.0), (10.0, 0.0, 10.0),
                              (20.0, 0.0, 20.0)]
         live, _prof = c._live_stroke()
-        self.assertEqual(len(live), 4)               # shown with the lead
+        # the lead is the last point ON SCREEN — a length check would only be
+        # measuring the resampling the live line now goes through
+        self.assertGreater(live[-1][0], 20.0)        # shown with the lead
         self.assertEqual(len(c.current_stroke), 3)   # stored without it
         c._on_drag_end(None, 0, 0)
         self.assertLessEqual(max(x for x, _y in c.strokes[-1]["pts"]), 20.0)

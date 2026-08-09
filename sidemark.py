@@ -890,11 +890,21 @@ INK_TAPER_FRAC = 0.18    # ...but never more than this share of the stroke, per
                          # the page.
 INK_TAPER_MIN = 0.4      # width factor at the very tip of a stroke
 INK_DOT_LEN = 5.0        # arc length under which a mark is really a DOT
-INK_DOT_BOOST = 2.1      # ...and a dot has to be WIDER than the line the same
+INK_DOT_BOOST = 2.0      # ...and a dot has to be WIDER than the line the same
                          # pen draws, or it disappears. A real nib pools ink
                          # where it is set down and lifted without travelling;
                          # at exactly the stroke width, the dot on an "i" reads
-                         # as a speck next to the stem beside it.
+                         # as a speck next to the stem beside it. This lands a
+                         # dot at ~1.6x the stem beside it, measured on real
+                         # taps — which is the number to hold onto, since the
+                         # constant alone says nothing.
+                         # It went 1.0 → 1.6 → 2.1 → 2.8 on four reports of
+                         # "too small" and then came back DOWN to 2.0 the
+                         # moment row 144 fixed the two real defects (a dot's
+                         # size depending on the sample count, and its being
+                         # drawn as a teardrop). The rises were compensating
+                         # for those, not setting a size. If a dot ever looks
+                         # wrong again, measure the SHAPE before touching this.
 
 
 def dot_boost(total_len):
@@ -926,6 +936,18 @@ def width_profile(pts, press=None, taper=True, dot=True,
             acc += math.hypot(p[0] - pts[i - 1][0], p[1] - pts[i - 1][1])
         fwd.append(acc)
     total = acc
+    # A DOT IS NOT A STROKE WITH ENDS. Capping the ramp's LENGTH is not enough:
+    # the ramp multiplies each ENDPOINT by taper_min whatever its length, and a
+    # dot is nothing but endpoints — so a tap came out at 0.4x before the boost
+    # even multiplied it back. That bit only marks the digitiser reported three
+    # samples instead of two, because the too-short-to-resample path passes
+    # taper=False and skips it: the same tap of the same pen painted 2.4x
+    # differently depending on which branch it fell down (measured on 62 real
+    # dots). The two paths have to agree, so the test is the same one that
+    # decides a dot is a dot.
+    dot_mark = dot and total < INK_DOT_LEN
+    if dot_mark:
+        taper = False
     if taper and n >= 2 and taper_len > 0 and total > 0:
         # ...and never more than a share of the stroke itself, or a short mark
         # is nothing but ramp (see INK_TAPER_FRAC)
@@ -935,6 +957,19 @@ def width_profile(pts, press=None, taper=True, dot=True,
             if d < taper_len:
                 u = d / taper_len
                 prof[i] *= taper_min + (1.0 - taper_min) * u
+    # A DOT HAS NO DIRECTION, so it must have no width variation ALONG it.
+    # Its pressure trace is not shape, it is the touchdown/liftoff envelope:
+    # the last sample of a tap reads ~0 because that is the pen leaving the
+    # glass. Left per-point, one end of the mark is drawn at the pressure floor
+    # and the other at full boost — measured across 64 real taps the two ends
+    # differed by 2.5x — and a round tap comes out as a TEARDROP pointing
+    # whichever way the pen happened to lift. The peak is the pressure the dot
+    # was actually made with; the ramp down to it is an artefact of the pen
+    # being in the air. (This is what trim_light_tail does for a stroke, but it
+    # cannot help here: a tap under three samples returns before it runs, and
+    # trimming a two-sample mark would leave nothing to draw.)
+    if dot_mark and prof:
+        prof = [max(prof)] * n
     # applied LAST and independently of the taper, so it survives a stroke too
     # short to have a meaningful ramp — which is every dot. It needs its own
     # flag rather than riding on `taper`, because the one caller that wants a
@@ -992,6 +1027,84 @@ def finish_ink_stroke(pts, press, strength, was_straight=False, flat=False,
     if prof and all(abs(v - 1.0) < 1e-6 for v in prof):
         prof = None          # nothing to say — let it paint flat
     return out, prof
+
+
+LIVE_SMOOTH_MAX_PTS = 600    # raw samples re-shaped per motion event. The
+                             # pipeline is O(n) and runs on every event, so an
+                             # unbounded stroke would eventually cost more per
+                             # frame than a frame has: measured, a whole stroke
+                             # is ~1.7 ms at 87 samples (real handwriting) but
+                             # ~6.9 ms at 1200. Past the window only the TAIL is
+                             # re-shaped and the head stays as it was until
+                             # commit — which is what the whole live line used
+                             # to be, so it is a graceful floor rather than a
+                             # new failure.
+
+
+def live_ink_stroke(pts, press, strength, flat=False, spacing=None,
+                    window=LIVE_SMOOTH_MAX_PTS, lead=None):
+    """The stroke still in FLIGHT, shaped the way its commit will shape it.
+
+    Interpolates and denoises exactly as `finish_ink_stroke` does, so the line
+    under the nib is the line you are going to be left with. Doing this live is
+    affordable and stable, both of which were measured on real captured strokes
+    rather than assumed: the cost is in LIVE_SMOOTH_MAX_PTS above, and the
+    settled body of a stroke moves by a median of 0% of an x-height (worst case
+    1.3%) when one more sample arrives — so the line does not crawl behind the
+    pen. Resampling re-indexes almost every point as the stroke grows, which
+    looks alarming in a diff and is invisible on screen: the samples slide
+    along a path that is not moving.
+
+    Two steps of the commit pipeline are deliberately skipped, both because the
+    stroke is not finished:
+
+      - the raw samples are not CAPTURED. That file is a record of what the
+        digitiser reported per STROKE, not per motion event.
+      - the light tail is not TRIMMED. `trim_light_tail` cuts the smear a pen
+        leaves as it lifts, but mid-stroke that falling edge is just where the
+        pen is now — trimming it would eat the tip and give it back the moment
+        you pressed harder.
+
+    The tail is therefore the one place the live line and the committed line
+    still differ, and it is the last millimetres of a stroke you are still
+    drawing.
+
+    `lead` is the predicted tip. It is appended AFTER the smoothing, never
+    before: the guess is meant to extend the line, not to bend the real samples
+    behind it toward itself (denoising pins its endpoints, so a predicted tip
+    passed through it would drag the last real points onto a guess).
+    """
+    press = [] if flat else list(press or [])
+    if len(pts) >= 3:
+        # from the WHOLE stroke, so a sliding window cannot change the spacing
+        # (and with it the smoothing radius) as you draw
+        if spacing is None:
+            spacing = adaptive_spacing(pts)
+        head, head_press = [], []
+        if window and len(pts) > window:
+            cut = len(pts) - window
+            head, pts = list(pts[:cut]), pts[cut:]
+            head_press, press = press[:cut], press[cut:]
+        trip = [(float(x), float(y),
+                 float(press[i]) if i < len(press) else 1.0)
+                for i, (x, y) in enumerate(pts)]
+        trip = resample_ink(trip, spacing)
+        trip = taubin_smooth(trip, strength)
+        # the join is seamless without blending: resampling starts at the first
+        # point and denoising holds both endpoints, so head and tail still meet
+        # at exactly the sample they were split on
+        pts = head + [(t[0], t[1]) for t in trip]
+        press = (head_press + [t[2] for t in trip]) if press else []
+    else:
+        pts = list(pts)
+    if lead is not None:
+        pts = pts + [lead]
+        if press:
+            press = press + [press[-1]]   # the tip inherits the pressure
+    if flat:
+        return pts, None
+    prof = width_profile(pts, press or None)
+    return pts, (None if all(abs(v - 1.0) < 1e-6 for v in prof) else prof)
 
 
 INK_PROFILE_TAG = "sidemark:press="   # marks OUR use of an annotation's
@@ -2589,6 +2702,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # earns its surprise until the user has chosen it.
         self.hover_lead = False
         self.predict_ms = 0.0
+        self.live_smooth = True
         self._predict_offset = None   # damped lead, reset per stroke
         # a touch lighter than this is not ink: it is the pen skating as you
         # land or lift. 0 disables the gate (and is the default — a threshold
@@ -3078,24 +3192,41 @@ class PDFCanvas(Gtk.DrawingArea):
     def _live_stroke(self):
         """(points, profile) for the stroke still in flight.
 
-        The profile is derived from the raw samples rather than the finished
-        pipeline — resampling on every motion event would cost more than it
-        could possibly show. The predicted tip is added HERE and nowhere else,
-        which is what confines a guess to the screen: the commit path reads
-        current_stroke, which never contains it."""
+        Shaped by the same pipeline the commit uses (`live_ink_stroke`), so the
+        line does not re-form under your hand when you lift the pen. The
+        predicted tip is added THERE and nowhere else, which is what confines a
+        guess to the screen: the commit path reads current_stroke, which never
+        contains it.
+
+        A SNAPPED stroke is exempt for the reason the commit exempts it — the
+        dwell has already settled that geometry, and denoising a recognised
+        rectangle would round the corners it was just given."""
         pts = self.current_stroke
         if len(pts) < 2:
             return pts, None
         lead = self._predicted_tip()
-        if lead is not None:
-            pts = pts + [self._screen_to_doc(*lead)]
-        if self._flat_tool():
+        lead = self._screen_to_doc(*lead) if lead is not None else None
+        if self._straight_mode:
+            pts = pts + [lead] if lead is not None else list(pts)
             return pts, None
-        press = self._stroke_pressure(self.current_stroke)
-        if press and len(pts) > len(self.current_stroke):
-            press = list(press) + [press[-1]]   # the tip inherits the pressure
-        prof = width_profile(pts, press)
-        return pts, (None if all(abs(v - 1.0) < 1e-6 for v in prof) else prof)
+        if not self.live_smooth:
+            # the raw polyline, shaped only by the width profile — what the
+            # live line was before row 143, kept so the two can be FELT against
+            # each other (the trade is real: raw never moves once drawn, but
+            # re-forms into the smoothed line when you lift)
+            press = self._stroke_pressure(pts)
+            if lead is not None:
+                pts = pts + [lead]
+                if press:
+                    press = list(press) + [press[-1]]
+            if self._flat_tool():
+                return pts, None
+            prof = width_profile(pts, press)
+            return pts, (None if all(abs(v - 1.0) < 1e-6 for v in prof)
+                         else prof)
+        return live_ink_stroke(pts, self._stroke_pressure(pts),
+                               self._smoothing_now(), flat=self._flat_tool(),
+                               lead=lead)
 
     def _stroke_pressure(self, pts):
         """The pressure list for the stroke in flight, if it still matches it.
@@ -3108,6 +3239,12 @@ class PDFCanvas(Gtk.DrawingArea):
         """Is the tool in hand one that paints a constant width? Each surface
         answers for itself; everything else about the profile is shared."""
         return bool(self.highlighter or self._temp_highlighter)
+
+    def _smoothing_now(self):
+        """Denoise strength for a stroke being drawn right now. The sheet keeps
+        the same setting behind a getter, so the shared live path asks for it
+        through this rather than reading an attribute only one class has."""
+        return self.smoothing
 
     def _finish_stroke(self, pts, was_straight):
         return finish_ink_stroke(
@@ -10477,6 +10614,7 @@ class TextPageView(Gtk.Overlay):
         self.get_min_pressure = lambda: 0.0
         self.get_hover_lead = lambda: False
         self.get_predict_ms = lambda: 0.0
+        self.get_live_smooth = lambda: True
         self.accent = lambda: (0.52, 0.70, 0.30)
         # GoodNotes-style straight-line snap, same as the PDF canvas: holding
         # still mid-stroke recognises a line / rectangle / ellipse / grid
@@ -11895,8 +12033,15 @@ class TextPageView(Gtk.Overlay):
     def predict_ms(self):
         return self.get_predict_ms()
 
+    @property
+    def live_smooth(self):
+        return self.get_live_smooth()
+
     def _flat_tool(self):
         return self.tool == "highlighter"
+
+    def _smoothing_now(self):
+        return self.get_smoothing()
 
     def _finish_stroke(self, pts, was_straight):
         """The sheet's adapter onto the shared pipeline — same decision, read
@@ -14168,6 +14313,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._hover_lead_check.connect("toggled", self._on_hover_lead_toggled)
         popover_box.append(self._hover_lead_check)
 
+        self._live_smooth_check = Gtk.CheckButton(label="Smooth while drawing")
+        self._live_smooth_check.set_active(self.canvas.live_smooth)
+        self._live_smooth_check.set_tooltip_text(
+            "Shape the line as you draw it, instead of only when you lift the "
+            "pen. Off, the line never moves once drawn but re-forms on release; "
+            "on, it is already the line you will keep, at the cost of the last "
+            "stretch re-settling on each point the pen reports.")
+        self._live_smooth_check.connect("toggled",
+                                        self._on_live_smooth_toggled)
+        popover_box.append(self._live_smooth_check)
+
         shape_label = Gtk.Label(label="Shape snap", xalign=0)
         shape_label.add_css_class("dim-label")
         shape_label.set_margin_top(6)
@@ -14709,6 +14865,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         tp.get_min_pressure = lambda s=s: s.canvas.min_pressure
         tp.get_hover_lead = lambda s=s: s.canvas.hover_lead
         tp.get_predict_ms = lambda s=s: s.canvas.predict_ms
+        tp.get_live_smooth = lambda s=s: s.canvas.live_smooth
         tp.accent = lambda s=s: s.canvas.zoom_accent
         # Ctrl+scroll / Ctrl+= on the sheet zooms the whole paper (text, ink
         # and margins together), not the persistent notes-font setting
@@ -18555,6 +18712,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _on_hover_lead_toggled(self, check):
         self.canvas.hover_lead = check.get_active()
+
+    def _on_live_smooth_toggled(self, check):
+        self.canvas.live_smooth = check.get_active()
 
     def _on_shape_snap_changed(self, dd, _param=None):
         self.canvas.shape_snap = ("off", "lines", "shapes")[dd.get_selected()]

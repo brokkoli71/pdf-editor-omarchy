@@ -236,6 +236,39 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
      long-wavelength shape, and preserving it is the same property that keeps a
      fast "o" round, so test denoising against a smooth arc plus per-sample
      noise, never a zigzag.
+  - **The same three jobs run LIVE** (`live_ink_stroke`, row 143), so the line
+    under the nib is the line you are left with. It skips exactly two steps of
+    `finish_ink_stroke`, both because the stroke is not over: the raw capture
+    (that file is one record per STROKE, so routing the live path through
+    `finish_ink_stroke` spams it every frame) and `trim_light_tail` (mid-stroke
+    the falling edge is just where the pen IS). The tail is the only place live
+    and committed differ. Three things hold it up: a **snapped** stroke is
+    exempt live exactly as at commit (`_straight_mode` — denoising a recognised
+    rectangle rounds the corners the dwell just gave it); the **predicted tip
+    is appended AFTER smoothing** (`lead=`), because `taubin_smooth` pins its
+    endpoints and a guess run through the filter drags the last real samples
+    onto it; and past `LIVE_SMOOTH_MAX_PTS` only the **tail** is re-shaped,
+    since the pipeline is O(n) per motion event and `INK_MAX_POINTS` is 3000
+    (the join needs no blending — resampling starts at the first point and
+    denoising holds both endpoints, so head and tail meet at the sample they
+    were split on). **Do not "fix" the re-indexing**: a new sample re-indexes
+    nearly every resampled point while the *path* stays put, so a live-smoothing
+    test must compare SHAPE — an index-aligned comparison fails against correct
+    behaviour. `_live_stroke` is shared by class assignment (the sheet borrows
+    the canvas's), so both modes get this at once; `_smoothing_now()` is the
+    adapter for the one setting they hold differently.
+    - **Its cost is the TAIL, and that is why there is a switch.** The line
+      does not lag (the drawn tip sits exactly on the pen's latest sample) but
+      the last stretch re-settles on every report — 0.21% of an x-height per
+      sample at the median, 6.6% at worst, against exactly 0 for a raw
+      polyline, which cannot move because appending a point never disturbs the
+      points before it. At ~3 samples per x-height writing small, that reads as
+      a wriggling tip. So the two modes fail in opposite directions and only
+      the hand can choose: `live_smooth` ("Smooth while drawing") keeps both
+      available, and the COMMITTED ink is identical either way. **Measuring the
+      settled body is not measuring what the hand watches** — the pre-ship
+      numbers excluded the tail as "expected to move", which is exactly where
+      the user was looking.
   - **Every length here SCALES with the writing** (`ink_feature_size`,
     `adaptive_spacing`). They are all really "a fraction of a letter" and only
     looked like constants because they were tuned at one size: a fixed spacing
@@ -246,6 +279,24 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     is just how long the word is), with a deliberately *small* diagonal
     fallback — at 0.15 it would win above ~6.6:1, which ordinary cursive
     exceeds, and the measure would then grow with word length.
+  - **A DOT IS NOT A SHORT STROKE (row 144).** Two rules, both learned from
+    captured taps after three futile rises of `INK_DOT_BOOST` — the multiplier
+    was never the wrong *value*, it was the wrong knob. **The taper must not
+    touch it**: a dot is nothing but endpoints, so `INK_TAPER_MIN` scales all
+    of it, and capping the ramp's LENGTH (`INK_TAPER_FRAC`) does not help. That
+    bit only the ≥3-sample path, because the too-short-to-resample branch
+    passes `taper=False` — so the same tap painted **2.4× differently
+    depending on how many samples the digitiser emitted**. **And its width must
+    be CONSTANT along it**: the last sample of a tap reads ~0 pressure (the pen
+    leaving the glass, not the shape), so per-point widths drew one end at the
+    floor and the other at full boost, and on a mark of near-zero length an
+    outline with two radii is a crescent with a bite out of it — a pac-man, not
+    a dot. The profile is flattened to its PEAK. `trim_light_tail` cannot do
+    this: a tap returns before it runs, and trimming two samples leaves nothing
+    to draw. *ceiling: `INK_DOT_LEN` is FIXED at 5.0 units — the one length
+    here not scaled to the writing — so a dot that slid past it gets nothing;
+    unfixed because an i-dot that slid cannot be told from a t-crossbar by
+    geometry.*
   3. **`width_profile` SHAPES** it. The end taper is capped at
      `INK_TAPER_FRAC` of the stroke as well as `INK_TAPER_LEN`: a ramp of fixed
      length is the *whole* of a short mark, which is why the dot on an "i" once
@@ -511,26 +562,48 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 
 ## Testing & verification
 
-- `./run_tests.sh` runs the whole suite (`test_pdfeditor.py`) inside a
-  **headless Weston compositor** (GTK4 has no offscreen backend — never use
+- `./run_tests.sh` runs `test_pdfeditor.py` inside a **headless Weston
+  compositor** (GTK4 has no offscreen backend — never use
   `GDK_BACKEND=offscreen`; needs `weston` installed). Pytest args pass through
-  (`./run_tests.sh -x -q test_pdfeditor.py::SomeTest`); `./run_tests.sh --stop`
+  (`./run_tests.sh -x test_pdfeditor.py::SomeTest`); `./run_tests.sh --stop`
   tears the compositor down.
-- **Iterate with `./run_tests.sh --fast`** (~3 s): it skips the `window`-marked
-  tier (classes that build real windows; auto-marked by `conftest.py` from the
-  class source — a misclassified test still *passes*, it just lands in the
-  wrong speed tier).
+- **The bare command is the FAST TIER (606 tests, ~18 s), and that is the
+  default on purpose.** `--full` is all 905 (~140 s). The window tier — classes
+  building real windows, auto-marked by `conftest.py` from the class source —
+  is 299 tests and **87% of the runtime** (~410 ms each against ~30 ms), so
+  making the expensive tier need a deliberate flag is what keeps a reflex from
+  costing two minutes and a hot laptop. A misclassified test still *passes*, it
+  just lands in the wrong tier. Asking for a test **by name** (`-k`, a `::`
+  nodeid) overrides the tier and gives you that test, window or not — a
+  selector that silently matches nothing is the worst failure a selector has.
+- **You rarely need `--full` at all: CI runs the whole suite on every push and
+  PR** (`.github/workflows/ci.yml`). Let the runner spend the two minutes.
+  Keep `--full` for a release, or for a change whose blast radius you genuinely
+  cannot bound (a shared constant is the usual case — one did break a test
+  outside the class being edited).
 - **Run the NARROWEST thing that could tell you something.** `-k <the classes
-  you touched>` after each behavioural edit, `--fast` at milestones, the full
-  suite once before committing, and nothing at all after a mechanical rename.
-  A full run is ~3–5 min: during a refactor it is the difference between a
-  tight loop and a crawl, and it almost never finds what a targeted run
-  didn't. Note `-k` matching a window-tier class is as slow as a full run, so
-  keep the selector tight.
-  Two traps that waste more time than the tests do: a run over 120 s is
+  you touched>` after each behavioural edit, the bare command at milestones,
+  and nothing at all after a mechanical rename — it almost never finds what a
+  targeted run didn't.
+  Three traps that waste more time than the tests do: a long run is
   backgrounded, so start it, do other work, and read the output file **once**
-  — polling it with short sleeps buys nothing; and never re-run a suite on an
-  unchanged tree because the output was hard to read (fix the grep instead).
+  — polling it with short sleeps buys nothing, and an `until … sleep` loop
+  OUTLIVES the run it was watching and respawns its `sleep`, so it must be
+  killed at the parent shell (one span two hours here); never run two suites at
+  once, since they share one compositor and both thrash; and never re-run a
+  suite on an unchanged tree because the output was hard to read (fix the grep
+  instead).
+- **Test what could break by ACCIDENT, not what someone would change on
+  purpose.** An assertion naming a tuned value — or echoing the constant that
+  holds it, which is the same thing in disguise — can only fire when somebody
+  edits it deliberately, so it is a speed bump on intentional change and no
+  safety net at all. `INK_DOT_BOOST` has moved five times; the invariants
+  worth pinning are that a dot is clearly fatter than the line beside it and
+  fades out with length. Constants belong in assertions as **bounds**
+  (`assertLess(near, INK_RESAMPLE_SPACING)`) or **identifiers** (`BTN_LEFT`),
+  not as expected values. Same trap in a different coat: asserting a *proxy*
+  for the behaviour (a point count standing in for "the line was resampled")
+  breaks on correct changes and misses real ones.
 - **Settings are isolated per run and per test.** `run_tests.sh` points
   `XDG_CONFIG_HOME` at a throwaway dir and a conftest fixture deletes
   `settings.json` after every test. `Bindings.save()` persists on every rebind,
@@ -596,6 +669,13 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 - **Commits**: Conventional Commits WITH scope (`feat(notes):`, `fix(nav):`);
   changelog via git-cliff. End commit messages with the Claude co-author
   trailer. Pragmatic granularity: when WIP is co-mingled, one commit is fine.
+- **Editing `ideas.csv` from a script: force LF** (`csv.writer(f,
+  lineterminator="\n")`, and read with `open(p, newline="")`). Python's csv
+  writes CRLF by default, which churns all ~144 rows into the diff and buries
+  the one line you added. `extras/sync_issues.py` — which owns the **Issue**
+  and **Hash** columns, writing them back after it syncs a row to GitHub, so
+  those are never yours to hand-edit — does this for the same reason, and its
+  `validate_csv()` is the cheap check that a row you appended is well-formed.
 - **Wayland file DnD** needs `Gtk.DropTargetAsync` + a drag-motion handler
   returning an action, or the drop never fires (portal transfer).
 - **GTK4 popovers**: never popdown one popover and popup a sibling on the same
@@ -960,7 +1040,11 @@ one validation session; `notes/validation-session.md` is its checklist.**
   settled (see "The ink pipeline" above), but four values have never been
   judged by hand: the Smear trim (measurement says start at 15–25),
   `INK_DOT_BOOST` (2.1, asked for bigger twice), whether the pointer really
-  hides for a whole stroke, and prediction now that it is damped. The
+  hides for a whole stroke, and prediction now that it is damped. **Judge them
+  as one pass, after row 143's live smoothing** — all four are about the line
+  near the nib, which live smoothing has just changed, so judging them against
+  the old raw live line only means doing it twice. **Prediction is explicitly
+  deferred behind it** (the user's call, 2026-08-09). The
   pen-popover settings are session-scoped and will want persisting once values
   are chosen. Measurements and the reasoning are in `ideas.csv` row 139 and
   `notes/ink-quality-plan.md`. **Deliberately NOT built, needs the user's
