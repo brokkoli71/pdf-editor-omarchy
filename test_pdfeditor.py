@@ -12232,11 +12232,47 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
-    def test_both_erasers_share_one_radius_policy(self):
-        """The sheet and the PDF canvas must agree on what counts as touching
-        a stroke — a duplicated formula is what let the erasers drift apart."""
-        self.assertAlmostEqual(sidemark.erase_radius(30), 15.0 + 3.0)
-        self.assertAlmostEqual(sidemark.erase_radius(2), 1.0 + 3.0)
+    def test_both_erasers_agree_on_what_counts_as_touching_ink(self):
+        """Row 116's regression: the sheet and the PDF canvas drifted apart
+        because one of them reimplemented the radius instead of calling the
+        shared helper.
+
+        So this drives BOTH erasers and compares what they DELETE. Asserting
+        erase_radius()'s arithmetic instead — which is what this test used to
+        do — restates the helper to itself and touches neither canvas, so a
+        canvas that grew its own formula tomorrow would sail straight past
+        it: the exact regression the test is named for."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "e.pdf")
+            make_pdf(pdf, n_pages=1)
+            canvas = PDFCanvas()
+            canvas.load(pdf)
+            canvas.scale, canvas.offset_x, canvas.offset_y = 1.0, 0.0, 0.0
+
+            def sheet_erases(width, miss_by):
+                tp = sidemark.TextPageView(font_px=16)
+                tp._commit_stroke([(120.0, 120.0), (420.0, 120.0)])
+                st = tp.strokes[0]
+                st["width"], st["font_px"] = width, tp.font_px
+                r = tp._erase_radius(st)
+                return miss_by <= r
+
+            def canvas_erases(width, miss_by):
+                stroke = {"pts": [(120.0, 120.0), (420.0, 120.0)],
+                          "color": (0, 0, 0), "width": width, "opacity": 1.0}
+                canvas.all_strokes[0] = [stroke]
+                return canvas._stroke_hits(stroke["pts"], 300.0,
+                                           120.0 + miss_by,
+                                           sidemark.erase_radius(width))
+
+            # thin ink and fat ink, aimed just inside and just outside the ink
+            for width in (2, 30):
+                edge = width / 2.0 + sidemark.ERASE_SLACK_PX
+                for miss_by, expected in ((edge - 0.5, True),
+                                          (edge + 0.5, False)):
+                    with self.subTest(width=width, miss_by=miss_by):
+                        self.assertEqual(canvas_erases(width, miss_by), expected)
+                        self.assertEqual(sheet_erases(width, miss_by), expected)
 
     def test_ctrl_r_reloads_a_text_page(self):
         """Ctrl+R silently did nothing in text mode: _reload() read only

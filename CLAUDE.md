@@ -1052,6 +1052,17 @@ one validation session; `notes/validation-session.md` is its checklist.**
 
 **Loose ends, roughly in order of how ready they are:**
 
+- **Row 145 — audit the test suite, and restructure THIS FILE using it as the
+  instrument.** The suite is 905 tests / ~140 s, of which the window tier is a
+  third of the tests and 87% of the time, and 26 of those are ≤6-line tests
+  dragged into the slow tier because `conftest.py` marks per CLASS. The sharper
+  half is value, not cost: three specimens found in one pass asserted *what the
+  code says* rather than *what the user gets*. Same session: note per area
+  whether this file helped, was silent, or was stale — then split it by WHEN a
+  thing is read (architecture = orient once; pitfalls = look up on touch;
+  process rules = put in tooling if they can be). **A test audit is a biased
+  sample**, so "unused" means unobserved, not useless.
+
 - **Row 119 (crop)** — the last piece of the image feature. Its design is
   settled in row 118 and must not be re-litigated: a field on the model applied
   at render, never a destructive re-encode, landing ONCE for both modes.
