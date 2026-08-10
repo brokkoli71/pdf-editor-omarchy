@@ -201,11 +201,32 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
       **abandons** whatever the first started (`_on_second_finger`, on both
       surfaces) rather than committing it. Never gate any of this on the pinch
       gesture, and never clear `_post_pinch` while a finger is still down.
-      *ceiling: the sheet still cannot pinch-zoom while its router holds the
-      first sequence. Releasing the claim is NOT the fix — the claim is what
-      keeps the `TextView` off the press, so releasing it gives the caret a
-      click mid-pinch, which is the symptom. The exit is to drive the zoom from
-      the latch's own touch positions; see row 150.*
+      - **The latch shipped DEAD twice, and neither cause was in its logic.**
+        (1) PyGObject hands `EventControllerLegacy` a **NULL event** for some
+        events — the pane-drag trap again — and dereferencing it raises, which
+        in a signal handler is silent apart from a traceback: the latch simply
+        stopped counting. `handle(None)` is a no-op and the controller's own
+        `get_current_event()` is the second chance at the same event. (2)
+        Capture controllers of ONE widget run in the order they were **added**,
+        and a gesture that CLAIMS returns STOP — so a latch attached after the
+        sheet's press router never saw the touches the router had taken. It is
+        the **first** controller on both surfaces. Anything reading a raw event
+        stream can be correct, unit-tested and never once run.
+      - **The sheet's pinch is the latch's own arithmetic** (row 150): it keeps
+        each finger's POSITION beside the count, and `_on_touch_multi` /
+        `_on_touch_move` drive `_apply_pinch` from centroid + spread.
+        `GestureZoom` stays for the **touchpad**, which pinches with no touch
+        sequences at all, and stands down while the latch holds fingers — one
+        pinch, two ways in. Do NOT release the router's claim to feed the
+        gesture instead: the claim is what keeps the `TextView` off the press,
+        so releasing it gives the caret a click mid-pinch, which is the
+        symptom. Surface→widget conversion takes the origin ONCE per gesture
+        (`_surface_origin`); the scale ratio needs no conversion at all.
+        *ceiling: with the finger unbound (or bound to `text`) the router
+        DENIES, so the `TextView` takes the first sequence and its own touch
+        text-selection popup can still appear under a pinch — the exit is to
+        give that selection UI to the finger only when the finger's tool IS
+        the caret (row 150).*
     - **No tilt** on this class of panel: the axes exist and are flat zero, so
       a presence check passes and the feature silently does nothing.
     - **A new DEFAULT binding reaches nobody who has customised their table**
@@ -1170,13 +1191,12 @@ one validation session; `notes/validation-session.md` is its checklist.**
   process rules = put in tooling if they can be). **A test audit is a biased
   sample**, so "unused" means unobserved, not useless.
 
-- **Row 150 — a text sheet cannot pinch-zoom**, because its press router holds
-  the first touch sequence and `GestureZoom` never gets two. Row 148's latch
-  stopped the damage (nothing draws, nothing reaches the caret) but not this.
-  The design is settled to one candidate and one rejection: **do not** release
-  the claim — that hands the `TextView` the press mid-pinch, which is the
-  symptom. Drive the zoom from the latch's own touch positions instead. Needs
-  the panel; confirm first whether it is still broken at all.
+- **Row 150's leftover — the touch text-selection popup.** The sheet pinches
+  now (see the stylus block), but with the finger unbound the `TextView` still
+  takes the first sequence and can raise its selection bubble under the pinch.
+  The user's proposal: that UI belongs to the finger only when the finger's
+  tool IS the caret. Needs the panel and a decision about what a lone finger
+  on a sheet should do at all (a PDF page pans).
 - **Row 119 (crop)** — the last piece of the image feature. Its design is
   settled in row 118 and must not be re-litigated: a field on the model applied
   at render, never a destructive re-encode, landing ONCE for both modes.

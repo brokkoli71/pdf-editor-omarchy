@@ -2331,50 +2331,112 @@ class TouchLatch:
     finger still down was the whole bug: the surviving finger began a fresh
     drag, that press resolved through the binding table like any other, and
     with a finger bound to `pen` it left a dot behind.
+
+    It also keeps each live finger's POSITION, because on the text sheet the
+    latch is not just the count — it is the only thing that can drive the zoom
+    itself (row 150). Positions are in SURFACE coordinates, which is what a raw
+    event carries; a consumer that needs widget coordinates takes the origin
+    once per gesture (`TextPageView._surface_origin`) rather than converting
+    per point.
     """
 
-    def __init__(self, on_multi=None):
-        self._live = set()
+    def __init__(self, on_multi=None, on_move=None, on_end=None):
+        self._live = {}          # sequence -> (x, y), surface coords
         self.multi = False
         self.on_multi = on_multi
+        self.on_move = on_move
+        self.on_end = on_end
 
     @property
     def count(self):
         return len(self._live)
 
+    @property
+    def points(self):
+        return [p for p in self._live.values() if p is not None]
+
+    def centroid(self):
+        """The mean of the live fingers, or None below two of them."""
+        pts = self.points
+        if len(pts) < 2:
+            return None
+        return (sum(p[0] for p in pts) / len(pts),
+                sum(p[1] for p in pts) / len(pts))
+
+    def spread(self):
+        """Mean distance from the centroid — the pinch's scale, up to a
+        constant factor (only its RATIO to the spread at begin is ever used)."""
+        c = self.centroid()
+        if c is None:
+            return None
+        pts = self.points
+        return sum(math.hypot(p[0] - c[0], p[1] - c[1]) for p in pts) / len(pts)
+
+    @staticmethod
+    def _position(event):
+        ok, x, y = event.get_position()
+        return (x, y) if ok else None
+
     def handle(self, event):
         """Feed one event. Returns True if it changed anything."""
+        if event is None:
+            # PyGObject hands a legacy controller a NULL event for some events
+            # (the same trap as the pane-drag gesture). It crashed here, and an
+            # exception in the handler is silent apart from a traceback — the
+            # latch simply stopped counting.
+            return False
         seq = event.get_event_sequence()
         if seq is None:
             return False        # a mouse or a pen: not a finger at all
         t = event.get_event_type()
         if t == Gdk.EventType.TOUCH_BEGIN:
-            self._live.add(seq)
+            self._live[seq] = self._position(event)
             if len(self._live) >= 2 and not self.multi:
                 self.multi = True
                 if self.on_multi:
                     self.on_multi()
                 return True
+        elif t == Gdk.EventType.TOUCH_UPDATE:
+            if seq in self._live:
+                self._live[seq] = self._position(event)
+                if self.multi and self.on_move:
+                    self.on_move()
+                return True
         elif t in (Gdk.EventType.TOUCH_END, Gdk.EventType.TOUCH_CANCEL):
-            self._live.discard(seq)
+            self._live.pop(seq, None)
             if not self._live and self.multi:
                 # every finger is up: the next touch is a fresh hand
                 self.multi = False
+                if self.on_end:
+                    self.on_end()
                 return True
         return False
 
 
-def attach_touch_latch(widget, on_multi=None):
+def attach_touch_latch(widget, on_multi=None, on_move=None, on_end=None):
     """Give `widget` a TouchLatch fed from a CAPTURE-phase legacy controller.
 
     Capture, and its own controller, for `track_barrel`'s reason: the gestures
     below take a sequence for themselves, so the raw touch stream is the only
     place the count is honest. It never consumes the event — counting is all
-    it does."""
-    latch = TouchLatch(on_multi)
+    it does.
+
+    **Attach it BEFORE any other capture-phase controller on the same widget.**
+    Controllers of one widget and one phase run in the order they were added,
+    and a gesture that CLAIMS a sequence returns STOP — so a latch added after
+    the sheet's press router never saw the touches the router had taken, which
+    is the count it exists to keep.
+
+    The event arrives twice over: as the signal argument, and from the
+    controller. They are the same event, but the argument is the one PyGObject
+    sometimes fails to marshal, so `get_current_event()` is the second chance.
+    """
+    latch = TouchLatch(on_multi, on_move, on_end)
     ctrl = Gtk.EventControllerLegacy()
     ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-    ctrl.connect("event", lambda _c, ev: (latch.handle(ev), False)[1])
+    ctrl.connect("event", lambda c, ev: (latch.handle(ev or
+                                                      c.get_current_event()),
+                                         False)[1])
     widget.add_controller(ctrl)
     return latch
 
@@ -11158,6 +11220,24 @@ class TextPageView(Gtk.Overlay):
         # there is exactly one path from a press to a tool.
         self._drag = None
 
+        # The finger COUNT and the finger POSITIONS, off the raw touch stream
+        # (rows 148+150). The sheet needs this more than the canvas does: its
+        # router CLAIMS a press for a drawing tool before any pinch can be
+        # recognised, so `GestureZoom` here can be starved and never fire at
+        # all — and then nothing at all tells the sheet a second finger
+        # arrived, and the first one goes on drawing through the whole
+        # gesture. It is also what drives the two-finger zoom itself, below.
+        #
+        # It is attached FIRST for the reason in `attach_touch_latch`: capture
+        # controllers on one widget run in add order, and the router below
+        # claims — which returns STOP and would hide the touches from a latch
+        # added after it.
+        self._touch_zoom = None      # (spread, origin_x, origin_y) at begin
+        self._touch_pan = None       # the survivor's pan, after a finger lifts
+        self._touch = attach_touch_latch(self, self._on_touch_multi,
+                                         self._on_touch_move,
+                                         self._on_touch_end)
+
         # ONE press router for the sheet (row 132). Capture phase on the
         # Overlay so it sees every press before both the ink overlay and the
         # TextView, `set_button(0)` so every button reaches it: it resolves the
@@ -11186,6 +11266,9 @@ class TextPageView(Gtk.Overlay):
 
         # Two-finger pinch zooms the sheet, mirroring the PDF canvas. Capture
         # phase on the overlay so the gesture wins over text-view scrolling.
+        # This one is for the TOUCHPAD, which pinches with no touch sequences
+        # at all; real fingers are driven by the latch above, which stands
+        # this gesture down while it holds them (row 150).
         self._pinch_base_zoom = 1.0
         self._pinch_base_scroll = (0.0, 0.0)
         self._pinch_center = (0.0, 0.0)
@@ -11194,14 +11277,6 @@ class TextPageView(Gtk.Overlay):
         pinch.connect("begin", self._on_sheet_pinch_begin)
         pinch.connect("scale-changed", self._on_sheet_pinch_scale)
         self.add_controller(pinch)
-
-        # The finger COUNT, off the raw touch stream (rows 148+150). The sheet
-        # needs this more than the canvas does: its router CLAIMS a press for a
-        # drawing tool before any pinch can be recognised, so `GestureZoom`
-        # here can be starved and never fire at all — and then nothing at all
-        # tells the sheet a second finger arrived, and the first one goes on
-        # drawing through the whole gesture.
-        self._touch = attach_touch_latch(self, self._on_second_finger)
 
         # MX Master thumb button (btn 10): hold to grab-pan the sheet, same as
         # the PDF canvas. A motion controller tracks the pointer; a legacy
@@ -11512,6 +11587,8 @@ class TextPageView(Gtk.Overlay):
         return (self.get_width() / 2, self.get_height() / 2)
 
     def _on_sheet_pinch_begin(self, gesture, _seq):
+        if self._touch.multi:
+            return              # real fingers: the latch drives it (row 150)
         self._pinch_base_zoom = self.zoom
         ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
         self._pinch_base_scroll = (ha.get_value(), va.get_value())
@@ -11536,16 +11613,25 @@ class TextPageView(Gtk.Overlay):
         self.ink.queue_draw()
 
     def _on_sheet_pinch_scale(self, gesture, scale):
-        self.set_zoom(self._pinch_base_zoom * scale)
-        # Zoom AND pan together (touchscreen parity, #106): the content point
-        # under the fingers' start centroid stays under their CURRENT centroid,
-        # so a two-finger drag pans even when the pinch scale barely changes.
-        # The sheet scales linearly with the zoom (same wrap), so base scroll +
-        # base centroid scale by f; subtracting the live centroid adds the pan.
-        f = self.zoom / self._pinch_base_zoom
+        if self._touch.multi:
+            return              # real fingers: the latch drives it (row 150)
         ok, cx, cy = gesture.get_bounding_box_center()
         if not ok:
             cx, cy = self._pinch_center
+        self._apply_pinch(scale, cx, cy)
+
+    def _apply_pinch(self, scale, cx, cy):
+        """Zoom to `scale`× the zoom at begin, with the fingers' start centroid
+        held under their CURRENT centroid `(cx, cy)` (widget coords).
+
+        The one place the sheet's pinch arithmetic lives — the touchpad gesture
+        and the touch latch both come through here, or the two ways to pinch
+        would drift apart. Zoom AND pan together (touchscreen parity, #106), so
+        a two-finger drag pans even when the scale barely changes: the sheet
+        scales linearly with the zoom (same wrap), so base scroll + base
+        centroid scale by f, and subtracting the live centroid adds the pan."""
+        self.set_zoom(self._pinch_base_zoom * scale)
+        f = self.zoom / self._pinch_base_zoom
         c0x, c0y = self._pinch_center
         s0h, s0v = self._pinch_base_scroll
         ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
@@ -11555,6 +11641,75 @@ class TextPageView(Gtk.Overlay):
         va.set_value(vv)
         # the relayout to the new width is async — re-apply once it lands
         GLib.idle_add(lambda: (ha.set_value(hv), va.set_value(vv)) and False)
+
+    # ── row 150: two fingers, driven by the latch ────────────────────────────
+    # The sheet cannot pinch through `GestureZoom`: its press router claims the
+    # first touch sequence (which is what keeps the TextView off the press —
+    # releasing the claim is NOT the fix, it hands the caret a click mid-pinch),
+    # so the zoom gesture only ever sees one finger and never recognises. The
+    # latch sees the raw stream, so it can do the arithmetic itself.
+
+    def _surface_origin(self):
+        """This widget's top-left in SURFACE coords — what turns a latch
+        position into a widget one. Taken once per gesture, never per point."""
+        native = self.get_native()
+        if native is None:
+            return (0.0, 0.0)
+        ok, x, y = self.translate_coordinates(native, 0.0, 0.0)
+        if not ok:
+            return (0.0, 0.0)
+        tx, ty = native.get_surface_transform()
+        return (x + tx, y + ty)
+
+    def _on_touch_multi(self):
+        """The second finger landed."""
+        self._on_second_finger()        # whatever the first was doing is over
+        self._touch_pan = None
+        self._touch_zoom = None
+        c, d = self._touch.centroid(), self._touch.spread()
+        if c is None or not d:
+            return
+        ox, oy = self._surface_origin()
+        self._pinch_base_zoom = self.zoom
+        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+        self._pinch_base_scroll = (ha.get_value(), va.get_value())
+        self._pinch_center = (c[0] - ox, c[1] - oy)
+        self._touch_zoom = (d, ox, oy)
+
+    def _on_touch_move(self):
+        if self._touch_zoom is None:
+            return
+        d0, ox, oy = self._touch_zoom
+        if self._touch.count >= 2:
+            if self._touch_pan is not None:
+                # a finger came BACK after a lift — re-base on the new pair
+                # rather than measuring against a spread from before the pan
+                self._on_touch_multi()
+                return
+            c, d = self._touch.centroid(), self._touch.spread()
+            if c is None or not d:
+                return
+            self._apply_pinch(d / d0, c[0] - ox, c[1] - oy)
+            return
+        # One finger left of a pinch. It keeps PANNING until it lifts (the PDF
+        # canvas' `_post_pinch`): the hand is still on the glass, and handing
+        # the survivor back to a tool is the dot this whole latch is about.
+        pts = self._touch.points
+        if not pts:
+            return
+        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+        if self._touch_pan is None:
+            self._touch_pan = (pts[0], ha.get_value(), va.get_value())
+            return
+        (px, py), h0, v0 = self._touch_pan
+        ha.set_value(h0 - (pts[0][0] - px))
+        va.set_value(v0 - (pts[0][1] - py))
+
+    def _on_touch_end(self):
+        """The last finger lifted: the next touch is a fresh hand."""
+        self._touch_zoom = None
+        self._touch_pan = None
+        self._ink_ignoring = False
 
     # ── grab pan (PDF-canvas parity) ─────────────────────────────────────────
 

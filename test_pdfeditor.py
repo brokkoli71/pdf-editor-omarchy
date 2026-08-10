@@ -524,9 +524,10 @@ class TestPinchZoom(unittest.TestCase):
     # ── rows 148 + 150: the hand, not the gesture ────────────────────────────
 
     @staticmethod
-    def _touch(kind, seq):
+    def _touch(kind, seq, x=0.0, y=0.0):
         return types.SimpleNamespace(get_event_sequence=lambda: seq,
-                                     get_event_type=lambda: kind)
+                                     get_event_type=lambda: kind,
+                                     get_position=lambda: (True, x, y))
 
     def _press(self, c, latch_seqs=()):
         """Route a press through the real router with a stand-in gesture."""
@@ -619,6 +620,87 @@ class TestPinchZoom(unittest.TestCase):
         tp._on_press_begin(g, 10.0, 10.0)
         self.assertIsNone(tp._press_tool)
         self.assertEqual(len(tp.strokes), 0)
+
+    def test_a_null_event_does_not_stop_the_latch_counting(self):
+        """PyGObject hands a legacy controller a NULL event for some events.
+        It raised in the handler, which is silent apart from a traceback — and
+        the latch then stopped counting fingers for the rest of the session,
+        so every guard built on it quietly did nothing."""
+        latch = sidemark.TouchLatch()
+        self.assertFalse(latch.handle(None))
+        a, b = object(), object()
+        latch.handle(self._touch(Gdk.EventType.TOUCH_BEGIN, a))
+        latch.handle(None)
+        latch.handle(self._touch(Gdk.EventType.TOUCH_BEGIN, b))
+        self.assertTrue(latch.multi)
+
+    def test_the_latch_follows_where_the_fingers_are(self):
+        """Row 150: the latch is not only the count. It is the only thing that
+        sees both fingers on a sheet whose router has claimed the first, so it
+        has to carry the geometry the zoom is computed from."""
+        latch = sidemark.TouchLatch()
+        a, b = object(), object()
+        latch.handle(self._touch(Gdk.EventType.TOUCH_BEGIN, a, 10.0, 10.0))
+        self.assertIsNone(latch.centroid())      # one finger has no pinch
+        latch.handle(self._touch(Gdk.EventType.TOUCH_BEGIN, b, 30.0, 10.0))
+        self.assertEqual(latch.centroid(), (20.0, 10.0))
+        near = latch.spread()
+        latch.handle(self._touch(Gdk.EventType.TOUCH_UPDATE, b, 50.0, 10.0))
+        self.assertEqual(latch.centroid(), (30.0, 10.0))
+        self.assertGreater(latch.spread(), near)   # the fingers moved apart
+
+    def _sheet_touch(self, tp, kind, seq, x, y):
+        tp._touch.handle(self._touch(kind, seq, x, y))
+
+    def test_two_fingers_zoom_the_sheet_without_the_pinch_gesture(self):
+        """Row 150. GestureZoom is starved on a text sheet — the press router
+        holds the first sequence — so the zoom has to come off the latch's own
+        touch positions. Fed only raw touches, with no gesture involved at all,
+        the sheet still zooms."""
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text("alpha\nbeta\n")
+        before = tp.zoom
+        a, b = object(), object()
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, a, 100.0, 100.0)
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, b, 200.0, 100.0)
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_UPDATE, b, 300.0, 100.0)
+        self.assertGreater(tp.zoom, before)
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_UPDATE, b, 150.0, 100.0)
+        self.assertLess(tp.zoom, before)          # …and back the other way
+        # the last lift ends the hand: the next touch starts a fresh pinch
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_END, a, 100.0, 100.0)
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_END, b, 150.0, 100.0)
+        self.assertIsNone(tp._touch_zoom)
+
+    def test_the_survivor_of_a_sheet_pinch_pans(self):
+        """One finger left of a pinch keeps panning until it lifts — the PDF
+        canvas' `_post_pinch`. It must not go back to being a press."""
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text("alpha\n" * 200)
+        va = tp.scroll.get_vadjustment()
+        va.set_upper(5000.0)
+        va.set_page_size(500.0)
+        va.set_value(1000.0)
+        a, b = object(), object()
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, a, 100.0, 300.0)
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, b, 200.0, 300.0)
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_END, b, 200.0, 300.0)
+        base = va.get_value()
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_UPDATE, a, 100.0, 300.0)
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_UPDATE, a, 100.0, 250.0)
+        self.assertAlmostEqual(va.get_value(), base + 50.0, places=3)
+
+    def test_a_touchpad_pinch_still_drives_the_sheet(self):
+        """The latch owns real fingers; a touchpad pinch carries no touch
+        sequences at all, so GestureZoom stays and must keep working."""
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text("alpha\nbeta\n")
+        g = mock.Mock()
+        g.get_bounding_box_center.return_value = (True, 100.0, 100.0)
+        before = tp.zoom
+        tp._on_sheet_pinch_begin(g, None)
+        tp._on_sheet_pinch_scale(g, 2.0)
+        self.assertGreater(tp.zoom, before)
 
     def test_pinch_without_page_is_noop(self):
         c = self._canvas()
