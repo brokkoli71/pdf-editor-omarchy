@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """Measure the pen's end-to-end latency by chasing a moving dot (row 147).
 
-A dot sweeps back and forth at a known speed. You keep the pen tip ON it. The
-dot's position is known for every frame and the pen's for every sample, so the
-time offset that best aligns the two curves is how far behind the pen's ink
-lands — the whole loop, in milliseconds.
+A dot travels a circle at constant speed. You keep the pen tip ON it. The dot's
+position is known for every frame and the pen's for every sample, so the time
+offset that best aligns the two curves is how far behind the pen's ink lands —
+the whole loop, in milliseconds.
 
     extras/latency_probe.py                 # 20 s, then the number
-    extras/latency_probe.py --seconds 30 --period 2.0
+    extras/latency_probe.py --period 3.5    # slower, if it is hard to follow
+    extras/latency_probe.py --path line     # the old back-and-forth sweep
     extras/latency_probe.py --selftest      # check the fit, no hardware
+
+Follow it round several times before trusting a run: the first lap is spent
+learning the path, and a hand that is still catching up is a hand contributing
+its own lag to the number. Slow it down until you can stay ON the dot rather
+than chase it — a clean fit at a slow speed beats a ragged one at a fast.
 
 WHAT IT MEASURES, and the honest limits:
 
@@ -39,10 +45,15 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
-# The sweep is a SINE, not a triangle: a triangle's velocity flips instantly at
-# each end, which no hand can follow, and the tracking error there would swamp
-# the lag being measured. A sine is smooth everywhere and its phase offset is
-# exactly what the fit is looking for.
+# A CIRCLE at constant angular speed is the default path, and the reason is the
+# hand rather than the maths. A back-and-forth sweep changes speed through every
+# cycle — fastest at the centre, stopping dead at each end — and a reversal is
+# the hardest thing there is to track, so the tracking error peaks exactly where
+# the measurement lives. A circle has no reversals and one constant speed, so
+# the hand settles into it and its error becomes a steady phase offset, which is
+# precisely what the fit reads. A guide ring is drawn under it for the same
+# reason: you cannot anticipate a path you cannot see, and anticipation is what
+# keeps the human term out of the number.
 MAX_LAG_MS = 200.0
 LAG_STEP_MS = 1.0
 
@@ -50,15 +61,19 @@ LAG_STEP_MS = 1.0
 def best_lag(dots, pens, max_lag=MAX_LAG_MS, step=LAG_STEP_MS):
     """The delay that best explains the pen curve as a copy of the dot curve.
 
-    `dots` is [(t_ms, x)] as DRAWN, `pens` is [(t_ms, x)] as REPORTED. Returns
-    (lag_ms, normalised residual). The residual matters as much as the lag: a
-    good fit means the hand really was tracking, and a poor one means the run
-    should be thrown away rather than believed.
+    `dots` is [(t_ms, x, y)] as DRAWN and `pens` [(t_ms, x, y)] as REPORTED;
+    the error is the 2D distance, so a circular path is fitted on both axes at
+    once and a straight one degenerates to the single axis that moves.
+
+    Returns (lag_ms, normalised residual). The residual matters as much as the
+    lag: a good fit means the hand really was tracking, and a poor one means
+    the run should be thrown away rather than believed.
     """
     if len(dots) < 8 or len(pens) < 8:
         return None, None
-    d_t = [t for t, _ in dots]
-    d_x = [x for _, x in dots]
+    d_t = [t for t, _, _ in dots]
+    d_x = [x for _, x, _ in dots]
+    d_y = [y for _, _, y in dots]
 
     def dot_at(t):
         if t <= d_t[0] or t >= d_t[-1]:
@@ -72,19 +87,21 @@ def best_lag(dots, pens, max_lag=MAX_LAG_MS, step=LAG_STEP_MS):
                 hi = mid
         span = d_t[hi] - d_t[lo]
         if span <= 0:
-            return d_x[lo]
+            return (d_x[lo], d_y[lo])
         f = (t - d_t[lo]) / span
-        return d_x[lo] + (d_x[hi] - d_x[lo]) * f
+        return (d_x[lo] + (d_x[hi] - d_x[lo]) * f,
+                d_y[lo] + (d_y[hi] - d_y[lo]) * f)
 
-    spread = statistics.pstdev([x for _, x in pens]) or 1.0
+    spread = math.hypot(statistics.pstdev([x for _, x, _ in pens]),
+                        statistics.pstdev([y for _, _, y in pens])) or 1.0
     best = (None, None)
     lag = 0.0
     while lag <= max_lag:
         errs = []
-        for t, px in pens:
-            dx = dot_at(t - lag)
-            if dx is not None:
-                errs.append((px - dx) ** 2)
+        for t, px, py in pens:
+            d = dot_at(t - lag)
+            if d is not None:
+                errs.append((px - d[0]) ** 2 + (py - d[1]) ** 2)
         if len(errs) >= 8:
             rms = math.sqrt(statistics.fmean(errs)) / spread
             if best[1] is None or rms < best[1]:
@@ -97,33 +114,41 @@ def _selftest():
     """Feed the fit a known lag — the maths must be checked without hardware,
     since a wrong answer here looks exactly like a fast machine."""
     ok = True
-    for truth in (0.0, 17.0, 45.0, 90.0):
-        dots = [(t * 4.0, 300 * math.sin(2 * math.pi * t * 4.0 / 1500.0))
-                for t in range(600)]
-        pens = [(t * 8.0, 300 * math.sin(2 * math.pi * (t * 8.0 - truth) / 1500.0))
-                for t in range(40, 280)]
-        lag, rms = best_lag(dots, pens)
-        good = lag is not None and abs(lag - truth) <= 2.0 and rms < 0.02
-        ok &= good
-        print(f"  true {truth:>5.0f} ms -> fitted {lag:>5.1f} ms  "
-              f"(residual {rms:.4f})  {'ok' if good else 'FAILED'}")
-    # and a hand that was NOT tracking must be reported as a bad fit, not as a
-    # confident number
-    dots = [(t * 4.0, 300 * math.sin(2 * math.pi * t * 4.0 / 1500.0))
-            for t in range(600)]
-    pens = [(t * 8.0, 300 * math.sin(t * 0.7)) for t in range(40, 280)]
+    P = 1500.0
+
+    def circle(t, lag=0.0):
+        a = 2 * math.pi * (t - lag) / P
+        return (300 * math.cos(a), 300 * math.sin(a))
+
+    def line(t, lag=0.0):
+        return (300 * math.sin(2 * math.pi * (t - lag) / P), 0.0)
+
+    for name, path in (("circle", circle), ("line", line)):
+        for truth in (0.0, 17.0, 45.0, 90.0):
+            dots = [(t * 4.0, *path(t * 4.0)) for t in range(600)]
+            pens = [(t * 8.0, *path(t * 8.0, truth)) for t in range(40, 280)]
+            lag, rms = best_lag(dots, pens)
+            good = lag is not None and abs(lag - truth) <= 2.0 and rms < 0.02
+            ok &= good
+            print(f"  {name:<6} true {truth:>5.0f} ms -> fitted {lag:>5.1f} ms"
+                  f"  (residual {rms:.4f})  {'ok' if good else 'FAILED'}")
+    # a hand that was NOT tracking must be reported as a bad fit, not as a
+    # confident number — the run that matters most is the one to throw away
+    dots = [(t * 4.0, *circle(t * 4.0)) for t in range(600)]
+    pens = [(t * 8.0, 300 * math.sin(t * 0.7), 300 * math.cos(t * 0.31))
+            for t in range(40, 280)]
     _lag, rms = best_lag(dots, pens)
     noise_ok = rms > 0.2
     ok &= noise_ok
-    print(f"  not tracking      -> residual {rms:.3f}  "
+    print(f"  not tracking          -> residual {rms:.3f}  "
           f"{'ok (rejected)' if noise_ok else 'FAILED (looked like a fit)'}")
     return 0 if ok else 1
 
 
 class Probe(Gtk.ApplicationWindow):
-    def __init__(self, app, seconds, period, amplitude):
+    def __init__(self, app, seconds, period, amplitude, path="circle"):
         super().__init__(application=app, title="Sidemark latency probe")
-        self.set_default_size(1000, 400)
+        self.set_default_size(900, 760)      # tall enough for a real circle
         # MILLISECONDS from here down. Every timestamp in this file is ms
         # (that is what the fit works in), so the two settings that arrive in
         # seconds are converted ONCE, here, and named for it — mixing the two
@@ -131,10 +156,12 @@ class Probe(Gtk.ApplicationWindow):
         self._run_ms = seconds * 1000.0
         self._period_ms = period * 1000.0
         self._amp = amplitude
+        self._path = path
         self._dots, self._pens = [], []
         self._t0 = None
         self._done = False
-        self._dot_x = 0.0
+        self._dot_x = self._dot_y = 0.0
+        self._radius = 0.0
 
         self._area = Gtk.DrawingArea()
         self._area.set_draw_func(self._draw)
@@ -163,20 +190,28 @@ class Probe(Gtk.ApplicationWindow):
             self.close()
             return GLib.SOURCE_REMOVE
         w = self._area.get_width() or 1000
-        centre = w / 2.0
-        amp = min(self._amp, centre - 40)
-        self._dot_x = centre + amp * math.sin(2 * math.pi * t / self._period_ms)
+        h = self._area.get_height() or 400
+        cx, cy = w / 2.0, h / 2.0
+        phase = 2 * math.pi * t / self._period_ms
+        if self._path == "line":
+            self._radius = min(self._amp, cx - 40)
+            self._dot_x = cx + self._radius * math.sin(phase)
+            self._dot_y = cy
+        else:
+            self._radius = max(30.0, min(self._amp, cx - 40, cy - 40))
+            self._dot_x = cx + self._radius * math.cos(phase)
+            self._dot_y = cy + self._radius * math.sin(phase)
         # logged at the time it is HANDED to the compositor, which is the only
         # timestamp we have any right to
-        self._dots.append((now, self._dot_x))
+        self._dots.append((now, self._dot_x, self._dot_y))
         self._area.queue_draw()
         return GLib.SOURCE_CONTINUE
 
-    def _record(self, x, age_ms=0.0):
+    def _record(self, x, y, age_ms=0.0):
         if self._t0 is not None:
-            self._pens.append((self._now() - age_ms, float(x)))
+            self._pens.append((self._now() - age_ms, float(x), float(y)))
 
-    def _record_history(self, controller, x):
+    def _record_history(self, controller, x, y):
         """The samples GTK compressed away since the last delivered event.
 
         Without these the probe would sample the pen once per FRAME and then
@@ -198,35 +233,44 @@ class Probe(Gtk.ApplicationWindow):
             hist = ev.get_history()
             if not hist:
                 return
-            ok, sx, _sy = ev.get_position()
+            ok, sx, sy = ev.get_position()
             ev_time = ev.get_time()
         except (AttributeError, TypeError, ValueError):
             return
         if not ok:
             return
-        dx = x - sx                          # surface -> widget
+        dx, dy = x - sx, y - sy              # surface -> widget
         for coord in hist:
-            if not (coord.flags & Gdk.AxisFlags.X):
+            if not (coord.flags & Gdk.AxisFlags.X
+                    and coord.flags & Gdk.AxisFlags.Y):
                 continue
             age = float(ev_time - coord.time)
             if 0.0 <= age <= 200.0:
-                self._record(coord.axes[int(Gdk.AxisUse.X)] + dx, age)
+                self._record(coord.axes[int(Gdk.AxisUse.X)] + dx,
+                             coord.axes[int(Gdk.AxisUse.Y)] + dy, age)
 
-    def _on_motion(self, c, x, _y):
-        self._record_history(c, x)
-        self._record(x)
+    def _on_motion(self, c, x, y):
+        self._record_history(c, x, y)
+        self._record(x, y)
 
     def _draw(self, _area, ctx, width, height):
         ctx.set_source_rgb(0.08, 0.08, 0.10)
         ctx.paint()
-        y = height / 2.0
+        cx, cy = width / 2.0, height / 2.0
+        # the path itself, faint: anticipation is what keeps the hand's own lag
+        # out of the number, and you cannot anticipate what you cannot see
         ctx.set_source_rgb(0.25, 0.25, 0.30)
         ctx.set_line_width(1)
-        ctx.move_to(0, y)
-        ctx.line_to(width, y)
+        ctx.new_sub_path()
+        if self._path == "line":
+            ctx.move_to(cx - self._radius, cy)
+            ctx.line_to(cx + self._radius, cy)
+        elif self._radius > 0:
+            ctx.arc(cx, cy, self._radius, 0, 2 * math.pi)
         ctx.stroke()
         ctx.set_source_rgb(0.95, 0.75, 0.15)
-        ctx.arc(self._dot_x, y, 14, 0, 2 * math.pi)
+        ctx.new_sub_path()
+        ctx.arc(self._dot_x, self._dot_y, 14, 0, 2 * math.pi)
         ctx.fill()
         ctx.set_source_rgb(0.6, 0.6, 0.65)
         ctx.move_to(16, 26)
@@ -239,9 +283,14 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seconds", type=float, default=20.0)
-    ap.add_argument("--period", type=float, default=1.6,
-                    help="seconds per full sweep (default 1.6)")
-    ap.add_argument("--amplitude", type=float, default=380.0)
+    ap.add_argument("--period", type=float, default=3.0,
+                    help="seconds per lap (default 3.0 — slow it down if you "
+                         "cannot stay ON the dot)")
+    ap.add_argument("--amplitude", type=float, default=260.0,
+                    help="circle radius / sweep half-width, px")
+    ap.add_argument("--path", choices=("circle", "line"), default="circle",
+                    help="circle (default) has no reversals and one constant "
+                         "speed, so the hand tracks it far better")
     ap.add_argument("--selftest", action="store_true",
                     help="check the fit against known lags, no hardware")
     args = ap.parse_args()
@@ -253,7 +302,8 @@ def main():
     app = Gtk.Application(application_id="de.hspitz.sidemark.latencyprobe")
 
     def on_activate(a):
-        win = Probe(a, args.seconds, args.period, args.amplitude)
+        win = Probe(a, args.seconds, args.period, args.amplitude,
+                    args.path)
 
         def on_close(_w):
             out["dots"], out["pens"] = win._dots, win._pens
@@ -275,6 +325,15 @@ def main():
     print(f"  pen sample interval  {span:.1f} ms (~{1000 / span:.0f} Hz)")
     frame = (dots[-1][0] - dots[0][0]) / max(1, len(dots) - 1)
     print(f"  frame interval       {frame:.1f} ms (~{1000 / frame:.0f} fps)")
+
+    # how far the dot moves in a millisecond decides what a lag of N ms even
+    # looks like — without it a number is unreadable
+    speed = 0.0
+    if len(dots) > 1:
+        moved = sum(math.dist(a[1:], b[1:]) for a, b in zip(dots, dots[1:]))
+        speed = moved / max(1e-6, dots[-1][0] - dots[0][0])
+    print(f"  dot speed            {speed * 1000:.0f} px/s "
+          f"({speed * 10:.1f} px per 10 ms)")
 
     lag, rms = best_lag(dots, pens)
     if lag is None:
