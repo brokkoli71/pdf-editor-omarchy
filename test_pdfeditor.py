@@ -15304,5 +15304,91 @@ class TestMergeImportInWindow(unittest.TestCase):
             self._run_in_window(body)
 
 
+class TestPenSettingsPersist(unittest.TestCase):
+    """The pen popover's values belong to the PEN, not to one tab or one run
+    (PEN_SETTINGS). Every canvas loads them; the window writes them everywhere.
+    Settings are wiped between tests by the conftest fixture, so each of these
+    starts from the stock pen."""
+
+    def test_a_saved_value_is_what_a_new_canvas_picks_up(self):
+        sidemark._save_setting("pen", {"pen_width": 4.2, "live_smooth": False,
+                                       "shape_snap": "lines",
+                                       "pen_color": [1.0, 0.0, 0.0]})
+        c = PDFCanvas()
+        self.assertAlmostEqual(c.pen_width, 4.2)
+        self.assertFalse(c.live_smooth)
+        self.assertEqual(c.shape_snap, "lines")
+        self.assertEqual(c.pen_color, (1.0, 0.0, 0.0))
+
+    def test_nothing_saved_leaves_the_stock_pen_alone(self):
+        c = PDFCanvas()
+        self.assertTrue(c.live_smooth)
+        self.assertEqual(c.shape_snap, "shapes")
+        self.assertEqual(c.predict_ms, 0.0)
+
+    def test_junk_in_the_file_never_reaches_the_ink_pipeline(self):
+        """settings.json is a plain file someone can edit, so every value is
+        validated on the way in: a wrong type falls back and a number out of
+        range is clamped to what the popover could show."""
+        sidemark._save_setting("pen", {
+            "pen_width": "wide",          # wrong type
+            "shape_snap": "sometimes",    # not one of the three
+            "live_smooth": 1,             # not a bool
+            "predict_ms": 1e9,            # far past the slider
+            "pen_color": [0.5, 0.5],      # not a triple
+        })
+        c = PDFCanvas()
+        self.assertAlmostEqual(c.pen_width, 2.0)
+        self.assertEqual(c.shape_snap, "shapes")
+        self.assertTrue(c.live_smooth)
+        self.assertLessEqual(c.predict_ms, sidemark.PREDICT_MAX_MS)
+        self.assertEqual(len(c.pen_color), 3)
+
+
+class TestPenSettingsInWindow(unittest.TestCase):
+    """The other half of TestPenSettingsPersist, which needs real tabs."""
+
+    _app_seq = 0
+
+    def _in_window(self, body):
+        TestPenSettingsInWindow._app_seq += 1
+        errors = []
+        app = Adw.Application(
+            application_id=f"test.sidemark.pensettings{self._app_seq}")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+
+    def test_a_change_reaches_every_tab_and_the_file(self):
+        """A tab that kept the old answer reads as the popover not having
+        worked — the show_comments precedent."""
+        def body(win):
+            win._new_tab()
+            self.assertGreater(len(win._sessions), 1)
+            win._set_pen_setting("smoothing", 0.9)
+            for s in win._sessions:
+                self.assertAlmostEqual(s.canvas.smoothing, 0.9)
+            self.assertAlmostEqual(
+                sidemark._saved_pen_settings()["smoothing"], 0.9)
+            # and a tab opened AFTERWARDS starts from it too
+            fresh = win._new_tab()
+            self.assertAlmostEqual(fresh.canvas.smoothing, 0.9)
+
+        self._in_window(body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

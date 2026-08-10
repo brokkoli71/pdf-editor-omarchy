@@ -701,6 +701,62 @@ def hover_lead_in(trail, x, y, now, lead_ms=HOVER_LEAD_MS,
     return out
 
 
+
+# ── the pen popover's settings, which belong to the PEN ───────────────────────
+# Not to one tab and not to one run. This is THE table behind both directions:
+# every PDFCanvas loads these at construction (so a new tab opens with the pen
+# you are already using, instead of handing you the stock blue one back) and
+# the window writes them to every open canvas AND to settings.json on each
+# change. A text sheet needs nothing — TextPageView reads its session's canvas.
+# Each entry carries the range the value is legal in, because settings.json is
+# a plain file a user can edit: a junk value must fall back to the default, not
+# reach the ink pipeline. The bounds are the popover widgets' own, so a scale
+# can always show what was loaded.
+PEN_SETTINGS = {
+    "pen_color":    ("rgb", None),
+    "pen_width":    ("num", (0.3, 5.0)),
+    "hl_color":     ("rgb", None),
+    "hl_width":     ("num", (4.0, 24.0)),
+    "smoothing":    ("num", (0.0, 1.0)),
+    "min_pressure": ("num", (0.0, 0.5)),
+    "predict_ms":   ("num", (0.0, PREDICT_MAX_MS)),
+    "hover_lead":   ("bool", None),
+    "live_smooth":  ("bool", None),
+    "shape_snap":   ("choice", ("off", "lines", "shapes")),
+}
+
+
+def _saved_pen_settings():
+    """The pen values as last chosen, as a raw dict (read `_pen_setting` for
+    one of them). Nested under "pen" so settings.json stays readable."""
+    raw = _load_settings().get("pen", {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def _pen_setting(saved, key, default):
+    """One saved pen value, validated against `PEN_SETTINGS`, else `default`."""
+    kind, arg = PEN_SETTINGS[key]
+    v = saved.get(key)
+    if v is None:
+        return default
+    if kind == "bool":
+        return v if isinstance(v, bool) else default
+    if kind == "num":
+        # bool is an int in Python, and `True` is not a width
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return default
+        lo, hi = arg
+        return min(max(float(v), lo), hi)
+    if kind == "choice":
+        return v if v in arg else default
+    # "rgb": JSON has no tuples, so a colour comes back as a list
+    if (isinstance(v, (list, tuple)) and len(v) == 3
+            and all(isinstance(c, (int, float)) and not isinstance(c, bool)
+                    for c in v)):
+        return tuple(min(max(float(c), 0.0), 1.0) for c in v)
+    return default
+
+
 PREDICT_MAX_TURN = math.pi / 2   # most a prediction may bend within its lead
 PREDICT_SMOOTH = 0.3   # EMA weight on each new guess. The estimate is rebuilt
                        # from scratch every motion event, so consecutive guesses
@@ -2678,13 +2734,17 @@ class PDFCanvas(Gtk.DrawingArea):
         self._erase_group = 0
         self._draw_group = 0
 
-        self.pen_color = (0.05, 0.05, 0.8)   # RGB — stroke alpha lives in "opacity"
-        self.pen_width = 2.0
+        # every value the pen popover offers is loaded from settings here, once
+        # (see PEN_SETTINGS): the pen is a property of the app, not of this tab
+        _pen = _saved_pen_settings()
+        self.pen_color = _pen_setting(   # RGB — stroke alpha lives in "opacity"
+            _pen, "pen_color", (0.05, 0.05, 0.8))
+        self.pen_width = _pen_setting(_pen, "pen_width", 2.0)
         # freehand denoise strength 0..1 (Taubin λ/μ passes applied on commit).
         # NB this is the DENOISE only: the resampling that fills a fast
         # stroke's gaps always runs, because that is interpolation, not
         # smoothing, and turning it off would only bring the facets back.
-        self.smoothing = 0.5
+        self.smoothing = _pen_setting(_pen, "smoothing", 0.5)
         # raw stylus pressure for the stroke in flight, one entry per point of
         # current_stroke. Trusted only while the two lengths agree, so a reset
         # that forgets this list degrades to "no pressure" instead of shifting
@@ -2700,26 +2760,26 @@ class PDFCanvas(Gtk.DrawingArea):
         # and lead the live stroke ahead of the pen by this many milliseconds.
         # Both default OFF — the lead-in did not help in the hand, and neither
         # earns its surprise until the user has chosen it.
-        self.hover_lead = False
-        self.predict_ms = 0.0
-        self.live_smooth = True
+        self.hover_lead = _pen_setting(_pen, "hover_lead", False)
+        self.predict_ms = _pen_setting(_pen, "predict_ms", 0.0)
+        self.live_smooth = _pen_setting(_pen, "live_smooth", True)
         self._predict_offset = None   # damped lead, reset per stroke
         # a touch lighter than this is not ink: it is the pen skating as you
         # land or lift. 0 disables the gate (and is the default — a threshold
         # that eats the start of a stroke is worse than a feathered end).
-        self.min_pressure = 0.0
+        self.min_pressure = _pen_setting(_pen, "min_pressure", 0.0)
         # extended dwell → shape recognition: "shapes" (line + rectangle +
         # ellipse + grid divider), "lines" (line only, the classic straight
         # snap) or "off" (never snap). See recognize_shape / the pen popover.
-        self.shape_snap = "shapes"
+        self.shape_snap = _pen_setting(_pen, "shape_snap", "shapes")
         # what the last dwell recognised, shown as a glyph at the cursor while
         # the stroke is still in flight (None once committed / never snapped)
         self._snap_kind = None
         self._snap_label = None
         self._snap_at = (0.0, 0.0)   # PDF-unit anchor for that glyph
         # highlighter mode: wide translucent strokes (PDF CA key via annot.set_opacity)
-        self.hl_color = (1.0, 0.85, 0.0)
-        self.hl_width = 12.0
+        self.hl_color = _pen_setting(_pen, "hl_color", (1.0, 0.85, 0.0))
+        self.hl_width = _pen_setting(_pen, "hl_width", 12.0)
         self.hl_opacity = 0.40
         # "free" = freehand highlighter strokes; "text" = drag selects text
         # (reading order) and lays one highlight rectangle per line over the
@@ -14210,7 +14270,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         popover_box.append(width_label)
 
         self._width_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.3, 5.0, 0.1)
-        self._width_scale.set_value(2.0)
+        self._width_scale.set_value(self.canvas.pen_width)
         self._width_scale.set_draw_value(True)
         self._width_scale.set_size_request(200, -1)
         self._width_scale.connect("value-changed", self._on_width_changed)
@@ -14224,10 +14284,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         color_dialog.set_with_alpha(True)
         self._color_btn = Gtk.ColorDialogButton.new(color_dialog)
         init_rgba = Gdk.RGBA()
-        init_rgba.red, init_rgba.green, init_rgba.blue, init_rgba.alpha = *acc, 1.0
+        init_rgba.red, init_rgba.green, init_rgba.blue, init_rgba.alpha = (
+            *self.canvas.pen_color, 1.0)
         self._color_btn.set_rgba(init_rgba)
         self._color_btn.connect("notify::rgba", self._on_color_changed)
-        self.canvas.pen_color = acc
         color_row.append(color_label)
         color_row.append(self._color_btn)
         popover_box.append(color_row)
@@ -14630,6 +14690,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s.canvas.bindings = self.bindings
         s.canvas.surround_color = self._theme_surround
         s.canvas.zoom_accent = self._theme_acc
+        # The stock pen wears the THEME's accent, which a canvas cannot know —
+        # but only until a colour has been picked, which is saved and which the
+        # canvas has therefore already loaded (PEN_SETTINGS). Applied per tab,
+        # not once at window build, or a second tab hands back the stock pen.
+        if "pen_color" not in _saved_pen_settings():
+            s.canvas.pen_color = self._theme_acc
         s.canvas.set_vexpand(True)
         s.canvas.set_hexpand(True)
         s.canvas.on_page_changed = lambda *a: s.win._on_page_changed(*a)
@@ -18675,17 +18741,35 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         toast.set_timeout(2)
         self.toast_overlay.add_toast(toast)
 
+    def _set_pen_setting(self, key, value):
+        """A pen-popover value belongs to the PEN, not to this tab or this run.
+
+        Write it to EVERY open canvas — the show_comments precedent: a tab that
+        kept the old answer reads as the popover not having worked — and
+        persist it, because a value chosen by hand is one the user has already
+        spent attention on. Text sheets need nothing: a TextPageView reads its
+        session's canvas.
+
+        # ceiling: one small settings write per scale step, so dragging a
+        # slider writes the file a few dozen times. Debounce if it ever shows
+        # up in a profile; a crash would then lose the last value.
+        """
+        for s in self._sessions:
+            setattr(s.canvas, key, value)
+        saved = _saved_pen_settings()
+        saved[key] = list(value) if isinstance(value, tuple) else value
+        _save_setting("pen", saved)
+
     def _on_width_changed(self, scale):
         if self._syncing_pen:
             return
-        if self.canvas.highlighter:
-            self.canvas.hl_width = scale.get_value()
-        else:
-            self.canvas.pen_width = scale.get_value()
+        self._set_pen_setting(
+            "hl_width" if self.canvas.highlighter else "pen_width",
+            scale.get_value())
         self._recolor_lasso_if_any()
 
     def _on_smoothing_changed(self, scale):
-        self.canvas.smoothing = scale.get_value() / 100.0
+        self._set_pen_setting("smoothing", scale.get_value() / 100.0)
 
     def _on_page_bg_changed(self, dd, _param=None):
         _save_setting("page_background", PAGE_BACKGROUNDS[dd.get_selected()])
@@ -18705,19 +18789,20 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     view._rehighlight()
 
     def _on_smear_changed(self, scale):
-        self.canvas.min_pressure = scale.get_value() / 100.0
+        self._set_pen_setting("min_pressure", scale.get_value() / 100.0)
 
     def _on_predict_changed(self, scale):
-        self.canvas.predict_ms = scale.get_value()
+        self._set_pen_setting("predict_ms", scale.get_value())
 
     def _on_hover_lead_toggled(self, check):
-        self.canvas.hover_lead = check.get_active()
+        self._set_pen_setting("hover_lead", check.get_active())
 
     def _on_live_smooth_toggled(self, check):
-        self.canvas.live_smooth = check.get_active()
+        self._set_pen_setting("live_smooth", check.get_active())
 
     def _on_shape_snap_changed(self, dd, _param=None):
-        self.canvas.shape_snap = ("off", "lines", "shapes")[dd.get_selected()]
+        self._set_pen_setting(
+            "shape_snap", ("off", "lines", "shapes")[dd.get_selected()])
 
     def _on_color_changed(self, btn, _param=None):
         if self._syncing_pen:
@@ -18725,10 +18810,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         rgba = btn.get_rgba()
         rgb = (rgba.red, rgba.green, rgba.blue)
         if self.canvas.highlighter:
-            self.canvas.hl_color = rgb
+            self._set_pen_setting("hl_color", rgb)
             self._mode_hl.get_child().queue_draw()
         else:
-            self.canvas.pen_color = rgb
+            self._set_pen_setting("pen_color", rgb)
         self._color_swatch.queue_draw()
         self._recolor_lasso_if_any()
 

@@ -777,6 +777,18 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   no-ops in text mode (this is what broke Ctrl+R) — use
   `self._path or self._notes_path`. If a feature really is PDF-only, say so
   loudly (`_on_export`, `_ocr_current`) rather than returning in silence.
+- **The pen belongs to the APP, not to a tab or a run** (`PEN_SETTINGS`). Every
+  value the pen popover offers — width, colour, both highlighter ones,
+  smoothing, smear trim, prediction, hover lead-in, live smoothing, shape snap
+  — is loaded by each `PDFCanvas` at construction and written by
+  `_set_pen_setting` to **every open canvas** and to `settings.json`. A text
+  sheet needs nothing: `TextPageView` reads its session's canvas. Two things
+  the table exists to prevent: a new tab handing back the stock blue pen after
+  you picked red (it took the hardcoded defaults, and only `pen_color` was ever
+  pushed onto a canvas, once, from the theme accent — which is now the
+  *fallback* for an unpicked colour), and a saved value reaching the ink
+  pipeline unvalidated, since `settings.json` is a plain file a user can edit.
+  The accent fallback is applied per tab.
 - **One table, not two**: `Bindings` (which button runs which tool),
   `zoom_factor_for_scroll` (scroll→zoom rate),
   `erase_radius` (what counts as touching ink),
@@ -1010,9 +1022,7 @@ session is a VALIDATION session, not a feature one.** In order:
 1. **Prediction (row 139)** — now unblocked, since live smoothing was accepted.
    A/B 0 vs a value on one sentence, check overshoot at a sharp cusp and a fast
    tight "o", and check it is inert when writing slowly.
-2. **Persist the pen-popover settings** — session-scoped today, so a value the
-   user has just chosen is gone on restart.
-3. **The rest of `notes/validation-session.md`** — the stylus block (row 135,
+2. **The rest of `notes/validation-session.md`** — the stylus block (row 135,
    nothing verified, and re-read its warning about the stylus/HDMI mapping
    first), the merge drops (row 123), the divider gesture (row 130), and
    rows 140–142.
@@ -1062,8 +1072,7 @@ one validation session; `notes/validation-session.md` is its checklist.**
   judged by A/B at 0 vs a value on one sentence, overshoot at a sharp cusp, a
   fast tight "o" (what the arc extrapolation exists for), and inertness when
   writing slowly. The discriminator is that prediction never reaches the file,
-  so ink still wrong *after* the lift is not prediction. The pen-popover
-  settings are session-scoped and want persisting once a value is chosen.
+  so ink still wrong *after* the lift is not prediction.
   Measurements and reasoning are in `ideas.csv` row 139 and
   `notes/ink-quality-plan.md`. **Deliberately NOT built, needs the user's
   call:** stroke-onset recovery — it invents ink that was never measured.
