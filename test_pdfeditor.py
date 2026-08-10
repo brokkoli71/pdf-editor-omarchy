@@ -15498,6 +15498,97 @@ class TestMotionHistory(unittest.TestCase):
         self.assertEqual(len(set(ts)), len(ts))
 
 
+class TestInkLayerCache(unittest.TestCase):
+    """Row 147: committed ink is a cached surface, not a per-frame repaint —
+    re-outlining every stroke each frame cost 0.164 ms apiece, so a page of
+    notes ate the whole frame at ~100 strokes and the pen's samples then
+    arrived every other frame. The one bug this design can have is a STALE
+    layer, so these pin what must invalidate it."""
+
+    def _canvas(self, n=3):
+        c = PDFCanvas()
+        c.page_width, c.page_height = 595.0, 842.0
+        c.scale = c._surface_scale = 1.0
+        c.all_strokes = {0: [{"pts": [(10.0 + i, 10.0), (20.0 + i, 30.0),
+                                      (30.0 + i, 10.0)],
+                              "color": (0, 0, 0.8), "width": 2.0}
+                             for i in range(n)]}
+        c.current_page_idx = 0
+        return c
+
+    def test_nothing_changing_reuses_the_layer(self):
+        c = self._canvas()
+        self.assertEqual(c._ink_signature(), c._ink_signature())
+
+    def test_every_way_a_stroke_changes_is_noticed(self):
+        """Not a list of invalidation call sites — a fingerprint of what would
+        be painted. There are a dozen ways a stroke changes here and a cache
+        that depends on remembering all of them goes stale on the thirteenth."""
+        c = self._canvas()
+        before = c._ink_signature()
+
+        def changed(what, mutate):
+            with self.subTest(what):
+                c.all_strokes[0] = [dict(s, pts=list(s["pts"]))
+                                    for s in self._canvas().all_strokes[0]]
+                base = c._ink_signature()
+                mutate(c)
+                self.assertNotEqual(c._ink_signature(), base)
+
+        changed("draw", lambda c: c.strokes.append(dict(c.strokes[0])))
+        changed("erase", lambda c: c.strokes.pop())
+        changed("recolour", lambda c: c.strokes[0].__setitem__("color", (1, 0, 0)))
+        changed("width", lambda c: c.strokes[0].__setitem__("width", 9.0))
+        changed("move", lambda c: c.strokes[0].__setitem__(
+            "pts", [(x + 5, y + 5) for x, y in c.strokes[0]["pts"]]))
+        # the case an endpoints-only signature would miss: a control-point drag
+        # that moves an INTERIOR vertex and leaves both ends where they were
+        changed("reshape", lambda c: c.strokes[0]["pts"].__setitem__(
+            1, (99.0, 99.0)))
+        changed("zoom", lambda c: setattr(c, "_surface_scale", 2.0))
+        changed("page", lambda c: setattr(c, "current_page_idx", 1))
+        changed("invalidate_ink", lambda c: c.invalidate_ink())
+        self.assertEqual(len(before[1]), 3)      # the fixture is what we think
+
+    def test_finishing_a_stroke_only_paints_that_stroke(self):
+        """A full repaint is O(strokes) — 80 ms at 400 of them, arriving
+        exactly when you lift the pen. An append is a PREFIX of the old
+        signature, so only the new ink is painted onto the layer already
+        there."""
+        c = self._canvas()
+        c._render_ink_layer(c._ink_signature())
+        first = c._ink_surface
+        c.strokes.append({"pts": [(40.0, 40.0), (50.0, 50.0)],
+                          "color": (0, 0, 0), "width": 1.0})
+        c._render_ink_layer(c._ink_signature())
+        self.assertIs(c._ink_surface, first)     # painted onto, not rebuilt
+
+    def test_anything_but_an_append_rebuilds(self):
+        """Erasing cannot be painted on top of — the layer has to lose ink,
+        and a surface only gains it."""
+        c = self._canvas()
+        c._render_ink_layer(c._ink_signature())
+        first = c._ink_surface
+        c.strokes.pop()
+        c._render_ink_layer(c._ink_signature())
+        self.assertIsNot(c._ink_surface, first)
+
+    def test_a_rerender_drops_the_layer_it_no_longer_matches(self):
+        """The layer is rendered AT a scale, like the page surface — keeping
+        one across a re-render blits yesterday's ink at today's zoom."""
+        c = self._canvas()
+        c._render_ink_layer(c._ink_signature())
+        self.assertIsNotNone(c._ink_surface)
+        c.page = None                    # _rerender_now returns early
+        c._rerender_now()
+        self.assertIsNotNone(c._ink_surface)   # nothing was re-rendered
+        c._ink_surface = object()
+        c.page, c.scale = mock.Mock(), 2.0
+        with mock.patch.object(c, "_page_to_surface", return_value=None):
+            c._rerender_now()
+        self.assertIsNone(c._ink_surface)
+
+
 class TestPenSettingsPersist(unittest.TestCase):
     """The pen popover's values belong to the PEN, not to one tab or one run
     (PEN_SETTINGS). Every canvas loads them; the window writes them everywhere.
