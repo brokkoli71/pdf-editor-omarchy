@@ -12399,17 +12399,18 @@ class TextPageView(Gtk.Overlay):
     def _commit_stroke(self, pts_overlay, profile=None):
         if len(pts_overlay) < 2:
             return
-        buf_pts = [self._overlay_to_buffer(x, y) for x, y in pts_overlay]
         # anchor at the first point: a left-gravity mark stays put when text is
-        # typed right at it and rides along with every edit above it
-        buf = self.view.get_buffer()
-        _over_text, it = self.view.get_iter_at_location(*buf_pts[0])
-        mark = buf.create_mark(None, it, True)
-        r = self.view.get_iter_location(it)
+        # typed right at it and rides along with every edit above it. Through
+        # _anchor_stroke_at, which keeps the FRACTION of every point: rounding
+        # each one to a whole buffer pixel here is independent per point, so it
+        # is uncorrelated ±1px noise — exactly what taubin_smooth just removed,
+        # put back where nothing downstream can take it out again, and stored
+        # that way in the sidecar for good.
+        mark, rel = self._anchor_stroke_at(pts_overlay)
         color, width, opacity = self.pen_style(self.tool == "highlighter")
         stroke = {
             "mark": mark,
-            "pts": [(bx - r.x, by - r.y) for bx, by in buf_pts],
+            "pts": rel,
             "color": tuple(color),
             # The pen setting is a DOCUMENT width (PDF-canvas parity): a stroke
             # must come out the same size whatever zoom it was drawn at, and

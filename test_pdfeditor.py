@@ -12207,6 +12207,37 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_a_stored_stroke_keeps_the_shape_it_was_drawn_with(self):
+        """Row 149 — the points a stroke is STORED with must keep their
+        fraction. Rounding each to a whole buffer pixel is independent per
+        point, so it is uncorrelated ±1px noise: precisely what the denoiser
+        just removed, put back after it, and written to the sidecar for good.
+
+        The assertion is the SHAPE (per-segment angles), not the coordinates —
+        the anchor arithmetic is free to change, the precision is not."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                win._set_tool_mode("pen")
+                # an arc at the sample spacing real handwriting produces when
+                # written small (row 139): neighbours ~1.5px apart, which is
+                # where a 1px lattice does its damage
+                pts = [(300.0 + 40 * math.cos(t / 26.0),
+                        160.0 + 40 * math.sin(t / 26.0)) for t in range(40)]
+                tp._commit_stroke(pts)
+                back = tp._stroke_overlay_pts(tp.strokes[0])
+
+                def angles(p):
+                    return [math.atan2(p[i + 1][1] - p[i][1],
+                                       p[i + 1][0] - p[i][0])
+                            for i in range(len(p) - 1)]
+
+                for want, got in zip(angles(pts), angles(back)):
+                    self.assertLess(abs(math.degrees(want - got)), 5.0)
+
+            self._run_in_window(body)
+
     def test_ink_joins_the_chronological_undo(self):
         with tempfile.TemporaryDirectory() as d:
             def body(win):
