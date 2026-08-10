@@ -15395,11 +15395,13 @@ def _coord(x, y, time, press=None, axes_ok=True):
     return types.SimpleNamespace(axes=axes, flags=flags, time=time)
 
 
-def _motion_event(history, time=1000, pos=(0.0, 0.0)):
+def _motion_event(history, time=1000, pos=(0.0, 0.0),
+                  kind=Gdk.EventType.MOTION_NOTIFY):
     return types.SimpleNamespace(
         get_history=lambda: history,
         get_time=lambda: time,
         get_position=lambda: (True, pos[0], pos[1]),
+        get_event_type=lambda: kind,
         get_event_sequence=lambda: None,
         get_device_tool=lambda: None)
 
@@ -15456,10 +15458,21 @@ class TestMotionHistory(unittest.TestCase):
         self.assertEqual(sidemark.motion_history(None, 0.0, 0.0), [])
         self.assertEqual(
             sidemark.motion_history(_motion_event([]), 0.0, 0.0), [])
-        # a touch event carries no compressed history at all — it was never
-        # compressed, which is why a finger already reached the canvas at rate
+
+    def test_only_a_motion_event_is_asked_for_its_history(self):
+        """`gdk_event_get_history` ASSERTS the event is a motion one, and a
+        finger drag delivers TOUCH_UPDATE — so asking anyway prints a
+        Gdk-CRITICAL per event of every touch stroke. Nothing is lost by not
+        asking: touch is never compressed, which is why a finger already
+        arrived at full rate."""
+        touch = _motion_event([_coord(1.0, 1.0, 999)], time=1000,
+                              kind=Gdk.EventType.TOUCH_UPDATE)
+        self.assertEqual(sidemark.motion_history(touch, 0.0, 0.0), [])
+        # ... while the same history on a motion event IS read
         self.assertEqual(
-            sidemark.motion_history(_stylus_event("touch"), 0.0, 0.0), [])
+            len(sidemark.motion_history(
+                _motion_event([_coord(1.0, 1.0, 999)], time=1000), 0.0, 0.0)),
+            1)
 
     def test_the_canvas_actually_draws_the_recovered_samples(self):
         """The helper being right is not the same as it being REACHED — the

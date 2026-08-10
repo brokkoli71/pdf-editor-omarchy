@@ -383,14 +383,25 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     bigger); below ~0.06 the pen is oversampling and any roughness left is
     tremor, so denoising is the lever. That ratio is how to answer "is this
     fixable in software or is the hardware just too coarse?" — measure, don't
-    guess. **It has been measured** (41 real strokes, kept in `notes/`): this
-    panel gives ~3 samples per x-height writing small and ~27 writing large, so
-    small writing is an INFORMATION limit, not a filter problem, and the
-    Smoothing slider is correctly near-inert there. Never answer a complaint
-    about small writing by strengthening the denoiser — at that density there
-    is no redundancy, so anything it removes is shape, not noise. (Writing
-    physically bigger helps; zooming in does not — the digitiser samples in
-    physical space, so letter and spacing shrink together.)
+    guess. **Measured twice, and the second reading retired the first.**
+    Before `motion_history` (row 147) the ratio was 0.337 — UNDERSAMPLED, ~3
+    samples per x-height writing small — and the conclusion drawn was that
+    small writing is an information limit and the denoiser must never be
+    strengthened for it. That was a fact about the 30 Hz the canvas was
+    *receiving*, not about the pen. At the pen's real rate the same hand
+    writing SMALLER measures 0.091, "reasonable sampling", so **small writing
+    is no longer information-limited** and that rule is void. What survives is
+    the method: measure the ratio, don't guess. (Writing physically bigger
+    still helps; zooming in still does not — the digitiser samples in physical
+    space, so letter and spacing shrink together.)
+  - **The denoiser is now near-inert, and that is expected.** Across its whole
+    range the Taubin passes move the committed ink 0.11%→0.16% of an x-height
+    (it was 0.44%→0.48% at 30 Hz): 0.0 and 1.0 differ by 0.05% of an x-height,
+    which is nothing. It was never mainly removing tremor — it was cleaning up
+    what INTERPOLATION invented between sparse samples, and there is little
+    left to invent. The shaping is now done by `resample_ink`. Do not "fix"
+    the slider by widening its range; if a stroke ever needs more filtering,
+    the question is what changed about the sampling.
 - **Page backgrounds (rows 139 + 140)** — `draw_page_background` rules a blank
   page (plain/lines/squares/dots) into the page CONTENT at creation: a
   background you write on is one you hand in, so it must print and export.

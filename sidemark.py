@@ -2150,6 +2150,13 @@ def motion_history(event, x, y):
     # same way the ink capture is: recovering extra samples is a bonus, and
     # failing to must never cost the user the stroke they are drawing.
     try:
+        # `gdk_event_get_history` ASSERTS the event is a motion (or scroll)
+        # one, and a finger drag delivers TOUCH_UPDATE — so asking anyway
+        # prints a Gdk-CRITICAL per event of every touch stroke. There is
+        # nothing to recover there in any case: touch is not compressed, which
+        # is the whole reason a finger already arrived at full rate (row 147).
+        if event.get_event_type() != Gdk.EventType.MOTION_NOTIFY:
+            return []
         hist = event.get_history()
         if not hist:
             return []
