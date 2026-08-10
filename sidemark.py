@@ -765,13 +765,36 @@ def _pen_setting(saved, key, default):
 
 
 PREDICT_MAX_TURN = math.pi / 2   # most a prediction may bend within its lead
-PREDICT_SMOOTH = 0.3   # EMA weight on each new guess. The estimate is rebuilt
-                       # from scratch every motion event, so consecutive guesses
-                       # disagree by more than the pen actually moved and the
-                       # tip JITTERS — the one thing a lead is supposed to cure.
-                       # Smoothing the OFFSET and not the point is what makes
-                       # this safe: the anchor still tracks the pen exactly, so
-                       # the lag being hidden is not re-introduced.
+PREDICT_SMOOTH_MS = 15.0  # TIME constant for damping the lead, not a per-event
+                       # weight. The estimate is rebuilt from scratch on every
+                       # motion event, so consecutive guesses disagree by more
+                       # than the pen actually moved and the tip JITTERS — the
+                       # one thing a lead is supposed to cure. Smoothing the
+                       # OFFSET and not the point is what makes that safe: the
+                       # anchor still tracks the pen exactly, so the lag being
+                       # hidden is not re-introduced.
+                       #
+                       # It is expressed in MILLISECONDS because a per-event
+                       # weight silently means something different at every
+                       # report rate. As a fixed 0.3 per event it worked out at
+                       # a ~92 ms time constant when the canvas was seeing
+                       # 30 Hz — five times the lead it was damping, so the
+                       # offset drawn came from a pen position 90 ms stale and
+                       # prediction recovered almost nothing (row 147). At the
+                       # pen's real 133 Hz the same 0.3 would have meant ~21 ms
+                       # instead. Anything tuned per event has this bug.
+                       #
+                       # 15 ms is a COMPROMISE the measurement can only see one
+                       # side of. Swept at a 20 ms lead on real ink, recovery
+                       # of the lag error falls monotonically with damping —
+                       # 41% undamped, 31% at 10 ms, 25% at 15, 19% at 20, 10%
+                       # at 30 — so accuracy alone says use none. Damping is
+                       # here for STABILITY, which no error metric measures:
+                       # it was added because the tip visibly jittered. That
+                       # complaint dates from when the canvas saw 30 Hz and
+                       # consecutive guesses disagreed wildly; at 133 Hz they
+                       # agree far better, so less damping is needed than then.
+                       # Re-judge it in the hand before moving it again.
 
 
 def predict_point(samples, lead_ms, max_px=PREDICT_MAX_PX):
@@ -2866,6 +2889,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.predict_ms = _pen_setting(_pen, "predict_ms", 0.0)
         self.live_smooth = _pen_setting(_pen, "live_smooth", True)
         self._predict_offset = None   # damped lead, reset per stroke
+        self._predict_at = None       # when that lead was computed
         # a touch lighter than this is not ink: it is the pen skating as you
         # land or lift. 0 disables the gate (and is the default — a threshold
         # that eats the start of a stroke is worse than a feathered end).
@@ -3354,18 +3378,22 @@ class PDFCanvas(Gtk.DrawingArea):
             self._capture_samples.append((x, y, now))
 
     def _predicted_tip(self):
-        """The predicted tip, damped across frames — see PREDICT_SMOOTH."""
+        """The predicted tip, damped across frames — see PREDICT_SMOOTH_MS."""
         raw = predict_point(self._recent_samples, self.predict_ms)
         if raw is None:
-            self._predict_offset = None
+            self._predict_offset = self._predict_at = None
             return None
-        ax, ay = self._recent_samples[-1][0], self._recent_samples[-1][1]
+        ax, ay, t = self._recent_samples[-1]
         off = (raw[0] - ax, raw[1] - ay)
-        prev = self._predict_offset
-        if prev is not None:
-            off = (prev[0] + (off[0] - prev[0]) * PREDICT_SMOOTH,
-                   prev[1] + (off[1] - prev[1]) * PREDICT_SMOOTH)
+        prev, prev_t = self._predict_offset, self._predict_at
+        if prev is not None and prev_t is not None and t > prev_t:
+            # the weight follows ELAPSED TIME, so the damping means the same
+            # thing however fast the pen reports
+            a = 1.0 - math.exp(-(t - prev_t) / PREDICT_SMOOTH_MS)
+            off = (prev[0] + (off[0] - prev[0]) * a,
+                   prev[1] + (off[1] - prev[1]) * a)
         self._predict_offset = off
+        self._predict_at = t
         return (ax + off[0], ay + off[1])
 
     def _live_stroke(self):
@@ -4905,7 +4933,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._recent_samples = []
         self._capture_samples = []
         self._capture_events = 0
-        self._predict_offset = None
+        self._predict_offset = self._predict_at = None
         lead = self._lead_in_points(start_x, start_y)
         self.current_stroke = ([self._screen_to_pdf(*p) for p in lead]
                                + [self._screen_to_pdf(start_x, start_y)])
@@ -10894,6 +10922,7 @@ class TextPageView(Gtk.Overlay):
         self._capture_events = 0    # motion EVENTS behind those samples
         self._capture_device = "mouse"   # which device drew it
         self._predict_offset = None   # damped lead, reset per stroke
+        self._predict_at = None       # when that lead was computed
         # Shift+drag rubber-bands a region to zoom to; a Shift+click (no rect)
         # fits the paper to the window — both PDF-canvas parity (#106 item 5).
         self._zoom_selecting = False
@@ -11936,7 +11965,7 @@ class TextPageView(Gtk.Overlay):
             self._recent_samples = []
             self._capture_samples = []
             self._capture_events = 0
-            self._predict_offset = None
+            self._predict_offset = self._predict_at = None
             lead = self._lead_in_points(x, y)
             self.current_stroke = list(lead) + [(x, y)]
             self._apply_cursor()      # the nib is the cursor now

@@ -360,7 +360,20 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     frames (`PREDICT_SMOOTH`), because it is rebuilt from scratch every motion
     event and consecutive guesses disagree by more than the pen moved; the
     **offset** is what gets damped, never the anchor, or the lag comes back.
-    Both default OFF. Under a stylus the POINTER is hidden for drawing tools
+    Both default OFF, and **prediction is settled: it cannot be the answer
+    here (row 147).** The pen's end-to-end lag on this hardware is ~110 ms,
+    measured two independent ways and shown to be UPSTREAM of the compositor
+    (a hardware cursor plane lags the nib just as much), so it is not
+    Sidemark's or Hyprland's to recover. Graded on 133 Hz ink, prediction
+    recovers ~10% of the lag error at a 10–20 ms lead, ~0 at 40, and is
+    NEGATIVE beyond — it makes things worse on a third of samples at best.
+    Predicting 110 ms ahead means guessing the second half of a letter, which
+    kinematics cannot know; a Kalman or learned model fits more parameters to a
+    future that is not in the data. Don't build one. `PREDICT_SMOOTH_MS` is a
+    TIME constant, never a per-event weight — as a weight it silently meant
+    ~92 ms at 30 Hz and ~21 ms at 133, which is most of why prediction once
+    measured as useless.
+    Under a stylus the POINTER is hidden for drawing tools
     (`_hide_pointer`) — an arrow trailing the nib is what gives the lag away —
     but never under a mouse, where the pointer is all the hand has.
   - **Tune it on real ink, not on synthetic curves.**

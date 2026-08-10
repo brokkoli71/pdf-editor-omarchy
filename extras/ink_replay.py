@@ -195,7 +195,7 @@ def predict_errors(recs, lead_ms, damped=True):
         samples = [tuple(s) for s in rec.get("samples") or []]
         if len(samples) < W + 2 or rec.get("straight"):
             continue
-        offset = None
+        offset = offset_t = None
         for i in range(len(samples)):
             window = samples[max(0, i - W + 1):i + 1]
             here = samples[i]
@@ -208,10 +208,15 @@ def predict_errors(recs, lead_ms, damped=True):
             else:
                 off = (raw[0] - here[0], raw[1] - here[1])
                 if damped:
-                    if offset is not None:
-                        off = (offset[0] + (off[0] - offset[0]) * sm.PREDICT_SMOOTH,
-                               offset[1] + (off[1] - offset[1]) * sm.PREDICT_SMOOTH)
-                    offset = off
+                    # the same TIME-constant damping the canvas applies, or the
+                    # grading would be of a filter the app does not run
+                    if offset is not None and offset_t is not None \
+                            and here[2] > offset_t:
+                        a = 1.0 - math.exp(-(here[2] - offset_t)
+                                           / sm.PREDICT_SMOOTH_MS)
+                        off = (offset[0] + (off[0] - offset[0]) * a,
+                               offset[1] + (off[1] - offset[1]) * a)
+                    offset, offset_t = off, here[2]
                 guess = (here[0] + off[0], here[1] + off[1])
             lin = linear_point(window, lead_ms) or (here[0], here[1])
             out["lag"].append(math.dist((here[0], here[1]), truth))
