@@ -124,7 +124,13 @@ class Probe(Gtk.ApplicationWindow):
     def __init__(self, app, seconds, period, amplitude):
         super().__init__(application=app, title="Sidemark latency probe")
         self.set_default_size(1000, 400)
-        self._seconds, self._period, self._amp = seconds, period, amplitude
+        # MILLISECONDS from here down. Every timestamp in this file is ms
+        # (that is what the fit works in), so the two settings that arrive in
+        # seconds are converted ONCE, here, and named for it — mixing the two
+        # closed the window one frame in, which reads as broken hardware.
+        self._run_ms = seconds * 1000.0
+        self._period_ms = period * 1000.0
+        self._amp = amplitude
         self._dots, self._pens = [], []
         self._t0 = None
         self._done = False
@@ -134,14 +140,13 @@ class Probe(Gtk.ApplicationWindow):
         self._area.set_draw_func(self._draw)
         self.set_child(self._area)
 
-        # motion only — the tip must be DOWN, so this is the same event path a
-        # stroke takes, not a hover
+        # ONE controller, and motion rather than a drag: the tip must be DOWN
+        # so this is the event path a stroke takes, and a GestureDrag beside
+        # it would report the same motion again, putting every sample into the
+        # fit twice.
         motion = Gtk.EventControllerMotion()
         motion.connect("motion", self._on_motion)
         self._area.add_controller(motion)
-        drag = Gtk.GestureDrag()
-        drag.connect("drag-update", self._on_drag)
-        self._area.add_controller(drag)
 
         self._area.add_tick_callback(self._tick)
 
@@ -152,32 +157,64 @@ class Probe(Gtk.ApplicationWindow):
         now = self._now()
         if self._t0 is None:
             self._t0 = now
-        t = now - self._t0
-        if t >= self._seconds:
+        t = now - self._t0                      # ms since the sweep began
+        if t >= self._run_ms:
             self._done = True
             self.close()
             return GLib.SOURCE_REMOVE
         w = self._area.get_width() or 1000
         centre = w / 2.0
         amp = min(self._amp, centre - 40)
-        self._dot_x = centre + amp * math.sin(2 * math.pi * t / self._period)
+        self._dot_x = centre + amp * math.sin(2 * math.pi * t / self._period_ms)
         # logged at the time it is HANDED to the compositor, which is the only
         # timestamp we have any right to
         self._dots.append((now, self._dot_x))
         self._area.queue_draw()
         return GLib.SOURCE_CONTINUE
 
-    def _record(self, x):
+    def _record(self, x, age_ms=0.0):
         if self._t0 is not None:
-            self._pens.append((self._now(), float(x)))
+            self._pens.append((self._now() - age_ms, float(x)))
 
-    def _on_motion(self, _c, x, _y):
+    def _record_history(self, controller, x):
+        """The samples GTK compressed away since the last delivered event.
+
+        Without these the probe would sample the pen once per FRAME and then
+        report the frame rate as the pen rate — the exact confusion that made
+        a 133 Hz pen look like a 30 Hz one for this whole investigation.
+
+        The history is in SURFACE coordinates while `x` arrives in widget
+        ones, so it is translated by the offset between the two — which the
+        current event gives us, being known in both. Skipping that would not
+        merely shift the curve: history and delivered samples would sit in
+        different spaces in one list, putting a sawtooth into the very signal
+        the lag is fitted to. Times are in the event clock, so only the
+        difference from the current event is usable.
+        """
+        ev = controller.get_current_event()
+        if ev is None or ev.get_event_type() != Gdk.EventType.MOTION_NOTIFY:
+            return
+        try:
+            hist = ev.get_history()
+            if not hist:
+                return
+            ok, sx, _sy = ev.get_position()
+            ev_time = ev.get_time()
+        except (AttributeError, TypeError, ValueError):
+            return
+        if not ok:
+            return
+        dx = x - sx                          # surface -> widget
+        for coord in hist:
+            if not (coord.flags & Gdk.AxisFlags.X):
+                continue
+            age = float(ev_time - coord.time)
+            if 0.0 <= age <= 200.0:
+                self._record(coord.axes[int(Gdk.AxisUse.X)] + dx, age)
+
+    def _on_motion(self, c, x, _y):
+        self._record_history(c, x)
         self._record(x)
-
-    def _on_drag(self, gesture, ox, _oy):
-        ok, sx, _sy = gesture.get_start_point()
-        if ok:
-            self._record(sx + ox)
 
     def _draw(self, _area, ctx, width, height):
         ctx.set_source_rgb(0.08, 0.08, 0.10)
@@ -229,6 +266,7 @@ def main():
     app.run([])
 
     dots, pens = out.get("dots") or [], out.get("pens") or []
+    pens.sort()          # recovered history is inserted before its own event
     print(f"\n  {len(dots)} dot frames, {len(pens)} pen samples")
     if len(pens) < 50:
         print("  too few pen samples — was the tip down on the dot?")
