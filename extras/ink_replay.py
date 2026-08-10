@@ -252,7 +252,7 @@ def report_rates(recs):
     undersampled, and then no filter and no predictor can recover what was
     never measured.
     """
-    by_dev = {}
+    by_dev, frames = {}, []
     for rec in recs:
         s = [tuple(x) for x in rec.get("samples") or []]
         if len(s) < 3:
@@ -260,6 +260,13 @@ def report_rates(recs):
         dts = [b[2] - a[2] for a, b in zip(s, s[1:])]
         by_dev.setdefault(rec.get("device") or "?", []).append(
             statistics.median(dts))
+        # events arrive per FRAME while samples arrive per pen report, so this
+        # is the canvas's frame rate DURING the stroke — the other half of the
+        # latency question, and the one a feel-based A/B cannot settle
+        n_ev = rec.get("events") or 0
+        span = s[-1][2] - s[0][2]
+        if n_ev >= 2 and span > 0:
+            frames.append(span / (n_ev - 1))
     if not by_dev:
         return
     print("  REPORT RATE (per stroke, median interval between samples)")
@@ -268,6 +275,10 @@ def report_rates(recs):
         print(f"    {dev:<8} {len(dts):>3} strokes   {med:>6.1f} ms "
               f"  ~{1000 / med:>3.0f} Hz   "
               f"(range {min(dts):.1f}..{max(dts):.1f})")
+    if frames:
+        med = statistics.median(frames)
+        print(f"    {'frames':<8} {len(frames):>3} strokes   {med:>6.1f} ms "
+              f"  ~{1000 / med:>3.0f} fps  (the canvas while drawing)")
     print()
 
 

@@ -1045,7 +1045,8 @@ def width_profile(pts, press=None, taper=True, dot=True,
 
 
 def finish_ink_stroke(pts, press, strength, was_straight=False, flat=False,
-                      min_pressure=0.0, spacing=None, samples=None, device=None):
+                      min_pressure=0.0, spacing=None, samples=None, device=None,
+                      events=0):
     """The whole commit pipeline, and THE decision about what gets it.
 
     Both canvases route every finished stroke through here, so the two can
@@ -1061,7 +1062,7 @@ def finish_ink_stroke(pts, press, strength, was_straight=False, flat=False,
     """
     capture_raw_stroke(pts, press, straight=was_straight, flat=flat,
                        smoothing=strength, min_pressure=min_pressure,
-                       samples=samples, device=device)
+                       samples=samples, device=device, events=events)
     if was_straight:
         return list(pts), None
     if len(pts) < 3:
@@ -2856,6 +2857,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # the last few samples of the stroke in flight, for predict_point
         self._recent_samples = []
         self._capture_samples = []
+        self._capture_events = 0
         # prototypes (row 139): recover a stroke's start from the hover trail,
         # and lead the live stroke ahead of the pen by this many milliseconds.
         # Both default OFF — the lead-in did not help in the hand, and neither
@@ -3428,7 +3430,7 @@ class PDFCanvas(Gtk.DrawingArea):
             pts, self._stroke_pressure(pts), self.smoothing,
             was_straight=was_straight, flat=self._flat_tool(),
             min_pressure=self.min_pressure, samples=self._capture_samples,
-            device=self._capture_device)
+            device=self._capture_device, events=self._capture_events)
 
     def _pen_attrs(self):
         """(color, width, opacity) of the active drawing tool. ``_temp_highlighter``
@@ -4902,6 +4904,7 @@ class PDFCanvas(Gtk.DrawingArea):
         whatever lead-in the hover trail can give it."""
         self._recent_samples = []
         self._capture_samples = []
+        self._capture_events = 0
         self._predict_offset = None
         lead = self._lead_in_points(start_x, start_y)
         self.current_stroke = ([self._screen_to_pdf(*p) for p in lead]
@@ -5325,6 +5328,10 @@ class PDFCanvas(Gtk.DrawingArea):
                 # settled it, the pointer no longer edits it (lift and re-draw,
                 # or Ctrl+Z, to change your mind)
             else:
+                # samples arrive per PEN REPORT but events arrive per FRAME,
+                # so counting both is what lets a capture say which of the two
+                # a stroke was limited by (row 147)
+                self._capture_events += 1
                 # everything GTK compressed away since the last frame comes
                 # first, in order — without this the pen draws at the frame
                 # rate instead of its own 133 Hz (row 147)
@@ -10884,6 +10891,7 @@ class TextPageView(Gtk.Overlay):
         self._hover_trail = []    # hovering stylus positions (overlay coords)
         self._recent_samples = []  # last few stroke samples, for prediction
         self._capture_samples = []  # the whole timed stroke, while capturing
+        self._capture_events = 0    # motion EVENTS behind those samples
         self._capture_device = "mouse"   # which device drew it
         self._predict_offset = None   # damped lead, reset per stroke
         # Shift+drag rubber-bands a region to zoom to; a Shift+click (no rect)
@@ -11927,6 +11935,7 @@ class TextPageView(Gtk.Overlay):
             self._snap_kind = self._snap_label = None
             self._recent_samples = []
             self._capture_samples = []
+            self._capture_events = 0
             self._predict_offset = None
             lead = self._lead_in_points(x, y)
             self.current_stroke = list(lead) + [(x, y)]
@@ -12016,6 +12025,7 @@ class TextPageView(Gtk.Overlay):
                         self.current_stroke, idx, tx, ty)
                 # a recognised rectangle/ellipse/divider is frozen until release
             else:
+                self._capture_events += 1
                 # the compressed-away trail first (PDF-canvas parity, row 147)
                 for hx, hy, hp, age in motion_history(
                         gesture.get_current_event(), x, y):
@@ -12355,7 +12365,7 @@ class TextPageView(Gtk.Overlay):
             pts, self._stroke_pressure(pts), self.get_smoothing(),
             was_straight=was_straight, flat=self._flat_tool(),
             min_pressure=self.min_pressure, samples=self._capture_samples,
-            device=self._capture_device)
+            device=self._capture_device, events=self._capture_events)
 
     def _commit_stroke(self, pts_overlay, profile=None):
         if len(pts_overlay) < 2:
