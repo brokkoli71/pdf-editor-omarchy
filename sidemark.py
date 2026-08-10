@@ -16077,9 +16077,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # is that the page side is collapsed. Applying it here put the default
         # split back and left the sheet in a corner. The value is still
         # remembered, which is where the page lands when it comes back.
-        if not self._text_mode:
-            self._mark_pane_programmatic()
-            self._paned.set_position(self._saved_pane_pos)
+        #
+        # A document whose notes are HIDDEN gets the divider pushed out instead.
+        # This idle runs AFTER the open (a window presents, then loads its file
+        # synchronously), so a PDF with no sidecar has already collapsed its
+        # panel by the time we get here, and applying the default split re-opened
+        # the empty slot. It has to happen here rather than only in
+        # _set_notes_shown: that ran before the window knew its width, so the
+        # collapse it applied was to a guessed one.
+        if self._text_mode:
+            return GLib.SOURCE_REMOVE
+        self._mark_pane_programmatic()
+        self._paned.set_position(self._saved_pane_pos
+                                 if self._notes_box.get_visible() else width)
         return GLib.SOURCE_REMOVE
 
     def _add_blank_page(self):
@@ -18881,14 +18891,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if self._text_mode:
             return          # the sheet owns that side of the divider
         self._notes_box.set_visible(shown)
+        w = self.get_width() or 1280
         if shown:
-            w = self.get_width() or 1280
             pos = self._saved_pane_pos
             if not (100 < pos < w - 150):
                 pos = int(w * 0.62)
                 self._saved_pane_pos = pos
             self._mark_pane_programmatic()
             self._paned.set_position(pos)
+        else:
+            # Hiding the WIDGET does not close the SLOT. The paned's end child
+            # is `_sheet_box` (row 130 keeps the sheet in the notes' side of
+            # the divider), and that is never hidden — so an empty box goes on
+            # holding whatever the position says, which is how a PDF with no
+            # sidecar opened with a wide blank strip beside it. Push the
+            # divider out, exactly as _on_notes_toggled's off branch does at
+            # the end of its animation.
+            self._mark_pane_programmatic()
+            self._paned.set_position(w)
 
     def _choose_notes_file(self):
         if not self._path and not self._notes_path:

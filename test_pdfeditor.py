@@ -2613,8 +2613,14 @@ class TestModeGestures(unittest.TestCase):
         def body(win):
             s = win._active_session
             win._enter_full_notes_view()
+            # what the idle must not do is MOVE it. Reading a fixed 0 here read
+            # the pane animation instead: the sheet slides in from wherever the
+            # divider stood, and a PDF whose notes were collapsed (row 146)
+            # starts that slide at the window edge rather than at 0.
+            before = s._paned.get_position()
             win._init_pane_position()
-            self.assertEqual(s._paned.get_position(), 0)
+            self.assertEqual(s._paned.get_position(), before)
+            self.assertTrue(s._text_mode)
             self.assertGreater(s._saved_pane_pos, 100)   # still remembered
 
         self._run_in_window(2, body)
@@ -10848,6 +10854,62 @@ class TestNotesFileSwitching(unittest.TestCase):
                 win._do_open_file(pdf)
                 self.assertFalse(win._notes_toggle.get_active())
                 self.assertFalse(win._notes_box.get_visible())
+
+            self._run(body)
+
+    @staticmethod
+    def _notes_slot_width(win):
+        """How much room the notes side of the divider is holding, in px.
+
+        The widget being hidden is not the question — the paned's end child is
+        `_sheet_box`, which is never hidden, so an empty box goes on holding
+        whatever the position says. Read the POSITION, which is the model, and
+        never the allocation: a full run has no live frame clock."""
+        paned = win._paned
+        w = paned.get_width() or win.get_width() or 1280
+        return w - paned.get_position()
+
+    def test_no_notes_leaves_no_empty_slot(self):
+        """Row 146 — collapsing the panel has to close the SLOT too, or a PDF
+        with no sidecar opens with a wide blank strip where the notes aren't."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+
+            def body(win):
+                win._do_open_file(pdf)
+                self.assertFalse(win._notes_box.get_visible())
+                self.assertLess(self._notes_slot_width(win), 150)
+                # the realize-time idle re-applies the default split; it must
+                # skip a document whose notes are hidden, or it re-opens the
+                # slot a moment after the open closed it
+                win._init_pane_position()
+                self.assertLess(self._notes_slot_width(win), 150)
+                # …and the move must be marked as OURS: an extreme position is
+                # row 130's mode switch, so an unmarked collapse would enter
+                # the sheet view on every open
+                self.assertTrue(win._active_session._pane_settling)
+
+            self._run(body)
+
+    def test_a_second_tab_without_notes_closes_the_slot_too(self):
+        """The tab path never re-runs _init_pane_position, so without the
+        collapse in _set_notes_shown the divider just stays where the previous
+        document left it."""
+        with tempfile.TemporaryDirectory() as d:
+            with_notes = os.path.join(d, "with.pdf")
+            without = os.path.join(d, "without.pdf")
+            make_pdf(with_notes)
+            make_pdf(without)
+            with open(notes_path_for(with_notes), "w", encoding="utf-8") as f:
+                f.write("<!-- page:0 -->\n\nexisting note\n")
+
+            def body(win):
+                win._do_open_file(with_notes)
+                self.assertGreater(self._notes_slot_width(win), 150)
+                win.open_file_in_tab(without)
+                self.assertFalse(win._notes_box.get_visible())
+                self.assertLess(self._notes_slot_width(win), 150)
 
             self._run(body)
 
