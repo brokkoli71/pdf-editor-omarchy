@@ -1045,7 +1045,7 @@ def width_profile(pts, press=None, taper=True, dot=True,
 
 
 def finish_ink_stroke(pts, press, strength, was_straight=False, flat=False,
-                      min_pressure=0.0, spacing=None, samples=None):
+                      min_pressure=0.0, spacing=None, samples=None, device=None):
     """The whole commit pipeline, and THE decision about what gets it.
 
     Both canvases route every finished stroke through here, so the two can
@@ -1061,7 +1061,7 @@ def finish_ink_stroke(pts, press, strength, was_straight=False, flat=False,
     """
     capture_raw_stroke(pts, press, straight=was_straight, flat=flat,
                        smoothing=strength, min_pressure=min_pressure,
-                       samples=samples)
+                       samples=samples, device=device)
     if was_straight:
         return list(pts), None
     if len(pts) < 3:
@@ -2114,6 +2114,23 @@ def pressure_for_event(event):
         return None
 
 
+def device_source_for(event):
+    """"stylus" / "touch" / "mouse", for the ink CAPTURE only.
+
+    Deliberately not a routing concept — `button_for_event` is what the app
+    reasons with, and giving the binding table a source dimension is the
+    superseded design (row 135). This exists because a capture that cannot say
+    which device drew a stroke cannot answer the question the captures are for:
+    the panel reports the pen and a finger at different rates, and every
+    measured constant in the pipeline depends on that rate.
+    """
+    if event is None:
+        return "mouse"
+    if event.get_event_sequence() is not None:
+        return "touch"
+    return "stylus" if event.get_device_tool() is not None else "mouse"
+
+
 def button_for_event(event, button, barrel_held=False):
     """THE mapping from a physical input to a BUTTON IDENTITY (row 135).
 
@@ -2759,6 +2776,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # every width along the stroke.
         self.current_press = []
         self._press_now = None    # pressure of the event being handled, if any
+        self._capture_device = "mouse"   # which device drew the stroke
         # recent hovering stylus positions, (x, y, t_ms) in SCREEN coords — the
         # ink a stroke was already drawing before the digitiser reported contact
         self._hover_trail = []
@@ -3326,7 +3344,8 @@ class PDFCanvas(Gtk.DrawingArea):
         return finish_ink_stroke(
             pts, self._stroke_pressure(pts), self.smoothing,
             was_straight=was_straight, flat=self._flat_tool(),
-            min_pressure=self.min_pressure, samples=self._capture_samples)
+            min_pressure=self.min_pressure, samples=self._capture_samples,
+            device=self._capture_device)
 
     def _pen_attrs(self):
         """(color, width, opacity) of the active drawing tool. ``_temp_highlighter``
@@ -4535,6 +4554,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # tool code below (and _on_drag_update) can read it without every one
         # of them having to be handed the gesture
         self._press_now = pressure_for_event(gesture.get_current_event())
+        self._capture_device = device_source_for(gesture.get_current_event())
         state = self._chord_state(gesture)
         ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
         shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
@@ -10668,6 +10688,7 @@ class TextPageView(Gtk.Overlay):
         self._hover_trail = []    # hovering stylus positions (overlay coords)
         self._recent_samples = []  # last few stroke samples, for prediction
         self._capture_samples = []  # the whole timed stroke, while capturing
+        self._capture_device = "mouse"   # which device drew it
         self._predict_offset = None   # damped lead, reset per stroke
         # Shift+drag rubber-bands a region to zoom to; a Shift+click (no rect)
         # fits the paper to the window — both PDF-canvas parity (#106 item 5).
@@ -11685,6 +11706,7 @@ class TextPageView(Gtk.Overlay):
         self._zoom_cancelled = False
         self._ink_ignoring = False
         self._press_now = pressure_for_event(gesture.get_current_event())
+        self._capture_device = device_source_for(gesture.get_current_event())
         if self.tool == "zoom":
             # a zoom-to-region rubber-band; a drag that never grows into a rect
             # falls back to fit-width on release
@@ -12128,7 +12150,8 @@ class TextPageView(Gtk.Overlay):
         return finish_ink_stroke(
             pts, self._stroke_pressure(pts), self.get_smoothing(),
             was_straight=was_straight, flat=self._flat_tool(),
-            min_pressure=self.min_pressure, samples=self._capture_samples)
+            min_pressure=self.min_pressure, samples=self._capture_samples,
+            device=self._capture_device)
 
     def _commit_stroke(self, pts_overlay, profile=None):
         if len(pts_overlay) < 2:

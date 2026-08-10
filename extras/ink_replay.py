@@ -59,6 +59,7 @@ def sample_stats(rec):
 
 def describe(recs):
     print(f"{len(recs)} strokes captured\n")
+    report_rates(recs)
     rows = [sample_stats(r) for r in recs]
     def col(key):
         vals = [r[key] for r in rows if r[key] is not None]
@@ -240,6 +241,36 @@ def turn_at(samples, i):
     return abs(d) / ((d1 + d2) / 2)
 
 
+def report_rates(recs):
+    """How often each device actually reports — the number every constant in
+    the pipeline secretly depends on.
+
+    Spacing, smoothing radius and the prediction window are all "a few
+    samples", so a device that reports at half the rate of another is a
+    different instrument, and tuning them together tunes neither. This is the
+    first thing to read in a capture: at a low enough rate the writing is
+    undersampled, and then no filter and no predictor can recover what was
+    never measured.
+    """
+    by_dev = {}
+    for rec in recs:
+        s = [tuple(x) for x in rec.get("samples") or []]
+        if len(s) < 3:
+            continue
+        dts = [b[2] - a[2] for a, b in zip(s, s[1:])]
+        by_dev.setdefault(rec.get("device") or "?", []).append(
+            statistics.median(dts))
+    if not by_dev:
+        return
+    print("  REPORT RATE (per stroke, median interval between samples)")
+    for dev, dts in sorted(by_dev.items()):
+        med = statistics.median(dts)
+        print(f"    {dev:<8} {len(dts):>3} strokes   {med:>6.1f} ms "
+              f"  ~{1000 / med:>3.0f} Hz   "
+              f"(range {min(dts):.1f}..{max(dts):.1f})")
+    print()
+
+
 def report_prediction(recs, leads):
     timed = [r for r in recs if r.get("samples")]
     print(f"{len(timed)} of {len(recs)} strokes carry per-sample times\n")
@@ -247,6 +278,7 @@ def report_prediction(recs, leads):
         print("  Nothing to measure. Timed capture is newer than this file —")
         print("  re-capture with SIDEMARK_CAPTURE_INK to grade prediction.")
         return
+    report_rates(recs)
     print("  Error against where the pen actually went, per sample.")
     print("  'lag' is the no-prediction error — the thing being cancelled;")
     print("  recovered = how much of it the arc removes (negative = worse).\n")

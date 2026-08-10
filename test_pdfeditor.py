@@ -1317,6 +1317,26 @@ class TestStrokeSmoothing(unittest.TestCase):
         self.assertEqual(recs[0]["samples"], [])
         self.assertEqual(len(recs[0]["pts"]), 3)
 
+    def test_a_capture_says_which_device_drew_it(self):
+        """The panel reports a pen and a finger at different RATES, and every
+        constant in the pipeline is really "a few samples" — so a capture that
+        cannot name the device cannot be read. Kept out of `button_for_event`
+        on purpose: a source dimension on the binding table is the superseded
+        design (row 135), and this is a diagnostic, not routing."""
+        self.assertEqual(sidemark.device_source_for(_stylus_event("pen")),
+                         "stylus")
+        self.assertEqual(sidemark.device_source_for(_stylus_event("eraser")),
+                         "stylus")
+        self.assertEqual(sidemark.device_source_for(_stylus_event("touch")),
+                         "touch")
+        self.assertEqual(sidemark.device_source_for(_stylus_event("mouse")),
+                         "mouse")
+        recs = self._captured(
+            lambda: sidemark.finish_ink_stroke(
+                [(0.0, 0.0), (5.0, 1.0), (10.0, 3.0)], None, 0.5,
+                device="touch"))
+        self.assertEqual(recs[0]["device"], "touch")
+
     def test_the_timed_list_is_only_built_while_capturing(self):
         """One entry per stroke sample when asked for, nothing at all when not
         — a diagnostic that grows a list on every motion event of every stroke
