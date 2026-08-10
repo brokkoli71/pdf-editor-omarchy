@@ -11655,11 +11655,14 @@ class TextPageView(Gtk.Overlay):
         native = self.get_native()
         if native is None:
             return (0.0, 0.0)
-        ok, x, y = self.translate_coordinates(native, 0.0, 0.0)
-        if not ok:
+        # translate_coordinates returns the POINT, or nothing at all if the two
+        # widgets share no root — never a (ok, x, y) triple, whatever the C
+        # signature suggests. The rest of the sheet unpacks it the same way.
+        res = self.translate_coordinates(native, 0.0, 0.0)
+        if not res:
             return (0.0, 0.0)
         tx, ty = native.get_surface_transform()
-        return (x + tx, y + ty)
+        return (res[0] + tx, res[1] + ty)
 
     def _on_touch_multi(self):
         """The second finger landed."""

@@ -922,6 +922,9 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   `_buffer_to_overlay` take the origin once and add the float delta — use them
   anywhere the result is persisted. Plain `_overlay_to_buffer` (int) is for
   hit-testing only. Symptom to recognise: shapes degrade a little per edit.
+  A neighbouring trap: **`translate_coordinates` returns the POINT** — or
+  nothing at all when the widgets share no root — never a `(ok, x, y)` triple,
+  whatever the C signature suggests. Unpacking three raises at the first call.
 - The codebase favors long, explanatory comments about *why* (and records
   hard-won platform quirks inline) — match that style. The test is whether the
   comment still earns its space once the change is old: an invariant, a

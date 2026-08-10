@@ -690,6 +690,28 @@ class TestPinchZoom(unittest.TestCase):
         self._sheet_touch(tp, Gdk.EventType.TOUCH_UPDATE, a, 100.0, 250.0)
         self.assertAlmostEqual(va.get_value(), base + 50.0, places=3)
 
+    def test_the_surface_origin_survives_a_real_window(self):
+        """The latch reports SURFACE coords and the pinch arithmetic wants
+        widget ones, so this conversion is on the path of every touch zoom —
+        and an unparented sheet has no native at all, which is the early
+        return every other test here takes. It has to run against a real one."""
+        win = Gtk.Window()
+        tp = sidemark.TextPageView()
+        win.set_child(tp)
+        win.present()
+        ctx = GLib.MainContext.default()
+        deadline = time.time() + 0.4
+        while time.time() < deadline:
+            ctx.iteration(False)
+        try:
+            if tp.get_native() is None:
+                self.skipTest("the sheet never got a native surface")
+            ox, oy = tp._surface_origin()   # it raised here on the real panel
+            self.assertIsInstance(ox, float)
+            self.assertIsInstance(oy, float)
+        finally:
+            win.destroy()
+
     def test_a_touchpad_pinch_still_drives_the_sheet(self):
         """The latch owns real fingers; a touchpad pinch carries no touch
         sequences at all, so GestureZoom stays and must keep working."""
