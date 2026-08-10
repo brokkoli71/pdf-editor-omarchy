@@ -327,6 +327,26 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     carries real pressure and the ink before it was never captured. A symmetric
     gate makes "the stroke starts too late" strictly worse. Never re-add a live
     per-sample gate.
+  - **The pen's samples arrive COMPRESSED, and `motion_history()` is how the
+    stroke gets them back (row 147).** GTK compresses POINTER motion to one
+    event per frame, and a stylus is delivered as the logical pointer (row
+    135), so the pen rides that path while a finger does not. Measured: the
+    panel reports the pen at **133 Hz** and the canvas was seeing **30 Hz** —
+    78% of every stroke discarded, which is the whole of what the pipeline
+    called "undersampling" (spacing/feature 0.337 for the pen against 0.08 for
+    touch). Both drawing routers walk the recovered trail into
+    `current_stroke` *before* the event's own point. Two traps, both silent:
+    the axes are **surface** coords while a gesture reports **widget** ones
+    (offset taken from the event's own position, which is known in both), and
+    `coord.time` is the **event** clock, not `GLib.get_monotonic_time()` — only
+    the difference from the current event means anything, so `_note_sample`
+    takes an `age_ms` and a frame's worth of samples never lands on one
+    instant. It is guarded like the ink capture: extra samples are a bonus,
+    and failing to get them must never cost the stroke. *This fixes SHAPE, not
+    latency* — the newest sample is still only as fresh as the frame it came
+    on, and 33.4 ms is two of them, so the canvas is also running at ~30 fps
+    mid-stroke (an empty page manages 16.5 ms). Don't sell one as the other.
+    `extras/device_rate.py` re-measures the raw rate below GTK.
   - **Latency: one recovery and one guess, kept apart.** `hover_lead_in` is
     free REAL data — a stylus is tracked in proximity, so the positions from
     just before contact are the ink that was otherwise lost; it walks backwards

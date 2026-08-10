@@ -5419,9 +5419,10 @@ def _scroll_ctrl(ctrl_held=False, smooth=False):
 class _FakeDrag:
     """Minimal stand-in for a Gtk drag gesture so the canvas drag handlers can be
     driven without a real pointer (headless: scale 1.0, offset 0 → screen==PDF)."""
-    def __init__(self, sx, sy, button=1, state=None):
+    def __init__(self, sx, sy, button=1, state=None, event=None):
         self._sx, self._sy, self._b = sx, sy, button
         self._st = state if state is not None else Gdk.ModifierType(0)
+        self._event = event            # None unless a test needs motion history
         self.claimed = None            # last set_state() the handler applied
 
     def set_state(self, state):
@@ -5437,7 +5438,7 @@ class _FakeDrag:
         return (True, self._sx, self._sy)
 
     def get_current_event(self):
-        return None
+        return self._event
 
 
 class TestLassoSelect(unittest.TestCase):
@@ -15380,6 +15381,108 @@ class TestMergeImportInWindow(unittest.TestCase):
                 self.assertEqual([t for _l, t, _p in win.canvas.get_toc()],
                                  ["2", "1"])
             self._run_in_window(body)
+
+
+def _coord(x, y, time, press=None, axes_ok=True):
+    """A stand-in GdkTimeCoord — motion_history only reads axes/flags/time."""
+    axes = [0.0] * int(Gdk.AxisUse.LAST)
+    axes[int(Gdk.AxisUse.X)] = x
+    axes[int(Gdk.AxisUse.Y)] = y
+    flags = (Gdk.AxisFlags.X | Gdk.AxisFlags.Y) if axes_ok else Gdk.AxisFlags(0)
+    if press is not None:
+        axes[int(Gdk.AxisUse.PRESSURE)] = press
+        flags |= Gdk.AxisFlags.PRESSURE
+    return types.SimpleNamespace(axes=axes, flags=flags, time=time)
+
+
+def _motion_event(history, time=1000, pos=(0.0, 0.0)):
+    return types.SimpleNamespace(
+        get_history=lambda: history,
+        get_time=lambda: time,
+        get_position=lambda: (True, pos[0], pos[1]),
+        get_event_sequence=lambda: None,
+        get_device_tool=lambda: None)
+
+
+class TestMotionHistory(unittest.TestCase):
+    """Row 147: GTK compresses pointer motion to one event per frame, and a
+    stylus is delivered as the logical pointer — so 78% of a 133 Hz pen was
+    being thrown away before it reached the ink. The discarded samples are
+    kept for drawing apps to ask for."""
+
+    def test_history_is_translated_from_surface_to_widget_coords(self):
+        """The axes are in SURFACE coordinates while the gesture reports WIDGET
+        ones. Get this wrong and every recovered sample lands offset by the
+        canvas's position in the window — a header bar's height too high."""
+        ev = _motion_event([_coord(10.0, 20.0, 990)], time=1000, pos=(50.0, 60.0))
+        # the event is at surface (50, 60) and the gesture calls it (200, 300),
+        # so the widget sits at +150,+240 and the sample must move with it
+        got = sidemark.motion_history(ev, 200.0, 300.0)
+        self.assertEqual(len(got), 1)
+        self.assertAlmostEqual(got[0][0], 160.0)
+        self.assertAlmostEqual(got[0][1], 260.0)
+
+    def test_samples_come_back_oldest_first_with_their_age(self):
+        """They are inserted into a stroke in order, and each needs its own
+        age: stamping a frame's worth of samples as simultaneous makes the
+        velocity estimate read an infinite speed."""
+        ev = _motion_event([_coord(3.0, 0.0, 997), _coord(1.0, 0.0, 993),
+                            _coord(2.0, 0.0, 995)], time=1000)
+        got = sidemark.motion_history(ev, 0.0, 0.0)
+        self.assertEqual([round(g[0]) for g in got], [1, 2, 3])
+        self.assertEqual([g[3] for g in got], [7.0, 5.0, 3.0])
+
+    def test_pressure_rides_along_when_the_axis_is_there(self):
+        ev = _motion_event([_coord(1.0, 0.0, 999, press=0.5),
+                            _coord(2.0, 0.0, 999)], time=1000)
+        got = sidemark.motion_history(ev, 0.0, 0.0)
+        self.assertEqual(sorted(g[2] for g in got if g[2] is not None), [0.5])
+        self.assertIn(None, [g[2] for g in got])
+
+    def test_junk_samples_are_dropped_not_drawn(self):
+        """A coord without X/Y is not a position, and `time` is a 32-bit
+        millisecond counter that wraps — a wrapped one would otherwise place a
+        sample seconds into the past and drag the stroke to it."""
+        ev = _motion_event([
+            _coord(1.0, 1.0, 999, axes_ok=False),     # no position
+            _coord(2.0, 2.0, 1001),                   # in the future
+            _coord(3.0, 3.0, 1),                      # wrapped / far too old
+            _coord(4.0, 4.0, 999),                    # the only good one
+        ], time=1000)
+        got = sidemark.motion_history(ev, 0.0, 0.0)
+        self.assertEqual([round(g[0]) for g in got], [4])
+
+    def test_no_event_and_no_history_are_both_nothing(self):
+        self.assertEqual(sidemark.motion_history(None, 0.0, 0.0), [])
+        self.assertEqual(
+            sidemark.motion_history(_motion_event([]), 0.0, 0.0), [])
+        # a touch event carries no compressed history at all — it was never
+        # compressed, which is why a finger already reached the canvas at rate
+        self.assertEqual(
+            sidemark.motion_history(_stylus_event("touch"), 0.0, 0.0), [])
+
+    def test_the_canvas_actually_draws_the_recovered_samples(self):
+        """The helper being right is not the same as it being REACHED — the
+        recurring trap in this codebase. Drive the real press router."""
+        c = PDFCanvas()
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c.tool = "pen"
+        c._on_drag_begin(_FakeDrag(100.0, 100.0), 100.0, 100.0)
+        n_before = len(c.current_stroke)
+        # the event reports the SAME pointer the gesture does (start 100 + a
+        # 12px drag), so here surface and widget coords coincide
+        ev = _motion_event([_coord(104.0, 100.0, 994),
+                            _coord(108.0, 100.0, 997)],
+                           time=1000, pos=(112.0, 100.0))
+        c._on_drag_update(_FakeDrag(100.0, 100.0, event=ev), 12.0, 0.0)
+        # two recovered samples plus the event's own point, in order
+        self.assertEqual(len(c.current_stroke), n_before + 3)
+        xs = [p[0] for p in c.current_stroke[n_before:]]
+        self.assertEqual(xs, sorted(xs))
+        self.assertAlmostEqual(xs[-1], 112.0)
+        # and they are spread over time, not stamped as one instant
+        ts = [s[2] for s in c._recent_samples]
+        self.assertEqual(len(set(ts)), len(ts))
 
 
 class TestPenSettingsPersist(unittest.TestCase):

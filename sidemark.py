@@ -2114,6 +2114,72 @@ def pressure_for_event(event):
         return None
 
 
+MOTION_HISTORY_MAX_AGE_MS = 200.0   # older than this is not one frame's worth
+
+
+def motion_history(event, x, y):
+    """The motion samples GTK COMPRESSED AWAY since the last delivered event.
+
+    Measured on this hardware (row 147): the panel reports the pen at 133 Hz
+    and the canvas was seeing 30 Hz — about 78% of every stroke was being
+    thrown away before it reached the ink. GTK compresses POINTER motion to
+    one event per frame, and a stylus is delivered as the logical pointer
+    (row 135), so the pen rides that path while a finger does not; the
+    discarded samples are kept precisely so a drawing app can ask for them.
+    Everything the pipeline calls "undersampling" was this.
+
+    Returns [(x, y, pressure|None, age_ms)], oldest first, NOT including the
+    event itself. `age_ms` is how long BEFORE the current event the sample was
+    taken, which is what the caller needs to place it on its own clock.
+
+    Two traps, both silent if you get them wrong:
+
+    - The axes are in SURFACE coordinates while a gesture reports WIDGET ones,
+      so the history is offset by the widget's position in the window — on a
+      canvas below a header bar, ink that lands a header's height too high.
+      The offset is taken from the event's own position, which is available in
+      both spaces at once, rather than from widget geometry.
+    - `coord.time` is in the EVENT clock (an arbitrary 32-bit millisecond
+      base), not `GLib.get_monotonic_time()`. Mixing the two makes prediction's
+      velocity estimate explode. Only the DIFFERENCE from the current event is
+      meaningful, so that is all this returns.
+    """
+    if event is None:
+        return []
+    # This runs on every motion event of every stroke, so it is guarded the
+    # same way the ink capture is: recovering extra samples is a bonus, and
+    # failing to must never cost the user the stroke they are drawing.
+    try:
+        hist = event.get_history()
+        if not hist:
+            return []
+        ok, sx, sy = event.get_position()
+        ev_time = event.get_time()
+    except (AttributeError, TypeError, ValueError):
+        return []
+    if not ok:
+        return []
+    # surface -> widget, from the one point known in both spaces
+    dx, dy = x - sx, y - sy
+    out = []
+    for coord in hist:
+        axes = coord.axes
+        flags = coord.flags
+        if not (flags & Gdk.AxisFlags.X and flags & Gdk.AxisFlags.Y):
+            continue
+        age = float(ev_time - coord.time) if ev_time else 0.0
+        if age < 0 or age > MOTION_HISTORY_MAX_AGE_MS:
+            # a wrapped 32-bit clock, or a stale trail from before this stroke
+            continue
+        press = (float(axes[int(Gdk.AxisUse.PRESSURE)])
+                 if flags & Gdk.AxisFlags.PRESSURE else None)
+        out.append((float(axes[int(Gdk.AxisUse.X)]) + dx,
+                    float(axes[int(Gdk.AxisUse.Y)]) + dy,
+                    press, age))
+    out.sort(key=lambda s: -s[3])      # oldest first
+    return out
+
+
 def device_source_for(event):
     """"stylus" / "touch" / "mouse", for the ink CAPTURE only.
 
@@ -3256,9 +3322,15 @@ class PDFCanvas(Gtk.DrawingArea):
     # velocity is estimated across this many samples: one pair is mostly noise
     PREDICT_WINDOW = 5
 
-    def _note_sample(self, x, y):
-        """Record a stroke sample's screen position and time, for prediction."""
-        now = self._now_ms()
+    def _note_sample(self, x, y, age_ms=0.0):
+        """Record a stroke sample's screen position and time, for prediction.
+
+        `age_ms` is how long before NOW the sample was taken — 0 for the event
+        being handled, and the real age for one recovered from the motion
+        history, which must not be stamped as simultaneous with it or the
+        velocity estimate reads a burst of samples as an infinite speed.
+        """
+        now = self._now_ms() - age_ms
         self._recent_samples.append((x, y, now))
         del self._recent_samples[:-self.PREDICT_WINDOW]
         if CAPTURE_INK_PATH:
@@ -5143,6 +5215,20 @@ class PDFCanvas(Gtk.DrawingArea):
                 # settled it, the pointer no longer edits it (lift and re-draw,
                 # or Ctrl+Z, to change your mind)
             else:
+                # everything GTK compressed away since the last frame comes
+                # first, in order — without this the pen draws at the frame
+                # rate instead of its own 133 Hz (row 147)
+                for hx, hy, hp, age in motion_history(
+                        gesture.get_current_event(), sx + offset_x,
+                        sy + offset_y):
+                    self.current_stroke.append(self._screen_to_pdf(hx, hy))
+                    if self._press_now is not None:
+                        # the press list must stay in lockstep with the points
+                        # or the whole stroke loses its taper, so a history
+                        # sample with no pressure axis borrows the event's
+                        self.current_press.append(
+                            hp if hp is not None else self._press_now)
+                    self._note_sample(hx, hy, age)
                 self.current_stroke.append(pt)
                 if self._press_now is not None:
                     self.current_press.append(self._press_now)
@@ -11820,6 +11906,14 @@ class TextPageView(Gtk.Overlay):
                         self.current_stroke, idx, tx, ty)
                 # a recognised rectangle/ellipse/divider is frozen until release
             else:
+                # the compressed-away trail first (PDF-canvas parity, row 147)
+                for hx, hy, hp, age in motion_history(
+                        gesture.get_current_event(), x, y):
+                    self.current_stroke.append((hx, hy))
+                    if self._press_now is not None:
+                        self.current_press.append(
+                            hp if hp is not None else self._press_now)
+                    self._note_sample(hx, hy, age)
                 self.current_stroke.append((x, y))
                 if self._press_now is not None:
                     self.current_press.append(self._press_now)
