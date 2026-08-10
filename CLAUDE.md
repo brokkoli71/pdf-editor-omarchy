@@ -1099,7 +1099,11 @@ Begin at:
 1. **Row 135, the stylus block** — the original plan, still entirely
    unverified, and the largest untested feature in the app. Re-read its
    warning about the stylus/HDMI mapping first.
-2. Then the merge drops (row 123), the shape/grid dwell (row 121), the divider
+2. **§1b, three bug fixes shipped 2026-08-10** (rows 146, 148/150, 149) —
+   two of them are touch gestures, so none of it is verified. The one to
+   report back on is **two-finger zoom on a text page**: it is expected to
+   still fail, and *how* it fails answers row 150's open design question.
+3. Then the merge drops (row 123), the shape/grid dwell (row 121), the divider
    gesture (row 130), and rows 140–142.
 
 *Closed 2026-08-10, with the measurements in `ideas.csv` rows 139/143/147:
@@ -1166,6 +1170,13 @@ one validation session; `notes/validation-session.md` is its checklist.**
   process rules = put in tooling if they can be). **A test audit is a biased
   sample**, so "unused" means unobserved, not useless.
 
+- **Row 150 — a text sheet cannot pinch-zoom**, because its press router holds
+  the first touch sequence and `GestureZoom` never gets two. Row 148's latch
+  stopped the damage (nothing draws, nothing reaches the caret) but not this.
+  The design is settled to one candidate and one rejection: **do not** release
+  the claim — that hands the `TextView` the press mid-pinch, which is the
+  symptom. Drive the zoom from the latch's own touch positions instead. Needs
+  the panel; confirm first whether it is still broken at all.
 - **Row 119 (crop)** — the last piece of the image feature. Its design is
   settled in row 118 and must not be re-litigated: a field on the model applied
   at render, never a destructive re-encode, landing ONCE for both modes.
