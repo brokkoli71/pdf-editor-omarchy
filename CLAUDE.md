@@ -1071,22 +1071,22 @@ when something lands, fold its invariants upward and delete it from here rather
 than writing a line about having finished it. The chronology lives in
 `ideas.csv` and git.
 
-**START HERE (2026-08-10). The branch is unvalidated work, and the current
-session is a VALIDATION session, not a feature one.** In order:
+**START HERE (2026-08-10). Still a VALIDATION session, not a feature one —
+`notes/validation-session.md` is the checklist.** The ink/latency thread
+(rows 139/143/147) is CLOSED; do not reopen it without a new measurement.
+Begin at:
 
-1. **Prediction (row 139)** — now unblocked, since live smoothing was accepted.
-   A/B 0 vs a value on one sentence, check overshoot at a sharp cusp and a fast
-   tight "o", and check it is inert when writing slowly.
-2. **The rest of `notes/validation-session.md`** — the stylus block (row 135,
-   nothing verified, and re-read its warning about the stylus/HDMI mapping
-   first), the merge drops (row 123), the divider gesture (row 130), and
-   rows 140–142.
+1. **Row 135, the stylus block** — the original plan, still entirely
+   unverified, and the largest untested feature in the app. Re-read its
+   warning about the stylus/HDMI mapping first.
+2. Then the merge drops (row 123), the shape/grid dwell (row 121), the divider
+   gesture (row 130), and rows 140–142.
 
-*Accepted 2026-08-10 and off the list: live smoothing ON (row 143 — including
-no seam on a long stroke and a snapped rectangle staying crisp; the tail-damping
-follow-up is therefore NOT to be built), dot size and shape (rows 143/144),
-pointer hiding. Smear trim was tried at every setting with no felt difference
-— left at its default, and not to be tuned further without a new reason.*
+*Closed 2026-08-10, with the measurements in `ideas.csv` rows 139/143/147:
+live smoothing ON, dot size and shape, pointer hiding, the smear trim (no felt
+difference at any setting), and PREDICTION — settled by grading, not taste, and
+nothing further is to be built for it. The pen's remaining ~110 ms of lag was
+measured to be UPSTREAM of the compositor and is not ours to recover.*
 
 **In flight — code-verified, needing a pass in the real app. The whole list is
 one validation session; `notes/validation-session.md` is its checklist.**
@@ -1120,17 +1120,18 @@ one validation session; `notes/validation-session.md` is its checklist.**
   PDF grid-divider commit/undo/redo are unit-tested (`TestShapeRecognition`,
   `TestGridDivider`); the dwell gestures need the app. Hand the user a
   checklist.
-- **Row 139's ink FEEL is one value from finished** — the pipeline is settled
-  (see "The ink pipeline" above) and the smear trim, dot size, pointer hiding
-  and live smoothing have all been judged. **Only prediction is left**, now
-  unblocked: it is damped (`PREDICT_SMOOTH`) and off by default, and it is
-  judged by A/B at 0 vs a value on one sentence, overshoot at a sharp cusp, a
-  fast tight "o" (what the arc extrapolation exists for), and inertness when
-  writing slowly. The discriminator is that prediction never reaches the file,
-  so ink still wrong *after* the lift is not prediction.
-  Measurements and reasoning are in `ideas.csv` row 139 and
-  `notes/ink-quality-plan.md`. **Deliberately NOT built, needs the user's
-  call:** stroke-onset recovery — it invents ink that was never measured.
+- **Row 147's SECOND half is open: the text sheet still repaints its ink every
+  frame.** The PDF canvas caches committed strokes into a surface and blits
+  them (flat ~1.5 ms/frame against 66 ms at 400 strokes); the sheet's ink lives
+  on an overlay with a different substrate, so it does not transfer for free —
+  but the parity rule says it should follow. Copy the *decisions* (a
+  fingerprint-keyed cache, an append painted onto the existing layer), not the
+  code. Also unfinished and trivial: two captures under `GSK_RENDERER=gl` vs
+  the default would settle whether to set a renderer in the launcher — the
+  probe measured 41 fps vs 60, but judged by feel in the app it was
+  "similar, maybe a tiny bit faster", which is not evidence to hardcode on.
+  **Deliberately NOT built, needs the user's call:** stroke-onset recovery —
+  it invents ink that was never measured.
 
 **Loose ends, roughly in order of how ready they are:**
 
