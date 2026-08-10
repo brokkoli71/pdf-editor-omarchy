@@ -1274,6 +1274,64 @@ class TestStrokeSmoothing(unittest.TestCase):
         self.assertIsNone(sidemark.CAPTURE_INK_PATH)
         sidemark.capture_raw_stroke([(0, 0), (1, 1)], None)   # no-op, no raise
 
+    def _captured(self, body):
+        """Run `body()` with ink capture pointed at a temp file; return the
+        records it wrote."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ink.jsonl")
+            old = sidemark.CAPTURE_INK_PATH
+            sidemark.CAPTURE_INK_PATH = path
+            try:
+                body()
+            finally:
+                sidemark.CAPTURE_INK_PATH = old
+            if not os.path.exists(path):
+                return []
+            with open(path) as fh:
+                return [json.loads(l) for l in fh if l.strip()]
+
+    def test_a_capture_carries_the_clock_prediction_reads(self):
+        """Prediction is the one part of the pipeline that reads TIME, so an
+        untimed capture cannot grade it — which is why 41 real strokes could
+        tune smoothing and say nothing about the lead. The samples ride beside
+        `pts` because they are in a different space: screen coords with a
+        timestamp, exactly what predict_point sees live."""
+        pts = [(0.0, 0.0), (5.0, 1.0), (10.0, 3.0)]
+        samples = [(0.0, 0.0, 0.0), (5.0, 1.0, 8.0), (10.0, 3.0, 16.0)]
+        recs = self._captured(
+            lambda: sidemark.finish_ink_stroke(pts, None, 0.5,
+                                               samples=samples))
+        self.assertEqual(len(recs), 1)
+        self.assertEqual([tuple(s) for s in recs[0]["samples"]], samples)
+        # times must be strictly usable as a clock, not a constant
+        ts = [s[2] for s in recs[0]["samples"]]
+        self.assertEqual(ts, sorted(ts))
+        self.assertGreater(ts[-1], ts[0])
+
+    def test_an_untimed_capture_still_records(self):
+        """The older captures in notes/ have no samples key and must keep
+        replaying — the harness says so rather than crashing."""
+        recs = self._captured(
+            lambda: sidemark.finish_ink_stroke(
+                [(0.0, 0.0), (5.0, 1.0), (10.0, 3.0)], None, 0.5))
+        self.assertEqual(recs[0]["samples"], [])
+        self.assertEqual(len(recs[0]["pts"]), 3)
+
+    def test_the_timed_list_is_only_built_while_capturing(self):
+        """One entry per stroke sample when asked for, nothing at all when not
+        — a diagnostic that grows a list on every motion event of every stroke
+        is not off."""
+        c = PDFCanvas()
+        c._capture_samples = []
+        for i in range(4):
+            c._note_sample(float(i), 0.0)
+        self.assertEqual(c._capture_samples, [])
+        self._captured(lambda: [c._note_sample(float(i), 0.0)
+                                for i in range(4)])
+        self.assertEqual(len(c._capture_samples), 4)
+        self.assertEqual([s[0] for s in c._capture_samples],
+                         [0.0, 1.0, 2.0, 3.0])
+
     # ── page backgrounds (row 139) ────────────────────────────────────────
 
     def test_ruling_is_drawn_into_the_page_content(self):

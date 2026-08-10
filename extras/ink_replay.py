@@ -9,6 +9,7 @@ writing, then measure and re-render it here.
     extras/ink_replay.py /tmp/ink.jsonl                    # what came out
     extras/ink_replay.py /tmp/ink.jsonl --png out.png      # see it
     extras/ink_replay.py /tmp/ink.jsonl --sweep smoothing  # compare settings
+    extras/ink_replay.py /tmp/ink.jsonl --predict          # grade prediction
 
 The capture holds RAW samples — exactly what the digitiser reported, before
 any interpolation or smoothing — so a replay can try settings the strokes were
@@ -135,6 +136,164 @@ def sweep(recs, what):
                   f"{statistics.mean(ratios):>7.1%}")
 
 
+def truth_at(samples, t):
+    """Where the pen actually was at time `t`, interpolated between reports.
+
+    None past the end of the stroke — there is no ground truth for a guess
+    about a pen that has already been lifted, and counting those as hits or
+    misses would grade prediction on the one moment it cannot be wrong.
+    """
+    if t > samples[-1][2] or t < samples[0][2]:
+        return None
+    for a, b in zip(samples, samples[1:]):
+        if a[2] <= t <= b[2]:
+            span = b[2] - a[2]
+            if span <= 0:
+                return (a[0], a[1])
+            f = (t - a[2]) / span
+            return (a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f)
+    return None
+
+
+def linear_point(window, lead_ms):
+    """The straight-line guess, as the baseline the ARC has to beat."""
+    if len(window) < 2 or lead_ms <= 0:
+        return None
+    (x0, y0, t0), (x1, y1, t1) = window[0], window[-1]
+    span = t1 - t0
+    if span <= 0:
+        return None
+    vx, vy = (x1 - x0) / span, (y1 - y0) / span
+    return (x1 + vx * lead_ms, y1 + vy * lead_ms)
+
+
+def predict_errors(recs, lead_ms, damped=True):
+    """Grade prediction against what the pen went on to do.
+
+    Walks each captured stroke sample by sample exactly as the live path does
+    — the same PREDICT_WINDOW of history, the same EMA on the OFFSET — and
+    compares three positions against the truth `lead_ms` later:
+
+      lag     the last reported sample, i.e. what you see with no prediction.
+              This is the error prediction exists to cancel, so it is the
+              number every other one is a fraction OF.
+      arc     what Sidemark draws (`predict_point`).
+      linear  straight-line extrapolation, the thing the arc claims to beat.
+
+    Returns per-sample error lists in the capture's own units.
+
+    The honest caveat: the truth here is the DIGITISER's later report, so this
+    measures how well the extrapolation guesses the pen's path — not how much
+    lag the hand perceives, which includes the panel's own reporting delay and
+    the compositor's. A prediction can score perfectly here and still feel
+    late.
+    """
+    W = sm.PDFCanvas.PREDICT_WINDOW
+    out = {"lag": [], "arc": [], "linear": [], "speed": [], "turn": []}
+    for rec in recs:
+        samples = [tuple(s) for s in rec.get("samples") or []]
+        if len(samples) < W + 2 or rec.get("straight"):
+            continue
+        offset = None
+        for i in range(len(samples)):
+            window = samples[max(0, i - W + 1):i + 1]
+            here = samples[i]
+            truth = truth_at(samples, here[2] + lead_ms)
+            if truth is None:
+                continue
+            raw = sm.predict_point(window, lead_ms)
+            if raw is None:
+                guess = (here[0], here[1])
+            else:
+                off = (raw[0] - here[0], raw[1] - here[1])
+                if damped:
+                    if offset is not None:
+                        off = (offset[0] + (off[0] - offset[0]) * sm.PREDICT_SMOOTH,
+                               offset[1] + (off[1] - offset[1]) * sm.PREDICT_SMOOTH)
+                    offset = off
+                guess = (here[0] + off[0], here[1] + off[1])
+            lin = linear_point(window, lead_ms) or (here[0], here[1])
+            out["lag"].append(math.dist((here[0], here[1]), truth))
+            out["arc"].append(math.dist(guess, truth))
+            out["linear"].append(math.dist(lin, truth))
+            # how fast and how sharply the pen was turning right there, so the
+            # error can be read against the cusps prediction is known to miss
+            span = window[-1][2] - window[0][2]
+            out["speed"].append(
+                math.dist(window[0][:2], window[-1][:2]) / span if span else 0.0)
+            out["turn"].append(turn_at(samples, i))
+    return out
+
+
+def turn_at(samples, i):
+    """Heading change per unit length around sample i, in radians/unit — the
+    curvature that decides whether an arc guess or a linear one is right."""
+    if i < 1 or i + 1 >= len(samples):
+        return 0.0
+    a, b, c = samples[i - 1][:2], samples[i][:2], samples[i + 1][:2]
+    d1, d2 = math.dist(a, b), math.dist(b, c)
+    if d1 <= 0 or d2 <= 0:
+        return 0.0
+    h1 = math.atan2(b[1] - a[1], b[0] - a[0])
+    h2 = math.atan2(c[1] - b[1], c[0] - b[0])
+    d = (h2 - h1 + math.pi) % (2 * math.pi) - math.pi
+    return abs(d) / ((d1 + d2) / 2)
+
+
+def report_prediction(recs, leads):
+    timed = [r for r in recs if r.get("samples")]
+    print(f"{len(timed)} of {len(recs)} strokes carry per-sample times\n")
+    if not timed:
+        print("  Nothing to measure. Timed capture is newer than this file —")
+        print("  re-capture with SIDEMARK_CAPTURE_INK to grade prediction.")
+        return
+    print("  Error against where the pen actually went, per sample.")
+    print("  'lag' is the no-prediction error — the thing being cancelled;")
+    print("  recovered = how much of it the arc removes (negative = worse).\n")
+    head = (f"  {'lead':>5} {'n':>6} {'lag p50':>8} {'arc p50':>8} "
+            f"{'lin p50':>8} {'arc p90':>8} {'recovered':>10} {'worse':>7}")
+    print(head)
+    for lead in leads:
+        e = predict_errors(recs, lead)
+        if not e["lag"]:
+            continue
+        lag50 = statistics.median(e["lag"])
+        arc50 = statistics.median(e["arc"])
+        lin50 = statistics.median(e["linear"])
+        arc90 = quantile(e["arc"], 0.9)
+        worse = sum(1 for a, l in zip(e["arc"], e["lag"]) if a > l) / len(e["arc"])
+        rec = (lag50 - arc50) / lag50 if lag50 else 0.0
+        print(f"  {lead:>5.0f} {len(e['lag']):>6} {lag50:>8.2f} {arc50:>8.2f} "
+              f"{lin50:>8.2f} {arc90:>8.2f} {rec:>9.1%} {worse:>7.1%}")
+
+    # where it goes wrong: the sharpest turns are where an extrapolation of any
+    # kind overshoots, and the flattest are where it should be free
+    lead = leads[-1]
+    e = predict_errors(recs, lead)
+    if not e["turn"]:
+        return
+    print(f"\n  By curvature, at {lead:.0f} ms (quartiles of turn rate):\n")
+    print(f"  {'turn':>18} {'n':>6} {'lag p50':>8} {'arc p50':>8} "
+          f"{'lin p50':>8} {'recovered':>10}")
+    order = sorted(range(len(e["turn"])), key=lambda i: e["turn"][i])
+    for q in range(4):
+        idx = order[q * len(order) // 4:(q + 1) * len(order) // 4]
+        if not idx:
+            continue
+        lag50 = statistics.median([e["lag"][i] for i in idx])
+        arc50 = statistics.median([e["arc"][i] for i in idx])
+        lin50 = statistics.median([e["linear"][i] for i in idx])
+        lo, hi = e["turn"][idx[0]], e["turn"][idx[-1]]
+        rec = (lag50 - arc50) / lag50 if lag50 else 0.0
+        print(f"  {lo:>7.3f}..{hi:<9.3f} {len(idx):>6} {lag50:>8.2f} "
+              f"{arc50:>8.2f} {lin50:>8.2f} {rec:>9.1%}")
+
+
+def quantile(vals, q):
+    s = sorted(vals)
+    return s[min(len(s) - 1, int(q * len(s)))]
+
+
 def render(recs, path, scale=2.0, pad=20.0):
     """Draw the replayed strokes exactly as Sidemark would paint them."""
     import cairo
@@ -171,6 +330,10 @@ def main():
     ap.add_argument("--png", help="render the replayed strokes to this file")
     ap.add_argument("--sweep", choices=("smoothing", "spacing"),
                     help="compare a setting across the captured strokes")
+    ap.add_argument("--predict", nargs="?", const="10,20,40,60,80", default=None,
+                    metavar="MS,MS",
+                    help="grade prediction against what the pen went on to do, "
+                         "at these lead times (needs a timed capture)")
     ap.add_argument("--scale", type=float, default=2.0)
     args = ap.parse_args()
 
@@ -178,7 +341,9 @@ def main():
     if not recs:
         print("no strokes in that file")
         return 1
-    if args.sweep:
+    if args.predict is not None:
+        report_prediction(recs, [float(v) for v in args.predict.split(",")])
+    elif args.sweep:
         sweep(recs, args.sweep)
     else:
         describe(recs)

@@ -445,8 +445,15 @@ def capture_raw_stroke(pts, press, **meta):
     if not CAPTURE_INK_PATH:
         return
     try:
+        # `samples` is the stroke as PREDICTION sees it: screen coords with a
+        # timestamp each, which `pts` cannot carry (it is document units and
+        # untimed). Nothing else needs the clock, so it rides as meta and old
+        # captures simply lack the key.
+        samples = meta.pop("samples", None) or []
         rec = {"pts": [[round(x, 3), round(y, 3)] for x, y in pts],
                "press": [round(p, 4) for p in (press or [])],
+               "samples": [[round(x, 3), round(y, 3), round(t, 1)]
+                           for x, y, t in samples],
                "t": time.time(), **meta}
         with open(CAPTURE_INK_PATH, "a") as fh:
             fh.write(json.dumps(rec) + "\n")
@@ -1038,7 +1045,7 @@ def width_profile(pts, press=None, taper=True, dot=True,
 
 
 def finish_ink_stroke(pts, press, strength, was_straight=False, flat=False,
-                      min_pressure=0.0, spacing=None):
+                      min_pressure=0.0, spacing=None, samples=None):
     """The whole commit pipeline, and THE decision about what gets it.
 
     Both canvases route every finished stroke through here, so the two can
@@ -1053,7 +1060,8 @@ def finish_ink_stroke(pts, press, strength, was_straight=False, flat=False,
     Returns (pts, profile); profile is None when the stroke should paint flat.
     """
     capture_raw_stroke(pts, press, straight=was_straight, flat=flat,
-                       smoothing=strength, min_pressure=min_pressure)
+                       smoothing=strength, min_pressure=min_pressure,
+                       samples=samples)
     if was_straight:
         return list(pts), None
     if len(pts) < 3:
@@ -2756,6 +2764,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._hover_trail = []
         # the last few samples of the stroke in flight, for predict_point
         self._recent_samples = []
+        self._capture_samples = []
         # prototypes (row 139): recover a stroke's start from the hover trail,
         # and lead the live stroke ahead of the pen by this many milliseconds.
         # Both default OFF — the lead-in did not help in the hand, and neither
@@ -3231,8 +3240,15 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _note_sample(self, x, y):
         """Record a stroke sample's screen position and time, for prediction."""
-        self._recent_samples.append((x, y, self._now_ms()))
+        now = self._now_ms()
+        self._recent_samples.append((x, y, now))
         del self._recent_samples[:-self.PREDICT_WINDOW]
+        if CAPTURE_INK_PATH:
+            # prediction is the one thing in the pipeline that reads the CLOCK,
+            # so it is the one thing the untimed capture could not be replayed
+            # against. Kept whole (the live list is capped at PREDICT_WINDOW)
+            # and only while capturing, which is a diagnostic switch.
+            self._capture_samples.append((x, y, now))
 
     def _predicted_tip(self):
         """The predicted tip, damped across frames — see PREDICT_SMOOTH."""
@@ -3310,7 +3326,7 @@ class PDFCanvas(Gtk.DrawingArea):
         return finish_ink_stroke(
             pts, self._stroke_pressure(pts), self.smoothing,
             was_straight=was_straight, flat=self._flat_tool(),
-            min_pressure=self.min_pressure)
+            min_pressure=self.min_pressure, samples=self._capture_samples)
 
     def _pen_attrs(self):
         """(color, width, opacity) of the active drawing tool. ``_temp_highlighter``
@@ -4683,6 +4699,7 @@ class PDFCanvas(Gtk.DrawingArea):
         """Open a fresh stroke at a screen point, with its pressure list and
         whatever lead-in the hover trail can give it."""
         self._recent_samples = []
+        self._capture_samples = []
         self._predict_offset = None
         lead = self._lead_in_points(start_x, start_y)
         self.current_stroke = ([self._screen_to_pdf(*p) for p in lead]
@@ -10650,6 +10667,7 @@ class TextPageView(Gtk.Overlay):
         self._press_now = None    # pressure of the event being handled, if any
         self._hover_trail = []    # hovering stylus positions (overlay coords)
         self._recent_samples = []  # last few stroke samples, for prediction
+        self._capture_samples = []  # the whole timed stroke, while capturing
         self._predict_offset = None   # damped lead, reset per stroke
         # Shift+drag rubber-bands a region to zoom to; a Shift+click (no rect)
         # fits the paper to the window — both PDF-canvas parity (#106 item 5).
@@ -11690,6 +11708,7 @@ class TextPageView(Gtk.Overlay):
             self._straight_mode = False
             self._snap_kind = self._snap_label = None
             self._recent_samples = []
+            self._capture_samples = []
             self._predict_offset = None
             lead = self._lead_in_points(x, y)
             self.current_stroke = list(lead) + [(x, y)]
@@ -12109,7 +12128,7 @@ class TextPageView(Gtk.Overlay):
         return finish_ink_stroke(
             pts, self._stroke_pressure(pts), self.get_smoothing(),
             was_straight=was_straight, flat=self._flat_tool(),
-            min_pressure=self.min_pressure)
+            min_pressure=self.min_pressure, samples=self._capture_samples)
 
     def _commit_stroke(self, pts_overlay, profile=None):
         if len(pts_overlay) < 2:

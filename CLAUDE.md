@@ -346,7 +346,18 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   - **Tune it on real ink, not on synthetic curves.**
     `SIDEMARK_CAPTURE_INK=<path>` appends every finished stroke's RAW samples
     (pre-interpolation) to a JSON-lines file, and `extras/ink_replay.py`
-    replays, measures, sweeps and re-renders them. Its key statistic is
+    replays, measures, sweeps and re-renders them. A record carries `pts`
+    (document units, untimed) **and `samples`** — the same stroke in screen
+    coords with a timestamp each, which is what `predict_point` sees live.
+    Prediction is the one part of the pipeline that reads the CLOCK, so an
+    untimed capture cannot grade it: the 41 strokes in `notes/` predate
+    `samples` and can say nothing about the lead. `--predict` grades it, walking
+    each stroke with the same window and EMA damping as the live path and
+    scoring the arc against the no-prediction lag and against a linear
+    extrapolation, broken down by curvature. Its ground truth is the
+    digitiser's *later report*, so it measures how well the guess tracks the
+    pen's path, **not** perceived latency — a prediction can score well here
+    and still feel late. Its key statistic is
     **sample spacing ÷ feature size**: above ~0.25 the hardware is
     undersampling the writing and interpolation is carrying the result (write
     bigger); below ~0.06 the pen is oversampling and any roughness left is
