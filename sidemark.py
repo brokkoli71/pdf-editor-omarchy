@@ -2316,6 +2316,69 @@ def track_barrel(surface, event):
     return True
 
 
+class TouchLatch:
+    """How many fingers are on the glass — and whether THIS hand ever had two.
+
+    Rows 148 + 150. A second finger means the hand is doing a pinch, and both
+    surfaces have to know that from the touch stream itself rather than from
+    `GestureZoom`, because the zoom is the thing that fails: it needs two
+    sequences, and the press routers take the first one (the sheet CLAIMS it
+    for a drawing tool, or DENIES it and the TextView's own selection drag
+    takes it), so it can be starved and never begin at all.
+
+    `multi` therefore latches on the second touchdown and clears only when
+    EVERY finger is up — not when the pinch ends. A gesture that ends with one
+    finger still down was the whole bug: the surviving finger began a fresh
+    drag, that press resolved through the binding table like any other, and
+    with a finger bound to `pen` it left a dot behind.
+    """
+
+    def __init__(self, on_multi=None):
+        self._live = set()
+        self.multi = False
+        self.on_multi = on_multi
+
+    @property
+    def count(self):
+        return len(self._live)
+
+    def handle(self, event):
+        """Feed one event. Returns True if it changed anything."""
+        seq = event.get_event_sequence()
+        if seq is None:
+            return False        # a mouse or a pen: not a finger at all
+        t = event.get_event_type()
+        if t == Gdk.EventType.TOUCH_BEGIN:
+            self._live.add(seq)
+            if len(self._live) >= 2 and not self.multi:
+                self.multi = True
+                if self.on_multi:
+                    self.on_multi()
+                return True
+        elif t in (Gdk.EventType.TOUCH_END, Gdk.EventType.TOUCH_CANCEL):
+            self._live.discard(seq)
+            if not self._live and self.multi:
+                # every finger is up: the next touch is a fresh hand
+                self.multi = False
+                return True
+        return False
+
+
+def attach_touch_latch(widget, on_multi=None):
+    """Give `widget` a TouchLatch fed from a CAPTURE-phase legacy controller.
+
+    Capture, and its own controller, for `track_barrel`'s reason: the gestures
+    below take a sequence for themselves, so the raw touch stream is the only
+    place the count is honest. It never consumes the event — counting is all
+    it does."""
+    latch = TouchLatch(on_multi)
+    ctrl = Gtk.EventControllerLegacy()
+    ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    ctrl.connect("event", lambda _c, ev: (latch.handle(ev), False)[1])
+    widget.add_controller(ctrl)
+    return latch
+
+
 def chord_id(button, ctrl=False, shift=False, alt=False):
     """The canonical id of a button+modifier chord, e.g. `ctrl+shift+left`."""
     name = BUTTON_NAMES.get(button, str(button))
@@ -3165,6 +3228,13 @@ class PDFCanvas(Gtk.DrawingArea):
         self.add_controller(zoom)
         self._pinch_start_scale = None
         self._pinch_anchor_pdf = None
+
+        # …and the finger COUNT, straight off the touch stream (rows 148+150).
+        # The pinch gesture cannot be what tells the canvas a second finger has
+        # landed: it only fires once it recognises, and the press router can
+        # starve it. This latch is what makes "two fingers on the glass" a fact
+        # the router can read.
+        self._touch = attach_touch_latch(self, self._on_second_finger)
 
         # MX Master thumb button (btn 10): hold to pan, scroll-while-held to
         # zoom. EventControllerLegacy is the only layer that reliably reports
@@ -4524,6 +4594,15 @@ class PDFCanvas(Gtk.DrawingArea):
                                   (cy - self.offset_y) / self.scale)
         # a single-finger drag may have already begun a stroke (a dot) before
         # the second finger landed — discard it and stop the drag from drawing
+        self._on_second_finger()
+
+    def _on_second_finger(self):
+        """A second finger is down: this hand belongs to the pinch.
+
+        Reached from the touch latch, not only from the pinch gesture — the
+        latch is what fires when GestureZoom is starved and never recognises,
+        and it is also what keeps the rest of the hand out of the tools until
+        every finger has lifted."""
         self.current_stroke = []
         self._ignoring = True
 
@@ -4756,7 +4835,21 @@ class PDFCanvas(Gtk.DrawingArea):
         table (row 132) and hand the gesture to that tool. Nothing here decides
         what a chord means — the table does, so the badge on a toolbar button,
         its tooltip and this dispatch can never disagree."""
-        self._post_pinch = False   # a fresh press starts a normal interaction
+        if self._touch.multi:
+            # A finger of a hand that is pinching. GtkGestureDrag is
+            # single-point, so when the finger holding it lifts, the SURVIVOR
+            # can arrive here as a brand new press — and it used to be routed
+            # through the table like any other, which is a dot with a finger
+            # bound to `pen` (row 148). The hand keeps panning until it is
+            # empty; the latch is what says so, since the pinch gesture has
+            # already ended by then.
+            self._ignoring = True
+            return
+        # a fresh press starts a normal interaction — but only a press that is
+        # really fresh. With a finger still down this is the leftover of a
+        # pinch, and clearing the flag here is what handed it back to the pen.
+        if self._touch.count <= 1:
+            self._post_pinch = False
         self._dismissed_selection = False
         self._text_highlighting = False
         btn = button_for_event(gesture.get_current_event(),
@@ -11102,6 +11195,13 @@ class TextPageView(Gtk.Overlay):
         pinch.connect("scale-changed", self._on_sheet_pinch_scale)
         self.add_controller(pinch)
 
+        # The finger COUNT, off the raw touch stream (rows 148+150). The sheet
+        # needs this more than the canvas does: its router CLAIMS a press for a
+        # drawing tool before any pinch can be recognised, so `GestureZoom`
+        # here can be starved and never fire at all — and then nothing at all
+        # tells the sheet a second finger arrived, and the first one goes on
+        # drawing through the whole gesture.
+        self._touch = attach_touch_latch(self, self._on_second_finger)
 
         # MX Master thumb button (btn 10): hold to grab-pan the sheet, same as
         # the PDF canvas. A motion controller tracks the pointer; a legacy
@@ -11417,6 +11517,23 @@ class TextPageView(Gtk.Overlay):
         self._pinch_base_scroll = (ha.get_value(), va.get_value())
         ok, cx, cy = gesture.get_bounding_box_center()
         self._pinch_center = (cx, cy) if ok else self._sheet_center()
+        self._on_second_finger()
+
+    def _on_second_finger(self):
+        """A second finger is down: this hand belongs to the pinch, so whatever
+        the first finger started stops here (row 148).
+
+        The PDF canvas' twin, and reached the same two ways — from the pinch
+        gesture, and from the touch latch for when the pinch is starved and
+        never begins. It abandons the stroke rather than committing it: the
+        first finger of a pinch never meant to draw."""
+        self.current_stroke = []
+        self._ink_ignoring = True   # the rest of this drag means nothing now
+        self._press_tool = None
+        self._panning = False
+        self._lassoing = False
+        self._rerase_press = None
+        self.ink.queue_draw()
 
     def _on_sheet_pinch_scale(self, gesture, scale):
         self.set_zoom(self._pinch_base_zoom * scale)
@@ -11825,6 +11942,15 @@ class TextPageView(Gtk.Overlay):
         Capture phase above both the ink overlay and the TextView, which is
         what makes it the only path: with the caret in hand the overlay is not
         even targetable, so a handler down there would never see the press."""
+        if self._touch.multi:
+            # a finger of a hand that is pinching — including the survivor of
+            # a lift, which arrives here as a brand new press (row 148). Claim
+            # it and do nothing: releasing it would hand the press to the
+            # TextView below, and a caret jump mid-pinch is the symptom this
+            # is here to prevent, not an improvement on it.
+            self._on_second_finger()
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            return
         state = self._chord_state(gesture)
         btn = button_for_event(gesture.get_current_event(),
                                gesture.get_current_button(),

@@ -186,6 +186,26 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
       gesture** (`track_barrel`): pressed before the tip it claims the
       `GestureDrag` and the tip's press then never produces a drag-begin at
       all. Same reason the window tracks held keys for touch.
+    - **TWO FINGERS ARE A FACT ABOUT THE HAND, NEVER ABOUT THE GESTURE**
+      (`TouchLatch` / `attach_touch_latch`, rows 148 + 150). `GestureZoom`
+      cannot be what tells a surface a second finger landed: it only fires once
+      it *recognises*, and it needs two sequences the press routers may already
+      have taken — the sheet's router CLAIMS the first one, so the pinch there
+      can be starved and never begin at all. So the count comes off the raw
+      touch stream, on its own capture-phase legacy controller, for
+      `track_barrel`'s reason. Two invariants: `multi` latches on the second
+      touchdown and clears only when the **last** finger lifts (a pinch ends
+      while a finger is still down, and `GtkGestureDrag` is single-point, so
+      the survivor arrives as a brand-new press — routed through the table like
+      any other, that is a dot with `finger: pen`); and a second finger
+      **abandons** whatever the first started (`_on_second_finger`, on both
+      surfaces) rather than committing it. Never gate any of this on the pinch
+      gesture, and never clear `_post_pinch` while a finger is still down.
+      *ceiling: the sheet still cannot pinch-zoom while its router holds the
+      first sequence. Releasing the claim is NOT the fix — the claim is what
+      keeps the `TextView` off the press, so releasing it gives the caret a
+      click mid-pinch, which is the symptom. The exit is to drive the zoom from
+      the latch's own touch positions; see row 150.*
     - **No tilt** on this class of panel: the axes exist and are flat zero, so
       a presence check passes and the feature silently does nothing.
     - **A new DEFAULT binding reaches nobody who has customised their table**

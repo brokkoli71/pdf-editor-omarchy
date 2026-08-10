@@ -521,6 +521,105 @@ class TestPinchZoom(unittest.TestCase):
         c._on_drag_begin(gesture, 10.0, 10.0)
         self.assertFalse(c._post_pinch)
 
+    # ── rows 148 + 150: the hand, not the gesture ────────────────────────────
+
+    @staticmethod
+    def _touch(kind, seq):
+        return types.SimpleNamespace(get_event_sequence=lambda: seq,
+                                     get_event_type=lambda: kind)
+
+    def _press(self, c, latch_seqs=()):
+        """Route a press through the real router with a stand-in gesture."""
+        g = mock.Mock()
+        g.get_current_button.return_value = 1
+        g.get_current_event.return_value = None
+        g.get_current_event_state.return_value = Gdk.ModifierType(0)
+        g.get_start_point.return_value = (True, 10.0, 10.0)
+        c._anchor_hit_test = lambda *a: None
+        c._on_drag_begin(g, 10.0, 10.0)
+        return g
+
+    def test_the_latch_holds_until_every_finger_lifts(self):
+        """The hand is 'pinching' from the second touchdown until the LAST
+        lift — not until the pinch gesture ends, which happens while a finger
+        is still down and is exactly when the survivor used to start drawing."""
+        fired = []
+        latch = sidemark.TouchLatch(lambda: fired.append(1))
+        a, b = object(), object()
+        latch.handle(self._touch(Gdk.EventType.TOUCH_BEGIN, a))
+        self.assertFalse(latch.multi)
+        latch.handle(self._touch(Gdk.EventType.TOUCH_BEGIN, b))
+        self.assertTrue(latch.multi)
+        self.assertEqual(len(fired), 1)
+        latch.handle(self._touch(Gdk.EventType.TOUCH_END, a))
+        self.assertTrue(latch.multi)        # one finger still on the glass
+        self.assertEqual(latch.count, 1)
+        latch.handle(self._touch(Gdk.EventType.TOUCH_END, b))
+        self.assertFalse(latch.multi)       # a fresh hand
+        self.assertEqual(latch.count, 0)
+
+    def test_a_pointer_is_not_a_finger(self):
+        latch = sidemark.TouchLatch()
+        latch.handle(self._touch(Gdk.EventType.BUTTON_PRESS, None))
+        self.assertEqual(latch.count, 0)
+        self.assertFalse(latch.multi)
+
+    def test_the_surviving_finger_of_a_pinch_never_draws(self):
+        """Row 148. GtkGestureDrag is single-point, so when the finger holding
+        it lifts the other one can arrive as a brand new press — and with a
+        finger bound to `pen` that press left a dot behind."""
+        c = self._canvas()
+        c.page = object()
+        c.bindings.bind(sidemark.chord_id(sidemark.BTN_FINGER), "pen")
+        a, b = object(), object()
+        c._touch.handle(self._touch(Gdk.EventType.TOUCH_BEGIN, a))
+        c._touch.handle(self._touch(Gdk.EventType.TOUCH_BEGIN, b))
+        c._touch.handle(self._touch(Gdk.EventType.TOUCH_END, a))
+        self._press(c)
+        self.assertTrue(c._ignoring)
+        self.assertEqual(c.current_stroke, [])
+        # …and the hand is only over once the last finger is up. The positive
+        # control matters as much as the guard: the same press has to reach the
+        # pen again, or the test would pass against a finger that never draws.
+        c._touch.handle(self._touch(Gdk.EventType.TOUCH_END, b))
+        self._press(c)
+        self.assertFalse(c._ignoring)
+        self.assertEqual(c._press_tool, "pen")
+
+    def test_a_second_finger_abandons_what_the_first_was_drawing(self):
+        c = self._canvas()
+        c.page = object()
+        c.current_stroke = [(10, 10), (11, 12)]
+        c._touch.handle(self._touch(Gdk.EventType.TOUCH_BEGIN, object()))
+        c._touch.handle(self._touch(Gdk.EventType.TOUCH_BEGIN, object()))
+        self.assertEqual(c.current_stroke, [])
+        self.assertTrue(c._ignoring)
+
+    def test_the_sheet_stops_drawing_on_a_second_finger_too(self):
+        """The sheet needs this more than the canvas: its router CLAIMS the
+        first press before any pinch can be recognised, so GestureZoom can be
+        starved and never fire — and then nothing else tells it a second
+        finger arrived (row 150)."""
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text("alpha\nbeta\n")
+        tp.bindings.bind(sidemark.chord_id(sidemark.BTN_FINGER), "pen",
+                         mode="text")
+        tp.current_stroke = [(10.0, 10.0), (12.0, 11.0)]
+        tp._press_tool = "pen"
+        tp._touch.handle(self._touch(Gdk.EventType.TOUCH_BEGIN, object()))
+        tp._touch.handle(self._touch(Gdk.EventType.TOUCH_BEGIN, object()))
+        self.assertEqual(tp.current_stroke, [])
+        self.assertIsNone(tp._press_tool)
+        # the survivor's fresh press is claimed and does nothing — releasing it
+        # would hand the caret a click in the middle of a pinch
+        g = mock.Mock()
+        g.get_current_button.return_value = 1
+        g.get_current_event.return_value = None
+        g.get_current_event_state.return_value = Gdk.ModifierType(0)
+        tp._on_press_begin(g, 10.0, 10.0)
+        self.assertIsNone(tp._press_tool)
+        self.assertEqual(len(tp.strokes), 0)
+
     def test_pinch_without_page_is_noop(self):
         c = self._canvas()
         c.page = None
