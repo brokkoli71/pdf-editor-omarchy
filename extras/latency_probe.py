@@ -9,6 +9,7 @@ the whole loop, in milliseconds.
     extras/latency_probe.py                 # 20 s, then the number
     extras/latency_probe.py --period 3.5    # slower, if it is hard to follow
     extras/latency_probe.py --path line     # the old back-and-forth sweep
+    extras/latency_probe.py --inject-lag 60 # add 60 ms, to check the tool
     extras/latency_probe.py --selftest      # check the fit, no hardware
 
 Follow it round several times before trusting a run: the first lap is spent
@@ -29,6 +30,13 @@ Which is why the number to trust is a DIFFERENCE. Run it twice, changing one
 thing (prediction on/off, a compositor setting, another machine): the human
 term is roughly constant between runs, so the delta is real even when the
 absolute is soft. A single reading in isolation says much less.
+
+--inject-lag MS is how you CHECK that claim instead of taking it on trust. It
+shows the dot where it was MS ago while still logging the true path, which is
+exactly what extra latency between intent and photons does to you. Run 0 / 40 /
+80 and the fitted lag must rise by the same amounts: if it does, deltas from
+this tool mean something on your hand and your hardware, and if it does not,
+nothing else it says is worth acting on.
 
 Deliberately standalone: it imports nothing from sidemark, so it measures the
 platform rather than this app, and can be pointed at a different toolkit or
@@ -146,7 +154,8 @@ def _selftest():
 
 
 class Probe(Gtk.ApplicationWindow):
-    def __init__(self, app, seconds, period, amplitude, path="circle"):
+    def __init__(self, app, seconds, period, amplitude, path="circle",
+                 inject_lag=0.0):
         super().__init__(application=app, title="Sidemark latency probe")
         self.set_default_size(900, 760)      # tall enough for a real circle
         # MILLISECONDS from here down. Every timestamp in this file is ms
@@ -157,6 +166,8 @@ class Probe(Gtk.ApplicationWindow):
         self._period_ms = period * 1000.0
         self._amp = amplitude
         self._path = path
+        self._inject_ms = inject_lag
+        self._shown = []          # (t, x, y) computed but not yet displayed
         self._dots, self._pens = [], []
         self._t0 = None
         self._done = False
@@ -202,8 +213,17 @@ class Probe(Gtk.ApplicationWindow):
             self._dot_x = cx + self._radius * math.cos(phase)
             self._dot_y = cy + self._radius * math.sin(phase)
         # logged at the time it is HANDED to the compositor, which is the only
-        # timestamp we have any right to
+        # timestamp we have any right to. With --inject-lag the LOGGED path
+        # stays the true one and the DRAWN dot is held back, which is what
+        # extra latency between intent and photons does: you track what you
+        # were shown, so the fitted lag must grow by exactly the delay.
         self._dots.append((now, self._dot_x, self._dot_y))
+        if self._inject_ms > 0:
+            self._shown.append((now, self._dot_x, self._dot_y))
+            cutoff = now - self._inject_ms
+            while len(self._shown) > 1 and self._shown[1][0] <= cutoff:
+                self._shown.pop(0)
+            self._dot_x, self._dot_y = self._shown[0][1], self._shown[0][2]
         self._area.queue_draw()
         return GLib.SOURCE_CONTINUE
 
@@ -288,6 +308,10 @@ def main():
                          "cannot stay ON the dot)")
     ap.add_argument("--amplitude", type=float, default=260.0,
                     help="circle radius / sweep half-width, px")
+    ap.add_argument("--inject-lag", type=float, default=0.0, metavar="MS",
+                    help="delay what is SHOWN by this many ms while logging "
+                         "the true path — run 0/40/80 to prove the tool "
+                         "measures differences on your own hardware")
     ap.add_argument("--path", choices=("circle", "line"), default="circle",
                     help="circle (default) has no reversals and one constant "
                          "speed, so the hand tracks it far better")
@@ -303,7 +327,7 @@ def main():
 
     def on_activate(a):
         win = Probe(a, args.seconds, args.period, args.amplitude,
-                    args.path)
+                    args.path, args.inject_lag)
 
         def on_close(_w):
             out["dots"], out["pens"] = win._dots, win._pens
@@ -340,6 +364,9 @@ def main():
         print("  not enough overlap to fit")
         return 1
     print(f"\n  END-TO-END LAG  {lag:.0f} ms      (fit residual {rms:.3f})")
+    if args.inject_lag > 0:
+        print(f"  ({args.inject_lag:.0f} ms of that was injected on purpose — "
+              f"baseline would be ~{lag - args.inject_lag:.0f} ms)")
     if rms > 0.2:
         print("  POOR FIT — the hand was not really tracking the dot.")
         print("  Discard this run rather than believing the number.")
