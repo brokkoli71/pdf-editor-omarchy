@@ -1004,21 +1004,22 @@ when something lands, fold its invariants upward and delete it from here rather
 than writing a line about having finished it. The chronology lives in
 `ideas.csv` and git.
 
-**START HERE (2026-08-10). The branch is two commits of unvalidated work on
-top of an already-unvalidated branch, and the next session is a VALIDATION
-session, not a feature one.** In order:
+**START HERE (2026-08-10). The branch is unvalidated work, and the current
+session is a VALIDATION session, not a feature one.** In order:
 
-1. **The live-smoothing A/B** — the "Smooth while drawing" switch in the pen
-   popover, same sentence written each way. This is the only open question on
-   row 143 and it **gates prediction** (row 139), which is deferred behind it
-   by the user's decision: both act on the line near the nib, so judging
-   prediction against the old raw live line would only have to be redone.
-2. **The rest of `notes/validation-session.md`** — the stylus block (row 135,
+1. **Prediction (row 139)** — now unblocked, since live smoothing was accepted.
+   A/B 0 vs a value on one sentence, check overshoot at a sharp cusp and a fast
+   tight "o", and check it is inert when writing slowly.
+2. **Persist the pen-popover settings** — session-scoped today, so a value the
+   user has just chosen is gone on restart.
+3. **The rest of `notes/validation-session.md`** — the stylus block (row 135,
    nothing verified, and re-read its warning about the stylus/HDMI mapping
    first), the merge drops (row 123), the divider gesture (row 130), and
    rows 140–142.
 
-*Accepted 2026-08-10 and off the list: dot size and shape (rows 143/144),
+*Accepted 2026-08-10 and off the list: live smoothing ON (row 143 — including
+no seam on a long stroke and a snapped rectangle staying crisp; the tail-damping
+follow-up is therefore NOT to be built), dot size and shape (rows 143/144),
 pointer hiding. Smear trim was tried at every setting with no felt difference
 — left at its default, and not to be tuned further without a new reason.*
 
@@ -1054,17 +1055,16 @@ one validation session; `notes/validation-session.md` is its checklist.**
   PDF grid-divider commit/undo/redo are unit-tested (`TestShapeRecognition`,
   `TestGridDivider`); the dwell gestures need the app. Hand the user a
   checklist.
-- **Row 139's ink FEEL is parked, not finished** — the pipeline itself is
-  settled (see "The ink pipeline" above), but four values have never been
-  judged by hand: the Smear trim (measurement says start at 15–25),
-  `INK_DOT_BOOST` (2.1, asked for bigger twice), whether the pointer really
-  hides for a whole stroke, and prediction now that it is damped. **Judge them
-  as one pass, after row 143's live smoothing** — all four are about the line
-  near the nib, which live smoothing has just changed, so judging them against
-  the old raw live line only means doing it twice. **Prediction is explicitly
-  deferred behind it** (the user's call, 2026-08-09). The
-  pen-popover settings are session-scoped and will want persisting once values
-  are chosen. Measurements and the reasoning are in `ideas.csv` row 139 and
+- **Row 139's ink FEEL is one value from finished** — the pipeline is settled
+  (see "The ink pipeline" above) and the smear trim, dot size, pointer hiding
+  and live smoothing have all been judged. **Only prediction is left**, now
+  unblocked: it is damped (`PREDICT_SMOOTH`) and off by default, and it is
+  judged by A/B at 0 vs a value on one sentence, overshoot at a sharp cusp, a
+  fast tight "o" (what the arc extrapolation exists for), and inertness when
+  writing slowly. The discriminator is that prediction never reaches the file,
+  so ink still wrong *after* the lift is not prediction. The pen-popover
+  settings are session-scoped and want persisting once a value is chosen.
+  Measurements and reasoning are in `ideas.csv` row 139 and
   `notes/ink-quality-plan.md`. **Deliberately NOT built, needs the user's
   call:** stroke-onset recovery — it invents ink that was never measured.
 
