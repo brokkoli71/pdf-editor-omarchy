@@ -89,6 +89,7 @@ export class Surface {
     this.docMode = "pdf";       // routing NEVER reads bindings.mode
     this.onChange = opts.onChange || (() => {});
     this.onPageChange = opts.onPageChange || (() => {});
+    this.onNotesRestored = opts.onNotesRestored || (() => {});
 
     // The document, and which page is in front. Sidemark shows ONE page at a
     // time and flips between them; it is not a continuous scroll.
@@ -1021,6 +1022,7 @@ export class Surface {
    * front now. Undo also brings you to the page it changed: a Ctrl+Z whose
    * effect you cannot see reads as nothing having happened. */
   _opStrokes(op) {
+    if (op.type === "notes") return null;   // a model op, not a stroke op
     if (!this.doc) return this.strokes;
     if (op.page !== this.pageIndex) this.setPage(op.page);
     return this.doc.strokesFor(op.page);
@@ -1030,6 +1032,13 @@ export class Surface {
     const op = this.undoStack.pop();
     if (!op) return;
     const strokes = this._opStrokes(op);
+    if (op.type === "notes") {
+      this.doc.notes.restore(op.before);
+      this.redoStack.push(op);
+      this.onNotesRestored();
+      this.onChange();
+      return;
+    }
     if (op.type === "draw") {
       const i = strokes.lastIndexOf(op.stroke);
       if (i >= 0) strokes.splice(i, 1);
@@ -1065,6 +1074,13 @@ export class Surface {
     const op = this.redoStack.pop();
     if (!op) return;
     const strokes = this._opStrokes(op);
+    if (op.type === "notes") {
+      this.doc.notes.restore(op.after);
+      this.undoStack.push(op);
+      this.onNotesRestored();
+      this.onChange();
+      return;
+    }
     if (op.type === "draw") {
       strokes.push(op.stroke);
     } else if (op.type === "erase") {

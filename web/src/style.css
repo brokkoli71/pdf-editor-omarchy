@@ -227,6 +227,9 @@ button:disabled:hover { background: transparent; }
 }
 #sidebar[hidden] { display: none; }
 
+.side-bookmarks { padding: 0 10px 6px; font-size: 12px; color: var(--dim); margin: 0; }
+.side-bookmarks[hidden] { display: none; }
+
 .side-switch { padding: 8px; }
 .side-switch[hidden] { display: none; }
 .side-switch > button { flex: 1; font-size: 13px; min-height: 28px; }
@@ -390,8 +393,26 @@ button:disabled:hover { background: transparent; }
 }
 #paned.full-notes > #divider:hover::before { opacity: 1; }
 
+#notes-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--view-bg);
+  min-height: 0;
+}
+.notes-header {
+  flex: none;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--separator);
+  background: var(--window-bg);
+}
+.notes-header .check { margin: 0; font-size: 13px; color: var(--dim); }
+.notes-header[hidden] { display: none; }
+
 #notes {
   flex: 1;
+  min-height: 0;
   min-width: 0;
   background: var(--view-bg);
   overflow: hidden;
@@ -505,6 +526,19 @@ hr { border: none; border-top: 1px solid var(--separator); margin: 10px 0 2px; w
   font-size: 12px; color: var(--dim); border-radius: 5px;
 }
 .binding button:hover { background: var(--btn-hover); color: inherit; }
+
+.name-popover { top: 55px; right: 14px; width: 260px; }
+.name-popover input[type="text"] {
+  font: inherit; color: inherit; background: var(--btn-bg);
+  border: none; border-radius: 6px; padding: 6px 9px; min-height: 32px;
+  width: 100%;
+}
+.name-popover input:focus { outline: 2px solid var(--accent-bg); outline-offset: -1px; }
+#bookmark-btn.marked { color: var(--accent-bg); }
+#bookmark-btn.marked svg path { fill: currentColor; }
+
+/* a bookmark row in the outline */
+.outline-row .star { color: var(--accent-bg); font-size: 11px; flex: none; }
 
 /* ── toast ───────────────────────────────────────────────────────────────── */
 

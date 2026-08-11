@@ -159,6 +159,88 @@ export class NotesModel {
   isBookmarked(idx) { return idx in this._bookmarks; }
   isHidden(idx) { return this._hidden.has(idx); }
 
+  /** Mark a page. An empty name means "derive one for display" — a stored name
+   * only appears once you have renamed it. */
+  setBookmark(idx, name = "") {
+    this._bookmarks[idx] = String(name || "").split(/\s+/).join(" ").trim();
+  }
+
+  dropBookmark(idx) { delete this._bookmarks[idx]; }
+
+  storedBookmarkName(idx) { return this._bookmarks[idx] ?? null; }
+
+  /** The label for a bookmark: the stored name if it was renamed, else DERIVED
+   * from the page's own first line, else its chapter, else the page number.
+   *
+   * Derived rather than stored, so editing notes cannot leave a label
+   * describing what used to be there. Renaming stores one, and that then wins. */
+  bookmarkLabel(idx, chapter = null) {
+    const stored = this._bookmarks[idx];
+    if (stored) return stored;
+    const own = (this.ownText(idx) || "").trim().split("\n")[0].trim();
+    if (own) return own.replace(/^#+\s*/, "").slice(0, 60);
+    if (chapter) return chapter;
+    return `Page ${idx + 1}`;
+  }
+
+  /** Every bookmarked page, in page order. */
+  bookmarkPages() {
+    return Object.keys(this._bookmarks).map(Number).sort((a, b) => a - b);
+  }
+
+  /** Continue this page from the one before it AND carry the run on through
+   * every following page that has nothing of its own to say.
+   *
+   * One tick is meant to cover a whole run of slides — the point of the feature
+   * is one set of notes across five pages, and asking for five clicks is asking
+   * for the thing it exists to avoid. The stop condition is a page that ALREADY
+   * has notes: absorbing those into the run is the one outcome you cannot see
+   * coming from the checkbox you clicked. */
+  linkForward(idx, pageCount) {
+    if (!this.link(idx)) return [];
+    const linked = [idx];
+    let next = idx + 1;
+    while (next < pageCount && !this.ownText(next).trim()) {
+      if (!this._links.has(next)) {
+        this._links.add(next);
+        linked.push(next);
+      }
+      next += 1;
+    }
+    return linked;
+  }
+
+  /** Break the run at this page and every page after it. */
+  unlinkForward(idx) {
+    const broken = [];
+    let next = idx;
+    while (this._links.has(next)) {
+      this._links.delete(next);
+      broken.push(next);
+      next += 1;
+    }
+    return broken;
+  }
+
+  /** The whole model, copied — undo's record of a LINK change. Linking MERGES
+   * two bodies, so there is no page-and-text pair that describes it: reversing
+   * means putting the split back. */
+  snapshot() {
+    return {
+      notes: { ...this._notes },
+      links: new Set(this._links),
+      bookmarks: { ...this._bookmarks },
+      hidden: new Set(this._hidden),
+    };
+  }
+
+  restore(snap) {
+    this._notes = { ...snap.notes };
+    this._links = new Set(snap.links);
+    this._bookmarks = { ...snap.bookmarks };
+    this._hidden = new Set(snap.hidden);
+  }
+
   // ── serialisation ──────────────────────────────────────────────────────────
 
   /** The attribute text of one page's marker. One builder, so the writer and

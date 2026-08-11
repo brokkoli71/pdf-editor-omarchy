@@ -11,6 +11,8 @@ export class Sidebar {
     this.onDropFiles = opts.onDropFiles;
     this.onMovePage = opts.onMovePage || (() => {});
     this.onDeletePage = opts.onDeletePage || (() => {});
+    this.onDropBookmark = opts.onDropBookmark || (() => {});
+    this.showBookmarks = opts.showBookmarks !== false;
     this.doc = null;
     this.page = 0;
     this.view = "pages";
@@ -25,6 +27,15 @@ export class Sidebar {
 
     this.pagesBtn.addEventListener("click", () => this.setView("pages"));
     this.outlineBtn.addEventListener("click", () => this.setView("outline"));
+    const box = root.querySelector("#side-bookmarks");
+    if (box) {
+      box.checked = this.showBookmarks;
+      box.addEventListener("change", () => {
+        this.showBookmarks = box.checked;
+        if (opts.onShowBookmarks) opts.onShowBookmarks(box.checked);
+        this.rebuild();
+      });
+    }
     this._installDrop();
   }
 
@@ -40,10 +51,47 @@ export class Sidebar {
   setDoc(doc) {
     this.doc = doc;
     this._thumbCentred = null;      // a document change clears it
-    const hasOutline = !!(doc && doc.outline.length);
+    // The switch appears when the document has a TOC *or* bookmarks — a lecture
+    // deck rarely has a TOC and is exactly what you bookmark your way around.
+    const marks = doc ? doc.notes.bookmarkPages() : [];
+    const hasOutline = !!(doc && (doc.outline.length || marks.length));
     this.switchEl.hidden = !hasOutline;
+    const box = this.root.querySelector("#side-bookmarks-row");
+    if (box) box.hidden = !marks.length;
     if (!hasOutline && this.view === "outline") this.setView("pages");
     else this.rebuild();
+  }
+
+  /** Bookmarks merged INTO the outline's own order, never sorted with it: each
+   * is emitted before the first entry starting AFTER its page, and one on the
+   * same page as an entry follows it.
+   *
+   * Re-sorting the whole list by page looks identical on a well-formed outline
+   * and silently hands a chapter drag the wrong span on one whose entries are
+   * out of page order. */
+  _mergedOutline() {
+    const doc = this.doc;
+    const entries = doc.outline.map((e) => ({ ...e, kind: "entry" }));
+    if (!this.showBookmarks) return entries;
+    const marks = doc.notes.bookmarkPages().map((page) => ({
+      kind: "bookmark",
+      page,
+      level: 0,
+      title: doc.notes.bookmarkLabel(page, this._chapterFor(page)),
+    }));
+    const out = entries.slice();
+    for (const mark of marks) {
+      let at = out.findIndex((e) => e.kind === "entry" && e.page > mark.page);
+      if (at < 0) at = out.length;
+      out.splice(at, 0, mark);
+    }
+    return out;
+  }
+
+  _chapterFor(page) {
+    let best = null;
+    for (const e of this.doc.outline) if (e.page <= page) best = e.title;
+    return best;
   }
 
   setPage(page) {
@@ -174,7 +222,7 @@ export class Sidebar {
   }
 
   _buildOutline() {
-    const entries = this.doc.outline;
+    const entries = this._mergedOutline();
     // WHERE YOU ARE IS A LINE when no entry names your page (row 153): on an
     // entry's own page that row gets the bar and a bold title; anywhere else a
     // rule carrying the page number is inserted BETWEEN the two entries you
@@ -196,6 +244,16 @@ export class Sidebar {
       row.style.paddingLeft = `${10 + entry.level * 14}px`;
       row.dataset.page = String(entry.page);
 
+      if (entry.kind === "bookmark") {
+        const star = document.createElement("span");
+        star.className = "star";
+        star.textContent = "★";
+        row.appendChild(star);
+        row.addEventListener("contextmenu", (ev) => {
+          ev.preventDefault();
+          this.onDropBookmark(entry.page);
+        });
+      }
       const title = document.createElement("span");
       title.className = "outline-title";
       title.textContent = entry.title;

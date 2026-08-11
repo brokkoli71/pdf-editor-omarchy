@@ -134,6 +134,11 @@ const heldMods = { ctrl: false, shift: false, alt: false };
 
 const surface = new Surface(document.getElementById("page"), pen, bindings, {
   onChange: () => { refreshUndo(); markDirty(true); rememberSession(); },
+  onNotesRestored: () => {
+    notes.showPage(surface.pageIndex);
+    syncPageChrome();
+    sidebar.setDoc(surface.doc);
+  },
   onPageChange: (page) => {
     sidebar.setPage(page);
     notes.showPage(page);
@@ -151,6 +156,9 @@ const sidebar = new Sidebar(document.getElementById("sidebar"), {
   onDropFiles: (files, gap) => importAt(files, gap),
   onMovePage: (from, to) => movePage(from, to),
   onDeletePage: (index) => removePage(index),
+  onDropBookmark: (page) => dropBookmark(page),
+  showBookmarks: store.get("outline_bookmarks") !== false,
+  onShowBookmarks: (on) => store.set("outline_bookmarks", on),
 });
 
 const search = new Search(
@@ -173,6 +181,7 @@ wireKeys();
 wireDocument();
 wireDivider();
 wireSearch();
+wireBookmarks();
 refreshToolBindings();
 refreshUndo();
 
@@ -311,6 +320,7 @@ function syncPageChrome() {
   const doc = surface.doc;
   const counter = document.getElementById("page-counter");
   counter.textContent = doc ? `${surface.pageIndex + 1} / ${doc.pageCount}` : "—";
+  syncBookmarkChrome();
   document.getElementById("prev-page").disabled = !doc || surface.pageIndex <= 0;
   document.getElementById("next-page").disabled =
     !doc || surface.pageIndex >= doc.pageCount - 1;
@@ -511,6 +521,122 @@ async function insertPagesFromPicker() {
     input.value = "";
   };
   input.click();
+}
+
+// ── bookmarks and linked notes ───────────────────────────────────────────────
+
+/** The header toggle and the notes checkbox both belong to the WINDOW, not to
+ * the page, so there is ONE place that points them at the current page. */
+function syncBookmarkChrome() {
+  const doc = surface.doc;
+  const btn = document.getElementById("bookmark-btn");
+  const marked = !!doc && doc.notes.isBookmarked(surface.pageIndex);
+  btn.classList.toggle("marked", marked);
+  btn.setAttribute("aria-pressed", String(marked));
+  btn.title = marked ? "Rename this bookmark (Ctrl+B)" : "Bookmark this page (Ctrl+B)";
+
+  const row = document.getElementById("link-check-row");
+  const check = document.getElementById("link-check");
+  // linked runs are a PDF-only idea: a text sheet has no page structure for a
+  // run to span
+  row.hidden = !doc || doc.pageCount <= 1;
+  check.checked = !!doc && doc.notes.isLinked(surface.pageIndex);
+  check.disabled = !doc || surface.pageIndex === 0;   // page 0 continues nothing
+}
+
+function chapterFor(page) {
+  const doc = surface.doc;
+  if (!doc) return null;
+  let best = null;
+  for (const e of doc.outline) if (e.page <= page) best = e.title;
+  return best;
+}
+
+/** Adding opens the name field with the derived label in it and SELECTED, so
+ * the first keystroke replaces it — a bookmark you must go and rename later is
+ * one you name never. A second press RENAMES; it does not remove. */
+function toggleBookmark() {
+  const doc = surface.doc;
+  if (!doc) return;
+  const page = surface.pageIndex;
+  const pop = document.getElementById("bookmark-popover");
+  const field = document.getElementById("bookmark-name");
+  field.value = doc.notes.bookmarkLabel(page, chapterFor(page));
+  pop.hidden = false;
+  field.focus();
+  field.select();
+  pop.dataset.page = String(page);
+  // the toggle flips itself on the click that opens the field, so cancelling
+  // has to put it back
+  document.getElementById("bookmark-btn").classList.add("marked");
+}
+
+function commitBookmark() {
+  const doc = surface.doc;
+  const pop = document.getElementById("bookmark-popover");
+  const page = Number(pop.dataset.page);
+  const typed = document.getElementById("bookmark-name").value.trim();
+  const derived = doc.notes.bookmarkLabel(page, chapterFor(page));
+  // committing the suggestion UNCHANGED stores no name, or the derived label
+  // would freeze into the file
+  doc.notes.setBookmark(page, typed === derived ? "" : typed);
+  pop.hidden = true;
+  markDirty(true);
+  rememberSession();
+  syncPageChrome();
+  sidebar.setDoc(doc);
+  toast(typed ? `Bookmarked “${typed}”` : `Bookmarked page ${page + 1}`);
+}
+
+function cancelBookmark() {
+  document.getElementById("bookmark-popover").hidden = true;
+  syncPageChrome();      // put the toggle back
+}
+
+function dropBookmark(page) {
+  const doc = surface.doc;
+  if (!doc || !doc.notes.isBookmarked(page)) return;
+  const name = doc.notes.bookmarkLabel(page, chapterFor(page));
+  // Removing ASKS — the name is stored nowhere else, and there is deliberately
+  // no "don't ask again": an opt-out is one stray click from losing the guard
+  // for good.
+  if (!window.confirm(`Remove the bookmark “${name}”?`)) return;
+  doc.notes.dropBookmark(page);
+  markDirty(true);
+  rememberSession();
+  syncPageChrome();
+  sidebar.setDoc(doc);
+}
+
+function toggleLinked(on) {
+  const doc = surface.doc;
+  if (!doc) return;
+  const page = surface.pageIndex;
+  const before = doc.notes.snapshot();
+  if (on) doc.notes.linkForward(page, doc.pageCount);
+  else doc.notes.unlinkForward(page);
+  // Ctrl+Z reaches it as a whole-model snapshot, because linking MERGES two
+  // bodies and no page/text pair describes that
+  surface.undoStack.push({ type: "notes", page, before,
+                           after: doc.notes.snapshot() });
+  surface.redoStack.length = 0;
+  notes.showPage(page);
+  markDirty(true);
+  rememberSession();
+  syncPageChrome();
+  refreshUndo();
+}
+
+function wireBookmarks() {
+  document.getElementById("bookmark-btn").addEventListener("click", toggleBookmark);
+  document.getElementById("bookmark-ok").addEventListener("click", commitBookmark);
+  document.getElementById("bookmark-cancel").addEventListener("click", cancelBookmark);
+  document.getElementById("bookmark-name").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); commitBookmark(); }
+    else if (e.key === "Escape") { e.preventDefault(); cancelBookmark(); }
+  });
+  document.getElementById("link-check").addEventListener("change", (e) =>
+    toggleLinked(e.target.checked));
 }
 
 // ── search ───────────────────────────────────────────────────────────────────
@@ -875,6 +1001,9 @@ function wireKeys() {
     if ((e.ctrlKey || e.metaKey) && key === "z") {
       e.preventDefault();
       if (e.shiftKey) surface.redo(); else surface.undo();
+    } else if ((e.ctrlKey || e.metaKey) && key === "b") {
+      e.preventDefault();
+      toggleBookmark();
     } else if ((e.ctrlKey || e.metaKey) && key === "c") {
       // App-level keys belong on the WINDOW so they fire whatever has focus,
       // and the window asks the surface rather than the surface owning the key.

@@ -39,6 +39,9 @@
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3l5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button>
     </div>
+    <button class="flat icon-btn" id="bookmark-btn" title="Bookmark this page (Ctrl+B)" aria-label="Bookmark page" aria-pressed="false">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.2l1.8 3.7 4 .6-2.9 2.8.7 4L8 11.4l-3.6 1.9.7-4L2.2 6.5l4-.6z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+    </button>
     <button class="flat icon-btn" id="undo-btn" title="Undo (Ctrl+Z)" aria-label="Undo">
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 7h6.5a3.5 3.5 0 1 1 0 7H7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M5.5 4.2 2.8 7l2.7 2.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
@@ -74,6 +77,9 @@
       <button id="side-pages" class="selected">Pages</button>
       <button id="side-outline">Outline</button>
     </div>
+    <label class="check side-bookmarks" id="side-bookmarks-row" hidden>
+      <input type="checkbox" id="side-bookmarks" checked> Bookmarks
+    </label>
     <div id="side-list"></div>
   </aside>
   <div id="paned">
@@ -85,7 +91,14 @@
       </div>
     </div>
     <div id="divider" role="separator" aria-label="Resize notes" tabindex="0"></div>
-    <div id="notes"></div>
+    <div id="notes-col">
+      <div class="notes-header" id="notes-header">
+        <label class="check" id="link-check-row" title="Continue this page's notes from the page before it. One tick carries the run on through every following page that has nothing of its own.">
+          <input type="checkbox" id="link-check"> Continues previous page
+        </label>
+      </div>
+      <div id="notes"></div>
+    </div>
   </div>
 </main>
 
@@ -145,6 +158,20 @@
     </div>
     <p class="hint">Click a tool with the button you want it on.</p>
     <div id="bindings-list"></div>
+  </div>
+</div>
+
+<!-- Naming IS the add: nothing touches the model until Enter, so Escape leaves
+     the page unmarked and the file not even dirty. -->
+<div class="popover name-popover" id="bookmark-popover" role="dialog" aria-label="Name bookmark" hidden>
+  <div class="popover-body">
+    <label class="dim" for="bookmark-name">Bookmark name</label>
+    <input type="text" id="bookmark-name" autocomplete="off">
+    <div class="row">
+      <span class="grow"></span>
+      <button class="flat small" id="bookmark-cancel">Cancel</button>
+      <button class="small suggested" id="bookmark-ok">Save</button>
+    </div>
   </div>
 </div>
 
