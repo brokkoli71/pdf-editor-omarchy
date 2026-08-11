@@ -14327,6 +14327,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._bookmark_pop = None
         self._bookmark_name_pop = None      # the "name this bookmark" popup
         self._bookmark_name_entry = None
+        self._bookmark_list_scroll = None   # the popover's list, for scrolling
+        self._bookmark_list_box = None      # to a row and renaming it in place
         self._toc_bookmarks_updating = False  # guards the ★-filter box
         # set while a document is loading: the load fires a page-0 change, and
         # remembering THAT would erase the position we are about to restore
@@ -15619,6 +15621,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         toc_click = Gtk.GestureClick()
         toc_click.connect("pressed", lambda *a: s.win._on_toc_list_pressed(*a))
         s._toc_list.add_controller(toc_click)
+        # F2 renames the selected bookmark row, in place (row 153)
+        toc_keys = Gtk.EventControllerKey()
+        toc_keys.connect("key-pressed", lambda *a: s.win._on_toc_key(*a))
+        s._toc_list.add_controller(toc_keys)
         # dropping documents anywhere in the sidebar imports them as chapters —
         # on the OUTLINE (which has no per-row file target of its own) and on
         # the empty space below the thumbnails alike. The per-thumbnail targets
@@ -16232,13 +16238,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         return True
 
     def _begin_rename(self, row):
-        """Swap the row's label for an entry in place. Enter commits, Escape
-        restores — no dialog, because renaming is a one-word edit and a modal
-        for it would cost more than the rename."""
+        """Swap the row's label for an entry in place. Enter or clicking away
+        commits, Escape restores — no dialog, because renaming is a one-word
+        edit and a modal for it would cost more than the rename. Shared by the
+        bookmark list and the outline's ★ rows (row 153), so both behave alike.
+
+        The name is put back on the ROW rather than through a rebuild while you
+        type: `_rename_bookmark` repopulates the outline, which destroys this
+        very row, so the entry has to come out FIRST."""
         if getattr(row, "_renaming", False):
             return
         idx = row._page_idx
         row._renaming = True
+        # ONE edit's identity, not a bare flag. A focus-leave is delivered
+        # after the fact, so a second rename on the same row can be under way
+        # by the time the first one's leave arrives — with only `_renaming` to
+        # go on, that stale callback passes the guard and commits the text of
+        # an edit that was already cancelled.
+        row._rename_token = token = object()
         entry = Gtk.Entry()
         entry.set_hexpand(True)
         entry.set_text(self._bookmark_label(idx))
@@ -16247,24 +16264,40 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         row._label_widget.set_visible(False)
 
         def finish(commit):
-            if not getattr(row, "_renaming", False):
+            # this edit's token, not the bare flag: a stale focus-leave arriving
+            # after a second rename has begun would otherwise pass the guard and
+            # commit text the user had already cancelled
+            if getattr(row, "_rename_token", None) is not token:
                 return
+            row._rename_token = None
             row._renaming = False
+            text = entry.get_text().strip()
+            # restore the row before committing: a commit repopulates the list
+            # this row belongs to, and touching it afterwards is touching a
+            # widget that has been thrown away
+            row._row_box.remove(entry)
+            row._label_widget.set_visible(True)
             if commit:
                 # committing the DERIVED label as a name would freeze today's
                 # first note line into the file; only a real change is stored
-                text = entry.get_text().strip()
-                self._rename_bookmark(idx, "" if text == self._bookmark_label(idx, "")
-                                      else text)
-            row._row_box.remove(entry)
-            row._label_widget.set_visible(True)
+                self._rename_bookmark(
+                    idx, "" if text == self._bookmark_label(idx, "") else text)
 
+        # kept on the row: the rename has two ends (Enter/focus-out commit,
+        # Escape cancels) and both live in this closure
+        row._finish_rename = finish
         entry.connect("activate", lambda _e: finish(True))
         esc = Gtk.EventControllerKey()
         esc.connect("key-pressed",
                     lambda _c, kv, _kc, _st: (kv == Gdk.KEY_Escape
                                               and (finish(False) or True)))
         entry.add_controller(esc)
+        # clicking away commits, which is what every rename-in-place does.
+        # Escape has already ended the edit by the time focus leaves, and the
+        # `_renaming` guard is what makes the second call a no-op.
+        focus = Gtk.EventControllerFocus()
+        focus.connect("leave", lambda _c: finish(True))
+        entry.add_controller(focus)
         entry.grab_focus()
 
     def _store_bookmark(self, idx, name=""):
@@ -16346,8 +16379,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._bookmark_toggle_item.add_css_class("flat")
         self._bookmark_toggle_item.set_child(
             Gtk.Label(label="Add bookmark", xalign=0))
+        # this item says what it does, so it removes rather than routing through
+        # _toggle_bookmark — whose second click is now "rename", not "remove"
         self._bookmark_toggle_item.connect(
-            "clicked", lambda _b: (pop.popdown(), self._toggle_bookmark()))
+            "clicked", lambda _b: (pop.popdown(), self._bookmark_item_verb()))
         box.append(self._bookmark_toggle_item)
         box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
         scroll, listbox = self._new_bookmark_list()
@@ -16355,19 +16390,84 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         box.append(scroll)
         pop.set_child(box)
 
-        def _popup(*_a):
-            if not self._can_bookmark():
-                return
-            self._bookmark_toggle_item.get_child().set_label(
-                "Remove bookmark"
-                if self.notes_model.is_bookmarked(self.canvas.current_page_idx)
-                else "Add bookmark")
-            self._refresh_bookmark_lists()
-            pop.popup()
-
+        self._bookmark_list_scroll = scroll
+        self._bookmark_list_box = listbox
         lp = Gtk.GestureLongPress()
-        lp.connect("pressed", lambda *_: _popup())
+        lp.connect("pressed", lambda *_: self._open_bookmark_popover())
         button.add_controller(lp)
+
+    def _bookmark_item_verb(self):
+        """The popover's own Add/Remove item — it names the verb, so it does
+        exactly that. Removing still asks (`_drop_bookmark`)."""
+        if not self._can_bookmark():
+            return
+        idx = self.canvas.current_page_idx
+        if self.notes_model.is_bookmarked(idx):
+            self._drop_bookmark(idx)
+        else:
+            self._prompt_bookmark_name(idx, creating=True)
+
+    def _open_bookmark_popover(self, rename_page=None):
+        """Show the bookmark list. With `rename_page`, scroll to that page's row
+        and open its name for editing — which is what a second click on the
+        bookmark button does: the page is already marked, so the useful verb is
+        "say what this is", not "remove it"."""
+        if not self._can_bookmark() or self._bookmark_pop is None:
+            return
+        # Both popovers hang off the bookmark button, and popping one up while
+        # a sibling on the same widget is closing is the GTK4 trap: defer to the
+        # "closed" signal. Reachable by hand — name a bookmark, then click the
+        # button again straight away.
+        naming = self._bookmark_name_pop
+        if naming is not None:
+            naming.connect(
+                "closed",
+                lambda _p: GLib.idle_add(self._open_bookmark_popover,
+                                         rename_page))
+            naming.popdown()
+            return
+        self._bookmark_toggle_item.get_child().set_label(
+            "Remove bookmark"
+            if self.notes_model.is_bookmarked(self.canvas.current_page_idx)
+            else "Add bookmark")
+        self._refresh_bookmark_lists()
+        self._bookmark_pop.popup()
+        if rename_page is None:
+            return
+        # after the popup: the list is rebuilt by the refresh above, and a row
+        # has no allocation to scroll to until the popover has been laid out.
+        # Same retry as the thumbnail strip — at the instant you ask, every row
+        # reports y=0 and the adjustment has nothing to scroll.
+        GLib.idle_add(self._begin_rename_for_page, rename_page)
+
+    def _begin_rename_for_page(self, page, tries=6):
+        row = None
+        child = self._bookmark_list_box.get_first_child()
+        while child is not None:
+            if getattr(child, "_page_idx", None) == page:
+                row = child
+                break
+            child = child.get_next_sibling()
+        if row is None:
+            return GLib.SOURCE_REMOVE
+        if row.get_height() == 0 and tries > 0:
+            # the popover has not been laid out yet, so every row reports height
+            # 0 at the same y and there is nothing to scroll to — ask again
+            # (the thumbnail strip's retry, for the same reason)
+            GLib.timeout_add(16, self._begin_rename_for_page, page, tries - 1)
+            return GLib.SOURCE_REMOVE
+        adj = self._bookmark_list_scroll.get_vadjustment()
+        # the POINT, or nothing at all when the widgets share no root — never a
+        # (ok, x, y) triple, whatever the C signature suggests
+        pt = row.translate_coordinates(self._bookmark_list_box, 0, 0)
+        y = pt[1] if pt else 0
+        # a list that fits needs no scrolling; keeping the row a third of the
+        # way down is what makes the ones around it readable when it does
+        if adj.get_upper() > adj.get_page_size():
+            adj.set_value(max(0, min(y - adj.get_page_size() / 3,
+                                     adj.get_upper() - adj.get_page_size())))
+        self._begin_rename(row)
+        return GLib.SOURCE_REMOVE
 
     def _menu_subpage(self, title, content):
         """A menu stack sub-page: a '← title' back header above the content. The
@@ -17100,20 +17200,29 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         return title or ""
 
     def _toggle_bookmark(self):
-        """The button's whole verb: click adds, click again removes.
+        """The button's whole verb: click marks the page, click again names it.
 
         Adding OPENS THE NAME POPUP with the field selected, so the one gesture
         is "mark this page and say what it is" — a bookmark you had to go and
         rename afterwards is one you name never. **Enter is what creates it**:
         the popup is the add, not a decoration on one that already happened, so
         Escape leaves the page exactly as it was — unmarked, and the file not
-        even dirty. Removing asks first (`_drop_bookmark`) — it destroys a name
-        that exists nowhere else."""
+        even dirty.
+
+        **Clicking again does NOT remove it.** The page is already marked, so
+        the useful verb is "say what this is": the list opens, scrolled to this
+        page, with its name selected. Removing is destructive and lives where it
+        reads as one — the ✕ in that list, which asks first. One button that
+        both marks and destroys put a confirmation dialog in front of you for a
+        stray click on a toggle."""
         if not self._can_bookmark():
             return
         idx = self.canvas.current_page_idx
         if self.notes_model.is_bookmarked(idx):
-            self._drop_bookmark(idx)
+            self._open_bookmark_popover(rename_page=idx)
+            # the toggle flipped itself on the click that got here; the page is
+            # still bookmarked, so put it back
+            self._update_bookmark_ui()
             return
         self._prompt_bookmark_name(idx, creating=True)
 
@@ -17212,7 +17321,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._bookmark_updating = False
         page = self.canvas.current_page_idx + 1
         self._bookmark_btn.set_tooltip_text(
-            (f"Remove the bookmark on page {page}" if on
+            (f"Rename the bookmark on page {page}" if on
              else f"Bookmark page {page}")
             + " (Ctrl+B) — hold for the list of bookmarks")
 
@@ -17863,7 +17972,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if self._toc_thumbs:
             self._toc_list.unselect_all()
 
-    def _populate_toc(self):
+    def _populate_toc(self, force_scroll=False):
+        """Rebuild the sidebar. `force_scroll` when the page you are looking at
+        must be brought into view whatever the strip was doing — switching
+        Outline▸Pages is the case: the remembered scroll belongs to the OTHER
+        view, and `_thumb_centred_page` can still name this page from the last
+        time the strip was up, so without it the strip restores an outline
+        scroll position and lands nowhere near the page you are on."""
         # a rebuild throws every row away, so remember where the strip was
         # standing: a bookmark added on page 200 must not send it back to the top
         keep_scroll = self._toc_scroll.get_vadjustment().get_value()
@@ -17905,7 +18020,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 # a fresh document (or a page turn) should bring it into view,
                 # a mere refresh — a bookmark, a link, a rename — must not move
                 idx = self.canvas.current_page_idx
-                fresh = self._thumb_centred_page != idx
+                fresh = force_scroll or self._thumb_centred_page != idx
                 self._select_thumb(idx, scroll=fresh)
                 if not fresh:
                     self._restore_toc_scroll(keep_scroll)
@@ -17913,7 +18028,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 "Toggle outline (Ctrl+T)" if self._has_toc else
                 "Toggle page thumbnails (Ctrl+T) — no outline in this document")
         else:
-            self._toc_list.set_selection_mode(Gtk.SelectionMode.NONE)
+            # SINGLE, not NONE: F2 renames the bookmark row you are on, and
+            # "the row you are on" has to be something you can see. The
+            # highlight is the answer to "what would F2 rename?"
+            self._toc_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
             self._toc_scroll.set_size_request(230, -1)
             # a chapter (level-1 entry) owns the pages up to the next one, and
             # dragging its row moves that whole RANGE (row 123)
@@ -17945,19 +18063,29 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                         label="★ " + (text or f"Page {idx + 1}"), xalign=0)
                     lab.add_css_class("accent")
                     lab.set_ellipsize(Pango.EllipsizeMode.END)
-                    lab.set_margin_start(8 + 14 * min(level_here, 3))
-                    lab.set_margin_end(8)
+                    lab.set_hexpand(True)
                     lab.set_margin_top(4)
                     lab.set_margin_bottom(4)
+                    # a Box around the label, not a bare label: F2 renames in
+                    # place by swapping an entry in beside it (`_begin_rename`),
+                    # and that needs a container to swap into
+                    line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                                   spacing=4)
+                    line.set_margin_start(8 + 14 * min(level_here, 3))
+                    line.set_margin_end(8)
+                    line.append(lab)
                     r = Gtk.ListBoxRow()
-                    r.set_child(lab)
+                    r.set_child(line)
                     r.toc_page = idx
                     r._bookmark_idx = idx
+                    r._page_idx = idx        # what _begin_rename renames
+                    r._label_widget = lab
+                    r._row_box = line
+                    self._attach_bookmark_row_menu(r)
                     r.set_tooltip_text(
                         f"Your bookmark on page {idx + 1}"
                         + (f": {text}" if text else "")
-                        + " — click to jump (rename or remove it from the "
-                          "bookmark list, Ctrl+B)")
+                        + " — click to jump, F2 to rename")
                     self._toc_list.append(r)
 
             for level, title, page in toc:
@@ -18054,8 +18182,60 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._toast(f"Moved chapter “{title}”")
 
     def _on_toc_view_toggled(self, _btn):
+        # switching the view is a fresh look at the strip, so it lands on the
+        # page you are on rather than restoring the other view's scroll
         if self.canvas.document:
-            self._populate_toc()
+            self._populate_toc(force_scroll=True)
+
+    def _attach_bookmark_row_menu(self, row):
+        """Right-click a ★ row for its two verbs. The same two the row already
+        has (F2 renames, the list's ✕ removes) — a menu is where you look for
+        them when you do not know the key."""
+        click = Gtk.GestureClick()
+        click.set_button(Gdk.BUTTON_SECONDARY)
+
+        def pressed(gesture, _n, x, y):
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            # right-clicking a row acts on THAT row, so select it first: the
+            # menu's verbs and F2 must never disagree about their target
+            self._toc_list.select_row(row)
+            idx = row._bookmark_idx
+            menu = Gtk.Popover()
+            menu.set_parent(row)
+            menu.set_has_arrow(False)
+            menu.set_pointing_to(Gdk.Rectangle(x=int(x), y=int(y),
+                                               width=1, height=1))
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            box.set_margin_start(4); box.set_margin_end(4)
+            box.set_margin_top(4); box.set_margin_bottom(4)
+            for label, action in (
+                    ("Rename (F2)", lambda: self._begin_rename(row)),
+                    ("Delete", lambda: self._drop_bookmark(idx))):
+                item = Gtk.Button()
+                item.add_css_class("flat")
+                item.set_child(Gtk.Label(label=label, xalign=0))
+                if label == "Delete":
+                    item.add_css_class("destructive-action-text")
+                item.connect("clicked",
+                             lambda _b, act=action: (menu.popdown(), act()))
+                box.append(item)
+            menu.set_child(box)
+            menu.connect("closed", lambda _p: menu.unparent())
+            menu.popup()
+
+        click.connect("pressed", pressed)
+        row.add_controller(click)
+
+    def _on_toc_key(self, _ctrl, keyval, _keycode, _state):
+        """F2 renames the outline's selected ★ row in place. An outline row of
+        the document's own is not ours to rename, so it falls through."""
+        if keyval != Gdk.KEY_F2:
+            return False
+        row = self._toc_list.get_selected_row()
+        if row is None or getattr(row, "_bookmark_idx", None) is None:
+            return False
+        self._begin_rename(row)
+        return True
 
     def _on_toc_bookmarks_toggled(self, btn):
         """Show or hide the ★ rows. Persisted app-wide, like `show_comments`:

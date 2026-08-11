@@ -45,6 +45,15 @@ sidemark.RECENT_PATH = os.path.join(
 
 # ── helper: create a minimal single-page PDF in memory ───────────────────────
 
+def _rows_of(container):
+    """Every direct child of a GTK container, as a list."""
+    out, child = [], container.get_first_child()
+    while child is not None:
+        out.append(child)
+        child = child.get_next_sibling()
+    return out
+
+
 def make_pdf(path, n_pages=1, width=595, height=842):
     surface = cairo.PDFSurface(path, width, height)
     ctx = cairo.Context(surface)
@@ -2456,11 +2465,13 @@ class TestBookmarksInWindow(unittest.TestCase):
             win._go_to_page(2)
             self.assertTrue(win._bookmark_btn.get_active())
             self.assertEqual(win.notes_model.bookmarks(), [(2, "")])
-            # removing ASKS first (a bookmark's name is stored nowhere else), so
-            # the verb alone leaves the mark in place until the dialog is
-            # answered — see test_removing_a_bookmark_asks_first
+            # a SECOND click renames — it does not remove. Removing is
+            # destructive and lives in the list, where it reads as one.
             win._toggle_bookmark()
             self.assertEqual(win.notes_model.bookmarks(), [(2, "")])
+            self.assertTrue(win._bookmark_btn.get_active(),
+                            "the page is still bookmarked, so the toggle that "
+                            "flipped itself on the click must go back")
             win._do_drop_bookmark(2)
             self.assertEqual(win.notes_model.bookmarks(), [])
             self.assertFalse(win._bookmark_btn.get_active())
@@ -2530,14 +2541,38 @@ class TestBookmarksInWindow(unittest.TestCase):
         def body(win, _pdf):
             win._go_to_page(2)
             self._add_bookmark(win, "Keep me")
-            # the header button / Ctrl+B
-            win._toggle_bookmark()
-            self.assertEqual(win.notes_model.bookmarks(), [(2, "Keep me")])
             # the ✕ in the bookmark list
             win._drop_bookmark(2)
             self.assertEqual(win.notes_model.bookmarks(), [(2, "Keep me")])
             # only the confirmed action removes it
             win._do_drop_bookmark(2)
+            self.assertEqual(win.notes_model.bookmarks(), [])
+
+        self._run_in_window(4, body)
+
+    def test_a_second_click_does_not_remove_the_bookmark(self):
+        """A stray click on a toggle must not destroy a name. What the second
+        click DOES instead (open the list on this page, ready to rename) is
+        widget choreography — asserted where it is cheap, on the row itself, in
+        TestBookmarksInOutline."""
+        def body(win, _pdf):
+            win._go_to_page(2)
+            self._add_bookmark(win, "Chapter start")
+            win._toggle_bookmark()                    # the second click
+            self.assertEqual(win.notes_model.bookmarks(), [(2, "Chapter start")])
+            self.assertTrue(win._bookmark_btn.get_active())
+
+        self._run_in_window(4, body)
+
+    def test_the_popovers_own_item_still_removes(self):
+        """It names the verb, so it does exactly that — and still asks."""
+        def body(win, _pdf):
+            win._go_to_page(1)
+            self._add_bookmark(win)
+            win._bookmark_item_verb()                 # "Remove bookmark"
+            self.assertEqual(win.notes_model.bookmarks(), [(1, "")],
+                             "removal must go through the confirmation")
+            win._do_drop_bookmark(1)
             self.assertEqual(win.notes_model.bookmarks(), [])
 
         self._run_in_window(4, body)
@@ -8356,15 +8391,16 @@ class TestSearchScan(unittest.TestCase):
         self._run(body)
 
     def test_a_new_term_abandons_the_old_scan(self):
+        """The hits of the term you have stopped typing must not survive into
+        the results for the one you are typing now."""
         def body(win):
             self._type(win, "needle")
             self.assertFalse(win._search_scan_done())
-            self._type(win, "nothing")
-            self.assertEqual(win._search_query, "nothing")
+            self._type(win, "haystack")               # matches nothing
+            self.assertEqual(win._search_query, "haystack")
             self._drain(win)
-            self.assertTrue(all(m[0] != "pdf" or m[1] not in (3, 20, 35)
-                                for m in win._search_matches)
-                            or bool(win._search_matches))
+            self.assertEqual(win._search_matches, [])
+            self.assertEqual(win._search_hits, {})
 
         self._run(body)
 
@@ -8406,11 +8442,18 @@ class TestBookmarksInOutline(unittest.TestCase):
     and it is exactly the document you bookmark your way around."""
 
     def _rows(self, win):
-        out, child = [], win._toc_list.get_first_child()
-        while child is not None:
-            lab = child.get_child()
-            out.append(lab.get_label() if isinstance(lab, Gtk.Label) else "")
-            child = child.get_next_sibling()
+        """Each outline row's text. A ★ row wraps its label in a Box (F2
+        renames in place, which needs something to swap the entry into), so
+        look one level down when the child is not the label itself."""
+        out = []
+        for row in _rows_of(win._toc_list):
+            child = row.get_child()
+            if isinstance(child, Gtk.Label):
+                out.append(child.get_label())
+                continue
+            lab = next((w for w in _rows_of(child)
+                        if isinstance(w, Gtk.Label)), None)
+            out.append(lab.get_label() if lab is not None else "")
         return out
 
     def _run(self, body, toc=None, pages=4):
@@ -8484,6 +8527,92 @@ class TestBookmarksInOutline(unittest.TestCase):
             self.assertIn("★ Kept", self._rows(win))
 
         self._run(body, toc=[[1, "Chapter One", 1]])
+
+    def test_f2_renames_the_selected_row_in_place(self):
+        """No popup: the name itself becomes an entry, selected, and Enter
+        commits. The outline list is SINGLE-select so that "the row you are on"
+        is something you can see — the highlight answers "what would F2
+        rename?"."""
+        def body(win):
+            win.notes_model.add_bookmark(1, "Old name")
+            win._populate_toc()
+            row = next(r for r in _rows_of(win._toc_list)
+                       if getattr(r, "_bookmark_idx", None) == 1)
+            win._toc_list.select_row(row)
+            handled = win._on_toc_key(None, Gdk.KEY_F2, 0, 0)
+            self.assertTrue(handled)
+            entry = next(w for w in _rows_of(row._row_box)
+                         if isinstance(w, Gtk.Entry))
+            self.assertEqual(entry.get_text(), "Old name")
+            bounds = entry.get_selection_bounds()
+            self.assertEqual((bounds[-2], bounds[-1]), (0, len("Old name")))
+            entry.set_text("New name")
+            entry.emit("activate")
+            self.assertEqual(win.notes_model.bookmark_name(1), "New name")
+            self.assertIn("★ New name",
+                          [lbl for lbl in self._rows(win)])
+
+        self._run(body)
+
+    def test_f2_on_the_documents_own_outline_row_does_nothing(self):
+        """The PDF's outline is not ours to rename."""
+        def body(win):
+            win.notes_model.add_bookmark(1, "Mine")
+            win._populate_toc()
+            row = next(r for r in _rows_of(win._toc_list)
+                       if getattr(r, "_bookmark_idx", None) is None)
+            win._toc_list.select_row(row)
+            self.assertFalse(win._on_toc_key(None, Gdk.KEY_F2, 0, 0))
+
+        self._run(body, toc=[[1, "Chapter One", 1]])
+
+    def test_escape_leaves_the_name_alone_and_clicking_away_commits(self):
+        def body(win):
+            win.notes_model.add_bookmark(1, "Keep")
+            win._populate_toc()
+
+            def row_for(page):
+                return next(r for r in _rows_of(win._toc_list)
+                            if getattr(r, "_bookmark_idx", None) == page)
+
+            row = row_for(1)
+            win._begin_rename(row)
+            entry = next(w for w in _rows_of(row._row_box)
+                         if isinstance(w, Gtk.Entry))
+            entry.set_text("Discarded")
+            row._finish_rename(False)                 # Escape
+            self.assertEqual(win.notes_model.bookmark_name(1), "Keep")
+            self.assertFalse(getattr(row, "_renaming", False))
+
+            row = row_for(1)
+            win._begin_rename(row)
+            entry = next(w for w in _rows_of(row._row_box)
+                         if isinstance(w, Gtk.Entry))
+            entry.set_text("Committed")
+            row._finish_rename(True)                  # clicking away / Enter
+            self.assertEqual(win.notes_model.bookmark_name(1), "Committed")
+
+        self._run(body)
+
+    def test_switching_to_pages_lands_on_the_page_you_are_on(self):
+        """The remembered scroll belongs to the OTHER view, and
+        `_thumb_centred_page` can still name this page from the last time the
+        strip was up — so the switch has to ask for the scroll explicitly."""
+        seen = []
+
+        def body(win):
+            win._toc_btn.set_active(True)
+            win._go_to_page(2)
+            win._toc_seg_outline.set_active(True)
+            orig = win._select_thumb
+            win._select_thumb = lambda idx, scroll=False: (
+                seen.append((idx, scroll)), orig(idx, scroll=scroll))[1]
+            win._toc_seg_pages.set_active(True)       # Outline ▸ Pages
+
+        self._run(body, pages=6)
+        self.assertTrue(seen, "the strip was never asked to show a page")
+        self.assertEqual(seen[-1], (2, True),
+                         "switching views must scroll to the current page")
 
     def test_an_unnamed_bookmark_still_says_which_page_it_is(self):
         def body(win):
