@@ -27,9 +27,20 @@
 
   <div class="hb-center">
     <div class="linked" id="toolbar"></div>
+    <!-- The pen's colour, where you can see it and reach it — the desktop puts
+         a filled dot right in the bar rather than only inside the popover. -->
+    <button class="swatch-btn" id="pen-swatch" title="Pen colour" aria-label="Pen colour"></button>
   </div>
 
   <div class="hb-end">
+    <div class="pager" id="zoomer">
+      <button class="flat icon-btn" id="zoom-out" title="Zoom out" aria-label="Zoom out">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8h9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      </button>
+      <button class="flat icon-btn" id="zoom-in" title="Zoom in" aria-label="Zoom in">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      </button>
+    </div>
     <div class="pager" id="pager">
       <button class="flat icon-btn" id="prev-page" title="Previous page" aria-label="Previous page">
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>

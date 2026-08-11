@@ -1,0 +1,48 @@
+# Publish the browser prototype to GitHub Pages.
+#
+# It is a static site — no build, no server code — so this copies `web/` and
+# nothing else. Over HTTPS the File System Access API works, which is what gives
+# save-in-place; that is the one thing a `file://` copy or a plain http server
+# cannot offer.
+#
+# Runs only for the branch the prototype lives on, so it cannot publish from
+# master by accident.
+name: pages
+
+on:
+  push:
+    branches: [web-prototype]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage the static site
+        run: |
+          mkdir -p _site
+          cp -r web/index.html web/input-probe.html web/src web/vendor _site/
+          # test/ and package.json are development-only and would just be
+          # megabytes of vectors nobody downloads
+          du -sh _site
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@v4

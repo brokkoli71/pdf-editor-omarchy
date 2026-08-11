@@ -176,6 +176,7 @@ const toolStrips = new Map();   // tool → [strip elements]
 buildToolbar(document.getElementById("toolbar"));
 buildToolbar(document.getElementById("popover-toolbar"));
 buildSwatches();
+refreshPenSwatch();
 wirePopover();
 wireKeys();
 wireDocument();
@@ -742,6 +743,18 @@ function wireDocument() {
     if (dirty) { e.preventDefault(); e.returnValue = ""; }
   });
 
+  const atCentre = (f) => {
+    // zoom about the middle of the view, which is where you are looking
+    surface.zoomAt(f, surface.cssW / 2, surface.cssH / 2);
+  };
+  document.getElementById("zoom-in").addEventListener("click", () => atCentre(1.25));
+  document.getElementById("zoom-out").addEventListener("click", () => atCentre(1 / 1.25));
+  document.getElementById("pen-swatch").addEventListener("click", () => {
+    const pop = document.getElementById("pen-popover");
+    pop.hidden = false;
+    document.getElementById("color-btn").click();
+  });
+
   document.getElementById("prev-page").addEventListener("click", () => surface.flipPage(-1));
   document.getElementById("next-page").addEventListener("click", () => surface.flipPage(1));
 
@@ -914,6 +927,13 @@ function buildBindingsList() {
 
 // ── the pen popover ──────────────────────────────────────────────────────────
 
+/** The pen's colour lives in the bar as well as the popover, so the thing you
+ * change most often is one click away and visible without opening anything. */
+function refreshPenSwatch() {
+  const el = document.getElementById("pen-swatch");
+  if (el) el.style.background = cssRgb(pen.pen_color);
+}
+
 function buildSwatches() {
   const host = document.getElementById("swatches");
   host.replaceChildren();
@@ -924,6 +944,7 @@ function buildSwatches() {
     b.addEventListener("click", () => {
       setPenSetting("pen_color", rgb);
       document.getElementById("color-btn").value = toHex(rgb);
+      refreshPenSwatch();
       surface.invalidateLayer();
       surface.requestDraw();
     });
@@ -959,6 +980,7 @@ function wirePopover() {
   color.value = toHex(pen.pen_color);
   color.addEventListener("input", () => {
     setPenSetting("pen_color", fromHex(color.value));
+    refreshPenSwatch();
     surface.invalidateLayer();
     surface.requestDraw();
   });

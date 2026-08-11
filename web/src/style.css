@@ -2,22 +2,26 @@
    the prototype reads as the same app rather than a web page about it. */
 
 :root {
-  --window-bg: #fafafa;
-  --window-fg: rgb(0 0 6 / 80%);
-  --headerbar-bg: #ffffff;
-  --headerbar-border: rgb(0 0 6 / 12%);
-  --view-bg: #ffffff;
-  --card-bg: #ffffff;
-  --popover-bg: #ffffff;
-  --popover-shadow: 0 1px 2px rgb(0 0 0 / 12%), 0 6px 18px rgb(0 0 0 / 18%);
+  /* Sidemark's OWN palette, not Adwaita's — `_load_theme()`'s defaults, which
+     are what the desktop falls back to before a system theme overrides them.
+     The app is meant to read like paper; a cool white-and-grey reads clinical
+     beside it. */
+  --window-bg: #fdf6ee;
+  --window-fg: #22211d;
+  --headerbar-bg: #f7f0e6;
+  --headerbar-border: rgb(34 33 29 / 14%);
+  --view-bg: #fffdf9;
+  --card-bg: #fffdf9;
+  --popover-bg: #fdf8f1;
+  --popover-shadow: 0 1px 2px rgb(34 33 29 / 12%), 0 6px 18px rgb(34 33 29 / 18%);
   --accent-bg: #3584e4;
   --accent-fg: #ffffff;
-  --dim: rgb(0 0 6 / 55%);
-  --btn-bg: rgb(0 0 6 / 8%);
-  --btn-hover: rgb(0 0 6 / 13%);
-  --btn-active: rgb(0 0 6 / 19%);
-  --separator: rgb(0 0 6 / 12%);
-  --surround: #ebe9e6;   /* the canvas surround, PDFCanvas.surround_color */
+  --dim: rgb(34 33 29 / 58%);
+  --btn-bg: rgb(34 33 29 / 7%);
+  --btn-hover: rgb(34 33 29 / 12%);
+  --btn-active: rgb(34 33 29 / 18%);
+  --separator: rgb(34 33 29 / 13%);
+  --surround: #e8ddd2;   /* PDFCanvas.surround_color, (0.910, 0.867, 0.824) */
   --radius: 8px;
 }
 
@@ -27,38 +31,38 @@
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --window-bg: #242424;
-    --window-fg: #ffffff;
-    --headerbar-bg: #303030;
-    --headerbar-border: rgb(0 0 0 / 36%);
-    --view-bg: #1e1e1e;
-    --card-bg: rgb(255 255 255 / 8%);
-    --popover-bg: #383838;
+    --window-bg: #232220;
+    --window-fg: #f2ece2;
+    --headerbar-bg: #2c2a27;
+    --headerbar-border: rgb(0 0 0 / 38%);
+    --view-bg: #1d1c1a;
+    --card-bg: rgb(255 253 249 / 7%);
+    --popover-bg: #35322e;
     --popover-shadow: 0 1px 2px rgb(0 0 0 / 36%), 0 6px 18px rgb(0 0 0 / 44%);
-    --dim: rgb(255 255 255 / 55%);
-    --btn-bg: rgb(255 255 255 / 10%);
-    --btn-hover: rgb(255 255 255 / 15%);
-    --btn-active: rgb(255 255 255 / 22%);
-    --separator: rgb(255 255 255 / 12%);
-    --surround: #1b1b1b;
+    --dim: rgb(242 236 226 / 55%);
+    --btn-bg: rgb(242 236 226 / 10%);
+    --btn-hover: rgb(242 236 226 / 15%);
+    --btn-active: rgb(242 236 226 / 22%);
+    --separator: rgb(242 236 226 / 13%);
+    --surround: #171614;
   }
 }
 
 :root[data-theme="dark"] {
-  --window-bg: #242424;
-  --window-fg: #ffffff;
-  --headerbar-bg: #303030;
-  --headerbar-border: rgb(0 0 0 / 36%);
-  --view-bg: #1e1e1e;
-  --card-bg: rgb(255 255 255 / 8%);
-  --popover-bg: #383838;
+  --window-bg: #232220;
+  --window-fg: #f2ece2;
+  --headerbar-bg: #2c2a27;
+  --headerbar-border: rgb(0 0 0 / 38%);
+  --view-bg: #1d1c1a;
+  --card-bg: rgb(255 253 249 / 7%);
+  --popover-bg: #35322e;
   --popover-shadow: 0 1px 2px rgb(0 0 0 / 36%), 0 6px 18px rgb(0 0 0 / 44%);
-  --dim: rgb(255 255 255 / 55%);
-  --btn-bg: rgb(255 255 255 / 10%);
-  --btn-hover: rgb(255 255 255 / 15%);
-  --btn-active: rgb(255 255 255 / 22%);
-  --separator: rgb(255 255 255 / 12%);
-  --surround: #1b1b1b;
+  --dim: rgb(242 236 226 / 55%);
+  --btn-bg: rgb(242 236 226 / 10%);
+  --btn-hover: rgb(242 236 226 / 15%);
+  --btn-active: rgb(242 236 226 / 22%);
+  --separator: rgb(242 236 226 / 13%);
+  --surround: #171614;
 }
 
 * { box-sizing: border-box; }
@@ -98,7 +102,16 @@ body {
 
 .hb-start, .hb-end { display: flex; align-items: center; gap: 2px; min-width: 0; }
 .hb-start { justify-self: start; padding-left: 2px; }
-.hb-center { justify-self: center; }
+.hb-center { justify-self: center; display: flex; align-items: center; gap: 8px; }
+
+.swatch-btn {
+  width: 22px; height: 22px; flex: none; padding: 0;
+  border-radius: 999px;
+  border: 1px solid rgb(34 33 29 / 25%);
+  box-shadow: inset 0 0 0 2px var(--headerbar-bg);
+}
+.swatch-btn:hover { box-shadow: inset 0 0 0 2px var(--headerbar-bg),
+                                0 0 0 2px var(--btn-hover); }
 .hb-end { justify-self: end; }
 
 /* the title must give way before the buttons do, not push them into a new row */
