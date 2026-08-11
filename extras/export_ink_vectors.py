@@ -115,8 +115,12 @@ def main():
     vectors = {"strokes": [], "scalars": {}}
 
     for case in strokes:
-        pts = [(float(x), float(y)) for x, y in case["pts"]]
-        press = [float(p) for p in case["press"]]
+        # Round FIRST, then compute. The vectors carry rounded points, so every
+        # expected output must be derived from exactly those — otherwise a
+        # sub-ulp difference in the input shows up as a divergence in the port,
+        # and the port gets blamed for the exporter's rounding.
+        pts = [tuple(p) for p in _round([(float(x), float(y)) for x, y in case["pts"]])]
+        press = _round([float(p) for p in case["press"]])
         trip = [(x, y, press[i] if i < len(press) else 1.0)
                 for i, (x, y) in enumerate(pts)]
         spacing = S.adaptive_spacing(pts)
