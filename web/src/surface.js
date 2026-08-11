@@ -9,8 +9,8 @@ import {
 } from "./ink.js";
 import { drawInkStroke, strokeHit, rgbCss } from "./draw.js";
 import { BTN_FINGER, buttonForEvent, chordId } from "./bindings.js";
-import { recognizeShape, snapGridDivider, respaceDividers, SNAP_LABELS }
-  from "./shapes.js";
+import { recognizeShape, snapGridDivider, respaceDividers, polylineIsClosed,
+         SNAP_LABELS } from "./shapes.js";
 import {
   pointInPolygon, lassoHandlePoints, lassoHandleAnchor, lassoScaleFactors,
   lassoHandleCursor, lassoChipCentre, lassoChipHit, lassoDeleteCentre,
@@ -26,6 +26,11 @@ export const PAGE_W = 595.0, PAGE_H = 842.0;   // A4 in document units, the size
 // — removing them would change the binding model, which is not ours to change —
 // but a press that resolves to one of them does nothing here.
 export const STRAIGHT_HOLD_MS = 500;   // hold still this long mid-stroke to snap
+// The same hold time, so there is only one to learn. What separates the two is
+// the pen LIFT, not the shape: hold WITHOUT lifting and the stroke snaps; hold
+// on a FINISHED stroke and it becomes the lasso. A stroke available to convert
+// was therefore never snapped.
+export const CIRCLE_LASSO_HOLD_MS = 500;
 
 export const IMPLEMENTED_TOOLS = new Set(["pen", "highlighter", "eraser", "pan",
                                           "zoom", "lasso"]);
@@ -122,6 +127,7 @@ export class Surface {
     // at commit, because denoising a recognised rectangle rounds the corners
     // the dwell just gave it.
     this._snapTimer = null;
+    this._circleTimer = null;   // press-and-hold on the loop you just drew
     this._straightMode = false;
     this._snapKind = null;
     this._snapLabel = null;
@@ -363,7 +369,10 @@ export class Surface {
     };
     this._clearSnap();
     if (tool === "eraser") this._eraseAt(dx, dy);
-    if (tool === "pen" || tool === "highlighter") this._armSnapTimer();
+    if (tool === "pen" || tool === "highlighter") {
+      this._armSnapTimer();
+      this._armCircleLasso(dx, dy);
+    }
     this._updateCursor();
     this.requestDraw();
   }
@@ -447,6 +456,7 @@ export class Surface {
     }
     a.lastView = [e.offsetX, e.offsetY];
     if (a.tool === "pen" || a.tool === "highlighter") this._armSnapTimer();
+    this._cancelCircleLasso();   // the pen moved: this was an ordinary stroke
     this.requestDraw();
   }
 
@@ -497,6 +507,59 @@ export class Surface {
     this.requestDraw();
   }
 
+  // ── circle to lasso (row 126) ──────────────────────────────────────────────
+
+  /** Only the LAST stroke converts — anything else means a resting hand eats
+   * ink into a selection. Deliberately NOT gated on `shape_snap`: that setting
+   * governs the dwell, and this is an independent mechanism that has to keep
+   * working with the snap off. The TOOL does not change either: the pen stays
+   * in your hand, which is the entire point. */
+  _circleLassoTarget(px, py) {
+    const strokes = this.strokes;
+    if (!strokes.length) return null;
+    const last = strokes[strokes.length - 1];
+    if (strokeHit(last.pts, px, py, eraseRadius(last.width))) return last;
+    if (polylineIsClosed(last.pts) && pointInPolygon(px, py, last.pts)) return last;
+    return null;
+  }
+
+  _armCircleLasso(px, py) {
+    this._cancelCircleLasso();
+    if (!this._circleLassoTarget(px, py)) return;
+    this._circleTimer = setTimeout(() => this._circleLassoFire(), CIRCLE_LASSO_HOLD_MS);
+  }
+
+  _cancelCircleLasso() {
+    if (this._circleTimer !== null) {
+      clearTimeout(this._circleTimer);
+      this._circleTimer = null;
+    }
+  }
+
+  /** The hold landed: the stroke under the pen becomes the lasso path.
+   *
+   * Removing it and selecting its catch is ONE undo entry, so a mis-fire costs
+   * exactly one Ctrl+Z. The rest of the still-held drag is dropped — the
+   * gesture stopped being a stroke the moment this fired. */
+  _circleLassoFire() {
+    this._circleTimer = null;
+    const strokes = this.strokes;
+    if (!strokes.length) return;
+    const loop = strokes[strokes.length - 1];
+    this.active = null;              // the nascent stroke is abandoned
+    this._clearSnap();
+    const index = strokes.indexOf(loop);
+    strokes.splice(index, 1);
+    this._pushUndo({ type: "erase", page: this.pageIndex,
+                     strokes: [{ stroke: loop, index }] });
+    this.invalidateLayer();
+    // fed through the ordinary lasso close, so a converted circle and a drawn
+    // one select identically — and both keep their outline
+    this._finishLasso(loop.pts, false);
+    this.onChange();
+    this.requestDraw();
+  }
+
   _clearSnap() {
     this._cancelSnapTimer();
     this._straightMode = false;
@@ -514,6 +577,7 @@ export class Surface {
     if (!this.active || e.pointerId !== this.active.pointerId) return;
     const a = this.active;
     this.active = null;
+    this._cancelCircleLasso();
     this._updateCursor();
 
     // Abandoning at the touchdown is not enough — a press can be cancelled with
