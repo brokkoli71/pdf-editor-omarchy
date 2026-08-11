@@ -191,6 +191,7 @@ surface.requestDraw();
 // Reopen where you left off; a blank A4 sheet when there is nothing to reopen.
 // A poor restore beats a failure to start, so anything unreadable falls through
 // to the blank page rather than stopping here.
+watchForStalledStart();
 restoreSession()
   .catch((err) => {
     console.error("could not restore the last session", err);
@@ -203,6 +204,26 @@ restoreSession()
     console.error("could not create the blank page", err);
     toast(`Could not start: ${err.message}`);
   });
+
+/** pdf.js needs a Worker, and a Worker built from a blob is refused on a
+ * `file://` page — it is created without complaint and then never loads, so the
+ * app simply hangs with an empty sheet and no error anywhere. Nothing else in
+ * the startup path can detect that, so it is detected by NOT HAPPENING. */
+function watchForStalledStart() {
+  setTimeout(() => {
+    if (surface.doc) return;
+    const local = location.protocol === "file:";
+    const note = document.createElement("div");
+    note.className = "startup-error";
+    note.innerHTML = local
+      ? "<strong>Sidemark needs a web server.</strong><br>"
+        + "Opened straight off the disk, the browser blocks the PDF engine.<br>"
+        + "Run <code>python3 serve.py</code> in this folder and use the link it prints."
+      : "<strong>Sidemark could not start.</strong><br>"
+        + "The PDF engine did not load. The browser console will say why.";
+    document.body.appendChild(note);
+  }, 6000);
+}
 
 async function restoreSession() {
   const rec = await loadSession();

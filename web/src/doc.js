@@ -9,8 +9,15 @@ import { PDFDocument } from "../vendor/pdf-lib.esm.js";
 import { NotesModel } from "./notes-model.js";
 import { readInk } from "./inkpdf.js";
 
-pdfjs.GlobalWorkerOptions.workerSrc =
-  new URL("../vendor/pdf.worker.min.mjs", import.meta.url).href;
+// The single-file build has no URLs to fetch from, so it hands us a Worker it
+// built from an inlined blob. Served normally, the worker is just a file next
+// to us.
+if (globalThis.__SIDEMARK_PDF_WORKER__) {
+  pdfjs.GlobalWorkerOptions.workerPort = globalThis.__SIDEMARK_PDF_WORKER__;
+} else {
+  pdfjs.GlobalWorkerOptions.workerSrc =
+    new URL("../vendor/pdf.worker.min.mjs", import.meta.url).href;
+}
 
 export const A4 = [595.0, 842.0];
 

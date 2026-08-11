@@ -555,3 +555,27 @@ hr { border: none; border-top: 1px solid var(--separator); margin: 10px 0 2px; w
   pointer-events: none;
 }
 .toast[hidden] { display: none; }
+
+/* Shown only when startup stalls — see watchForStalledStart. A blank sheet with
+   no explanation is the worst way for this to fail. */
+.startup-error {
+  position: fixed;
+  inset: auto 0 0 0;
+  margin: 0 auto 28px;
+  max-width: 460px;
+  z-index: 100;
+  padding: 14px 18px;
+  text-align: center;
+  line-height: 1.5;
+  font-size: 14px;
+  background: var(--popover-bg);
+  border: 1px solid var(--separator);
+  border-radius: 12px;
+  box-shadow: var(--popover-shadow);
+}
+.startup-error code {
+  font-family: ui-monospace, monospace;
+  background: var(--btn-bg);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
