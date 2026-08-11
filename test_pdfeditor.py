@@ -2410,6 +2410,16 @@ class TestBookmarks(unittest.TestCase):
 class TestBookmarksInWindow(unittest.TestCase):
     """The button, its understudy in the menu, and reopening where you left off."""
 
+    @staticmethod
+    def _add_bookmark(win, name=None):
+        """Add one the way a user does: the verb opens the name field, and
+        ENTER is what creates the bookmark. Escape leaves the page unmarked —
+        which is why adding is not a single call."""
+        win._toggle_bookmark()
+        if name is not None:
+            win._bookmark_name_entry.set_text(name)
+        win._bookmark_name_entry.emit("activate")
+
     def _run_in_window(self, pdf_pages, body):
         errors = []
         app = Adw.Application(application_id="test.sidemark.bookmarks")
@@ -2437,7 +2447,7 @@ class TestBookmarksInWindow(unittest.TestCase):
         def body(win, _pdf):
             win._go_to_page(2)
             self.assertFalse(win._bookmark_btn.get_active())
-            win._toggle_bookmark()
+            self._add_bookmark(win)
             self.assertTrue(win._bookmark_btn.get_active())
             self.assertEqual(win.notes_model.bookmarks(), [(2, "")])
             # turning the page re-points the button without re-running the verb
@@ -2497,16 +2507,20 @@ class TestBookmarksInWindow(unittest.TestCase):
 
         self._run_in_window(4, body)
 
-    def test_dismissing_the_name_popup_keeps_the_bookmark(self):
-        """The mark is stored on the click; the popup only names it. So Ctrl+B
-        stays a one-key verb — closing the popup leaves a bookmark carrying its
-        derived label, never nothing."""
+    def test_dismissing_the_name_popup_adds_no_bookmark(self):
+        """ENTER is what creates the bookmark — the field is the add, not a
+        decoration on one that already happened. So Escape leaves the page
+        exactly as it was, and nothing has touched the model to undo."""
         def body(win, _pdf):
             win._go_to_page(2)
             win._toggle_bookmark()
-            win._bookmark_name_pop.popdown()
-            self.assertEqual(win.notes_model.bookmarks(), [(2, "")])
-            self.assertTrue(win._bookmark_btn.get_active())
+            win._bookmark_name_pop.popdown()        # Escape / clicking away
+            self.assertEqual(win.notes_model.bookmarks(), [])
+            self.assertFalse(win._bookmark_btn.get_active(),
+                             "the toggle flipped on the click that opened the "
+                             "field, and a cancelled add must put it back")
+            self.assertFalse(win._dirty,
+                             "a bookmark nobody made must not dirty the file")
 
         self._run_in_window(4, body)
 
@@ -2515,8 +2529,7 @@ class TestBookmarksInWindow(unittest.TestCase):
         path goes through the one confirmation, not one per caller."""
         def body(win, _pdf):
             win._go_to_page(2)
-            win._toggle_bookmark()
-            win._rename_bookmark(2, "Keep me")
+            self._add_bookmark(win, "Keep me")
             # the header button / Ctrl+B
             win._toggle_bookmark()
             self.assertEqual(win.notes_model.bookmarks(), [(2, "Keep me")])
@@ -2535,7 +2548,7 @@ class TestBookmarksInWindow(unittest.TestCase):
         be there, which is what storing it would do."""
         def body(win, _pdf):
             win._go_to_page(1)
-            win._toggle_bookmark()
+            self._add_bookmark(win)
             # nothing to derive from yet: the row still carries the page
             # number of its own, so an empty label is honest rather than a lie
             self.assertEqual(win._bookmark_label(1), "")
@@ -2558,7 +2571,7 @@ class TestBookmarksInWindow(unittest.TestCase):
             win.notes_model.set(0, "the shared thought")
             win.notes_model.set_links({1})
             win._go_to_page(1)
-            win._toggle_bookmark()
+            self._add_bookmark(win)
             self.assertNotEqual(win._bookmark_label(1), "the shared thought")
 
         self._run_in_window(3, body)
@@ -2586,9 +2599,9 @@ class TestBookmarksInWindow(unittest.TestCase):
         and the menu come to disagree about what is bookmarked."""
         def body(win, _pdf):
             win._go_to_page(2)
-            win._toggle_bookmark()
+            self._add_bookmark(win)
             win._go_to_page(4)
-            win._toggle_bookmark()
+            self._add_bookmark(win)
             self.assertGreaterEqual(len(win._bookmark_lists), 2)
             for box in win._bookmark_lists:
                 pages = []

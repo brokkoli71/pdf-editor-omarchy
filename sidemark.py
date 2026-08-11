@@ -16192,6 +16192,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         entry.add_controller(esc)
         entry.grab_focus()
 
+    def _store_bookmark(self, idx, name=""):
+        """Create the bookmark — the confirmed half of the add. Nothing before
+        this point has touched the model, so a cancelled add leaves no mark and
+        does not even make the file dirty."""
+        self.notes_model.add_bookmark(idx, name)
+        self._mark_dirty()
+        self._populate_toc()
+        self._update_bookmark_ui()
+        self._refresh_bookmark_lists()
+        self._toast(f"Bookmarked page {idx + 1}")
+
     def _rename_bookmark(self, idx, name):
         if not self.notes_model.rename_bookmark(idx, name):
             return
@@ -17018,10 +17029,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         Adding OPENS THE NAME POPUP with the field selected, so the one gesture
         is "mark this page and say what it is" — a bookmark you had to go and
-        rename afterwards is one you name never. The mark is stored FIRST and
-        the popup only edits it, which is what keeps Ctrl+B a one-key verb:
-        dismissing the popup leaves a bookmark carrying its derived label, not
-        nothing. Removing asks first (`_drop_bookmark`) — it destroys a name
+        rename afterwards is one you name never. **Enter is what creates it**:
+        the popup is the add, not a decoration on one that already happened, so
+        Escape leaves the page exactly as it was — unmarked, and the file not
+        even dirty. Removing asks first (`_drop_bookmark`) — it destroys a name
         that exists nowhere else."""
         if not self._can_bookmark():
             return
@@ -17029,16 +17040,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if self.notes_model.is_bookmarked(idx):
             self._drop_bookmark(idx)
             return
-        self.notes_model.add_bookmark(idx)
-        self._mark_dirty()
-        self._populate_toc()
-        self._update_bookmark_ui()
-        self._refresh_bookmark_lists()
-        self._toast(f"Bookmarked page {idx + 1}")
-        self._prompt_bookmark_name(idx)
+        self._prompt_bookmark_name(idx, creating=True)
 
-    def _prompt_bookmark_name(self, idx):
-        """Name a just-added bookmark, without a trip to the list.
+    def _prompt_bookmark_name(self, idx, creating=False):
+        """Name a bookmark: the field a fresh one is created through
+        (`creating`), and the same field for renaming one that exists.
 
         A popover rather than a modal, for `_begin_rename`'s reason: this is a
         one-word edit. It is anchored to whichever chrome is actually on screen
@@ -17049,13 +17055,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                                    getattr(self, "_menu_btn", None))
                        if w is not None and w.get_visible()), None)
         if anchor is None:
+            # nowhere to show the field: a bookmark the user asked for still has
+            # to happen, so it lands unnamed rather than silently not at all
+            if creating:
+                self._store_bookmark(idx, "")
             return
         pop = Gtk.Popover()
         pop.set_parent(anchor)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.set_margin_start(10); box.set_margin_end(10)
         box.set_margin_top(10); box.set_margin_bottom(10)
-        title = Gtk.Label(label=f"Name the bookmark on page {idx + 1}", xalign=0)
+        title = Gtk.Label(
+            label=(f"Bookmark page {idx + 1} as…" if creating
+                   else f"Rename the bookmark on page {idx + 1}"), xalign=0)
         title.add_css_class("heading")
         box.append(title)
         entry = Gtk.Entry()
@@ -17065,7 +17077,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # think of something for
         entry.set_text(self._bookmark_label(idx))
         hint = Gtk.Label(
-            label="Enter to save · Esc keeps the suggested name", xalign=0)
+            label=("Enter to bookmark · Esc to cancel" if creating
+                   else "Enter to save · Esc to cancel"), xalign=0)
         hint.add_css_class("dim-label")
         hint.add_css_class("caption")
 
@@ -17073,8 +17086,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             text = entry.get_text().strip()
             # storing the derived label would freeze today's first note line
             # into the file; only a real change becomes a stored name
-            self._rename_bookmark(
-                idx, "" if text == self._bookmark_label(idx, "") else text)
+            name = "" if text == self._bookmark_label(idx, "") else text
+            if creating:
+                self._store_bookmark(idx, name)
+            else:
+                self._rename_bookmark(idx, name)
             pop.popdown()
 
         entry.connect("activate", lambda _e: commit())
@@ -17091,6 +17107,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 self._bookmark_name_pop = None
                 self._bookmark_name_entry = None
             pop.unparent()
+            # the header toggle flipped itself on the click that opened this;
+            # a cancelled add has to put it back (nothing was ever stored)
+            self._update_bookmark_ui()
 
         pop.connect("closed", closed)
         pop.popup()

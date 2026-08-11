@@ -659,11 +659,16 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   - **Making one and destroying one are both a moment, and both are handled
     there** (row 152). Adding opens the name field with the derived label in it
     and SELECTED (`_prompt_bookmark_name`), so the first keystroke replaces it
-    — a bookmark you must go and rename later is one you name never. The mark
-    is stored on the CLICK and the popup only edits it, which is what keeps
-    Ctrl+B a one-key verb: dismiss the popup and you still have a bookmark.
-    Committing the suggestion unchanged stores NO name, or the derived label
-    would freeze into the file. Removing asks first, through one confirmation
+    — a bookmark you must go and rename later is one you name never. **The
+    field IS the add**: nothing touches the model until Enter, so Escape leaves
+    the page unmarked and the file not even dirty, and there is no
+    create-then-undo to get wrong. (Storing the mark on the click and letting
+    the popup edit it kept Ctrl+B a stricter one-key verb, and was rejected in
+    the hand.) The header toggle flips itself on the click that opens the
+    field, so cancelling must put it back; and with no chrome on screen to
+    anchor the popover to, the bookmark is created UNNAMED rather than silently
+    not at all. Committing the suggestion unchanged stores NO name, or the
+    derived label would freeze into the file. Removing asks first, through one confirmation
     every path routes into (`_drop_bookmark` asks, `_do_drop_bookmark` acts) —
     with no "don't ask again", unlike the page-drop dialog: the name is stored
     nowhere else, and an opt-out is one stray click from losing the guard for
