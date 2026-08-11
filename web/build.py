@@ -17,6 +17,7 @@ have to resolve imports and topologically sort them, and getting that subtly
 wrong is a silent failure. It is fetched with npx if it is not installed.
 """
 
+import base64
 import json
 import os
 import re
@@ -75,6 +76,8 @@ def main():
         worker = fh.read()
     with open(os.path.join(HERE, "index.html"), encoding="utf-8") as fh:
         html = fh.read()
+    with open(os.path.join(HERE, "icon.svg"), encoding="utf-8") as fh:
+        icon = fh.read()
 
     # The worker rides as a JSON string rather than inside a <script> block: its
     # source contains sequences that would close the tag, and JSON escaping is
@@ -99,6 +102,11 @@ def main():
         "</script>\n"
     )
 
+    # the favicon rides as a data URI; a single file has nothing to fetch
+    icon_uri = "data:image/svg+xml;base64," + base64.b64encode(
+        icon.encode("utf-8")).decode("ascii")
+    html = inline(html, r'<link rel="icon"[^>]*>',
+                  f'<link rel="icon" href="{icon_uri}" type="image/svg+xml">')
     html = inline(html, r'<link rel="stylesheet"[^>]*>',
                   "<style>\n" + css + "\n</style>")
     html = inline(html, r'<script type="module" src="src/app\.js"></script>',

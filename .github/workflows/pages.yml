@@ -35,7 +35,7 @@ jobs:
       - name: Stage the static site
         run: |
           mkdir -p _site
-          cp -r web/index.html web/input-probe.html web/src web/vendor _site/
+          cp -r web/index.html web/input-probe.html web/icon.svg web/src web/vendor _site/
           # test/ and package.json are development-only and would just be
           # megabytes of vectors nobody downloads
           du -sh _site
