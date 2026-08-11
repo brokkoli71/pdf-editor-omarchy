@@ -10959,6 +10959,25 @@ class TestDragAndDrop(unittest.TestCase):
         self.assertTrue(result["file"])    # a real file drag is still accepted
 
 
+class TestUnixSignalFallback(unittest.TestCase):
+    """Ctrl+C from the launching terminal should stop the app cleanly. The
+    fallback that picks the right API for this PyGObject caught ImportError and
+    ValueError — but the case it exists for raises neither: on Ubuntu and
+    Debian the GLibUnix module imports and simply has no `signal_add`."""
+
+    def test_a_module_without_signal_add_falls_back(self):
+        class Bare:
+            pass
+
+        with mock.patch.dict(sys.modules,
+                             {"gi.repository.GLibUnix": Bare()}):
+            add = sidemark._unix_signal_adder()
+        self.assertTrue(callable(add))
+
+    def test_the_adder_is_always_callable(self):
+        self.assertTrue(callable(sidemark._unix_signal_adder()))
+
+
 class TestReloadRestoresTheSession(unittest.TestCase):
     """Ctrl+R spawns a fresh process, so everything it should bring back has to
     be written down first: EVERY tab and its page, plus the view you were

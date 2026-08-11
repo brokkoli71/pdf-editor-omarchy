@@ -8126,6 +8126,26 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
     return result
 
 
+def _unix_signal_adder():
+    """The `unix_signal_add` of whichever PyGObject this is.
+
+    `GLibUnix.signal_add` is the current API and `GLib.unix_signal_add` the
+    deprecated one. The version that matters is the middle case: on Ubuntu and
+    Debian the GLibUnix module IMPORTS but has no `signal_add` — an
+    AttributeError, which is neither of the two the first version caught. It
+    escaped `do_startup`, so Ctrl+C handling was never installed at all on the
+    distros this fallback exists for, and every launch printed a traceback."""
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        add = getattr(GLibUnix, "signal_add", None)
+        if add is not None:
+            return add
+    except (ValueError, ImportError):
+        pass
+    return GLib.unix_signal_add
+
+
 def _drop_popover(pop):
     """Unparent a popover once, from its own `closed` handler.
 
@@ -12166,8 +12186,17 @@ class TextPageView(Gtk.Overlay):
             if im in self._selected_images:
                 ar, ag, ab = self.accent()
                 pad = 3.0
+                # Fields ASSIGNED, never passed to the constructor: PyGObject
+                # ignores arguments to a boxed type's __init__ (it warns, and
+                # some versions only warn), so the kwargs form yields an
+                # all-zero RGBA — a fully transparent highlight, i.e. selecting
+                # an image simply showed nothing. Invisible on the PyGObject
+                # here, visible on Ubuntu's.
+                accent = Gdk.RGBA()
+                accent.red, accent.green, accent.blue, accent.alpha = (
+                    ar, ag, ab, 0.55)
                 snapshot.append_color(
-                    Gdk.RGBA(red=ar, green=ag, blue=ab, alpha=0.55),
+                    accent,
                     Graphene.Rect().init(x - pad, y - pad,
                                          w + 2 * pad, h + 2 * pad))
             snapshot.save()
@@ -22714,13 +22743,8 @@ class PDFEditorApp(Adw.Application):
         # than surface a KeyboardInterrupt traceback through the GLib main loop.
         # GLibUnix.signal_add is the current API; fall back to the (deprecated)
         # GLib.unix_signal_add on older PyGObject (Ubuntu/Fedora CI runners).
-        try:
-            gi.require_version("GLibUnix", "2.0")
-            from gi.repository import GLibUnix
-            add_signal = GLibUnix.signal_add
-        except (ValueError, ImportError):
-            add_signal = GLib.unix_signal_add
-        add_signal(GLib.PRIORITY_DEFAULT, signal.SIGINT, self._on_sigint)
+        _unix_signal_adder()(GLib.PRIORITY_DEFAULT, signal.SIGINT,
+                             self._on_sigint)
         # The middle button is a BOUND button here (row 132) — pan by default,
         # anything the user puts there — so GTK's middle-click primary paste
         # must not fire behind it. A GtkTextView pastes the primary selection
