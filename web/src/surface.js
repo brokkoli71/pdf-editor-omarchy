@@ -9,6 +9,7 @@ import {
 } from "./ink.js";
 import { drawInkStroke, strokeHit, rgbCss } from "./draw.js";
 import { BTN_FINGER, buttonForEvent, chordId } from "./bindings.js";
+import { recognizeShape, SNAP_LABELS } from "./shapes.js";
 import {
   pointInPolygon, lassoHandlePoints, lassoHandleAnchor, lassoScaleFactors,
   lassoHandleCursor, lassoChipCentre, lassoChipHit, lassoDeleteCentre,
@@ -23,6 +24,8 @@ export const PAGE_W = 595.0, PAGE_H = 842.0;   // A4 in document units, the size
 // Tools this prototype implements. The others stay in the table and in the bar
 // — removing them would change the binding model, which is not ours to change —
 // but a press that resolves to one of them does nothing here.
+export const STRAIGHT_HOLD_MS = 500;   // hold still this long mid-stroke to snap
+
 export const IMPLEMENTED_TOOLS = new Set(["pen", "highlighter", "eraser", "pan",
                                           "zoom", "lasso"]);
 
@@ -112,6 +115,16 @@ export class Surface {
     this.latch = new TouchLatch();
     this._heldMods = { ctrl: false, shift: false, alt: false };
     this._pinch = null;
+    // the extended dwell: hold still mid-stroke and the freehand line is
+    // replaced by a clean primitive. `_straightMode` says this stroke has
+    // already been settled — it is exempt from live smoothing exactly as it is
+    // at commit, because denoising a recognised rectangle rounds the corners
+    // the dwell just gave it.
+    this._snapTimer = null;
+    this._straightMode = false;
+    this._snapKind = null;
+    this._snapLabel = null;
+    this._snapAt = null;
     this._frame = null;
     this._layer = null;         // cached committed ink
     this._layerKey = null;
@@ -347,7 +360,9 @@ export class Surface {
       erased: [],
       touchStrokes: [],
     };
+    this._clearSnap();
     if (tool === "eraser") this._eraseAt(dx, dy);
+    if (tool === "pen" || tool === "highlighter") this._armSnapTimer();
     this._updateCursor();
     this.requestDraw();
   }
@@ -430,7 +445,56 @@ export class Surface {
       }
     }
     a.lastView = [e.offsetX, e.offsetY];
+    if (a.tool === "pen" || a.tool === "highlighter") this._armSnapTimer();
     this.requestDraw();
+  }
+
+  /** Re-armed on every motion, so it only fires when the pen has actually
+   * rested. One hold time to learn, shared with circle-to-lasso. */
+  _armSnapTimer() {
+    this._cancelSnapTimer();
+    if (this.pen.shape_snap === "off") return;
+    this._snapTimer = setTimeout(() => this._snapToShape(), STRAIGHT_HOLD_MS);
+  }
+
+  _cancelSnapTimer() {
+    if (this._snapTimer !== null) {
+      clearTimeout(this._snapTimer);
+      this._snapTimer = null;
+    }
+  }
+
+  /** The cursor has rested mid-stroke: recognise the stroke so far as a clean
+   * line, rectangle, ellipse or polygon and replace it in place. The LINE is
+   * the fallback, so "lines only" and the classic straight snap are the same
+   * code path — which is why turning recognition down can never regress it. */
+  _snapToShape() {
+    this._snapTimer = null;
+    const a = this.active;
+    if (!a || a.pts.length < 2) return;
+    let kind, pts;
+    if (this.pen.shape_snap === "lines") {
+      kind = "line";
+      pts = [a.pts[0], a.pts[a.pts.length - 1]];
+    } else {
+      ({ kind, pts } = recognizeShape(a.pts));
+    }
+    this._straightMode = true;
+    this._snapKind = kind;
+    this._snapLabel = SNAP_LABELS[kind];
+    const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+    this._snapAt = [Math.max(...xs), Math.min(...ys)];
+    a.pts = pts;
+    a.press = [];              // a settled shape has no pressure profile
+    this.requestDraw();
+  }
+
+  _clearSnap() {
+    this._cancelSnapTimer();
+    this._straightMode = false;
+    this._snapKind = null;
+    this._snapLabel = null;
+    this._snapAt = null;
   }
 
   _onUp(e, cancelled = false) {
@@ -458,6 +522,7 @@ export class Surface {
 
     if (a.tool === "pen" || a.tool === "highlighter") {
       this._commitStroke(a);
+      this._clearSnap();
     } else if (a.tool === "eraser") {
       if (a.erased.length) {
         this._pushUndo({ type: "erase", page: this.pageIndex, strokes: a.erased });
@@ -723,6 +788,7 @@ export class Surface {
     const { pts, profile } = finishInkStroke(a.pts, press, this.pen.smoothing, {
       flat,
       minPressure: this.pen.min_pressure,
+      wasStraight: this._straightMode,
     });
     if (pts.length < 1) return;
     const stroke = {
@@ -939,6 +1005,7 @@ export class Surface {
     ctx.drawImage(this._layer, 0, 0, this.cssW, this.cssH);
 
     this._drawLive(ctx);
+    this._drawSnapLabel(ctx);
     this._drawLassoPath(ctx);
     this._drawSelection(ctx);
     this._drawZoomMarquee(ctx);
@@ -950,7 +1017,10 @@ export class Surface {
     const flat = a.tool === "highlighter";
     const press = this._hasPressureFor(a) ? a.press : [];
     let pts = a.pts, profile = null;
-    if (this.pen.live_smooth) {
+    if (this._straightMode) {
+      // a settled shape is drawn as it is — denoising a recognised rectangle
+      // would round the corners the dwell just gave it
+    } else if (this.pen.live_smooth) {
       // The same three jobs run LIVE, so the line under the nib is the line you
       // are left with. Its cost is the TAIL re-settling on each report — which
       // is why this is a switch and not a default nobody chose.
@@ -1035,6 +1105,29 @@ export class Surface {
     drawLassoChip(ctx, chx, chy, this.selectionBoxed, accent);
     const [dlx, dly] = lassoDeleteCentre(box[0], box[1], LASSO_PAD);
     drawLassoDelete(ctx, dlx, dly);
+  }
+
+  /** The glyph naming what the dwell recognised, at the shape's top-right —
+   * so you can see what you are about to be left with before you lift. */
+  _drawSnapLabel(ctx) {
+    if (!this._snapLabel || !this._snapAt || !this.active) return;
+    const [vx, vy] = this.toView(this._snapAt[0], this._snapAt[1]);
+    ctx.save();
+    ctx.font = "500 12px Cantarell, system-ui, sans-serif";
+    const text = this._snapLabel;
+    const w = ctx.measureText(text).width;
+    const x = vx + 10, y = vy - 10;
+    ctx.fillStyle = "rgba(53, 132, 228, 0.92)";
+    ctx.beginPath();
+    ctx.roundRect(x, y - 14, w + 12, 20, 10);
+    ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(text, x + 6, y);
+    // cairo's save/restore does not save the PATH, and neither does this one
+    // in spirit: end a shared painter with a fresh path so the next arc cannot
+    // join onto a stale current point
+    ctx.beginPath();
+    ctx.restore();
   }
 
   _drawZoomMarquee(ctx) {

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Sidemark — ink prototype</title>
+<title>Sidemark — browser prototype</title>
 <link rel="stylesheet" href="src/style.css">
 </head>
 <body>
@@ -71,8 +71,8 @@
 
 <input type="file" id="file-input" accept="application/pdf,.pdf,.md,text/markdown" multiple hidden>
 
-<!-- the pen popover: the same rows as Sidemark's, minus the two settings this
-     prototype does not implement (Predict ahead, Shape snap) -->
+<!-- the pen popover: the same rows as Sidemark's, minus "Predict ahead" —
+     prediction was settled by grading and is deliberately not ported -->
 <div class="popover" id="pen-popover" role="dialog" aria-label="Pen settings" hidden>
   <div class="popover-body">
     <div class="linked" id="popover-toolbar"></div>
@@ -108,6 +108,13 @@
     <label class="check" title="Shape the line as you draw it, instead of only when you lift the pen. Off, the line never moves once drawn but re-forms on release; on, it is already the line you will keep, at the cost of the last stretch re-settling on each point the pen reports.">
       <input type="checkbox" id="live-smooth"> Smooth while drawing
     </label>
+
+    <label class="dim" for="shape-snap">Shape snap</label>
+    <select id="shape-snap" title="What holding still mid-stroke snaps to">
+      <option value="off">Off</option>
+      <option value="lines">Lines only</option>
+      <option value="shapes">Shapes &amp; grids</option>
+    </select>
 
     <hr>
 

@@ -399,6 +399,12 @@ input[type="color"] {
   background: var(--btn-bg); cursor: pointer;
 }
 
+select {
+  font: inherit; color: inherit; background: var(--btn-bg);
+  border: none; border-radius: 6px; padding: 5px 8px; min-height: 30px;
+  cursor: pointer;
+}
+
 .swatches { display: flex; gap: 5px; margin-top: 4px; }
 .swatches button {
   width: 26px; height: 26px; border-radius: 999px; padding: 0;

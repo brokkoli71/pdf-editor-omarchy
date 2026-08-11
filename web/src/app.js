@@ -44,6 +44,7 @@ const PEN_SETTINGS = {
   min_pressure: ["num", [0.0, 0.5]],
   hover_lead:   ["bool", null],
   live_smooth:  ["bool", null],
+  shape_snap:   ["choice", ["off", "lines", "shapes"]],
 };
 
 const PEN_DEFAULTS = {
@@ -56,6 +57,7 @@ const PEN_DEFAULTS = {
   min_pressure: 0.0,
   hover_lead: false,
   live_smooth: true,
+  shape_snap: "shapes",
 };
 
 function penSetting(saved, key, def) {
@@ -67,6 +69,7 @@ function penSetting(saved, key, def) {
     return Math.max(bounds[0], Math.min(bounds[1], v));
   }
   if (kind === "bool") return typeof v === "boolean" ? v : def;
+  if (kind === "choice") return bounds.includes(v) ? v : def;
   if (kind === "rgb") {
     if (!Array.isArray(v) || v.length !== 3) return def;
     if (!v.every((c) => typeof c === "number" && c >= 0 && c <= 1)) return def;
@@ -600,6 +603,10 @@ function wirePopover() {
 
   bindCheck("hover-lead", pen.hover_lead, (on) => setPenSetting("hover_lead", on));
   bindCheck("live-smooth", pen.live_smooth, (on) => setPenSetting("live_smooth", on));
+
+  const snap = document.getElementById("shape-snap");
+  snap.value = pen.shape_snap;
+  snap.addEventListener("change", () => setPenSetting("shape_snap", snap.value));
 
   document.getElementById("reset-bindings").addEventListener("click", () => {
     bindings.reset(bindings.mode);
