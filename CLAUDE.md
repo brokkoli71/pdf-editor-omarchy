@@ -709,7 +709,17 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     is unreachable in other readers, and deleting is its own verb), and
     deleting **promotes the subtree by one level explicitly** — leaving that to
     `normalize_toc` promotes only the first orphan and hangs its siblings
-    under it.
+    under it. The menu also changes an entry's PAGE and adds a heading or
+    sub-heading **on the page of the row you clicked**, never the page you are
+    viewing; a sibling lands after that row's own children. A double-click
+    opens title and page together, the page field standing IN PLACE OF the page
+    number (a row showing the page twice makes the untypeable one look
+    editable), and both are written in one `set_toc` — separate writes rebuild
+    the sidebar under the edit that is still running. **A move between the two
+    fields is not "clicking away", and testing that needs the WINDOW's focus
+    widget**: a `GtkEntry` delegates focus to an internal `GtkText`, so
+    `entry.has_focus()` is False even while you type in it — the guard silently
+    never fired and clicking the page field ended the rename.
   - **Bookmarks are outline entries too, and can BE the outline** (row 153).
     The Outline/Pages switch appears when the document has a TOC *or*
     bookmarks — a lecture deck rarely has a TOC and is exactly what you

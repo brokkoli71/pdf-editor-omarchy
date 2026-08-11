@@ -30,7 +30,7 @@ jobs:
           # pytest is NOT optional here: conftest.py's autouse fixture is what
           # resets settings.json between tests, and running the suite through
           # plain unittest silently loses it (see the Run tests step).
-          pip install pymupdf pytest
+          pip install pymupdf pytest pytest-timeout
 
       - name: Start headless Wayland compositor
         run: |
@@ -75,7 +75,15 @@ jobs:
         # error in client communication" — a hard crash in the GTK/Mesa
         # software stack), which kills it before pytest prints anything. With
         # one test name per line, the LAST line names the test it died on.
-        run: python3 -m pytest test_pdfeditor.py -v -rf --tb=short
+        # --timeout: a GPU-less runner does not just crash, it also HANGS —
+        # a run sat at 85% for 17 minutes and would have burned the job's
+        # whole budget. A per-test limit turns that into a named failure
+        # with a stack dump of where it stalled; `thread` dumps the stack
+        # rather than unwinding, which is what makes a GTK stall readable.
+        # 120 s is ~300x the slowest test here (~410 ms), so it can only
+        # fire on a genuine stall.
+        run: python3 -m pytest test_pdfeditor.py -v -rf --tb=short \
+               --timeout=120 --timeout-method=thread
 
       # The compositor has died mid-run before ("Error flushing display: Broken
       # pipe"), which kills the process before any summary is printed — the run

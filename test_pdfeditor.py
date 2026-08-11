@@ -8790,6 +8790,196 @@ class TestBookmarksInOutline(unittest.TestCase):
                              [2, "Section B", 3], [1, "Chapter Two", 4]],
                   pages=6)
 
+    def test_editing_a_heading_opens_a_title_and_a_page_field(self):
+        """Both are things you came to the row to change, so one double-click
+        opens both rather than making the page a second trip through the menu.
+        """
+        def body(win):
+            win._populate_toc()
+            row = next(r for r in self._entries(win)
+                       if getattr(r, "_toc_entry", None) == 1)
+            win._begin_rename(row)
+            fields = [w for w in _rows_of(row._row_box)
+                      if isinstance(w, Gtk.Entry)]
+            self.assertEqual(len(fields), 2, "expected a title and a page field")
+            self.assertEqual(fields[0].get_text(), "Chapter Two")
+            self.assertEqual(fields[1].get_text(), "2")
+
+            fields[0].set_text("Operators")
+            fields[1].set_text("5")
+            fields[1].emit("activate")          # Enter in EITHER field saves
+            self.assertEqual([(e[1], e[2]) for e in win.canvas.get_toc()],
+                             [("Chapter One", 1), ("Operators", 5)])
+
+        self._run(body, toc=[[1, "Chapter One", 1], [1, "Chapter Two", 2]],
+                  pages=8)
+
+    def test_a_bookmark_row_edits_its_page_too(self):
+        """Moving a bookmark is re-marking the page you meant, which is
+        otherwise remove-then-add-and-retype."""
+        def body(win):
+            win.notes_model.add_bookmark(2, "A mark")
+            win._populate_toc()
+            row = next(r for r in self._entries(win)
+                       if getattr(r, "_bookmark_idx", None) == 2)
+            win._begin_rename(row)
+            fields = [w for w in _rows_of(row._row_box)
+                      if isinstance(w, Gtk.Entry)]
+            self.assertEqual(len(fields), 2)
+            self.assertEqual(fields[1].get_text(), "3")      # 1-based
+            fields[0].set_text("Moved mark")
+            fields[1].set_text("5")
+            fields[1].emit("activate")
+            self.assertEqual(win.notes_model.bookmarks(), [(4, "Moved mark")])
+
+        self._run(body, pages=6)
+
+    def test_a_bookmark_will_not_land_on_a_page_that_has_one(self):
+        """One of the two names would have to lose, silently, and there is no
+        undo for a name."""
+        def body(win):
+            win.notes_model.add_bookmark(1, "First")
+            win.notes_model.add_bookmark(4, "Second")
+            win._populate_toc()
+            win._apply_bookmark_edit(1, "First", "5")        # onto page 4
+            self.assertEqual(win.notes_model.bookmarks(),
+                             [(1, "First"), (4, "Second")])
+
+        self._run(body, pages=6)
+
+    def test_the_page_field_stands_in_for_the_page_number(self):
+        """The row would otherwise show the page twice — once to read and once
+        to edit — and the one you must not type in looks just as editable."""
+        def body(win):
+            win.notes_model.add_bookmark(2, "A mark")
+            win._populate_toc()
+            row = next(r for r in self._entries(win)
+                       if getattr(r, "_bookmark_idx", None) == 2)
+            self.assertTrue(row._page_label_widget.get_visible())
+            win._begin_rename(row)
+            self.assertFalse(row._page_label_widget.get_visible(),
+                             "the page number is still showing beside its own "
+                             "edit field")
+            row._finish_rename(False)
+            self.assertTrue(row._page_label_widget.get_visible())
+
+        self._run(body, pages=6)
+
+    def test_both_fields_are_written_in_one_pass(self):
+        """Each write repopulates the sidebar, so doing them separately
+        rebuilds the list under the edit that is still running."""
+        def body(win):
+            win._populate_toc()
+            win._apply_toc_entry(0, "Renamed", "3")
+            self.assertEqual([(e[1], e[2]) for e in win.canvas.get_toc()],
+                             [("Renamed", 3), ("Chapter Two", 2)])
+            # a blank title keeps the old one; a bad page keeps the old page
+            win._apply_toc_entry(0, "   ", "nonsense")
+            self.assertEqual([(e[1], e[2]) for e in win.canvas.get_toc()],
+                             [("Renamed", 3), ("Chapter Two", 2)])
+
+        self._run(body, toc=[[1, "Chapter One", 1], [1, "Chapter Two", 2]],
+                  pages=8)
+
+    def test_moving_to_the_page_field_does_not_end_the_edit(self):
+        """Clicking the page field committed the rename and closed the row, so
+        renaming was impossible. The guard has to ask the WINDOW which widget
+        has focus: a GtkEntry delegates focus to an internal GtkText, so
+        `entry.has_focus()` is False even while you are typing in it."""
+        def body(win):
+            win._populate_toc()
+            row = next(r for r in self._entries(win)
+                       if getattr(r, "_toc_entry", None) == 1)
+            win._begin_rename(row)
+            fields = [w for w in _rows_of(row._row_box)
+                      if isinstance(w, Gtk.Entry)]
+            fields[0].set_text("Half-typed")
+            fields[1].grab_focus()
+            ctx = GLib.MainContext.default()
+            for _ in range(50):
+                ctx.iteration(False)
+            if win.get_focus() is None:
+                self.skipTest("no keyboard focus in this environment")
+            self.assertTrue(getattr(row, "_renaming", False),
+                            "moving to the page field ended the edit")
+            self.assertEqual(fields[0].get_text(), "Half-typed")
+            self.assertEqual([e[1] for e in win.canvas.get_toc()],
+                             ["Chapter One", "Chapter Two"])
+
+        self._run(body, toc=[[1, "Chapter One", 1], [1, "Chapter Two", 2]],
+                  pages=6)
+
+    def test_a_new_heading_lands_on_the_page_of_the_row_you_clicked(self):
+        """Never the page you happen to be viewing: the heading has to appear
+        where you asked for it, or the gesture and the result disagree."""
+        def body(win):
+            win._go_to_page(5)                    # looking somewhere else
+            win._populate_toc()
+            win._add_toc_heading(2, level=1, after_no=0)   # clicked row 0, p2
+            toc = win.canvas.get_toc()
+            self.assertEqual([(e[0], e[1], e[2]) for e in toc],
+                             [(1, "Chapter One", 1),
+                              (1, win.DEFAULT_HEADING, 2),
+                              (1, "Chapter Two", 2)])
+            self.assertTrue(win._dirty)
+
+        self._run(body, toc=[[1, "Chapter One", 1], [1, "Chapter Two", 2]],
+                  pages=8)
+
+    def test_a_sub_heading_hangs_under_the_row_you_clicked(self):
+        def body(win):
+            win._populate_toc()
+            win._add_toc_heading(1, level=2, after_no=0)
+            self.assertEqual([(e[0], e[1]) for e in win.canvas.get_toc()],
+                             [(1, "Chapter One"),
+                              (2, win.DEFAULT_HEADING),
+                              (1, "Chapter Two")])
+
+        self._run(body, toc=[[1, "Chapter One", 1], [1, "Chapter Two", 2]])
+
+    def test_a_sibling_goes_after_the_clicked_rows_children(self):
+        """Its sub-entries belong to the row above, so a SIBLING must not land
+        between a heading and its own children."""
+        def body(win):
+            win._populate_toc()
+            win._add_toc_heading(1, level=1, after_no=0)
+            self.assertEqual([(e[0], e[1]) for e in win.canvas.get_toc()],
+                             [(1, "Chapter One"), (2, "Section A"),
+                              (2, "Section B"), (1, win.DEFAULT_HEADING),
+                              (1, "Chapter Two")])
+
+        self._run(body, toc=[[1, "Chapter One", 1], [2, "Section A", 2],
+                             [2, "Section B", 3], [1, "Chapter Two", 4]],
+                  pages=6)
+
+    def test_a_heading_can_be_started_from_a_bookmark_row(self):
+        """The only way in when the document has no outline of its own — and it
+        lands in page order, since a bookmark row has no index into the
+        outline."""
+        def body(win):
+            win.notes_model.add_bookmark(3, "Worked example")
+            win._populate_toc()
+            win._add_toc_heading(4)               # the bookmark's page, 1-based
+            self.assertEqual([(e[1], e[2]) for e in win.canvas.get_toc()],
+                             [(win.DEFAULT_HEADING, 4)])
+
+        self._run(body, pages=6)
+
+    def test_changing_a_headings_page_clamps_rather_than_refuses(self):
+        """A number past the end is a typo with an obvious intent, and an entry
+        pointing off the document is unreachable."""
+        def body(win):
+            win._populate_toc()
+            win._set_toc_entry_page(1, 4)
+            self.assertEqual(win.canvas.get_toc()[1][2], 4)
+            win._set_toc_entry_page(1, 999)
+            self.assertEqual(win.canvas.get_toc()[1][2], win.canvas.n_pages)
+            win._set_toc_entry_page(1, 0)
+            self.assertEqual(win.canvas.get_toc()[1][2], 1)
+
+        self._run(body, toc=[[1, "Chapter One", 1], [1, "Chapter Two", 2]],
+                  pages=6)
+
     def test_deleting_a_heading_asks_first(self):
         def body(win):
             win._populate_toc()
@@ -8864,10 +9054,11 @@ class TestBookmarksInOutline(unittest.TestCase):
             entry = next(w for w in _rows_of(row._row_box)
                          if isinstance(w, Gtk.Entry))
             entry.set_text("Typed then clicked away")
-            focus = next(c for c in _controllers(entry)
-                         if isinstance(c, Gtk.EventControllerFocus))
-
-            focus.emit("leave")
+            # focus moved for REAL, not an emitted signal: the guard that keeps
+            # the page field from ending the edit asks the window which widget
+            # has focus, so a synthetic leave with focus still in the entry is
+            # correctly ignored
+            win._toc_btn.grab_focus()
             self.assertTrue(getattr(row, "_renaming", False),
                             "the edit was torn down inside the focus change")
             self.assertEqual(win.notes_model.bookmark_name(1), "Old")
@@ -8875,6 +9066,8 @@ class TestBookmarksInOutline(unittest.TestCase):
             ctx = GLib.MainContext.default()
             for _ in range(50):
                 ctx.iteration(False)
+            if win.get_focus() is None:
+                self.skipTest("no keyboard focus in this environment")
             self.assertEqual(win.notes_model.bookmark_name(1),
                              "Typed then clicked away")
 

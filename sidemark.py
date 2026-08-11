@@ -16330,6 +16330,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # edit in place, so they share every mechanism below.
         read = row._rename_read
         write = row._rename_write
+        # A heading has a PAGE as well as a title, and both are things you came
+        # to this row to change — so one double-click opens both fields rather
+        # than making the page a second trip through the menu.
+        page_read = getattr(row, "_page_read", None)
         row._renaming = True
         # ONE edit's identity, not a bare flag. A focus-leave is delivered
         # after the fact, so a second rename on the same row can be under way
@@ -16343,6 +16347,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         entry.select_region(0, -1)
         row._row_box.insert_child_after(entry, row._label_widget)
         row._label_widget.set_visible(False)
+        page_entry = None
+        page_label = getattr(row, "_page_label_widget", None)
+        if page_read is not None:
+            page_entry = Gtk.Entry()
+            page_entry.set_width_chars(4)
+            page_entry.set_max_width_chars(4)
+            page_entry.set_input_purpose(Gtk.InputPurpose.DIGITS)
+            page_entry.set_tooltip_text("The page this points at")
+            page_entry.set_text(str(page_read()))
+            # IN PLACE OF the page number, not beside it: the row would
+            # otherwise show the page twice — once to read and once to edit —
+            # and the one you must not type in looks just as editable.
+            if page_label is not None:
+                row._row_box.insert_child_after(page_entry, page_label)
+                page_label.set_visible(False)
+            else:
+                row._row_box.insert_child_after(page_entry, entry)
+        fields = [e for e in (entry, page_entry) if e is not None]
 
         def finish(commit):
             # this edit's token, not the bare flag: a stale focus-leave arriving
@@ -16362,22 +16384,33 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # the list first. `remove()` on a box that no longer owns the child
             # is `gtk_widget_get_parent: assertion 'GTK_IS_WIDGET' failed`, the
             # critical this guard exists to stop.
-            if entry.get_parent() is row._row_box:
-                row._row_box.remove(entry)
+            page_text = page_entry.get_text().strip() if page_entry else ""
+            for field in fields:
+                if field.get_parent() is row._row_box:
+                    row._row_box.remove(field)
             if row._label_widget.get_parent() is not None:
                 row._label_widget.set_visible(True)
+            if page_label is not None and page_label.get_parent() is not None:
+                page_label.set_visible(True)
             if commit:
-                write(text)
+                if page_entry is not None:
+                    row._edit_write(text, page_text)
+                else:
+                    write(text)
 
         # kept on the row: the rename has two ends (Enter/focus-out commit,
         # Escape cancels) and both live in this closure
         row._finish_rename = finish
-        entry.connect("activate", lambda _e: finish(True))
-        esc = Gtk.EventControllerKey()
-        esc.connect("key-pressed",
-                    lambda _c, kv, _kc, _st: (kv == Gdk.KEY_Escape
-                                              and (finish(False) or True)))
-        entry.add_controller(esc)
+        for field in fields:
+            # Enter in EITHER field saves the row: they are one edit, and
+            # having to return to the first one to commit is a rule nobody
+            # would guess
+            field.connect("activate", lambda _e: finish(True))
+            esc = Gtk.EventControllerKey()
+            esc.connect("key-pressed",
+                        lambda _c, kv, _kc, _st: (kv == Gdk.KEY_Escape
+                                                  and (finish(False) or True)))
+            field.add_controller(esc)
         # Clicking away commits, which is what every rename-in-place does — but
         # from an IDLE, never inside the focus change itself. Ending the edit
         # removes the entry from its row and rebuilds the list, i.e. it destroys
@@ -16387,9 +16420,31 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # because it does not stop. Enter and Escape are not inside a focus
         # change and stay immediate; the edit's token makes whichever call
         # arrives second a no-op.
-        focus = Gtk.EventControllerFocus()
-        focus.connect("leave", lambda _c: GLib.idle_add(finish, True) and None)
-        entry.add_controller(focus)
+        def left_the_edit(_c):
+            def settled():
+                # Moving between the title and the page is not "clicking away":
+                # by the next idle focus has landed, so one of our own fields
+                # holding it means the edit is still going. Without this,
+                # clicking the page field saves and closes the row you were
+                # still editing — renaming became impossible.
+                #
+                # Asked of the WINDOW's focus widget, never `f.has_focus()`: a
+                # GtkEntry delegates focus to an internal GtkText child, so the
+                # entry itself never "has" it and the guard silently never
+                # fired.
+                focused = self.get_focus()
+                if focused is not None and any(
+                        focused is f or focused.is_ancestor(f) for f in fields):
+                    return GLib.SOURCE_REMOVE
+                finish(True)
+                return GLib.SOURCE_REMOVE
+
+            GLib.idle_add(settled)
+
+        for field in fields:
+            focus = Gtk.EventControllerFocus()
+            focus.connect("leave", left_the_edit)
+            field.add_controller(focus)
         entry.grab_focus()
 
     def _store_bookmark(self, idx, name=""):
@@ -18198,7 +18253,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     line.set_margin_start(8 + 14 * min(level_here, 3))
                     line.set_margin_end(8)
                     line.append(lab)
-                    line.append(self._entry_page_label(idx))
+                    page_lab = self._entry_page_label(idx)
+                    line.append(page_lab)
                     r = Gtk.ListBoxRow()
                     r.set_child(line)
                     r.toc_page = idx
@@ -18206,10 +18262,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     r._page_idx = idx        # what _begin_rename renames
                     r._label_widget = lab
                     r._row_box = line
-                    self._bookmark_rename_hooks(r, idx)
+                    r._page_label_widget = page_lab
+                    self._bookmark_rename_hooks(r, idx, editable_page=True)
                     self._attach_row_menu(
                         r, delete_label="Delete bookmark",
-                        on_delete=lambda i=idx: self._drop_bookmark(i))
+                        on_delete=lambda i=idx: self._drop_bookmark(i),
+                        extra=((f"Add heading here (page {idx + 1})",
+                                lambda i=idx: self._add_toc_heading(i + 1)),))
                     r.set_tooltip_text(
                         f"Your bookmark on page {idx + 1}"
                         + (f": {text}" if text else "")
@@ -18231,7 +18290,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 line.set_margin_start(8 + 14 * max(0, level - 1))
                 line.set_margin_end(8)
                 line.append(label)
-                line.append(self._entry_page_label(max(0, page - 1)))
+                page_lab = self._entry_page_label(max(0, page - 1))
+                line.append(page_lab)
                 row = Gtk.ListBoxRow()
                 row.set_child(line)
                 # a deleted page leaves its entry pointing at page -1 (PyMuPDF's
@@ -18248,12 +18308,27 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 row._label_widget = label
                 row._row_box = line
                 row._toc_entry = entry_no
+                row._page_label_widget = page_lab
                 row._rename_read = (lambda t=title: t.strip())
                 row._rename_write = (
                     lambda new, k=entry_no: self._rename_toc_entry(k, new))
+                # …and the page, edited in the same breath (row 159)
+                row._page_read = (lambda p=page: max(1, p))
+                row._edit_write = (
+                    lambda new, pg, k=entry_no: self._apply_toc_entry(k, new, pg))
                 self._attach_row_menu(
                     row, delete_label="Delete heading",
-                    on_delete=lambda k=entry_no: self._delete_toc_entry(k))
+                    on_delete=lambda k=entry_no: self._delete_toc_entry(k),
+                    extra=(
+                        ("Change page…",
+                         lambda k=entry_no, r=row: self._prompt_toc_page(k, r)),
+                        (f"Add heading here (page {max(1, page)})",
+                         lambda k=entry_no, lv=level, pg=page:
+                             self._add_toc_heading(pg, lv, after_no=k)),
+                        ("Add sub-heading",
+                         lambda k=entry_no, lv=level, pg=page:
+                             self._add_toc_heading(pg, lv + 1, after_no=k)),
+                    ))
                 row.set_tooltip_text(
                     tip + ", double-click to rename"
                     " (PageUp/PageDown to flip pages)")
@@ -18337,15 +18412,50 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if self.canvas.document:
             self._populate_toc(force_scroll=True)
 
-    def _bookmark_rename_hooks(self, row, idx):
+    def _bookmark_rename_hooks(self, row, idx, editable_page=False):
         """What `_begin_rename` reads and writes for a bookmark row. The
         derived-label rule lives HERE rather than in the editor: committing the
         suggestion unchanged must store nothing, or the label stops being
-        derived (row 134)."""
+        derived (row 134).
+
+        `editable_page` where the row shows a page number to edit in place (the
+        outline). The popover list has no page column, so there is nothing for
+        the field to stand in for and it stays a name-only edit."""
         row._page_idx = idx
         row._rename_read = lambda i=idx: self._bookmark_label(i)
         row._rename_write = lambda text, i=idx: self._rename_bookmark(
             i, "" if text == self._bookmark_label(i, "") else text)
+        if editable_page:
+            row._page_read = lambda i=idx: i + 1
+            row._edit_write = (
+                lambda text, pg, i=idx: self._apply_bookmark_edit(i, text, pg))
+
+    def _apply_bookmark_edit(self, idx, name, page_text):
+        """A bookmark's name and page in one go — moving it is re-marking the
+        page you meant, which is otherwise remove-then-add-and-retype.
+
+        Refuses to land on a page that is already bookmarked rather than
+        merging: one of the two names would have to lose, silently, and there
+        is no undo for a name."""
+        name = "" if name == self._bookmark_label(idx, "") else name
+        try:
+            page = int(str(page_text).strip())
+        except ValueError:
+            page = idx + 1
+        page = max(1, min(page, self.canvas.n_pages)) - 1
+        if page != idx and self.notes_model.is_bookmarked(page):
+            self._toast(f"Page {page + 1} already has a bookmark")
+            page = idx
+        if page == idx:
+            self._rename_bookmark(idx, name)
+            return
+        stored = _clean_name(name) or self.notes_model.bookmark_name(idx)
+        self.notes_model.remove_bookmark(idx)
+        self.notes_model.add_bookmark(page, stored)
+        self._mark_dirty()
+        self._populate_toc()
+        self._update_bookmark_ui()
+        self._refresh_bookmark_lists()
 
     def _rename_toc_entry(self, entry_no, title):
         """Retitle one of the DOCUMENT's outline headings (row 159).
@@ -18367,6 +18477,153 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         self._mark_dirty()
         self._populate_toc()
+
+    def _apply_toc_entry(self, entry_no, title, page_text):
+        """Write a heading's title AND page in one go.
+
+        One `set_toc`, not two: each write repopulates the sidebar, so doing
+        them separately rebuilds the list under the edit that is still running
+        and makes the second write read a row that has just been thrown away."""
+        toc = self.canvas.get_toc() if self.canvas.document else []
+        if not 0 <= entry_no < len(toc):
+            self._populate_toc()
+            return
+        title = " ".join((title or "").split())
+        if not title:
+            # a heading with no text is unreachable in other readers; keep what
+            # was there and let the menu's Delete be the way to remove it
+            title = toc[entry_no][1]
+        try:
+            page = int(str(page_text).strip())
+        except ValueError:
+            page = toc[entry_no][2]
+        page = max(1, min(page, self.canvas.n_pages))
+        if (toc[entry_no][1], toc[entry_no][2]) == (title, page):
+            self._populate_toc()      # nothing changed; put the label back
+            return
+        toc[entry_no][1], toc[entry_no][2] = title, page
+        if not self.canvas.set_toc(toc):
+            self._toast("Could not save that heading")
+            return
+        self._mark_dirty()
+        self._populate_toc()
+
+    def _prompt_toc_page(self, entry_no, row):
+        """Point an outline heading at a different page.
+
+        A field rather than a page picker: you already know the number — it is
+        printed on the row you right-clicked and in the header — and typing it
+        is one gesture against a dialog's several."""
+        toc = self.canvas.get_toc() if self.canvas.document else []
+        if not 0 <= entry_no < len(toc):
+            return
+        pop = Gtk.Popover()
+        pop.set_parent(row)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_start(10); box.set_margin_end(10)
+        box.set_margin_top(10); box.set_margin_bottom(10)
+        title = Gtk.Label(label=f"Page for “{toc[entry_no][1]}”", xalign=0)
+        title.add_css_class("heading")
+        box.append(title)
+        entry = Gtk.Entry()
+        entry.set_width_chars(8)
+        entry.set_input_purpose(Gtk.InputPurpose.DIGITS)
+        entry.set_text(str(toc[entry_no][2]))
+        box.append(entry)
+        hint = Gtk.Label(label=f"1 to {self.canvas.n_pages} · Enter to save",
+                         xalign=0)
+        hint.add_css_class("dim-label")
+        hint.add_css_class("caption")
+        box.append(hint)
+
+        def commit(_e):
+            pop.popdown()
+            try:
+                page = int(entry.get_text().strip())
+            except ValueError:
+                return
+            self._set_toc_entry_page(entry_no, page)
+
+        entry.connect("activate", commit)
+        pop.set_child(box)
+        pop.connect("closed", lambda _p: _drop_popover(pop))
+        pop.popup()
+        entry.grab_focus()
+        entry.select_region(0, -1)
+
+    def _set_toc_entry_page(self, entry_no, page):
+        """`page` is 1-based, as the outline stores it. Clamped rather than
+        refused: a number past the end is a typo with an obvious intent, and
+        an outline entry pointing off the document is unreachable."""
+        toc = self.canvas.get_toc() if self.canvas.document else []
+        if not 0 <= entry_no < len(toc):
+            return
+        page = max(1, min(int(page), self.canvas.n_pages))
+        if toc[entry_no][2] == page:
+            return
+        toc[entry_no][2] = page
+        if not self.canvas.set_toc(toc):
+            self._toast("Could not move that heading")
+            return
+        self._mark_dirty()
+        self._populate_toc()
+
+    DEFAULT_HEADING = "New heading"
+
+    def _add_toc_heading(self, page, level=1, after_no=None):
+        """Add an outline heading on `page` (1-based), then open it for typing.
+
+        The page comes from the ROW you right-clicked, never from the page you
+        happen to be viewing: the new heading has to appear where you asked for
+        it, or the gesture and the result disagree. `after_no` places it
+        directly below that row; without one it lands in page order, which is
+        what a bookmark row needs (it has no index into the outline).
+
+        It is created named, then opened for rename — the bookmark rule (row
+        152), except that an outline entry with no title is unreachable in
+        other readers, so there has to be something there if you walk away."""
+        if self.canvas.document is None:
+            return
+        toc = self.canvas.get_toc() or []
+        page = max(1, min(int(page), self.canvas.n_pages))
+        level = max(1, int(level))
+        if after_no is None:
+            at = len([e for e in toc if e[2] <= page])
+        else:
+            at = after_no + 1
+            # its own sub-entries belong to the row above, so a SIBLING goes
+            # after them rather than between a heading and its children
+            if level <= toc[after_no][0]:
+                while at < len(toc) and toc[at][0] > toc[after_no][0]:
+                    at += 1
+        toc.insert(at, [level, self.DEFAULT_HEADING, page])
+        if not self.canvas.set_toc(toc):
+            self._toast("Could not add that heading")
+            return
+        self._mark_dirty()
+        self._populate_toc()
+        # …and straight into the name, so the placeholder is never what you keep
+        GLib.idle_add(self._rename_toc_row, at)
+
+    def _rename_toc_row(self, entry_no, tries=6):
+        row = next((r for r in self._toc_rows()
+                    if getattr(r, "_toc_entry", None) == entry_no), None)
+        if row is None:
+            return GLib.SOURCE_REMOVE
+        if row.get_height() == 0 and tries > 0:
+            GLib.timeout_add(16, self._rename_toc_row, entry_no, tries - 1)
+            return GLib.SOURCE_REMOVE
+        self._toc_list.select_row(row)
+        self._scroll_row_into_view(row)
+        self._begin_rename(row)
+        return GLib.SOURCE_REMOVE
+
+    def _toc_rows(self):
+        out, child = [], self._toc_list.get_first_child()
+        while child is not None:
+            out.append(child)
+            child = child.get_next_sibling()
+        return out
 
     def _delete_toc_entry(self, entry_no):
         """Remove a heading from the document's outline, after asking.
@@ -18535,14 +18792,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                                      adj.get_upper() - page_size)))
         return GLib.SOURCE_REMOVE
 
-    def _attach_row_menu(self, row, delete_label, on_delete):
-        """Right-click an outline row for its two verbs, and double-click to
-        rename it.
+    def _attach_row_menu(self, row, delete_label, on_delete, extra=()):
+        """Right-click an outline row for its verbs, and double-click to rename
+        it.
 
         One builder for BOTH kinds of row — your bookmarks and the document's
         own headings (row 159). To the reader the sidebar is one list, so the
         gestures have to be one set; what differs is only what the verbs write
-        to, which the row carries in `_rename_write` and `on_delete`."""
+        to, which the row carries in `_rename_write`, `on_delete` and any
+        `extra` items (label, callback) that only one kind has."""
         click = Gtk.GestureClick()
         click.set_button(Gdk.BUTTON_SECONDARY)
 
@@ -18559,9 +18817,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             box.set_margin_start(4); box.set_margin_end(4)
             box.set_margin_top(4); box.set_margin_bottom(4)
-            for label, action, destructive in (
-                    ("Rename (F2)", lambda: self._begin_rename(row), False),
-                    (delete_label, on_delete, True)):
+            items = [("Rename (F2)", lambda: self._begin_rename(row), False)]
+            items += [(lab, cb, False) for lab, cb in extra]
+            items.append((delete_label, on_delete, True))
+            for label, action, destructive in items:
                 item = Gtk.Button()
                 item.add_css_class("flat")
                 item.set_child(Gtk.Label(label=label, xalign=0))
