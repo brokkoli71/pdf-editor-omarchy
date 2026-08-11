@@ -9,6 +9,12 @@ import {
 } from "./ink.js";
 import { drawInkStroke, strokeHit, rgbCss } from "./draw.js";
 import { BTN_FINGER, buttonForEvent, chordId } from "./bindings.js";
+import {
+  pointInPolygon, lassoHandlePoints, lassoHandleAnchor, lassoScaleFactors,
+  lassoHandleCursor, lassoChipCentre, lassoChipHit, lassoDeleteCentre,
+  lassoDeleteHit, drawLassoChip, drawLassoDelete, mergeSelection, selectionBbox,
+  scalePoint, HANDLE_SIZE,
+} from "./lasso.js";
 
 export const PAGE_W = 595.0, PAGE_H = 842.0;   // A4 in document units, the size
                                                // blank_pdf_file() makes
@@ -16,7 +22,8 @@ export const PAGE_W = 595.0, PAGE_H = 842.0;   // A4 in document units, the size
 // Tools this prototype implements. The others stay in the table and in the bar
 // — removing them would change the binding model, which is not ours to change —
 // but a press that resolves to one of them does nothing here.
-export const IMPLEMENTED_TOOLS = new Set(["pen", "highlighter", "eraser", "pan", "zoom"]);
+export const IMPLEMENTED_TOOLS = new Set(["pen", "highlighter", "eraser", "pan",
+                                          "zoom", "lasso"]);
 
 /** How many fingers are on the glass — and whether THIS hand ever had two.
  *
@@ -83,6 +90,14 @@ export class Surface {
 
     this.undoStack = [];
     this.redoStack = [];
+
+    // The lasso selection. `selected` is the strokes; `loop` is the path you
+    // drew, in DOCUMENT units, and is the grab region while it exists — a
+    // selection wears the loop it was drawn with, not a box. The chip switches
+    // to the 8-handle box, which is the only way to scale.
+    this.selected = [];
+    this.selectionLoop = null;
+    this.selectionBoxed = false;
 
     // view: document units → CSS px is `zoom`, origin at (offX, offY)
     this.zoom = 1.0;
@@ -298,6 +313,11 @@ export class Surface {
       // table.
     }
 
+    // ── the selection's own targets, before any tool is resolved ────────────
+    // A live selection is grabbable with ANY tool (row 125), and its chip and
+    // delete cross are tap targets that have to beat the tool underneath them.
+    if (this.hasSelection() && this._selectionPress(e, dx, dy)) return;
+
     const tool = this.toolForEvent(e);
     if (!tool || !IMPLEMENTED_TOOLS.has(tool)) return;
 
@@ -385,6 +405,11 @@ export class Surface {
       this.requestDraw();
       return;
     }
+    if (a.tool === "move" || a.tool === "resize") {
+      this._transformSelection(a, dx, dy);
+      a.lastView = [e.offsetX, e.offsetY];
+      return;
+    }
 
     // THE PEN'S SAMPLES ARRIVE COMPRESSED (row 147). The browser delivers one
     // pointermove per frame and buffers the rest; `getCoalescedEvents()` is the
@@ -438,6 +463,11 @@ export class Surface {
       }
     } else if (a.tool === "zoom") {
       this._zoomToRegion(a.startView, [e.offsetX, e.offsetY]);
+    } else if (a.tool === "lasso") {
+      const { shift } = this._chordState(e);
+      this._finishLasso(a.pts, shift);
+    } else if (a.tool === "move" || a.tool === "resize") {
+      this._commitTransform(a);
     }
     this.requestDraw();
   }
@@ -455,6 +485,210 @@ export class Surface {
       this.active = null;
       this._updateCursor();
     }
+  }
+
+  // ── the lasso selection ────────────────────────────────────────────────────
+
+  hasSelection() { return this.selected.length > 0; }
+
+  /** ONE box, used by the frame AND the hit-tests, or they drift apart. */
+  _selectionBbox() { return selectionBbox(this.selected); }
+
+  _selectionScreenBox() {
+    const b = this._selectionBbox();
+    if (!b) return null;
+    const [x0, y0] = this.toView(b[0], b[1]);
+    const [x1, y1] = this.toView(b[2], b[3]);
+    return [x0, y0, x1, y1];
+  }
+
+  /** The GRAB region: the LOOP in loop mode, the padded box otherwise. It has
+   * to match what is painted — with the loop on screen, a press in the corner
+   * of the box but outside the loop is not a grab, it is a new lasso. */
+  _pointInSelection(px, py) {
+    if (!this.selectionBoxed && this.selectionLoop) {
+      return pointInPolygon(px, py, this.selectionLoop);
+    }
+    const b = this._selectionBbox();
+    if (!b) return false;
+    const pad = HANDLE_SIZE / this.zoom;
+    return px >= b[0] - pad && px <= b[2] + pad
+        && py >= b[1] - pad && py <= b[3] + pad;
+  }
+
+  _handleAt(sx, sy) {
+    const box = this._selectionScreenBox();
+    if (!box) return null;
+    const pts = lassoHandlePoints(box[0], box[1], box[2], box[3], HANDLE_SIZE);
+    for (let i = 0; i < pts.length; i++) {
+      if (Math.abs(sx - pts[i][0]) <= HANDLE_SIZE
+          && Math.abs(sy - pts[i][1]) <= HANDLE_SIZE) return i;
+    }
+    return null;
+  }
+
+  /** A deep copy of the selected strokes' geometry, for the undo op. */
+  _snapshotSelected() {
+    return this.selected.map((s) => ({
+      stroke: s,
+      pts: s.pts.map((p) => [p[0], p[1]]),
+      width: s.width,
+      loop: this.selectionLoop ? this.selectionLoop.map((p) => [p[0], p[1]]) : null,
+    }));
+  }
+
+  /** Chip, delete cross, resize handle or a grab — in that order. Returns true
+   * when the press has been claimed. */
+  _selectionPress(e, dx, dy) {
+    const box = this._selectionScreenBox();
+    if (!box) return false;
+    const [chx, chy] = lassoChipCentre(box[0], box[1], HANDLE_SIZE);
+    const [dlx, dly] = lassoDeleteCentre(box[0], box[1], HANDLE_SIZE);
+
+    // ANY tap target on a canvas must kill the REST of the gesture, not just
+    // consume the press: a pen tap always jitters, and the drawing branch is
+    // the last one in the router, so a consumed press that forgets this leaves
+    // a stray mark beside the button you pressed.
+    if (lassoDeleteHit(dlx, dly, e.offsetX, e.offsetY)) {
+      this.deleteSelected();
+      return true;
+    }
+    if (lassoChipHit(chx, chy, e.offsetX, e.offsetY)) {
+      this.selectionBoxed = !this.selectionBoxed;
+      this.requestDraw();
+      return true;
+    }
+    const base = {
+      pointerId: e.pointerId, device: e.pointerType,
+      start: [dx, dy], before: this._snapshotSelected(),
+      lastView: [e.offsetX, e.offsetY], startView: [e.offsetX, e.offsetY],
+      pts: [], press: [], erased: [],
+    };
+    if (this.selectionBoxed) {
+      const handle = this._handleAt(e.offsetX, e.offsetY);
+      if (handle !== null) {
+        this.active = { ...base, tool: "resize", handle, bbox: this._selectionBbox() };
+        return true;
+      }
+    }
+    if (this._pointInSelection(dx, dy)) {
+      this.active = { ...base, tool: "move" };
+      this._updateCursor();
+      return true;
+    }
+    return false;
+  }
+
+  /** Turn the drawn loop into a selection. Shift ADDS to what was already
+   * selected — Shift+lasso is still the lasso, which is why this is an
+   * exception AT the router rather than a fork of the binding table. */
+  _finishLasso(loop, additive) {
+    if (loop.length < 3) {
+      // a click, not a loop: select what is under it, ink before images
+      const hit = this._strokeAt(loop[0]);
+      this._setSelected(hit ? [hit] : [], null);
+      return;
+    }
+    const caught = this.strokes.filter((s) =>
+      s.pts.some((p) => pointInPolygon(p[0], p[1], loop)));
+    this._setSelected(additive ? mergeSelection(this.selected, caught) : caught, loop);
+  }
+
+  _strokeAt(pt) {
+    for (let i = this.strokes.length - 1; i >= 0; i--) {
+      const s = this.strokes[i];
+      if (strokeHit(s.pts, pt[0], pt[1], Math.max(s.width, 6) / 2 + 3)) return s;
+    }
+    return null;
+  }
+
+  /** `loop` null means BOX mode — a click, a paste or an additive selection has
+   * no loop to wear. `_finishLasso` is the only thing that puts one back. */
+  _setSelected(strokes, loop) {
+    this.selected = strokes;
+    this.selectionLoop = strokes.length ? loop : null;
+    if (!loop) this.selectionBoxed = strokes.length > 0;
+    else this.selectionBoxed = false;
+    this._updateCursor();
+    this.requestDraw();
+  }
+
+  clearSelection() { this._setSelected([], null); }
+
+  deleteSelected() {
+    if (!this.hasSelection()) return;
+    const removed = [];
+    for (const s of this.selected) {
+      const i = this.strokes.indexOf(s);
+      if (i >= 0) { this.strokes.splice(i, 1); removed.push({ stroke: s, index: i }); }
+    }
+    if (removed.length) {
+      this._pushUndo({ type: "erase", page: this.pageIndex, strokes: removed });
+    }
+    this.clearSelection();
+    this.invalidateLayer();
+    this.onChange();
+    this.requestDraw();
+  }
+
+  duplicateSelected() {
+    if (!this.hasSelection()) return;
+    const offset = 12;
+    const copies = this.selected.map((s) => ({
+      ...s,
+      pts: s.pts.map((p) => [p[0] + offset, p[1] + offset]),
+      profile: s.profile ? s.profile.slice() : null,
+    }));
+    for (const c of copies) this.strokes.push(c);
+    this._pushUndo({ type: "add", page: this.pageIndex, strokes: copies });
+    // the copy comes back selected, so it drags immediately — with the pen or
+    // the caret still in hand
+    this._setSelected(copies, null);
+    this.invalidateLayer();
+    this.onChange();
+    this.requestDraw();
+  }
+
+  /** Move or scale the live selection. One undo entry per GESTURE. */
+  _transformSelection(a, dx, dy) {
+    if (a.tool === "move") {
+      const ox = dx - a.start[0], oy = dy - a.start[1];
+      for (const rec of a.before) {
+        rec.stroke.pts = rec.pts.map((p) => [p[0] + ox, p[1] + oy]);
+      }
+      if (a.before[0]?.loop) {
+        this.selectionLoop = a.before[0].loop.map((p) => [p[0] + ox, p[1] + oy]);
+      }
+    } else {
+      const { mode, anchor } = lassoHandleAnchor(a.handle, a.bbox);
+      const [fx, fy] = lassoScaleFactors(mode, anchor, a.start, [dx, dy]);
+      for (const rec of a.before) {
+        rec.stroke.pts = rec.pts.map((p) => scalePoint(p, fx, fy, anchor[0], anchor[1]));
+        // a stroke's width scales with the area, so a uniform resize keeps it
+        // looking like the same pen
+        rec.stroke.width = rec.width * Math.sqrt(Math.abs(fx * fy));
+      }
+      if (a.before[0]?.loop) {
+        this.selectionLoop = a.before[0].loop
+          .map((p) => scalePoint(p, fx, fy, anchor[0], anchor[1]));
+      }
+    }
+    this.invalidateLayer();
+    this.requestDraw();
+  }
+
+  _commitTransform(a) {
+    const moved = a.before.some((rec, i) =>
+      rec.pts.length !== rec.stroke.pts.length
+      || rec.pts.some((p, j) => p[0] !== rec.stroke.pts[j][0]
+                             || p[1] !== rec.stroke.pts[j][1]));
+    if (!moved) return;
+    this._pushUndo({ type: "reshape", page: this.pageIndex, records: a.before,
+                     after: a.before.map((rec) => ({
+                       pts: rec.stroke.pts.map((p) => [p[0], p[1]]),
+                       width: rec.stroke.width,
+                     })) });
+    this.onChange();
   }
 
   // ── committing ─────────────────────────────────────────────────────────────
@@ -537,7 +771,20 @@ export class Surface {
       for (const { stroke, index } of op.strokes) {
         strokes.splice(Math.min(index, strokes.length), 0, stroke);
       }
+    } else if (op.type === "add") {
+      for (const stroke of op.strokes) {
+        const i = strokes.lastIndexOf(stroke);
+        if (i >= 0) strokes.splice(i, 1);
+      }
+    } else if (op.type === "reshape") {
+      for (const rec of op.records) {
+        rec.stroke.pts = rec.pts.map((p) => [p[0], p[1]]);
+        rec.stroke.width = rec.width;
+      }
     }
+    // a stale loop after an undone move is impossible only because undo clears
+    // the selection — do not remove this
+    this.clearSelection();
     this.redoStack.push(op);
     this.invalidateLayer();
     this.onChange();
@@ -555,7 +802,15 @@ export class Surface {
         const i = strokes.lastIndexOf(stroke);
         if (i >= 0) strokes.splice(i, 1);
       }
+    } else if (op.type === "add") {
+      for (const stroke of op.strokes) strokes.push(stroke);
+    } else if (op.type === "reshape") {
+      op.records.forEach((rec, i) => {
+        rec.stroke.pts = op.after[i].pts.map((p) => [p[0], p[1]]);
+        rec.stroke.width = op.after[i].width;
+      });
     }
+    this.clearSelection();
     this.undoStack.push(op);
     this.invalidateLayer();
     this.onChange();
@@ -660,6 +915,8 @@ export class Surface {
     ctx.drawImage(this._layer, 0, 0, this.cssW, this.cssH);
 
     this._drawLive(ctx);
+    this._drawLassoPath(ctx);
+    this._drawSelection(ctx);
     this._drawZoomMarquee(ctx);
   }
 
@@ -691,6 +948,70 @@ export class Surface {
     ctx.restore();
   }
 
+  /** The loop being drawn, in flight. */
+  _drawLassoPath(ctx) {
+    const a = this.active;
+    if (!a || a.tool !== "lasso" || a.pts.length < 2) return;
+    ctx.save();
+    ctx.translate(this.offX, this.offY);
+    ctx.scale(this.zoom, this.zoom);
+    ctx.strokeStyle = "rgba(53, 132, 228, 0.9)";
+    ctx.lineWidth = 1.2 / this.zoom;
+    ctx.setLineDash([5 / this.zoom, 4 / this.zoom]);
+    ctx.beginPath();
+    ctx.moveTo(a.pts[0][0], a.pts[0][1]);
+    for (const p of a.pts.slice(1)) ctx.lineTo(p[0], p[1]);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  /** The selection frame. A selection wears the LOOP it was drawn with; the
+   * chip switches to the box, and the resize handles exist ONLY there — a
+   * hit-test that outlives its painter is exactly how a frame drifts from what
+   * a grab catches. */
+  _drawSelection(ctx) {
+    if (!this.hasSelection()) return;
+    const box = this._selectionScreenBox();
+    if (!box) return;
+    const accent = "rgb(53, 132, 228)";
+    ctx.save();
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 1.2;
+
+    if (!this.selectionBoxed && this.selectionLoop) {
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      const first = this.toView(this.selectionLoop[0][0], this.selectionLoop[0][1]);
+      ctx.moveTo(first[0], first[1]);
+      for (const p of this.selectionLoop.slice(1)) {
+        const v = this.toView(p[0], p[1]);
+        ctx.lineTo(v[0], v[1]);
+      }
+      ctx.closePath();
+      ctx.stroke();
+    } else {
+      const [x0, y0, x1, y1] = box;
+      const p = HANDLE_SIZE;
+      ctx.setLineDash([4, 3]);
+      ctx.strokeRect(x0 - p, y0 - p, (x1 - x0) + p * 2, (y1 - y0) + p * 2);
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#ffffff";
+      for (const [hx, hy] of lassoHandlePoints(x0, y0, x1, y1, p)) {
+        ctx.beginPath();
+        ctx.rect(hx - 4, hy - 4, 8, 8);
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+
+    const [chx, chy] = lassoChipCentre(box[0], box[1], HANDLE_SIZE);
+    drawLassoChip(ctx, chx, chy, this.selectionBoxed, accent);
+    const [dlx, dly] = lassoDeleteCentre(box[0], box[1], HANDLE_SIZE);
+    drawLassoDelete(ctx, dlx, dly);
+  }
+
   _drawZoomMarquee(ctx) {
     const a = this.active;
     if (!a || a.tool !== "zoom") return;
@@ -715,6 +1036,7 @@ export class Surface {
     const drawing = a && (a.tool === "pen" || a.tool === "highlighter");
     if (drawing && a.device === "pen") this.el.style.cursor = "none";
     else if (a && a.tool === "pan") this.el.style.cursor = "grabbing";
+    else if (a && a.tool === "move") this.el.style.cursor = "grabbing";
     else this.el.style.cursor = "crosshair";
   }
 }

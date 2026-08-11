@@ -660,7 +660,22 @@ function wireKeys() {
       e.preventDefault();
       surface.redo();
     }
-    else if (key === "pagedown" || key === "arrowright") { surface.flipPage(1); }
+    else if (key === "delete" || key === "backspace") {
+      // Delete belongs to the EDITOR while the caret is in it — an app-level
+      // shortcut that fires whatever has focus would eat a character you were
+      // trying to remove from your notes.
+      if (surface.hasSelection() && !typingInNotes()) {
+        e.preventDefault();
+        surface.deleteSelected();
+      }
+    } else if ((e.ctrlKey || e.metaKey) && key === "d") {
+      if (surface.hasSelection() && !typingInNotes()) {
+        e.preventDefault();
+        surface.duplicateSelected();
+      }
+    } else if (key === "escape") {
+      surface.clearSelection();
+    } else if (key === "pagedown" || key === "arrowright") { surface.flipPage(1); }
     else if (key === "pageup" || key === "arrowleft") { surface.flipPage(-1); }
     // There are NO keyboard tool shortcuts. A key that lends a button a tool is
     // a second mapping beside the table, which is the one thing this design
@@ -669,6 +684,14 @@ function wireKeys() {
 
   document.getElementById("undo-btn").addEventListener("click", () => surface.undo());
   document.getElementById("redo-btn").addEventListener("click", () => surface.redo());
+}
+
+/** Is the caret in the notes editor? CodeMirror puts focus on a contenteditable
+ * inside the panel, so asking the panel whether it CONTAINS the focused node is
+ * the reliable test — `.has-focus` on the wrapper is not always set yet. */
+function typingInNotes() {
+  const panel = document.getElementById("notes");
+  return !!(panel && document.activeElement && panel.contains(document.activeElement));
 }
 
 function refreshUndo() {
