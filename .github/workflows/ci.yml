@@ -63,7 +63,11 @@ jobs:
           # so the suite must never write the settings.json of whoever runs it
           XDG_CONFIG_HOME: /tmp/sidemark-ci-config
           SIDEMARK_TEST: "1"
-        run: python3 -m pytest test_pdfeditor.py -q -rf --tb=short
+        # -v, not -q: the runner's process has died mid-suite ("libwayland:
+        # error in client communication" — a hard crash in the GTK/Mesa
+        # software stack), which kills it before pytest prints anything. With
+        # one test name per line, the LAST line names the test it died on.
+        run: python3 -m pytest test_pdfeditor.py -v -rf --tb=short
 
       # The compositor has died mid-run before ("Error flushing display: Broken
       # pipe"), which kills the process before any summary is printed — the run

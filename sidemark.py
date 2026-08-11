@@ -16288,6 +16288,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         row.set_child(line)
         row._label_widget = label
         row._row_box = line
+        self._bookmark_rename_hooks(row, idx)
         return row
 
     def _on_bookmark_row_activated(self, box, row):
@@ -16323,7 +16324,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         very row, so the entry has to come out FIRST."""
         if getattr(row, "_renaming", False):
             return
-        idx = row._page_idx
+        # WHAT is being renamed is the row's business, not this method's: a
+        # bookmark writes a name into the notes model, a PDF outline heading
+        # writes a title into the document's own outline. Both are a label you
+        # edit in place, so they share every mechanism below.
+        read = row._rename_read
+        write = row._rename_write
         row._renaming = True
         # ONE edit's identity, not a bare flag. A focus-leave is delivered
         # after the fact, so a second rename on the same row can be under way
@@ -16333,7 +16339,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         row._rename_token = token = object()
         entry = Gtk.Entry()
         entry.set_hexpand(True)
-        entry.set_text(self._bookmark_label(idx))
+        entry.set_text(read())
         entry.select_region(0, -1)
         row._row_box.insert_child_after(entry, row._label_widget)
         row._label_widget.set_visible(False)
@@ -16361,10 +16367,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             if row._label_widget.get_parent() is not None:
                 row._label_widget.set_visible(True)
             if commit:
-                # committing the DERIVED label as a name would freeze today's
-                # first note line into the file; only a real change is stored
-                self._rename_bookmark(
-                    idx, "" if text == self._bookmark_label(idx, "") else text)
+                write(text)
 
         # kept on the row: the rename has two ends (Enter/focus-out commit,
         # Escape cancels) and both live in this closure
@@ -18203,7 +18206,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     r._page_idx = idx        # what _begin_rename renames
                     r._label_widget = lab
                     r._row_box = line
-                    self._attach_bookmark_row_menu(r)
+                    self._bookmark_rename_hooks(r, idx)
+                    self._attach_row_menu(
+                        r, delete_label="Delete bookmark",
+                        on_delete=lambda i=idx: self._drop_bookmark(i))
                     r.set_tooltip_text(
                         f"Your bookmark on page {idx + 1}"
                         + (f": {text}" if text else "")
@@ -18211,7 +18217,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                           "right-click for more")
                     self._toc_list.append(r)
 
-            for level, title, page in toc:
+            for entry_no, (level, title, page) in enumerate(toc):
                 # a bookmark on the SAME page as an outline entry follows it:
                 # the entry names the page, the bookmark names your place in it
                 emit_marks_before(max(0, page - 1))
@@ -18236,8 +18242,21 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     self._attach_chapter_dnd(row, chapter_no, spans)
                     tip += ", drag to reorder this chapter"
                     chapter_no += 1
+                # a heading of the document's own is editable too (row 159):
+                # same gestures as a bookmark — double-click renames, right-click
+                # offers both verbs — because to the reader they are one list
+                row._label_widget = label
+                row._row_box = line
+                row._toc_entry = entry_no
+                row._rename_read = (lambda t=title: t.strip())
+                row._rename_write = (
+                    lambda new, k=entry_no: self._rename_toc_entry(k, new))
+                self._attach_row_menu(
+                    row, delete_label="Delete heading",
+                    on_delete=lambda k=entry_no: self._delete_toc_entry(k))
                 row.set_tooltip_text(
-                    tip + " (PageUp/PageDown to flip pages)")
+                    tip + ", double-click to rename"
+                    " (PageUp/PageDown to flip pages)")
                 self._toc_list.append(row)
             emit_marks_before(self.canvas.n_pages + 1)   # the tail, and the
             # whole list when the document has no outline of its own
@@ -18317,6 +18336,91 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # page you are on rather than restoring the other view's scroll
         if self.canvas.document:
             self._populate_toc(force_scroll=True)
+
+    def _bookmark_rename_hooks(self, row, idx):
+        """What `_begin_rename` reads and writes for a bookmark row. The
+        derived-label rule lives HERE rather than in the editor: committing the
+        suggestion unchanged must store nothing, or the label stops being
+        derived (row 134)."""
+        row._page_idx = idx
+        row._rename_read = lambda i=idx: self._bookmark_label(i)
+        row._rename_write = lambda text, i=idx: self._rename_bookmark(
+            i, "" if text == self._bookmark_label(i, "") else text)
+
+    def _rename_toc_entry(self, entry_no, title):
+        """Retitle one of the DOCUMENT's outline headings (row 159).
+
+        The outline is the PDF's own, so this edits the file — `_mark_dirty`
+        and a save are what make it stick. An empty title is refused rather
+        than written: a heading with no text is unreachable in every other
+        reader, and deleting is a verb of its own right there in the menu."""
+        title = " ".join((title or "").split())
+        toc = self.canvas.get_toc() if self.canvas.document else []
+        if not 0 <= entry_no < len(toc) or not title:
+            self._populate_toc()      # put the row's old label back
+            return
+        if toc[entry_no][1] == title:
+            return
+        toc[entry_no][1] = title
+        if not self.canvas.set_toc(toc):
+            self._toast("Could not rename that heading")
+            return
+        self._mark_dirty()
+        self._populate_toc()
+
+    def _delete_toc_entry(self, entry_no):
+        """Remove a heading from the document's outline, after asking.
+
+        Its SUB-HEADINGS survive: `normalize_toc` clamps a level to at most one
+        deeper than the entry above it, so children of a deleted chapter simply
+        move up a level rather than vanishing with it. Losing a whole subtree to
+        one click on the parent is not something you could see coming."""
+        toc = self.canvas.get_toc() if self.canvas.document else []
+        if not 0 <= entry_no < len(toc):
+            return
+        level, title, _page = toc[entry_no][0], toc[entry_no][1], toc[entry_no][2]
+        kids = 0
+        for nxt in toc[entry_no + 1:]:
+            if nxt[0] <= level:
+                break
+            kids += 1
+        body = f"“{title}” is removed from the document's outline."
+        if kids:
+            body += (f" Its {kids} sub-heading{'s' if kids != 1 else ''} "
+                     "move up a level rather than being deleted.")
+        body += " The pages themselves are not touched."
+        dialog = Adw.AlertDialog.new("Delete this heading?", body)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("delete", "Delete")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect(
+            "response",
+            lambda _d, r: r == "delete" and self._do_delete_toc_entry(entry_no))
+        dialog.present(self)
+
+    def _do_delete_toc_entry(self, entry_no):
+        toc = self.canvas.get_toc() if self.canvas.document else []
+        if not 0 <= entry_no < len(toc):
+            return
+        title, level = toc[entry_no][1], toc[entry_no][0]
+        del toc[entry_no]
+        # Promote the whole subtree by one, explicitly. Leaving it to
+        # `normalize_toc` is not the same thing: it clamps each level to at most
+        # one deeper than the entry ABOVE it, so the first orphan is promoted
+        # and its siblings then hang UNDER it — the children of a deleted
+        # chapter would silently become children of each other.
+        i = entry_no
+        while i < len(toc) and toc[i][0] > level:
+            toc[i][0] -= 1
+            i += 1
+        if not self.canvas.set_toc(toc):
+            self._toast("Could not delete that heading")
+            return
+        self._mark_dirty()
+        self._populate_toc()
+        self._toast(f"Deleted heading “{title}”")
 
     def _entry_page_label(self, idx):
         """The page an outline row starts on, dim at its right end. It is also
@@ -18431,10 +18535,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                                      adj.get_upper() - page_size)))
         return GLib.SOURCE_REMOVE
 
-    def _attach_bookmark_row_menu(self, row):
-        """Right-click a ★ row for its two verbs. The same two the row already
-        has (F2 renames, the list's ✕ removes) — a menu is where you look for
-        them when you do not know the key."""
+    def _attach_row_menu(self, row, delete_label, on_delete):
+        """Right-click an outline row for its two verbs, and double-click to
+        rename it.
+
+        One builder for BOTH kinds of row — your bookmarks and the document's
+        own headings (row 159). To the reader the sidebar is one list, so the
+        gestures have to be one set; what differs is only what the verbs write
+        to, which the row carries in `_rename_write` and `on_delete`."""
         click = Gtk.GestureClick()
         click.set_button(Gdk.BUTTON_SECONDARY)
 
@@ -18443,7 +18551,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # right-clicking a row acts on THAT row, so select it first: the
             # menu's verbs and F2 must never disagree about their target
             self._toc_list.select_row(row)
-            idx = row._bookmark_idx
             menu = Gtk.Popover()
             menu.set_parent(row)
             menu.set_has_arrow(False)
@@ -18452,13 +18559,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             box.set_margin_start(4); box.set_margin_end(4)
             box.set_margin_top(4); box.set_margin_bottom(4)
-            for label, action in (
-                    ("Rename (F2)", lambda: self._begin_rename(row)),
-                    ("Delete", lambda: self._drop_bookmark(idx))):
+            for label, action, destructive in (
+                    ("Rename (F2)", lambda: self._begin_rename(row), False),
+                    (delete_label, on_delete, True)):
                 item = Gtk.Button()
                 item.add_css_class("flat")
                 item.set_child(Gtk.Label(label=label, xalign=0))
-                if label == "Delete":
+                if destructive:
                     item.add_css_class("destructive-action-text")
                 item.connect("clicked",
                              lambda _b, act=action: (menu.popdown(), act()))
@@ -18483,12 +18590,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         row.add_controller(dbl)
 
     def _on_toc_key(self, _ctrl, keyval, _keycode, _state):
-        """F2 renames the outline's selected ★ row in place. An outline row of
-        the document's own is not ours to rename, so it falls through."""
+        """F2 renames the selected outline row in place — a bookmark of yours
+        or a heading of the document's own (row 159). A thumbnail row carries
+        no label to edit, so it falls through."""
         if keyval != Gdk.KEY_F2:
             return False
         row = self._toc_list.get_selected_row()
-        if row is None or getattr(row, "_bookmark_idx", None) is None:
+        if row is None or getattr(row, "_rename_read", None) is None:
             return False
         self._begin_rename(row)
         return True

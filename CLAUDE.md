@@ -700,6 +700,16 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     removed, never moved, so a stale second line is impossible, and it is
     neither selectable nor activatable: a row you could click would be a
     destination that does not exist.
+  - **The document's OWN headings rename and delete the same way** (row 159):
+    double-click, or right-click for both verbs. The sidebar is one list to the
+    reader, so `_begin_rename` no longer knows what it is renaming — the ROW
+    carries `_rename_read`/`_rename_write`, and `_attach_row_menu` builds the
+    menu for both kinds. A heading writes into the PDF's outline (`set_toc`),
+    so it dirties the FILE. An empty title is refused (a heading with no text
+    is unreachable in other readers, and deleting is its own verb), and
+    deleting **promotes the subtree by one level explicitly** — leaving that to
+    `normalize_toc` promotes only the first orphan and hangs its siblings
+    under it.
   - **Bookmarks are outline entries too, and can BE the outline** (row 153).
     The Outline/Pages switch appears when the document has a TOC *or*
     bookmarks — a lecture deck rarely has a TOC and is exactly what you

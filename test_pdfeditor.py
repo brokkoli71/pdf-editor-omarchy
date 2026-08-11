@@ -8743,17 +8743,61 @@ class TestBookmarksInOutline(unittest.TestCase):
 
         self._run(body)
 
-    def test_f2_on_the_documents_own_outline_row_does_nothing(self):
-        """The PDF's outline is not ours to rename."""
+    def test_f2_renames_a_heading_of_the_documents_own_outline(self):
+        """The sidebar is ONE list to the reader, so a heading renames with the
+        same gesture as a bookmark — and writes into the PDF's own outline."""
         def body(win):
-            win.notes_model.add_bookmark(1, "Mine")
             win._populate_toc()
-            row = next(r for r in _rows_of(win._toc_list)
-                       if getattr(r, "_bookmark_idx", None) is None)
+            row = next(r for r in self._entries(win)
+                       if getattr(r, "_toc_entry", None) == 0)
             win._toc_list.select_row(row)
-            self.assertFalse(win._on_toc_key(None, Gdk.KEY_F2, 0, 0))
+            self.assertTrue(win._on_toc_key(None, Gdk.KEY_F2, 0, 0))
+            entry = next(w for w in _rows_of(row._row_box)
+                         if isinstance(w, Gtk.Entry))
+            self.assertEqual(entry.get_text(), "Chapter One")
+            entry.set_text("Linear maps")
+            entry.emit("activate")
+            self.assertEqual([e[1] for e in win.canvas.get_toc()],
+                             ["Linear maps", "Chapter Two"])
+            self.assertIn("Linear maps", self._rows(win))
+            self.assertTrue(win._dirty, "the outline lives in the FILE")
 
-        self._run(body, toc=[[1, "Chapter One", 1]])
+        self._run(body, toc=[[1, "Chapter One", 1], [1, "Chapter Two", 2]])
+
+    def test_an_empty_title_is_refused_rather_than_written(self):
+        """A heading with no text is unreachable in every other reader, and
+        deleting is its own verb one line below in the menu."""
+        def body(win):
+            win._populate_toc()
+            win._rename_toc_entry(0, "   ")
+            self.assertEqual([e[1] for e in win.canvas.get_toc()],
+                             ["Chapter One", "Chapter Two"])
+
+        self._run(body, toc=[[1, "Chapter One", 1], [1, "Chapter Two", 2]])
+
+    def test_deleting_a_heading_keeps_its_sub_headings(self):
+        """Losing a whole subtree to one click on the parent is not something
+        you could see coming — normalize_toc moves the children up a level."""
+        def body(win):
+            win._populate_toc()
+            win._do_delete_toc_entry(0)          # the confirmed action
+            self.assertEqual([(e[0], e[1]) for e in win.canvas.get_toc()],
+                             [(1, "Section A"), (1, "Section B"),
+                              (1, "Chapter Two")])
+            self.assertTrue(win._dirty)
+
+        self._run(body, toc=[[1, "Chapter One", 1], [2, "Section A", 2],
+                             [2, "Section B", 3], [1, "Chapter Two", 4]],
+                  pages=6)
+
+    def test_deleting_a_heading_asks_first(self):
+        def body(win):
+            win._populate_toc()
+            win._delete_toc_entry(0)             # opens the dialog, acts later
+            self.assertEqual([e[1] for e in win.canvas.get_toc()],
+                             ["Chapter One", "Chapter Two"])
+
+        self._run(body, toc=[[1, "Chapter One", 1], [1, "Chapter Two", 2]])
 
     def test_escape_leaves_the_name_alone_and_clicking_away_commits(self):
         def body(win):
