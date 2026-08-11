@@ -6,7 +6,7 @@
   "scripts": {
     "serve": "python3 -m http.server 8000",
     "vectors": "../extras/export_ink_vectors.py > test/vectors.json",
-    "test": "node test/conformance.mjs",
+    "test": "node test/conformance.mjs && node test/merge.mjs",
     "check": "node --check src/ink.js && node --check src/draw.js && node --check src/bindings.js && node --check src/surface.js && node --check src/app.js"
   }
 }

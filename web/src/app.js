@@ -8,6 +8,8 @@ import {
   toolbarBindingFor, BTN_LEFT,
 } from "./bindings.js";
 import { Surface, IMPLEMENTED_TOOLS } from "./surface.js";
+import { Doc, mergeDocuments, insertDocuments } from "./doc.js";
+import { Sidebar } from "./sidebar.js";
 
 // ── settings (the settings.json analogue) ────────────────────────────────────
 
@@ -123,6 +125,12 @@ const heldMods = { ctrl: false, shift: false, alt: false };
 
 const surface = new Surface(document.getElementById("page"), pen, bindings, {
   onChange: refreshUndo,
+  onPageChange: (page) => { sidebar.setPage(page); syncPageChrome(); },
+});
+
+const sidebar = new Sidebar(document.getElementById("sidebar"), {
+  onGoToPage: (page) => surface.setPage(page),   // absolute nav, never a flip
+  onDropFiles: (files, gap) => importAt(files, gap),
 });
 
 const toolStrips = new Map();   // tool → [strip elements]
@@ -132,11 +140,140 @@ buildToolbar(document.getElementById("popover-toolbar"));
 buildSwatches();
 wirePopover();
 wireKeys();
+wireDocument();
 refreshToolBindings();
 refreshUndo();
 
 window.addEventListener("resize", () => { surface.fit(); surface.requestDraw(); });
 surface.requestDraw();
+
+// open on a blank A4 sheet, the same page `blank_pdf_file()` makes
+Doc.blank()
+  .then((doc) => setDoc(doc, "Untitled"))
+  .catch((err) => {
+    // A blank page that fails to appear is the whole app failing to start, so
+    // it must say so rather than leaving an empty canvas that looks deliberate.
+    console.error("could not create the blank page", err);
+    toast(`Could not start: ${err.message}`);
+  });
+
+// ── the document ─────────────────────────────────────────────────────────────
+
+async function setDoc(doc, title) {
+  await surface.setDoc(doc, 0);
+  document.getElementById("doc-title").textContent = title || doc.name;
+  sidebar.setDoc(doc);
+  sidebar.setPage(0);
+  syncPageChrome();
+  refreshUndo();
+}
+
+/** The page counter and the pager belong to the WINDOW, not to the page, so
+ * there is ONE place that points them at the document's current page. */
+function syncPageChrome() {
+  const doc = surface.doc;
+  const counter = document.getElementById("page-counter");
+  counter.textContent = doc ? `${surface.pageIndex + 1} / ${doc.pageCount}` : "—";
+  document.getElementById("prev-page").disabled = !doc || surface.pageIndex <= 0;
+  document.getElementById("next-page").disabled =
+    !doc || surface.pageIndex >= doc.pageCount - 1;
+}
+
+async function readFiles(files) {
+  const pdfs = [...files].filter((f) => /\.pdf$/i.test(f.name)
+    || f.type === "application/pdf");
+  const out = [];
+  for (const f of pdfs) {
+    out.push({ bytes: new Uint8Array(await f.arrayBuffer()), name: f.name });
+  }
+  return out;
+}
+
+/** One file OPENS; several MERGE into one document with a chapter per file.
+ * That is the whole point of dropping more than one at once — you get a single
+ * document whose outline names where each source began, not a pile of tabs. */
+async function openFiles(files) {
+  const sources = await readFiles(files);
+  if (!sources.length) return toast("No PDFs in that drop");
+  try {
+    if (sources.length === 1) {
+      const doc = await Doc.open(sources[0].bytes, sources[0].name);
+      await setDoc(doc, sources[0].name);
+      toast(`Opened ${sources[0].name}`);
+      return;
+    }
+    const { bytes, chapters, ink } = await mergeDocuments(sources);
+    const doc = await Doc.open(bytes, "Merged");
+    doc.ink = ink;
+    await setDoc(doc, `Merged — ${chapters.length} chapters`);
+    toast(`Merged ${chapters.length} documents, a chapter each`);
+  } catch (err) {
+    toast(`Could not open: ${err.message}`);
+  }
+}
+
+/** A drop on the SIDEBAR imports at that gap, keeping the document you are in.
+ * Everywhere else opens or merges into a new one. */
+async function importAt(files, gap) {
+  if (!surface.doc) return openFiles(files);
+  const sources = await readFiles(files);
+  if (!sources.length) return toast("No PDFs in that drop");
+  try {
+    const host = surface.doc;
+    const { bytes, ink } = await insertDocuments(host, sources, gap);
+    const doc = await Doc.open(bytes, host.name);
+    doc.ink = ink;
+    await setDoc(doc, document.getElementById("doc-title").textContent);
+    await surface.setPage(gap);
+    toast(`Inserted ${sources.length} document${sources.length > 1 ? "s" : ""} at page ${gap + 1}`);
+  } catch (err) {
+    toast(`Could not insert: ${err.message}`);
+  }
+}
+
+function wireDocument() {
+  const input = document.getElementById("file-input");
+  document.getElementById("open-btn").addEventListener("click", () => input.click());
+  input.addEventListener("change", () => {
+    if (input.files.length) openFiles(input.files);
+    input.value = "";
+  });
+
+  document.getElementById("sidebar-btn").addEventListener("click", () => {
+    const bar = document.getElementById("sidebar");
+    bar.hidden = !bar.hidden;
+    if (!bar.hidden) sidebar.rebuild();
+    surface.fit();
+    surface.requestDraw();
+  });
+
+  document.getElementById("prev-page").addEventListener("click", () => surface.flipPage(-1));
+  document.getElementById("next-page").addEventListener("click", () => surface.flipPage(1));
+
+  // The window's own drop target. The sidebar has its own and stops the event,
+  // so a drop there imports at the gap instead of replacing the document.
+  const hint = document.getElementById("drop-hint");
+  let depth = 0;
+  window.addEventListener("dragenter", (e) => {
+    e.preventDefault();
+    depth++;
+    const n = e.dataTransfer?.items?.length || 0;
+    document.getElementById("drop-title").textContent =
+      n > 1 ? `Drop to merge ${n} files` : "Drop to open";
+    hint.hidden = false;
+  });
+  window.addEventListener("dragover", (e) => { e.preventDefault(); });
+  window.addEventListener("dragleave", (e) => {
+    e.preventDefault();
+    if (--depth <= 0) { depth = 0; hint.hidden = true; }
+  });
+  window.addEventListener("drop", (e) => {
+    e.preventDefault();
+    depth = 0;
+    hint.hidden = true;
+    if (e.dataTransfer.files.length) openFiles(e.dataTransfer.files);
+  });
+}
 
 // ── the toolbar as a binding surface ─────────────────────────────────────────
 
@@ -390,6 +527,8 @@ function wireKeys() {
       e.preventDefault();
       surface.redo();
     }
+    else if (key === "pagedown" || key === "arrowright") { surface.flipPage(1); }
+    else if (key === "pageup" || key === "arrowleft") { surface.flipPage(-1); }
     // There are NO keyboard tool shortcuts. A key that lends a button a tool is
     // a second mapping beside the table, which is the one thing this design
     // does not allow — tools change by binding them.

@@ -1,0 +1,205 @@
+// The sidebar: page thumbnails and the document outline.
+//
+// The Outline/Pages switch appears only when the document HAS an outline — on a
+// lecture deck there is nothing to switch to, and an empty half of a switch is
+// worse than no switch.
+
+export class Sidebar {
+  constructor(root, opts) {
+    this.root = root;
+    this.onGoToPage = opts.onGoToPage;
+    this.onDropFiles = opts.onDropFiles;
+    this.doc = null;
+    this.page = 0;
+    this.view = "pages";
+    this._thumbCentred = null;   // "is this a new page or the same one?"
+
+    this.switchEl = root.querySelector("#side-switch");
+    this.listEl = root.querySelector("#side-list");
+    this.pagesBtn = root.querySelector("#side-pages");
+    this.outlineBtn = root.querySelector("#side-outline");
+
+    this.pagesBtn.addEventListener("click", () => this.setView("pages"));
+    this.outlineBtn.addEventListener("click", () => this.setView("outline"));
+    this._installDrop();
+  }
+
+  setView(view) {
+    if (this.view === view) return;
+    this.view = view;
+    this.pagesBtn.classList.toggle("selected", view === "pages");
+    this.outlineBtn.classList.toggle("selected", view === "outline");
+    this._thumbCentred = null;
+    this.rebuild();
+  }
+
+  setDoc(doc) {
+    this.doc = doc;
+    this._thumbCentred = null;      // a document change clears it
+    const hasOutline = !!(doc && doc.outline.length);
+    this.switchEl.hidden = !hasOutline;
+    if (!hasOutline && this.view === "outline") this.setView("pages");
+    else this.rebuild();
+  }
+
+  setPage(page) {
+    if (this.page === page) return;
+    this.page = page;
+    this.rebuild();
+  }
+
+  /** A rebuild puts the strip back exactly where it stood; a genuine page
+   * change brings the new page into view. The two are told apart by
+   * `_thumbCentred` — without it the strip jumps to the top on every rebuild. */
+  rebuild() {
+    if (!this.doc) { this.listEl.replaceChildren(); return; }
+    const keep = this.listEl.scrollTop;
+    this.listEl.replaceChildren();
+    if (this.view === "pages") this._buildPages();
+    else this._buildOutline();
+
+    if (this._thumbCentred === this.page) {
+      this.listEl.scrollTop = keep;
+    } else {
+      this._thumbCentred = this.page;
+      // A freshly built row has no layout yet, so ask on the next frame — at
+      // the instant we are called every row reports y = 0 and there is nothing
+      // to scroll to, which is why the strip used to open at page 1.
+      requestAnimationFrame(() => {
+        const el = this.listEl.querySelector(".row.current");
+        if (el) el.scrollIntoView({ block: "nearest" });
+      });
+    }
+  }
+
+  _buildPages() {
+    for (let i = 0; i < this.doc.pageCount; i++) {
+      const row = document.createElement("button");
+      row.className = "row thumb" + (i === this.page ? " current" : "");
+      row.dataset.page = String(i);
+
+      const holder = document.createElement("span");
+      holder.className = "thumb-img";
+      row.appendChild(holder);
+
+      const label = document.createElement("span");
+      label.className = "thumb-no";
+      label.textContent = String(i + 1);
+      row.appendChild(label);
+
+      row.addEventListener("click", () => this.onGoToPage(i));
+      this.listEl.appendChild(row);
+
+      // rendered lazily — a 400-page deck must not render 400 thumbnails to
+      // show you the first screenful
+      this._observe(row, holder, i);
+    }
+  }
+
+  _observe(row, holder, index) {
+    if (!this._io) {
+      this._io = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          this._io.unobserve(entry.target);
+          const i = Number(entry.target.dataset.page);
+          const slot = entry.target.querySelector(".thumb-img");
+          this.doc.thumbnail(i).then((canvas) => {
+            if (slot.isConnected) slot.replaceChildren(canvas);
+          }).catch(() => { /* a page that will not render just stays blank */ });
+        }
+      }, { root: this.listEl, rootMargin: "200px" });
+    }
+    this._io.observe(row);
+  }
+
+  _buildOutline() {
+    const entries = this.doc.outline;
+    // WHERE YOU ARE IS A LINE when no entry names your page (row 153): on an
+    // entry's own page that row gets the bar and a bold title; anywhere else a
+    // rule carrying the page number is inserted BETWEEN the two entries you
+    // fall between, and the containing entry keeps only a faint tint. It counts
+    // every row, because "the entry above me" is whatever is actually above me.
+    const exact = entries.findIndex((e) => e.page === this.page);
+    let insertAt = -1;
+    if (exact < 0) {
+      insertAt = entries.findIndex((e) => e.page > this.page);
+      if (insertAt < 0) insertAt = entries.length;
+    }
+
+    entries.forEach((entry, i) => {
+      if (i === insertAt) this.listEl.appendChild(this._hereLine());
+      const row = document.createElement("button");
+      row.className = "row outline-row";
+      if (i === exact) row.classList.add("current");
+      else if (exact < 0 && i === insertAt - 1) row.classList.add("containing");
+      row.style.paddingLeft = `${10 + entry.level * 14}px`;
+      row.dataset.page = String(entry.page);
+
+      const title = document.createElement("span");
+      title.className = "outline-title";
+      title.textContent = entry.title;
+      row.appendChild(title);
+
+      const no = document.createElement("span");
+      no.className = "outline-page";
+      no.textContent = String(entry.page + 1);
+      row.appendChild(no);
+
+      row.addEventListener("click", () => this.onGoToPage(entry.page));
+      this.listEl.appendChild(row);
+    });
+    if (insertAt === entries.length) this.listEl.appendChild(this._hereLine());
+  }
+
+  /** Neither selectable nor activatable: a row you could click would be a
+   * destination that does not exist. */
+  _hereLine() {
+    const line = document.createElement("div");
+    line.className = "here-line current";
+    const n = document.createElement("span");
+    n.textContent = String(this.page + 1);
+    line.appendChild(n);
+    return line;
+  }
+
+  // ── drop ───────────────────────────────────────────────────────────────────
+
+  /** A drop on the sidebar imports AT THAT GAP — between the two rows you
+   * dropped between, or at the end when you drop in the empty space below. */
+  _installDrop() {
+    const el = this.listEl;
+    el.addEventListener("dragover", (e) => {
+      if (!this.doc) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+      this._markGap(this._gapAt(e.clientY));
+    });
+    el.addEventListener("dragleave", () => this._markGap(null));
+    el.addEventListener("drop", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const gap = this._gapAt(e.clientY);
+      this._markGap(null);
+      const files = [...(e.dataTransfer.files || [])];
+      if (files.length) this.onDropFiles(files, gap);
+    });
+  }
+
+  _gapAt(clientY) {
+    const rows = [...this.listEl.querySelectorAll(".row")];
+    for (const row of rows) {
+      const r = row.getBoundingClientRect();
+      if (clientY < r.top + r.height / 2) return Number(row.dataset.page);
+    }
+    return this.doc ? this.doc.pageCount : 0;
+  }
+
+  _markGap(gap) {
+    for (const row of this.listEl.querySelectorAll(".row")) {
+      row.classList.toggle("gap-before", gap !== null && Number(row.dataset.page) === gap);
+    }
+    this.listEl.classList.toggle("gap-end",
+      gap !== null && this.doc && gap >= this.doc.pageCount);
+  }
+}

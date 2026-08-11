@@ -69,9 +69,18 @@ export class Surface {
     this.bindings = bindings;
     this.docMode = "pdf";       // routing NEVER reads bindings.mode
     this.onChange = opts.onChange || (() => {});
-    this.onToolChange = opts.onToolChange || (() => {});
+    this.onPageChange = opts.onPageChange || (() => {});
 
-    this.strokes = [];          // {pts, press(profile), width, color, opacity, flat}
+    // The document, and which page is in front. Sidemark shows ONE page at a
+    // time and flips between them; it is not a continuous scroll.
+    this.doc = null;
+    this.pageIndex = 0;
+    this.pageW = PAGE_W;
+    this.pageH = PAGE_H;
+    this._pageCanvas = document.createElement("canvas");
+    this._pageKey = null;
+    this._renderToken = 0;
+
     this.undoStack = [];
     this.redoStack = [];
 
@@ -94,6 +103,61 @@ export class Surface {
     this._install();
   }
 
+  // ── the document ───────────────────────────────────────────────────────────
+
+  /** Strokes are stored PER PAGE on the document, so paging away and back
+   * finds the ink where you left it. */
+  get strokes() {
+    return this.doc ? this.doc.strokesFor(this.pageIndex) : (this._loose ||= []);
+  }
+
+  async setDoc(doc, page = 0) {
+    this.doc = doc;
+    this.undoStack.length = 0;
+    this.redoStack.length = 0;
+    await this.setPage(page, { fit: true });
+    this.onChange();
+  }
+
+  async setPage(index, { fit = false } = {}) {
+    if (!this.doc) return;
+    index = Math.max(0, Math.min(this.doc.pageCount - 1, index));
+    this.pageIndex = index;
+    [this.pageW, this.pageH] = await this.doc.pageSize(index);
+    if (fit) this.fit();
+    this._pageKey = null;
+    this.invalidateLayer();
+    await this._renderPage();
+    this.onPageChange(index);
+    this.requestDraw();
+  }
+
+  /** Only RELATIVE navigation is a "flip" — a thumbnail click or an outline row
+   * goes straight to its page. */
+  flipPage(delta) {
+    if (!this.doc) return;
+    const next = this.pageIndex + delta;
+    if (next < 0 || next >= this.doc.pageCount) return;
+    this.setPage(next, { fit: false });
+  }
+
+  async _renderPage() {
+    if (!this.doc) return;
+    const dpr = window.devicePixelRatio || 1;
+    const scale = this.zoom * dpr;
+    const key = `${this.pageIndex}@${scale.toFixed(3)}`;
+    if (this._pageKey === key) return;
+    const token = ++this._renderToken;
+    try {
+      await this.doc.render(this.pageIndex, scale, this._pageCanvas);
+    } catch {
+      return;                    // a page that will not render must not wedge
+    }
+    if (token !== this._renderToken) return;   // a newer render won
+    this._pageKey = key;
+    this.requestDraw();
+  }
+
   // ── view ───────────────────────────────────────────────────────────────────
 
   get cssW() { return this.el.clientWidth; }
@@ -101,10 +165,20 @@ export class Surface {
 
   fit() {
     const m = 24;
-    this.zoom = Math.min((this.cssW - m * 2) / PAGE_W, (this.cssH - m * 2) / PAGE_H);
-    this.offX = (this.cssW - PAGE_W * this.zoom) / 2;
-    this.offY = (this.cssH - PAGE_H * this.zoom) / 2;
+    this.zoom = Math.min((this.cssW - m * 2) / this.pageW,
+                         (this.cssH - m * 2) / this.pageH);
+    this.offX = (this.cssW - this.pageW * this.zoom) / 2;
+    this.offY = (this.cssH - this.pageH * this.zoom) / 2;
     this.invalidateLayer();
+    this._schedulePageRender();
+  }
+
+  /** Re-rendering the page is expensive, so it is debounced behind the zoom
+   * gesture: the old bitmap is scaled meanwhile, which is what keeps a pinch
+   * smooth instead of blocking on pdf.js at every step. */
+  _schedulePageRender() {
+    clearTimeout(this._renderTimer);
+    this._renderTimer = setTimeout(() => this._renderPage(), 120);
   }
 
   toDoc(x, y) { return [(x - this.offX) / this.zoom, (y - this.offY) / this.zoom]; }
@@ -116,6 +190,7 @@ export class Surface {
     this.offX = cx - dx * this.zoom;
     this.offY = cy - dy * this.zoom;
     this.invalidateLayer();
+    this._schedulePageRender();
     this.requestDraw();
   }
 
@@ -177,9 +252,26 @@ export class Surface {
     if (e.ctrlKey) {
       // the touchpad pinch, which arrives as ctrl+wheel and carries no pointers
       this.zoomAt(Math.exp(-e.deltaY * 0.01), e.offsetX, e.offsetY);
-    } else {
-      this.panBy(-e.deltaX, -e.deltaY);
+      return;
     }
+    // Scrolling PAST THE EDGE turns the page — the page is the unit of
+    // navigation here, so a scroll that has nowhere left to go means "next".
+    const pageTop = this.offY;
+    const pageBottom = this.offY + this.pageH * this.zoom;
+    const atBottom = pageBottom <= this.cssH + 1;
+    const atTop = pageTop >= -1;
+    if (e.deltaY > 0 && atBottom) { this._flipVisible(1); return; }
+    if (e.deltaY < 0 && atTop) { this._flipVisible(-1); return; }
+    this.panBy(-e.deltaX, -e.deltaY);
+  }
+
+  /** Scroll-past-edge and the page buttons resolve navigation in ONE place, so
+   * the two cannot disagree about where "next" lands. */
+  _flipVisible(delta) {
+    const now = performance.now();
+    if (now - (this._lastFlip || 0) < 220) return;   // one page per gesture
+    this._lastFlip = now;
+    this.flipPage(delta);
   }
 
   _onDown(e) {
@@ -341,7 +433,9 @@ export class Surface {
     if (a.tool === "pen" || a.tool === "highlighter") {
       this._commitStroke(a);
     } else if (a.tool === "eraser") {
-      if (a.erased.length) this._pushUndo({ type: "erase", strokes: a.erased });
+      if (a.erased.length) {
+        this._pushUndo({ type: "erase", page: this.pageIndex, strokes: a.erased });
+      }
     } else if (a.tool === "zoom") {
       this._zoomToRegion(a.startView, [e.offsetX, e.offsetY]);
     }
@@ -382,7 +476,7 @@ export class Surface {
       flat,
     };
     this.strokes.push(stroke);
-    this._pushUndo({ type: "draw", stroke });
+    this._pushUndo({ type: "draw", page: this.pageIndex, stroke });
     this._appendToLayer(stroke);
     this.onChange();
   }
@@ -422,15 +516,26 @@ export class Surface {
     this.redoStack.length = 0;
   }
 
+  /** The page an undo op belongs to — an op carries its own, so undoing a
+   * stroke drawn three pages back edits THAT page rather than whatever is in
+   * front now. Undo also brings you to the page it changed: a Ctrl+Z whose
+   * effect you cannot see reads as nothing having happened. */
+  _opStrokes(op) {
+    if (!this.doc) return this.strokes;
+    if (op.page !== this.pageIndex) this.setPage(op.page);
+    return this.doc.strokesFor(op.page);
+  }
+
   undo() {
     const op = this.undoStack.pop();
     if (!op) return;
+    const strokes = this._opStrokes(op);
     if (op.type === "draw") {
-      const i = this.strokes.lastIndexOf(op.stroke);
-      if (i >= 0) this.strokes.splice(i, 1);
+      const i = strokes.lastIndexOf(op.stroke);
+      if (i >= 0) strokes.splice(i, 1);
     } else if (op.type === "erase") {
       for (const { stroke, index } of op.strokes) {
-        this.strokes.splice(Math.min(index, this.strokes.length), 0, stroke);
+        strokes.splice(Math.min(index, strokes.length), 0, stroke);
       }
     }
     this.redoStack.push(op);
@@ -442,12 +547,13 @@ export class Surface {
   redo() {
     const op = this.redoStack.pop();
     if (!op) return;
+    const strokes = this._opStrokes(op);
     if (op.type === "draw") {
-      this.strokes.push(op.stroke);
+      strokes.push(op.stroke);
     } else if (op.type === "erase") {
       for (const { stroke } of op.strokes) {
-        const i = this.strokes.lastIndexOf(stroke);
-        if (i >= 0) this.strokes.splice(i, 1);
+        const i = strokes.lastIndexOf(stroke);
+        if (i >= 0) strokes.splice(i, 1);
       }
     }
     this.undoStack.push(op);
@@ -457,9 +563,11 @@ export class Surface {
   }
 
   clear() {
-    if (!this.strokes.length) return;
-    this._pushUndo({ type: "erase", strokes: this.strokes.map((s, i) => ({ stroke: s, index: i })) });
-    this.strokes = [];
+    const strokes = this.strokes;
+    if (!strokes.length) return;
+    this._pushUndo({ type: "erase", page: this.pageIndex,
+                     strokes: strokes.map((s, i) => ({ stroke: s, index: i })) });
+    strokes.length = 0;          // in place: `strokes` is the page's own array
     this.invalidateLayer();
     this.onChange();
     this.requestDraw();
@@ -527,7 +635,10 @@ export class Surface {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, this.cssW, this.cssH);
 
-    // the page itself
+    // the page itself: the rendered PDF, or white paper before one is open.
+    // The bitmap is drawn to the page's document-unit rect whatever scale it
+    // was rendered at, so a zoom shows a stretched page for one beat rather
+    // than blocking on pdf.js — the re-render lands behind it.
     ctx.save();
     ctx.translate(this.offX, this.offY);
     ctx.scale(this.zoom, this.zoom);
@@ -535,8 +646,15 @@ export class Surface {
     ctx.shadowColor = "rgba(0,0,0,0.28)";
     ctx.shadowBlur = 12 / this.zoom;
     ctx.shadowOffsetY = 2 / this.zoom;
-    ctx.fillRect(0, 0, PAGE_W, PAGE_H);
+    ctx.fillRect(0, 0, this.pageW, this.pageH);
     ctx.restore();
+    if (this._pageKey && this._pageCanvas.width > 1) {
+      ctx.save();
+      ctx.translate(this.offX, this.offY);
+      ctx.scale(this.zoom, this.zoom);
+      ctx.drawImage(this._pageCanvas, 0, 0, this.pageW, this.pageH);
+      ctx.restore();
+    }
 
     this._ensureLayer();
     ctx.drawImage(this._layer, 0, 0, this.cssW, this.cssH);
