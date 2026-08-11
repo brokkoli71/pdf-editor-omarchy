@@ -10088,6 +10088,8 @@ class MarkdownNotesView(GtkSource.View):
 
     # ── formatting shortcuts ──────────────────────────────────────────────────
 
+    ZOOM_SCROLL_NAME = "sidemark-notes-font-zoom"
+
     def attach_zoom_scroll(self, ancestor):
         """Install the Ctrl+scroll font-zoom controller on `ancestor`, in the
         CAPTURE phase. The owner must call this, because the controller cannot
@@ -10108,6 +10110,12 @@ class MarkdownNotesView(GtkSource.View):
         ctrl = Gtk.EventControllerScroll(
             flags=Gtk.EventControllerScrollFlags.VERTICAL)
         ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        # NAMED, so "is our zoom controller in the right place?" can be asked
+        # of the widget tree. `observe_controllers()` also returns GTK's own
+        # internal controllers, and which of those exist differs by GTK
+        # version — a test that counted them was really asserting a fact about
+        # the toolkit, and failed on a different one.
+        ctrl.set_name(self.ZOOM_SCROLL_NAME)
         ctrl.connect("scroll", self._on_scroll)
         ancestor.add_controller(ctrl)
 

@@ -9665,12 +9665,18 @@ class TestNotesFontZoom(unittest.TestCase):
             s = win._active_session
             view = s._panel_notes_view
 
-            # no scroll controller may be left on the view: it is unreachable
+            # OUR zoom controller must not sit on the view: it is unreachable
+            # there. Asked by NAME — `observe_controllers()` also returns
+            # GTK's own internal controllers, and which of those exist differs
+            # by GTK version, so counting them asserted a fact about the
+            # toolkit rather than about us (and failed on Ubuntu's GTK while
+            # passing here).
+            name = sidemark.MarkdownNotesView.ZOOM_SCROLL_NAME
             leftover = [c for c in view.observe_controllers()
-                        if isinstance(c, Gtk.EventControllerScroll)]
+                        if c.get_name() == name]
             if leftover:
                 raise AssertionError(
-                    "notes view has its own scroll controller; the "
+                    "the font-zoom controller is on the notes view; the "
                     "ScrolledWindow will swallow Ctrl+scroll before it fires")
 
             # ...and one must exist in the capture phase SOMEWHERE above the
@@ -9690,12 +9696,13 @@ class TestNotesFontZoom(unittest.TestCase):
             caps, anc = [], sw.get_parent()
             while anc is not None and not caps:
                 caps = [c for c in anc.observe_controllers()
-                        if isinstance(c, Gtk.EventControllerScroll)
+                        if c.get_name() == name
                         and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE]
                 anc = anc.get_parent()
             if not caps:
                 raise AssertionError(
-                    "no capture-phase scroll controller above the ScrolledWindow")
+                    "the font-zoom controller is not in the capture phase "
+                    "above the ScrolledWindow")
 
             # and it actually zooms: Ctrl+scroll up → bigger notes font
             base = win._notes_font_px
@@ -13862,8 +13869,15 @@ class TestTextFirstMode(unittest.TestCase):
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
+                sheet_tab = win._active_session._tab_page
                 self.assertTrue(tp._zoom_css_state["added"])   # realized → active
-                win._tab_view.close_page(win._active_session._tab_page)
+                # a SECOND tab first, so this closes a tab and not the whole
+                # application. Closing the last one takes GTK down the
+                # shutdown path, which on a GPU-less runner blocks inside
+                # app.run() below Python — a 120 s stall for a teardown this
+                # test is not about (the tab close is).
+                win._new_tab()
+                win._tab_view.close_page(sheet_tab)
                 self._settle()
                 self.assertFalse(tp._zoom_css_state["added"])  # closed → removed
 
