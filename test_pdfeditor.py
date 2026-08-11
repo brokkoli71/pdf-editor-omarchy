@@ -8624,12 +8624,18 @@ class TestBookmarksInOutline(unittest.TestCase):
     make the outline worth offering — a lecture deck almost never has a TOC,
     and it is exactly the document you bookmark your way around."""
 
+    def _entries(self, win):
+        """The outline's real rows — the position line is chrome, not an
+        entry."""
+        return [r for r in _rows_of(win._toc_list)
+                if not getattr(r, "_here_marker", False)]
+
     def _rows(self, win):
-        """Each outline row's text. A ★ row wraps its label in a Box (F2
+        """Each outline ENTRY's text. A ★ row wraps its label in a Box (F2
         renames in place, which needs something to swap the entry into), so
         look one level down when the child is not the label itself."""
         out = []
-        for row in _rows_of(win._toc_list):
+        for row in self._entries(win):
             child = row.get_child()
             if isinstance(child, Gtk.Label):
                 out.append(child.get_label())
@@ -8830,11 +8836,7 @@ class TestBookmarksInOutline(unittest.TestCase):
 
         self._run(body)
 
-    def test_where_you_are_is_marked_at_two_strengths(self):
-        """The entry you are ON and the entry you are INSIDE are different
-        answers, and one marker would have to lie about one of them: on page 25
-        of a chapter starting at 20 you are in that chapter but not on its page,
-        and while presenting that is a difference you would act on."""
+    def test_on_an_entrys_own_page_that_row_is_marked_and_no_line_is_drawn(self):
         def body(win):
             win._toc_btn.set_active(True)
             win.notes_model.add_bookmark(3, "A mark")
@@ -8843,15 +8845,13 @@ class TestBookmarksInOutline(unittest.TestCase):
             def classes():
                 return {lbl: (r.has_css_class("current-entry"),
                               r.has_css_class("in-section"))
-                        for lbl, r in zip(self._rows(win), _rows_of(win._toc_list))}
+                        for lbl, r in zip(self._rows(win), self._entries(win))}
 
             win._go_to_page(1)          # exactly Chapter Two's page
             win._mark_current_outline_row()
             self.assertEqual(classes()["Chapter Two"], (True, False))
-
-            win._go_to_page(2)          # inside Chapter Two, not on its page
-            win._mark_current_outline_row()
-            self.assertEqual(classes()["Chapter Two"], (False, True))
+            self.assertFalse(self._marker(win),
+                             "an entry names this page, so there is no gap")
 
             win._go_to_page(3)          # exactly the bookmark's page
             win._mark_current_outline_row()
@@ -8859,9 +8859,88 @@ class TestBookmarksInOutline(unittest.TestCase):
             self.assertEqual(marks["★ A mark"], (True, False))
             self.assertEqual(marks["Chapter Two"], (False, False),
                              "only one row may claim to be where you are")
+            self.assertFalse(self._marker(win))
 
         self._run(body, toc=[[1, "Chapter One", 1], [1, "Chapter Two", 2]],
                   pages=6)
+
+    def _marker(self, win):
+        return next((r for r in _rows_of(win._toc_list)
+                     if getattr(r, "_here_marker", False)), None)
+
+    def _marker_index(self, win):
+        rows = _rows_of(win._toc_list)
+        return next((i for i, r in enumerate(rows)
+                     if getattr(r, "_here_marker", False)), None)
+
+    def test_between_entries_a_line_is_drawn_where_you_are(self):
+        """A faint tint on the containing chapter was too little to find while
+        presenting. The line is exact where no entry can be: it goes BETWEEN
+        the two entries your page falls between, and carries the page number.
+        """
+        def body(win):
+            win._toc_btn.set_active(True)
+            win.notes_model.add_bookmark(3, "A mark")
+            win._populate_toc()
+
+            win._go_to_page(2)          # after Chapter Two (p2), before ★ (p4)
+            win._mark_current_outline_row()
+            rows = _rows_of(win._toc_list)
+            i = self._marker_index(win)
+            self.assertIsNotNone(i, "no position line between the entries")
+            self.assertIn("Chapter Two", _row_text(rows[i - 1]))
+            self.assertIn("A mark", _row_text(rows[i + 1]))
+            self.assertIn("page 3", _row_text(rows[i]))
+            # …and the section it falls in still says so, faintly
+            self.assertTrue(rows[i - 1].has_css_class("in-section"))
+
+        self._run(body, toc=[[1, "Chapter One", 1], [1, "Chapter Two", 2]],
+                  pages=6)
+
+    def test_the_line_counts_bookmarks_as_entries_too(self):
+        """"The entry above me" is whatever is actually above me in the list —
+        a line that ignored ★ rows would point at a chapter several screens
+        up."""
+        def body(win):
+            win._toc_btn.set_active(True)
+            win.notes_model.add_bookmark(1, "Early")
+            win.notes_model.add_bookmark(4, "Late")
+            win._populate_toc()
+
+            win._go_to_page(2)
+            win._mark_current_outline_row()
+            rows = _rows_of(win._toc_list)
+            i = self._marker_index(win)
+            self.assertIn("Early", _row_text(rows[i - 1]))
+            self.assertIn("Late", _row_text(rows[i + 1]))
+
+        self._run(body, pages=6)
+
+    def test_the_line_moves_and_never_doubles(self):
+        def body(win):
+            win._toc_btn.set_active(True)
+            win.notes_model.add_bookmark(4, "Late")
+            win._populate_toc()
+            for page in (1, 2, 3):
+                win._go_to_page(page)
+                win._mark_current_outline_row()
+                markers = [r for r in _rows_of(win._toc_list)
+                           if getattr(r, "_here_marker", False)]
+                self.assertEqual(len(markers), 1, f"page {page}: {len(markers)}")
+                self.assertIn(f"page {page + 1}", _row_text(markers[0]))
+
+        self._run(body, pages=6)
+
+    def test_a_page_ahead_of_every_entry_puts_the_line_first(self):
+        def body(win):
+            win._toc_btn.set_active(True)
+            win.notes_model.add_bookmark(4, "Late")
+            win._populate_toc()
+            win._go_to_page(0)
+            win._mark_current_outline_row()
+            self.assertEqual(self._marker_index(win), 0)
+
+        self._run(body, pages=6)
 
     def test_an_unnamed_bookmark_still_says_which_page_it_is(self):
         def body(win):

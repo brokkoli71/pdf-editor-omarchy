@@ -689,6 +689,17 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     widget with no parent — `gtk_widget_get_parent` assertions without end
     (millions, not a handful). Enter and Escape are not inside a focus change
     and stay immediate.
+  - **Where you are in the outline is a LINE when no entry names your page**
+    (row 153). On an entry's own page that row gets the solid bar and a bold
+    title; anywhere else a rule carrying the page number is inserted BETWEEN
+    the two entries you fall between, and the containing entry keeps only a
+    faint tint (a tint alone was too little to find while presenting). The line
+    counts every row — chapters, sub-entries and bookmarks alike — because "the
+    entry above me" is whatever is actually above me in the list; ignoring ★
+    rows would point at a chapter several screens up. It is inserted and
+    removed, never moved, so a stale second line is impossible, and it is
+    neither selectable nor activatable: a row you could click would be a
+    destination that does not exist.
   - **Bookmarks are outline entries too, and can BE the outline** (row 153).
     The Outline/Pages switch appears when the document has a TOC *or*
     bookmarks — a lecture deck rarely has a TOC and is exactly what you

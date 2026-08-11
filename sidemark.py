@@ -14529,7 +14529,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 background: alpha({acc_hex}, 0.10);
             }}
             .current-entry label {{ font-weight: bold; }}
-            .in-section {{ box-shadow: inset 3px 0 0 0 alpha({acc_hex}, 0.45); }}
+            /* the section the gap belongs to — deliberately faint, because the
+               LINE is the signal now and two strong marks compete */
+            .in-section {{ box-shadow: inset 3px 0 0 0 alpha({acc_hex}, 0.35); }}
+            /* the position line, drawn BETWEEN the two entries you are between:
+               a rule across the list with the page number on it, which is the
+               only mark that can be exact when no entry names your page */
+            .here-line {{ margin-top: 1px; margin-bottom: 1px; }}
+            .here-rule {{
+                background: {acc_hex};
+                min-height: 2px;
+                border-radius: 1px;
+            }}
+            .here-label {{
+                font-size: 0.78em;
+                font-weight: bold;
+                color: {acc_hex};
+            }}
             .entry-page {{ font-size: 0.85em; opacity: 0.55; }}
             .current-entry .entry-page {{ opacity: 1; }}
             /* a hidden page (row 158) stays in the strip — dimmed, because it
@@ -18313,46 +18329,89 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         return lab
 
     def _mark_current_outline_row(self, scroll=True):
-        """Show where you are in the outline, at TWO strengths.
+        """Show where you are in the outline.
 
-        The entry you are ON and the entry you are INSIDE are different answers,
-        and a single marker has to lie about one of them: on page 25 of a
-        chapter starting at 20, you are *in* that chapter but not *on* its page,
-        and a marker that says "here" is wrong in a way you would act on while
-        presenting. So an exact page match gets the solid bar and the bold
-        title, and the innermost entry whose span contains the page gets a
-        half-strength bar. Between two bookmarks with no chapter around them,
-        nothing is marked — which is the honest answer.
+        The entry you are ON and the page you are BETWEEN entries on are
+        different answers, and one marker has to lie about one of them: on page
+        25 of a chapter starting at 20 you are in that chapter but not on its
+        page, and while presenting that is a difference you would act on.
 
-        A CSS class per row, never a rebuild: `_populate_toc` throws every row
-        away, which would drop the selection F2 depends on."""
+        - Exactly on an entry's page: that row gets the solid bar and bold
+          title.
+        - Anywhere else: a **line is drawn between the two entries you are
+          between**, carrying the page number. It counts EVERY row — chapters,
+          sub-entries and bookmarks alike — because "the entry above me" is
+          whatever is actually above you in the list, and a line that ignored
+          bookmarks would point at a chapter heading several screens up. The
+          containing entry keeps a faint tint as well, which is what says which
+          section the gap belongs to.
+
+        A CSS class per row and one inserted line, never a rebuild:
+        `_populate_toc` throws every row away, which would drop the selection
+        F2 depends on."""
         rows = []
         child = self._toc_list.get_first_child()
         while child is not None:
-            child.remove_css_class("current-entry")
-            child.remove_css_class("in-section")
-            rows.append(child)
-            child = child.get_next_sibling()
+            nxt = child.get_next_sibling()
+            if getattr(child, "_here_marker", False):
+                # the previous position line — removed rather than moved, so
+                # there is never a second one to go stale
+                self._toc_list.remove(child)
+            else:
+                child.remove_css_class("current-entry")
+                child.remove_css_class("in-section")
+                rows.append(child)
+            child = nxt
         if self._toc_thumbs or self.canvas.document is None or not rows:
             return
         page = self.canvas.current_page_idx
         exact = next((r for r in rows if getattr(r, "toc_page", None) == page),
                      None)
-        target = exact
         if exact is not None:
             exact.add_css_class("current-entry")
-        else:
-            # the last row starting at or before this page — the section it
-            # falls in. Bookmarks are page-sized, so a bookmark row only ever
-            # matches exactly and never claims a span of its own.
-            inside = [r for r in rows
-                      if getattr(r, "_bookmark_idx", None) is None
-                      and getattr(r, "toc_page", -1) <= page]
-            if inside:
-                target = inside[-1]
-                target.add_css_class("in-section")
-        if scroll and target is not None:
-            self._scroll_row_into_view(target)
+            if scroll:
+                self._scroll_row_into_view(exact)
+            return
+        # between entries: the line goes after the last row starting at or
+        # before this page — index 0 when the page is ahead of every entry
+        above = [i for i, r in enumerate(rows)
+                 if getattr(r, "toc_page", -1) <= page]
+        at = (above[-1] + 1) if above else 0
+        # the section the gap belongs to is the last non-bookmark entry above:
+        # a bookmark marks one page and owns no span
+        section = [r for r in rows
+                   if getattr(r, "_bookmark_idx", None) is None
+                   and getattr(r, "toc_page", -1) <= page]
+        if section:
+            section[-1].add_css_class("in-section")
+        marker = self._here_marker_row(page)
+        self._toc_list.insert(marker, at)
+        if scroll:
+            self._scroll_row_into_view(marker)
+
+    def _here_marker_row(self, page):
+        """The line drawn between the two entries the current page falls
+        between. Not selectable and not activatable: it is a readout, and a row
+        you could click would be a destination that does not exist."""
+        row = Gtk.ListBoxRow()
+        row._here_marker = True
+        row.set_selectable(False)
+        row.set_activatable(False)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.add_css_class("here-line")
+        box.set_margin_start(8)
+        box.set_margin_end(8)
+        rule = Gtk.Box()
+        rule.add_css_class("here-rule")
+        rule.set_hexpand(True)
+        rule.set_valign(Gtk.Align.CENTER)
+        box.append(rule)
+        lab = Gtk.Label(label=f"page {page + 1}")
+        lab.add_css_class("here-label")
+        box.append(lab)
+        row.set_child(box)
+        row.set_tooltip_text(f"You are on page {page + 1}")
+        return row
 
     def _scroll_row_into_view(self, row, tries=6):
         """Bring an outline row into view, with the strip's retry: at the
