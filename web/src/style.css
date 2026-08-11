@@ -586,6 +586,12 @@ hr { border: none; border-top: 1px solid var(--separator); margin: 10px 0 2px; w
   border-radius: 12px;
   box-shadow: var(--popover-shadow);
 }
+.startup-error.info { border-color: var(--accent-bg); }
+.startup-error button {
+  margin-top: 10px;
+  background: var(--btn-bg);
+}
+
 .startup-error code {
   font-family: ui-monospace, monospace;
   background: var(--btn-bg);

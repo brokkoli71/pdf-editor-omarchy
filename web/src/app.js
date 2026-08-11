@@ -193,6 +193,7 @@ surface.requestDraw();
 // A poor restore beats a failure to start, so anything unreadable falls through
 // to the blank page rather than stopping here.
 watchForStalledStart();
+noteSavingSupport();
 restoreSession()
   .catch((err) => {
     console.error("could not restore the last session", err);
@@ -210,6 +211,35 @@ restoreSession()
  * `file://` page — it is created without complaint and then never loads, so the
  * app simply hangs with an empty sheet and no error anywhere. Nothing else in
  * the startup path can detect that, so it is detected by NOT HAPPENING. */
+/** Say once, in browsers that cannot do it, that saving writes a COPY.
+ *
+ * File System Access is Chromium-only, so everywhere else Ctrl+S produces a
+ * download instead of writing back to the file you opened. That is a real
+ * difference in how the app behaves, and finding it out by looking in your
+ * downloads folder for work you thought you had saved is the wrong way to learn
+ * it. Said once and remembered, because a banner on every visit is noise. */
+function noteSavingSupport() {
+  if (canSaveInPlace || store.get("save_note_seen")) return;
+  const note = document.createElement("div");
+  note.className = "startup-error info";
+  note.innerHTML =
+    "<strong>Saving works differently in this browser.</strong><br>"
+    + "Ctrl+S will download a copy of the PDF and the notes rather than writing "
+    + "back to the files you opened.<br>"
+    + "For save-in-place, open Sidemark in <strong>Chrome</strong> or "
+    + "<strong>Edge</strong>.";
+  const ok = document.createElement("button");
+  ok.className = "small";
+  ok.textContent = "Got it";
+  ok.addEventListener("click", () => {
+    store.set("save_note_seen", true);
+    note.remove();
+  });
+  note.appendChild(document.createElement("br"));
+  note.appendChild(ok);
+  document.body.appendChild(note);
+}
+
 function watchForStalledStart() {
   setTimeout(() => {
     if (surface.doc) return;
@@ -438,7 +468,8 @@ async function doSave({ reask = false } = {}) {
     if (!result) return;                       // cancelled
     markDirty(false);
     const what = result.notes ? `${result.pdf} + ${result.notes}` : result.pdf;
-    toast(result.inPlace ? `Saved ${what}` : `Downloaded ${what}`);
+    toast(result.inPlace ? `Saved ${what}`
+                         : `Downloaded ${what} — this browser cannot write back to the original`);
   } catch (err) {
     toast(`Could not save: ${err.message}`);
   } finally {
