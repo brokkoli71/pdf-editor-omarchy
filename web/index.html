@@ -53,12 +53,16 @@
     </div>
     <div id="side-list"></div>
   </aside>
-  <div id="stage">
-    <canvas id="page" aria-label="Drawing page"></canvas>
-    <div class="drop-hint" id="drop-hint" hidden>
-      <strong id="drop-title">Drop to open</strong>
-      <span id="drop-sub">Several files merge into one document, a chapter each</span>
+  <div id="paned">
+    <div id="stage">
+      <canvas id="page" aria-label="Drawing page"></canvas>
+      <div class="drop-hint" id="drop-hint" hidden>
+        <strong id="drop-title">Drop to open</strong>
+        <span id="drop-sub">Several files merge into one document, a chapter each</span>
+      </div>
     </div>
+    <div id="divider" role="separator" aria-label="Resize notes" tabindex="0"></div>
+    <div id="notes"></div>
   </div>
 </main>
 

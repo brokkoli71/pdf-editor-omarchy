@@ -6,6 +6,7 @@
 
 import * as pdfjs from "../vendor/pdf.min.mjs";
 import { PDFDocument } from "../vendor/pdf-lib.esm.js";
+import { NotesModel } from "./notes-model.js";
 
 pdfjs.GlobalWorkerOptions.workerSrc =
   new URL("../vendor/pdf.worker.min.mjs", import.meta.url).href;
@@ -20,6 +21,10 @@ export class Doc {
     this.name = name;
     this.pageCount = pdf ? pdf.numPages : 1;
     this.ink = new Map();        // page index → strokes[]
+    // The `.md` sidecar's model. It belongs to the document, not to the editor:
+    // the panel is a view of one page of it.
+    this.notes = new NotesModel();
+    this.notes.pdfName = name || null;
     this.outline = [];           // [{title, page, level}]
     this._pageCache = new Map(); // page index → pdf.js PDFPageProxy
     this._sizeCache = new Map();

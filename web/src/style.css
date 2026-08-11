@@ -269,12 +269,44 @@ button:disabled:hover { background: transparent; }
 
 /* ── the page ────────────────────────────────────────────────────────────── */
 
-#stage {
+/* The page and the notes, split by a draggable divider. The default is 62% to
+   the page — the same split the desktop app opens on. */
+#paned {
   flex: 1;
+  min-width: 0;
+  display: flex;
+}
+
+#stage {
+  flex: 0 0 62%;
   min-width: 0;
   background: var(--surround);
   position: relative;
 }
+
+#divider {
+  flex: none;
+  width: 6px;
+  cursor: col-resize;
+  background: var(--separator);
+  position: relative;
+  touch-action: none;
+}
+#divider::after {
+  content: "";
+  position: absolute;
+  inset: 0 -4px;      /* the grab region is wider than the paint */
+}
+#divider:hover, #divider.dragging { background: var(--accent-bg); }
+
+#notes {
+  flex: 1;
+  min-width: 0;
+  background: var(--view-bg);
+  overflow: hidden;
+  display: flex;
+}
+#notes .cm-editor { flex: 1; min-width: 0; }
 
 .drop-hint {
   position: absolute;

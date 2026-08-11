@@ -10,6 +10,8 @@ import {
 import { Surface, IMPLEMENTED_TOOLS } from "./surface.js";
 import { Doc, mergeDocuments, insertDocuments } from "./doc.js";
 import { Sidebar } from "./sidebar.js";
+import { NotesView } from "./notes.js";
+import { NotesModel } from "./notes-model.js";
 
 // ── settings (the settings.json analogue) ────────────────────────────────────
 
@@ -125,8 +127,14 @@ const heldMods = { ctrl: false, shift: false, alt: false };
 
 const surface = new Surface(document.getElementById("page"), pen, bindings, {
   onChange: refreshUndo,
-  onPageChange: (page) => { sidebar.setPage(page); syncPageChrome(); },
+  onPageChange: (page) => {
+    sidebar.setPage(page);
+    notes.showPage(page);
+    syncPageChrome();
+  },
 });
+
+const notes = new NotesView(document.getElementById("notes"));
 
 const sidebar = new Sidebar(document.getElementById("sidebar"), {
   onGoToPage: (page) => surface.setPage(page),   // absolute nav, never a flip
@@ -141,6 +149,7 @@ buildSwatches();
 wirePopover();
 wireKeys();
 wireDocument();
+wireDivider();
 refreshToolBindings();
 refreshUndo();
 
@@ -164,8 +173,44 @@ async function setDoc(doc, title) {
   document.getElementById("doc-title").textContent = title || doc.name;
   sidebar.setDoc(doc);
   sidebar.setPage(0);
+  notes.setModel(doc.notes);
   syncPageChrome();
   refreshUndo();
+}
+
+/** The divider between the page and the notes. GtkPaned's position, by hand. */
+function wireDivider() {
+  const divider = document.getElementById("divider");
+  const paned = document.getElementById("paned");
+  const stage = document.getElementById("stage");
+  let dragging = false;
+
+  const apply = (x) => {
+    const r = paned.getBoundingClientRect();
+    const frac = Math.max(0.15, Math.min(0.92, (x - r.left) / r.width));
+    stage.style.flexBasis = `${(frac * 100).toFixed(2)}%`;
+    store.set("pane_fraction", frac);
+    surface.fit();
+    surface.requestDraw();
+  };
+
+  divider.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    divider.setPointerCapture(e.pointerId);
+    divider.classList.add("dragging");
+    e.preventDefault();
+  });
+  divider.addEventListener("pointermove", (e) => { if (dragging) apply(e.clientX); });
+  divider.addEventListener("pointerup", (e) => {
+    dragging = false;
+    divider.classList.remove("dragging");
+    divider.releasePointerCapture(e.pointerId);
+  });
+
+  const saved = store.get("pane_fraction");
+  if (typeof saved === "number" && saved > 0.1 && saved < 0.95) {
+    stage.style.flexBasis = `${(saved * 100).toFixed(2)}%`;
+  }
 }
 
 /** The page counter and the pager belong to the WINDOW, not to the page, so
