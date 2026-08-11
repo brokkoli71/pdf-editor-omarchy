@@ -8614,6 +8614,39 @@ class TestBookmarksInOutline(unittest.TestCase):
         self.assertEqual(seen[-1], (2, True),
                          "switching views must scroll to the current page")
 
+    def test_where_you_are_is_marked_at_two_strengths(self):
+        """The entry you are ON and the entry you are INSIDE are different
+        answers, and one marker would have to lie about one of them: on page 25
+        of a chapter starting at 20 you are in that chapter but not on its page,
+        and while presenting that is a difference you would act on."""
+        def body(win):
+            win._toc_btn.set_active(True)
+            win.notes_model.add_bookmark(3, "A mark")
+            win._populate_toc()
+
+            def classes():
+                return {lbl: (r.has_css_class("current-entry"),
+                              r.has_css_class("in-section"))
+                        for lbl, r in zip(self._rows(win), _rows_of(win._toc_list))}
+
+            win._go_to_page(1)          # exactly Chapter Two's page
+            win._mark_current_outline_row()
+            self.assertEqual(classes()["Chapter Two"], (True, False))
+
+            win._go_to_page(2)          # inside Chapter Two, not on its page
+            win._mark_current_outline_row()
+            self.assertEqual(classes()["Chapter Two"], (False, True))
+
+            win._go_to_page(3)          # exactly the bookmark's page
+            win._mark_current_outline_row()
+            marks = classes()
+            self.assertEqual(marks["★ A mark"], (True, False))
+            self.assertEqual(marks["Chapter Two"], (False, False),
+                             "only one row may claim to be where you are")
+
+        self._run(body, toc=[[1, "Chapter One", 1], [1, "Chapter Two", 2]],
+                  pages=6)
+
     def test_an_unnamed_bookmark_still_says_which_page_it_is(self):
         def body(win):
             win.notes_model.add_bookmark(2)

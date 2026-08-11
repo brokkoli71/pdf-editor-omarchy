@@ -14483,6 +14483,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             }}
             .drop-before {{ box-shadow: inset 0 3px 0 0 {acc_hex}; }}
             .drop-after  {{ box-shadow: inset 0 -3px 0 0 {acc_hex}; }}
+            /* Where you are in the OUTLINE, at two strengths — because the
+               entry you are "on" and the entry you are "inside" are different
+               answers. A solid bar means this row IS your page; a half-strength
+               one means your page falls in its section, with no entry of its
+               own. One class would have to lie about one of the two. */
+            .current-entry {{
+                box-shadow: inset 3px 0 0 0 {acc_hex};
+                background: alpha({acc_hex}, 0.10);
+            }}
+            .current-entry label {{ font-weight: bold; }}
+            .in-section {{ box-shadow: inset 3px 0 0 0 alpha({acc_hex}, 0.45); }}
+            .entry-page {{ font-size: 0.85em; opacity: 0.55; }}
+            .current-entry .entry-page {{ opacity: 1; }}
             /* row 132: a tool wears the colour of each UNMODIFIED button it
                owns — a dot bottom-right plus that edge tinted. Modified chords
                deliberately get none, or every button wears a constellation;
@@ -17148,6 +17161,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._remember_page(idx)
         if self._toc_thumbs and self._toc_revealer.get_reveal_child():
             self._select_thumb(idx)
+        elif self._toc_revealer.get_reveal_child():
+            # the outline is a position readout while you present, so it
+            # follows the page and brings its row back into view
+            self._mark_current_outline_row()
         if self._presenter is not None:
             self._presenter.sync_page()
 
@@ -18074,6 +18091,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     line.set_margin_start(8 + 14 * min(level_here, 3))
                     line.set_margin_end(8)
                     line.append(lab)
+                    line.append(self._entry_page_label(idx))
                     r = Gtk.ListBoxRow()
                     r.set_child(line)
                     r.toc_page = idx
@@ -18095,12 +18113,16 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 level_here = max(0, level - 1) + 1
                 label = Gtk.Label(label=title.strip() or "—", xalign=0)
                 label.set_ellipsize(Pango.EllipsizeMode.END)
-                label.set_margin_start(8 + 14 * max(0, level - 1))
-                label.set_margin_end(8)
+                label.set_hexpand(True)
                 label.set_margin_top(4)
                 label.set_margin_bottom(4)
+                line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+                line.set_margin_start(8 + 14 * max(0, level - 1))
+                line.set_margin_end(8)
+                line.append(label)
+                line.append(self._entry_page_label(max(0, page - 1)))
                 row = Gtk.ListBoxRow()
-                row.set_child(label)
+                row.set_child(line)
                 # a deleted page leaves its entry pointing at page -1 (PyMuPDF's
                 # "no destination"); clamp so a click can't jump off the front
                 row.toc_page = max(0, page - 1)   # get_toc() pages are 1-based
@@ -18114,6 +18136,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 self._toc_list.append(row)
             emit_marks_before(self.canvas.n_pages + 1)   # the tail, and the
             # whole list when the document has no outline of its own
+            # a rebuild drops every row, so the marker is re-applied here —
+            # scrolling only when the caller asked for it, or a bookmark added
+            # on page 200 would drag the list about
+            self._mark_current_outline_row(scroll=force_scroll)
             self._toc_btn.set_tooltip_text(
                 "Toggle outline (Ctrl+T)" if self._has_toc else
                 "Toggle your bookmarks (Ctrl+T) — no outline in this document")
@@ -18186,6 +18212,76 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # page you are on rather than restoring the other view's scroll
         if self.canvas.document:
             self._populate_toc(force_scroll=True)
+
+    def _entry_page_label(self, idx):
+        """The page an outline row starts on, dim at its right end. It is also
+        what makes the position marker legible: a bar saying 'you are in this
+        section' is much easier to read against the page each section starts
+        on."""
+        lab = Gtk.Label(label=str(idx + 1), xalign=1)
+        lab.add_css_class("entry-page")
+        lab.set_width_chars(3)
+        return lab
+
+    def _mark_current_outline_row(self, scroll=True):
+        """Show where you are in the outline, at TWO strengths.
+
+        The entry you are ON and the entry you are INSIDE are different answers,
+        and a single marker has to lie about one of them: on page 25 of a
+        chapter starting at 20, you are *in* that chapter but not *on* its page,
+        and a marker that says "here" is wrong in a way you would act on while
+        presenting. So an exact page match gets the solid bar and the bold
+        title, and the innermost entry whose span contains the page gets a
+        half-strength bar. Between two bookmarks with no chapter around them,
+        nothing is marked — which is the honest answer.
+
+        A CSS class per row, never a rebuild: `_populate_toc` throws every row
+        away, which would drop the selection F2 depends on."""
+        rows = []
+        child = self._toc_list.get_first_child()
+        while child is not None:
+            child.remove_css_class("current-entry")
+            child.remove_css_class("in-section")
+            rows.append(child)
+            child = child.get_next_sibling()
+        if self._toc_thumbs or self.canvas.document is None or not rows:
+            return
+        page = self.canvas.current_page_idx
+        exact = next((r for r in rows if getattr(r, "toc_page", None) == page),
+                     None)
+        target = exact
+        if exact is not None:
+            exact.add_css_class("current-entry")
+        else:
+            # the last row starting at or before this page — the section it
+            # falls in. Bookmarks are page-sized, so a bookmark row only ever
+            # matches exactly and never claims a span of its own.
+            inside = [r for r in rows
+                      if getattr(r, "_bookmark_idx", None) is None
+                      and getattr(r, "toc_page", -1) <= page]
+            if inside:
+                target = inside[-1]
+                target.add_css_class("in-section")
+        if scroll and target is not None:
+            self._scroll_row_into_view(target)
+
+    def _scroll_row_into_view(self, row, tries=6):
+        """Bring an outline row into view, with the strip's retry: at the
+        instant a rebuild asks, no row has an allocation and every one of them
+        reports y=0."""
+        if row.get_height() == 0 and tries > 0:
+            GLib.timeout_add(16, self._scroll_row_into_view, row, tries - 1)
+            return GLib.SOURCE_REMOVE
+        adj = self._toc_scroll.get_vadjustment()
+        pt = row.translate_coordinates(self._toc_list, 0, 0)
+        if pt is None:
+            return GLib.SOURCE_REMOVE
+        y, h = pt[1], row.get_height()
+        page_size = adj.get_page_size()
+        if y < adj.get_value() or y + h > adj.get_value() + page_size:
+            adj.set_value(max(0, min(y - page_size / 3,
+                                     adj.get_upper() - page_size)))
+        return GLib.SOURCE_REMOVE
 
     def _attach_bookmark_row_menu(self, row):
         """Right-click a ★ row for its two verbs. The same two the row already
