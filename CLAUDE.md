@@ -722,6 +722,31 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   merge) fires the callback through `PDFCanvas._load_page`, so those were never
   the problem; a TAB SWITCH changes which page is in front without any page
   changing, and so fires nothing at all.
+- **Hidden pages (row 158)** — a page can be set aside: still in the document
+  and still editable, but **skipped when paging, skipped when presenting, and
+  left out of an export** (the PowerPoint "hide slide" meaning, not a sidebar
+  filter). Right-click a thumbnail for Hide/Unhide. The flag lives in the same
+  page marker as the row-129 link and the row-134 bookmark (` hidden`) and
+  **ranges** like `continued` does — hiding a block of slides is one fact about
+  a run — so the coalescing rule is now "same attributes, no body, not
+  bookmarked" rather than a special case; a bookmark still breaks a range
+  because it names ONE page. Like a bookmark it needs no adjacency rule.
+  - **Skipping is resolved ONCE per navigation.** `_flip_visible` is the single
+    entry that consults `next_page_for` (scroll-past-edge included);
+    `_flip_page` takes a plain delta. Resolving in both is how paging from 1
+    over a hidden 2–4 lands on 7 instead of 5.
+  - **Only RELATIVE navigation skips.** A thumbnail click, a link and a
+    bookmark still open a hidden page — that is what keeps it reachable and
+    editable, and the dimmed row in the strip is the only way to select it
+    again and bring it back.
+  - The canvas has no notes model, so it asks the window through
+    `next_page_for`, which takes the **session** rather than reading the
+    active-tab proxies.
+  - `_pages_acted_on` is the one rule for which pages a per-page verb applies
+    to — the multi-selection when the clicked row is in it, else that row alone
+    — shared with the drag-export so the two cannot disagree. The menu offers
+    the verb that CHANGES something (Hide unless all are hidden), so a mixed
+    selection needs no thought. PDF-only, like bookmarks.
 - **Reopen where you left off** lives in `recent.json` (`_recent_page` /
   `_remember_recent_page`), NOT the sidecar: a sidecar appears only once you
   write something, and storing the reading position there would drop a `.md`

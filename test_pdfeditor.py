@@ -45,6 +45,19 @@ sidemark.RECENT_PATH = os.path.join(
 
 # ── helper: create a minimal single-page PDF in memory ───────────────────────
 
+def _row_text(row):
+    """All the text a list row shows, whatever it is wrapped in."""
+    def walk(w):
+        if isinstance(w, Gtk.Label):
+            return [w.get_label()]
+        out = []
+        for child in _rows_of(w):
+            out += walk(child)
+        return out
+
+    return " ".join(walk(row))
+
+
 def _rows_of(container):
     """Every direct child of a GTK container, as a list."""
     out, child = [], container.get_first_child()
@@ -8246,6 +8259,171 @@ class TestNotesUndoIsolation(unittest.TestCase):
             raise errors[0]
 
 
+class TestHiddenPages(unittest.TestCase):
+    """A page can be set aside (row 158): still in the document and still
+    editable, but skipped when paging and presenting, and left out of an
+    export."""
+
+    def test_the_flag_rides_in_the_page_marker_and_ranges(self):
+        m = NotesModel()
+        m.set(0, "intro")
+        for p in (2, 3, 4):
+            m.set_page_hidden(p, True)
+        text = m.to_text()
+        self.assertIn("<!-- page:2-4 hidden -->", text,
+                      "a hidden block is one fact about a run, not four")
+        back = NotesModel()
+        back.set_from_text(text)
+        self.assertEqual(back.hidden_pages(), {2, 3, 4})
+        self.assertEqual(back.get(0), "intro")
+
+    def test_a_bookmark_breaks_the_range_and_composes(self):
+        m = NotesModel()
+        for p in (1, 2, 3):
+            m.set_page_hidden(p, True)
+        m.add_bookmark(2, "Mark")
+        text = m.to_text()
+        self.assertIn('<!-- page:2 hidden bookmark="Mark" -->', text)
+        back = NotesModel()
+        back.set_from_text(text)
+        self.assertEqual(back.hidden_pages(), {1, 2, 3})
+        self.assertEqual(back.bookmark_name(2), "Mark")
+
+    def test_hiding_follows_its_page_through_a_rekey(self):
+        """A property OF a page, so it needs no adjacency rule — it just goes
+        where the page goes, and a deleted page takes it with it."""
+        m = NotesModel()
+        for p in (2, 5):
+            m.set_page_hidden(p, True)
+        m.shift_for_insert(3, 2)
+        self.assertEqual(m.hidden_pages(), {2, 7})
+        m.shift_for_delete(2)
+        self.assertEqual(m.hidden_pages(), {6})
+        m.reorder({6: 0})
+        self.assertEqual(m.hidden_pages(), {0})
+
+    def test_an_old_sidecar_without_the_flag_still_parses(self):
+        back = NotesModel()
+        back.set_from_text("<!-- page:1 continued -->\n\n"
+                           '<!-- page:2 bookmark="Old" -->\n\nbody\n')
+        self.assertEqual(back.hidden_pages(), set())
+        self.assertEqual(back.bookmark_name(2), "Old")
+
+    def test_a_hidden_page_is_worth_a_sidecar_on_its_own(self):
+        """Losing the flag loses the only copy of it — the same reason a bare
+        bookmark counts."""
+        m = NotesModel()
+        m.set_page_hidden(3, True)
+        self.assertTrue(m.has_content())
+
+
+class TestHiddenPagesInWindow(unittest.TestCase):
+    def _run(self, body, pages=8):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.hidden")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "deck.pdf")
+                    make_pdf(pdf, n_pages=pages)
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    body(win, d)
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+
+    def test_paging_skips_a_hidden_run_but_a_click_still_opens_it(self):
+        """Skipped when you TURN the page — never unreachable, or you could
+        not edit it or bring it back."""
+        def body(win, _d):
+            for p in (2, 3, 4):
+                win.notes_model.set_page_hidden(p, True)
+            win._go_to_page(1)
+            win._nav_page(1)
+            self.assertEqual(win.canvas.current_page_idx, 5)
+            win._nav_page(-1)
+            self.assertEqual(win.canvas.current_page_idx, 1)
+            # …but going there directly still works
+            win._go_to_page(3)
+            self.assertEqual(win.canvas.current_page_idx, 3)
+
+        self._run(body)
+
+    def test_paging_off_the_end_of_a_hidden_run_stays_put(self):
+        def body(win, _d):
+            for p in (6, 7):
+                win.notes_model.set_page_hidden(p, True)
+            win._go_to_page(5)
+            win._nav_page(1)
+            self.assertEqual(win.canvas.current_page_idx, 5,
+                             "there is nothing visible ahead, so stay rather "
+                             "than land on a page that was set aside")
+
+        self._run(body)
+
+    def test_the_menu_verb_follows_the_pages_it_would_act_on(self):
+        """All hidden → Unhide, otherwise Hide: a menu offering both would make
+        you work out which applies to a mixed selection."""
+        def body(win, _d):
+            win._set_pages_hidden([1, 2], True)
+            self.assertEqual(win.notes_model.hidden_pages(), {1, 2})
+            # a mixed set hides the rest rather than unhiding the two
+            win._set_pages_hidden([1, 2, 3], True)
+            self.assertEqual(win.notes_model.hidden_pages(), {1, 2, 3})
+            win._set_pages_hidden([1, 2, 3], False)
+            self.assertEqual(win.notes_model.hidden_pages(), set())
+
+        self._run(body)
+
+    def test_the_selection_decides_what_a_right_click_acts_on(self):
+        """One rule for every per-page verb — the drag-export's rule."""
+        def body(win, _d):
+            win._toc_btn.set_active(True)
+            win._toc_seg_pages.set_active(True)
+            rows = {r.toc_page: r for r in _rows_of(win._toc_list)
+                    if getattr(r, "toc_page", None) is not None}
+            win._toc_list.select_row(rows[1])
+            win._toc_list.select_row(rows[2])
+            # a row inside the selection acts on all of it…
+            self.assertEqual(win._pages_acted_on(1), [1, 2])
+            # …and one outside it acts on itself alone
+            self.assertEqual(win._pages_acted_on(5), [5])
+
+        self._run(body)
+
+    def test_an_export_leaves_hidden_pages_out(self):
+        def body(win, d):
+            win.notes_model.set(0, "keep me")
+            win.notes_model.set(3, "gone with its page")
+            for p in (3, 4):
+                win.notes_model.set_page_hidden(p, True)
+            out = os.path.join(d, "handout.pdf")
+            sidemark._export_pdf_with_notes(
+                win._path, out, win.notes_model, False, (0, 0, 0))
+            doc = fitz.open(out)
+            try:
+                # 8 pages, two hidden, plus the one notes page page 0 earns
+                self.assertEqual(len(doc), 7)
+                text = "".join(p.get_text() for p in doc)
+            finally:
+                doc.close()
+            self.assertIn("keep me", text)
+            self.assertNotIn("gone with its page", text,
+                             "a notes page for a slide nobody receives")
+
+        self._run(body)
+
+
 class TestSearchScan(unittest.TestCase):
     """Typing must never wait for the document. The first match is found
     synchronously and jumped to; the rest of the pages are scanned in idle
@@ -9284,14 +9462,19 @@ class TestThumbnailSidebar(unittest.TestCase):
                 self.assertTrue(win._toc_thumbs)
                 rows = self._rows(win)
                 self.assertEqual(len(rows), 3)
-                self.assertIsInstance(rows[0].get_child(), Gtk.Box)
+                # a thumbnail row carries a page PICTURE, which is what makes it
+                # a preview rather than an outline entry
+                self.assertTrue(
+                    any(isinstance(w, Gtk.Picture)
+                        for w in _rows_of(rows[0].get_child())))
                 self.assertEqual(win._toc_scroll.get_size_request()[0],
                                  win.THUMB_WIDTH + 32)
                 self._pump_thumbs(win)
                 win._toc_seg_outline.set_active(True)
                 self.assertFalse(win._toc_thumbs)
                 self.assertEqual(win._toc_scroll.get_size_request()[0], 230)
-                self.assertIsInstance(self._rows(win)[0].get_child(), Gtk.Label)
+                # …and the outline shows entry TITLES, not page previews
+                self.assertIn("One", _row_text(self._rows(win)[0]))
 
             self._run_in_window(body)
 
@@ -9330,7 +9513,10 @@ class TestThumbnailSidebar(unittest.TestCase):
                 win._toc_seg_outline.set_active(True)
                 rows = self._rows(win)
                 self.assertEqual(len(rows), 2)
-                self.assertIsInstance(rows[0].get_child(), Gtk.Label)
+                # an outline row shows its TITLE (the widget holding it has
+                # changed shape twice — page numbers, in-place rename — and the
+                # title is the part that is the point)
+                self.assertIn("One", _row_text(rows[0]))
 
             self._run_in_window(body)
 

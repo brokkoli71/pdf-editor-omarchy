@@ -3075,6 +3075,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self.on_live_draw = None
 
         self.on_page_changed = None    # callback(current_idx, n_pages)
+        # callback(start, delta) -> target page, so a relative flip can skip
+        # hidden pages (row 158). The canvas has no notes model of its own.
+        self.next_page_for = None
         self.on_page_will_change = None  # callback() before leaving the page (commit notes)
         self.on_nav_button = None     # callback(delta: int) for back/forward buttons
         self.on_change = None         # callback() whenever strokes are modified
@@ -4733,10 +4736,23 @@ class PDFCanvas(Gtk.DrawingArea):
             self._scroll_past = 0.0   # direction reversed — restart resistance
         self._scroll_past += dy
         if self._scroll_past >= threshold:
-            self._flip_page(1)
+            self._flip_visible(1)
         elif self._scroll_past <= -threshold:
-            self._flip_page(-1)
+            self._flip_visible(-1)
         return True
+
+    def _flip_visible(self, direction):
+        """Turn one page, skipping hidden ones (row 158). The canvas has no
+        notes model, so it asks the window through `next_page_for`.
+
+        Resolving happens HERE and nowhere else on the way down: `_flip_page`
+        takes a plain delta, so a caller that has already resolved a target
+        (`_nav_page`) does not get it skipped a second time."""
+        target = (self.next_page_for(self.current_page_idx, direction)
+                  if self.next_page_for
+                  else self.current_page_idx + direction)
+        if target != self.current_page_idx:
+            self._flip_page(target - self.current_page_idx)
 
     def _flip_page(self, delta):
         if self._is_fitted:
@@ -9216,6 +9232,10 @@ def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty,
     src_doc = fitz.open(src_path)
     out_doc = fitz.open()
     anchor_color = accent
+    # a hidden page (row 158) is left out of the export entirely — that is what
+    # makes "hide" a way to cut a handout down from a longer deck. Its notes go
+    # with it: a notes page for a slide nobody receives is a puzzle.
+    hidden = notes_model.hidden_pages()
 
     def _draw_marks(out_page, notes_text, _anchors):
         _draw_page_marks(out_page, notes_text, anchor_color)
@@ -9237,6 +9257,8 @@ def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty,
             pending.clear()
 
         for page_idx in range(len(src_doc)):
+            if page_idx in hidden:
+                continue
             notes_text = _symbolize(notes_model.own_text(page_idx))
             anchors = _parse_anchors(notes_text)
             out_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
@@ -9255,6 +9277,8 @@ def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty,
         _flush()
     else:
         for page_idx in range(len(src_doc)):
+            if page_idx in hidden:
+                continue
             notes_text = _symbolize(notes_model.own_text(page_idx))
             anchors = _parse_anchors(notes_text)
             out_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
@@ -14496,6 +14520,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             .in-section {{ box-shadow: inset 3px 0 0 0 alpha({acc_hex}, 0.45); }}
             .entry-page {{ font-size: 0.85em; opacity: 0.55; }}
             .current-entry .entry-page {{ opacity: 1; }}
+            /* a hidden page (row 158) stays in the strip — dimmed, because it
+               is the only way to select it again and bring it back */
+            .page-hidden {{ opacity: 0.4; }}
             /* row 132: a tool wears the colour of each UNMODIFIED button it
                owns — a dot bottom-right plus that edge tinted. Modified chords
                deliberately get none, or every button wears a constellation;
@@ -14765,7 +14792,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         prev_btn = Gtk.Button()
         prev_btn.set_icon_name("go-previous-symbolic")
         prev_btn.set_tooltip_text("Previous page (PageUp)")
-        prev_btn.connect("clicked", lambda _: self._go_to_page(self.canvas.current_page_idx - 1))
+        prev_btn.connect("clicked", lambda _: self._nav_page(-1))
 
         self._page_label = Gtk.Label(label="—")
         self._page_label.set_width_chars(7)
@@ -14773,7 +14800,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         next_btn = Gtk.Button()
         next_btn.set_icon_name("go-next-symbolic")
         next_btn.set_tooltip_text("Next page (PageDown)")
-        next_btn.connect("clicked", lambda _: self._go_to_page(self.canvas.current_page_idx + 1))
+        next_btn.connect("clicked", lambda _: self._nav_page(1))
 
         self._nav_box = nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         nav_box.add_css_class("linked")
@@ -15490,6 +15517,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s.canvas.on_change = lambda *a: s.win._mark_dirty(*a)
         s.canvas.on_text_copied = lambda *a: s.win._on_text_copied(*a)
         s.canvas.on_nav_button = lambda d: s.win._nav_page(d)
+        s.canvas.next_page_for = (
+            lambda start, d, sess=s: sess.win.next_visible_page(start, d, sess))
         # commit the current note before any canvas-initiated page change
         # (scroll flip, link jump, undo on another page)
         s.canvas.on_page_will_change = lambda *a: s.win._commit_note()
@@ -17409,6 +17438,32 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         for it in _load_recent():
             yield ("recent", it["path"])
 
+    def next_visible_page(self, start, delta, session=None):
+        """The next page in `delta`'s direction that is not hidden (row 158).
+
+        Relative navigation only: clicking a thumbnail, a link or a bookmark
+        still opens a hidden page, which is what keeps a hidden page reachable
+        and editable. Falls back to `start` when there is nothing visible that
+        way, so paging off the end of a hidden run stays put rather than
+        landing on a page you set aside.
+
+        Takes the SESSION rather than reading the active-tab proxies: the
+        canvas that asks is the one this answer is about."""
+        s = session or self._active_session
+        model, canvas = s.notes_model, s.canvas
+        if canvas is None:
+            return start
+        step = 1 if delta >= 0 else -1
+        idx = start
+        for _ in range(abs(delta)):
+            nxt = idx + step
+            while 0 <= nxt < canvas.n_pages and model.is_hidden(nxt):
+                nxt += step
+            if not 0 <= nxt < canvas.n_pages:
+                break
+            idx = nxt
+        return idx
+
     def _nav_page(self, delta):
         """Relative page navigation (PageUp/Down, mouse back/forward): zoomed
         views keep their zoom and align to the new page's top/bottom, fitted
@@ -17416,7 +17471,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         c = self.canvas
         if not c.document:
             return
-        target = max(0, min(c.n_pages - 1, c.current_page_idx + delta))
+        target = self.next_visible_page(c.current_page_idx, delta)
+        target = max(0, min(c.n_pages - 1, target))
         if target == c.current_page_idx:
             return
         self._commit_note()
@@ -18378,8 +18434,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # …and so is a bookmark: the strip is where you look for the page
             # you want, so the marks that help you find it belong here
             marked = self.notes_model.is_bookmarked(i)
+            # a hidden page stays IN the strip, dimmed and marked (row 158):
+            # it is the only way to select it again to bring it back
+            hidden = self.notes_model.is_hidden(i)
             num = Gtk.Label(label=str(i + 1) + (" ⤸" if linked else "")
-                            + (" ★" if marked else ""))
+                            + (" ★" if marked else "")
+                            + (" 🚫" if hidden else ""))
             num.add_css_class("dim-label")
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             box.set_margin_top(6)
@@ -18396,9 +18456,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                  f"{self.notes_model.run_start(i) + 1}" if linked else
                  f"Page {i + 1}")
                 + (f" — bookmarked: {self._bookmark_label(i)}" if marked else "")
+                + (" — hidden: skipped when paging and presenting, left out of "
+                   "an export" if hidden else "")
                 + " — click to open (PageUp/PageDown to flip), "
-                  "Ctrl+click to select, drag to reorder or export")
+                  "Ctrl+click to select, right-click to hide, "
+                  "drag to reorder or export")
+            if hidden:
+                row.add_css_class("page-hidden")
             self._add_thumb_dnd(row, i)
+            self._attach_thumb_menu(row, i)
             self._toc_list.append(row)
             pictures.append(pic)
 
@@ -18426,6 +18492,65 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return True
 
         self._thumb_idle_id = GLib.idle_add(render_next)
+
+    def _attach_thumb_menu(self, row, idx):
+        """Right-click a thumbnail for its per-page verbs (row 158).
+
+        The verb is decided by the pages it would act on: all hidden → Unhide,
+        otherwise Hide. A menu that offered both would make you work out which
+        one applies to a mixed selection; picking the one that CHANGES
+        something is the answer that needs no thought."""
+        click = Gtk.GestureClick()
+        click.set_button(Gdk.BUTTON_SECONDARY)
+
+        def pressed(gesture, _n, x, y):
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            pages = self._pages_acted_on(idx)
+            if len(pages) == 1:
+                # a right-click outside the selection acts on THIS page, so make
+                # the strip say so before the menu names it
+                self._toc_list.unselect_all()
+            hidden = [p for p in pages if self.notes_model.is_hidden(p)]
+            hiding = len(hidden) != len(pages)
+            what = (f"{len(pages)} pages" if len(pages) > 1
+                    else f"page {pages[0] + 1}")
+            menu = Gtk.Popover()
+            menu.set_parent(row)
+            menu.set_has_arrow(False)
+            menu.set_pointing_to(Gdk.Rectangle(x=int(x), y=int(y),
+                                               width=1, height=1))
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            box.set_margin_start(4); box.set_margin_end(4)
+            box.set_margin_top(4); box.set_margin_bottom(4)
+            item = Gtk.Button()
+            item.add_css_class("flat")
+            item.set_child(Gtk.Label(
+                label=("Hide" if hiding else "Unhide") + f" {what}", xalign=0))
+            item.set_tooltip_text(
+                "Hidden pages are skipped when you page through the document "
+                "and when presenting, and are left out of an export — they "
+                "stay in the file and stay editable"
+                if hiding else "Bring these pages back into the document")
+            item.connect("clicked", lambda _b: (menu.popdown(),
+                                                self._set_pages_hidden(pages, hiding)))
+            box.append(item)
+            menu.set_child(box)
+            menu.connect("closed", lambda _p: menu.unparent())
+            menu.popup()
+
+        click.connect("pressed", pressed)
+        row.add_controller(click)
+
+    def _set_pages_hidden(self, pages, hidden):
+        changed = [p for p in pages
+                   if self.notes_model.set_page_hidden(p, hidden)]
+        if not changed:
+            return
+        self._mark_dirty()
+        self._populate_toc()
+        n = len(changed)
+        self._toast(("Hid " if hidden else "Unhid ")
+                    + (f"{n} pages" if n > 1 else f"page {changed[0] + 1}"))
 
     def _add_thumb_dnd(self, row, idx):
         """Make a thumbnail row draggable and a drop target. Dropping a thumbnail
@@ -19028,15 +19153,22 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             GObject.Value(Gdk.FileList, flist))
         return Gdk.ContentProvider.new_union([reorder, export])
 
-    def _drag_export_indices(self, idx):
-        """Pages to export when dragging thumbnail idx: the whole multi-selection
-        if the grabbed row belongs to it, otherwise just the grabbed page."""
+    def _pages_acted_on(self, idx):
+        """The pages a verb aimed at thumbnail `idx` applies to: the whole
+        multi-selection when that row belongs to it, otherwise just that page.
+
+        One rule for every per-page verb — dragging out to export, and hiding
+        (row 158). Two implementations is how "it exported five but hid one"
+        happens."""
         selected = sorted(
             r.toc_page for r in self._toc_list.get_selected_rows()
             if getattr(r, "toc_page", None) is not None)
         if idx in selected and len(selected) > 1:
             return selected
         return [idx]
+
+    def _drag_export_indices(self, idx):
+        return self._pages_acted_on(idx)
 
     def _export_pages_tempfile(self, indices):
         """Export the given pages to a temp PDF (ink baked in, plus a notes page
