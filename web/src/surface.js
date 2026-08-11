@@ -29,14 +29,19 @@ export const PAGE_W = 595.0, PAGE_H = 842.0;   // A4 in document units, the size
 // but a press that resolves to one of them does nothing here.
 // The page is rendered ABOVE the resolution it is shown at and scaled down, so
 // glyph edges get the benefit of oversampling instead of landing on whatever
-// pixel grid the zoom happens to produce. Measured on an A4 page at fit: 4 ms
-// at 1:1 against 17 ms at 2x, for a 921x1304 bitmap — one frame, once, per zoom
-// step, against text that looks soft for as long as you are reading it.
-export const RENDER_SUPERSAMPLE = 2;
+// pixel grid the zoom happens to produce.
+//
+// 3x rather than 2x because the cost turned out not to be where it looked:
+// measured on an A4 page at fit, rasterising took 17 ms at 1x, 17 ms at 2x and
+// 17 ms at 3x, reaching 21 ms only at 4x. The time goes on parsing the page,
+// not on filling pixels, so the first few factors are nearly free. What does
+// grow is MEMORY — 3 MB, 11 MB, 24 MB, 43 MB — and that is what picks the
+// number: 4x doubles the bitmap for a difference the eye cannot find.
+export const RENDER_SUPERSAMPLE = 3;
 // …but a big page at a deep zoom would ask for a bitmap that costs more memory
 // than it is worth, so the factor gives way rather than the resolution: the
 // budget can pull it back to 1:1 and never below.
-export const RENDER_PIXEL_BUDGET = 16e6;
+export const RENDER_PIXEL_BUDGET = 24e6;
 // A canvas past this on either side is refused by the browser and comes back
 // BLANK rather than throwing, so deep zoom would lose the page entirely. The
 // floor at 1:1 gives way here: a slightly soft page beats no page.

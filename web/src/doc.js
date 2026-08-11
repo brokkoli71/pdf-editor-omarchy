@@ -138,9 +138,11 @@ export class Doc {
     if (this._thumbs.has(index)) return this._thumbs.get(index);
     const [w] = await this.pageSize(index);
     const canvas = document.createElement("canvas");
-    // rendered at DEVICE pixels and laid out at CSS width, or every thumbnail
-    // is soft on a HiDPI screen
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    // Rendered above DEVICE pixels and laid out at CSS width, or every
+    // thumbnail is soft on a HiDPI screen. A thumbnail is small enough that
+    // oversampling it costs almost nothing, and it is nearly all fine detail,
+    // which is exactly what benefits.
+    const dpr = Math.min(window.devicePixelRatio || 1, 2) * 2;
     await this.render(index, (width * dpr) / w, canvas);
     canvas.style.width = "100%";
     this._thumbs.set(index, canvas);
