@@ -82,8 +82,13 @@ jobs:
         # rather than unwinding, which is what makes a GTK stall readable.
         # 120 s is ~300x the slowest test here (~410 ms), so it can only
         # fire on a genuine stall.
-        run: python3 -m pytest test_pdfeditor.py -v -rf --tb=short \
-               --timeout=120 --timeout-method=thread
+        # a BLOCK scalar, not a backslash continuation: YAML folds a plain
+        # scalar's lines with a space and leaves the backslash in, so the shell
+        # saw an argument literally called " --timeout=120" and pytest exited 4
+        # before collecting a single test
+        run: |
+          python3 -m pytest test_pdfeditor.py -v -rf --tb=short \
+            --timeout=120 --timeout-method=thread
 
       # The compositor has died mid-run before ("Error flushing display: Broken
       # pipe"), which kills the process before any summary is printed — the run
