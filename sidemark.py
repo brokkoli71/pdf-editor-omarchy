@@ -7721,6 +7721,7 @@ class NoteSections(NamedTuple):
     linked: set
     had_markers: bool
     bookmarks: dict = {}     # page idx → label ("" = derive one for display)
+    hidden: set = frozenset() # pages set aside (row 158)
 
 
 # `<!-- page:12 -->` opens a page's notes; the ` continued` variant says the
@@ -7736,9 +7737,11 @@ class NoteSections(NamedTuple):
 # the fact is about the run, not about each page. The reader expands a range
 # onto every page in it, so the per-page form keeps working and a file written
 # by an older Sidemark (or by hand) needs no migration. The writer only
-# coalesces pages that carry NOTHING but `continued`: a bookmark is a property
-# of one page, so it breaks the range and gets its own marker.
-_MARKER_ATTRS_RE = r'(?:\s+continued|\s+bookmark(?:="[^"\n]*")?)*'
+# coalesces pages that carry the SAME attributes and no body of their own; a
+# bookmark is the one attribute that breaks a range, because it names one page.
+# `<!-- page:13 hidden -->` sets a page aside (row 158) and ranges like
+# `continued` does — hiding a block of slides is one fact about a run.
+_MARKER_ATTRS_RE = r'(?:\s+continued|\s+hidden|\s+bookmark(?:="[^"\n]*")?)*'
 _PAGE_MARKER_RE = (r'<!--\s*page:(\d+)(?:-(\d+))?('
                    + _MARKER_ATTRS_RE + r')\s*-->')
 
@@ -7773,8 +7776,8 @@ def parse_note_sections(raw):
     parts = re.split(_PAGE_MARKER_RE, raw)
     if len(parts) == 1:
         text = raw.strip()
-        return NoteSections({0: text} if text else {}, set(), False, {})
-    sections, linked, bookmarks = {}, set(), {}
+        return NoteSections({0: text} if text else {}, set(), False, {}, set())
+    sections, linked, bookmarks, hidden = {}, set(), {}, set()
     # re.split yields [prefix, page, end, attrs, body, ...] — one group per
     # marker capture, so the stride is 4, not 2.
     for i in range(1, len(parts), 4):
@@ -7787,13 +7790,15 @@ def parse_note_sections(raw):
         span = range(idx, max(last, idx) + 1)
         if re.search(r'\bcontinued\b', attrs):
             linked.update(span)
+        if re.search(r'\bhidden\b', attrs):
+            hidden.update(span)
         bm = re.search(r'\bbookmark\b(?:="([^"\n]*)")?', attrs)
         if bm:
             for p in span:
                 bookmarks[p] = _unesc_marker(bm.group(1) or "")
         if content:
             sections[idx] = content
-    return NoteSections(sections, linked, True, bookmarks)
+    return NoteSections(sections, linked, True, bookmarks, hidden)
 
 
 def read_note_sections(path):
@@ -7993,6 +7998,7 @@ class MergeResult:
         self.notes = {}         # page idx → markdown
         self.linked = set()     # page idxs that continue their predecessor
         self.bookmarks = {}     # page idx → bookmark name ("" = derived)
+        self.hidden = set()     # page idxs set aside (row 158)
         self.images = {}        # "page idx" → sidecar image records
         self.error = None
 
@@ -8015,6 +8021,7 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
     out = fitz.open()
     result = MergeResult()
     toc, notes, images, linked, bookmarks = [], {}, {}, set(), {}
+    hidden = set()
     offset = 0
     try:
         for src_info in sources:
@@ -8045,10 +8052,12 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
             toc += shift_toc(sub, offset, base_level=2)
             if src_info.notes is not None:
                 sections, src_links, src_marks = dict(src_info.notes), set(), {}
+                src_hidden = set()
             else:
                 parsed = read_note_sections(notes_path_for(src_info.origin))
                 sections, src_links = parsed.sections, parsed.linked
                 src_marks = parsed.bookmarks
+                src_hidden = parsed.hidden
             for idx, text in sections.items():
                 if text.strip():
                     notes[idx + offset] = text
@@ -8059,6 +8068,9 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
             # a bookmark marks a page, so the chapter offset is the whole story
             bookmarks.update({idx + offset: name
                               for idx, name in src_marks.items() if 0 <= idx < n})
+            # a hidden page is a property of that page too — a chapter keeps
+            # the slides its author had set aside
+            hidden |= {idx + offset for idx in src_hidden if 0 <= idx < n}
             for key, entries in page_images.items():
                 try:
                     images[str(int(key) + offset)] = entries
@@ -8070,6 +8082,7 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
         result.toc, result.notes, result.images = toc, notes, images
         result.linked = linked
         result.bookmarks = bookmarks
+        result.hidden = hidden
         if not offset:
             return result
         out.set_toc(toc)
@@ -8080,13 +8093,14 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
         out.close()
     if not write_sidecars:
         return result
-    if notes or linked or bookmarks:
+    if notes or linked or bookmarks or hidden:
         model = NotesModel()
         model.pdf_name = os.path.basename(dest_path)
         for idx, text in notes.items():
             model.set(idx, text)     # links go on AFTER, or set() would
         model.set_links(linked)      # route a run's pages onto its start
         model.set_bookmarks(bookmarks)
+        model.set_hidden_pages(hidden)
         model.save(notes_path_for(dest_path))
     if images:
         tmp = _ink_path_for(dest_path) + ".tmp"
@@ -9525,6 +9539,10 @@ class NotesModel:
         # bookmark is a property OF a page, so unlike a link it needs no
         # adjacency rule: it simply follows its page through every re-key.
         self._bookmarks = {}
+        # pages set aside (row 158): still in the document and still editable,
+        # but skipped when paging, when presenting and on export. A property OF
+        # a page, exactly like a bookmark, so it needs no adjacency rule.
+        self._hidden = set()
         self.pdf_name = None  # written as ![[name.pdf]] at top of the file
 
     # ── runs ─────────────────────────────────────────────────────────────────
@@ -9650,6 +9668,36 @@ class NotesModel:
         """Replace the bookmarks wholesale (a merge, a re-key, an undo)."""
         self._bookmarks = {int(k): v for k, v in dict(marks).items()}
 
+    # ── hidden pages (row 158) ───────────────────────────────────────────────
+    #
+    # A page can be set aside: still in the document and still yours to edit,
+    # but skipped when you page through it, skipped when presenting, and left
+    # out of an export. Like a bookmark it is a property OF one page, so it
+    # needs no adjacency rule and just follows its page through a re-key; and
+    # like a bookmark it lives in the page marker, as ` hidden`.
+
+    def is_hidden(self, idx):
+        return idx in self._hidden
+
+    def hidden_pages(self):
+        return set(self._hidden)
+
+    def set_page_hidden(self, idx, on=True):
+        """Returns True if the page's state actually changed."""
+        if on:
+            if idx in self._hidden:
+                return False
+            self._hidden.add(idx)
+            return True
+        if idx not in self._hidden:
+            return False
+        self._hidden.discard(idx)
+        return True
+
+    def set_hidden_pages(self, pages):
+        """Replace the hidden set wholesale (a merge, a re-key, an undo)."""
+        self._hidden = {int(p) for p in pages}
+
     def set_links(self, pages):
         """Replace the link flags wholesale (a merge, a re-key, an undo).
         Texts must already be in place: `set` routes through a link, so
@@ -9687,6 +9735,7 @@ class NotesModel:
         bare link flag or bookmark counts: losing a link would silently
         re-split a run, and losing a bookmark loses the only copy of it."""
         return (bool(self._links) or bool(self._bookmarks)
+                or bool(self._hidden)
                 or any(v.strip() for v in self._notes.values()))
 
     def set(self, idx, text):
@@ -9701,12 +9750,16 @@ class NotesModel:
         page-and-text pair that describes the change: reversing it means
         putting the split back. Bookmarks ride along because a snapshot that
         restored less than it captured would silently drop one."""
-        return (dict(self._notes), set(self._links), dict(self._bookmarks))
+        return (dict(self._notes), set(self._links), dict(self._bookmarks),
+                set(self._hidden))
 
     def restore(self, snap):
-        notes, links, bookmarks = snap
+        # older snapshots predate the hidden set; a short one restores what it
+        # captured rather than raising
+        notes, links, bookmarks = snap[0], snap[1], snap[2]
         self._notes, self._links = dict(notes), set(links)
         self._bookmarks = dict(bookmarks)
+        self._hidden = set(snap[3]) if len(snap) > 3 else set()
 
     def load(self, path):
         # the parse lives at module level (parse_note_sections): merging notes
@@ -9716,6 +9769,7 @@ class NotesModel:
         parsed = read_note_sections(path)
         self._notes, self._links = parsed.sections, set(parsed.linked)
         self._bookmarks = dict(parsed.bookmarks)
+        self._hidden = set(parsed.hidden)
         self._normalize()
 
     # ── re-keying (every path that re-pages a document; see row 123) ─────────
@@ -9733,6 +9787,8 @@ class NotesModel:
         # to preserve and nothing the inserted blank pages could inherit
         self._bookmarks = {(k + count if k >= idx else k): v
                            for k, v in self._bookmarks.items()}
+        # …and so does a hidden flag: the inserted pages are new and visible
+        self._hidden = {(k + count if k >= idx else k) for k in self._hidden}
         # the new pages are blank and unlinked, so the run is broken anyway:
         # cut the tail loose rather than let its text reach across the gap
         self._links.discard(idx + count)
@@ -9758,6 +9814,8 @@ class NotesModel:
         # handing it to a neighbour would silently point somewhere else
         self._bookmarks = {(k - 1 if k > idx else k): v
                            for k, v in self._bookmarks.items() if k != idx}
+        self._hidden = {(k - 1 if k > idx else k)
+                        for k in self._hidden if k != idx}
 
     def reorder(self, old_to_new):
         """Re-key notes after pages were reordered. old_to_new maps each old
@@ -9775,6 +9833,7 @@ class NotesModel:
         self._links = {k for k in kept if k > 0}
         self._bookmarks = {old_to_new.get(k, k): v
                            for k, v in self._bookmarks.items()}
+        self._hidden = {old_to_new.get(k, k) for k in self._hidden}
         self._normalize()   # a torn-off page may now own text behind a link
 
     def to_text(self):
@@ -9783,28 +9842,27 @@ class NotesModel:
         Split out of `save` because the full-notes view (row 130) shows this
         exact text as one sheet: what you edit there is the file, markers and
         all, which is the only way one buffer can hold a per-page model."""
+        pages = sorted(set(self._notes) | self._links | set(self._bookmarks)
+                       | set(self._hidden))
         sections = []
-        pages = sorted(set(self._notes) | self._links | set(self._bookmarks))
         i = 0
         while i < len(pages):
             idx = last = pages[i]
-            attrs = ""
-            if idx in self._links:
-                attrs += " continued"
-                # coalesce the maximal run of pages carrying nothing BUT
-                # `continued` into one range marker — the fact is about the
-                # run, and a bookmark (a per-page property) ends the range
-                if idx not in self._bookmarks:
-                    while (i + 1 < len(pages) and pages[i + 1] == last + 1
-                           and pages[i + 1] in self._links
-                           and pages[i + 1] not in self._bookmarks):
-                        i += 1
-                        last = pages[i]
-            if idx in self._bookmarks:
-                name = self._bookmarks[idx]
-                attrs += f' bookmark="{_esc_marker(name)}"' if name else " bookmark"
+            attrs = self._marker_attrs(idx)
             # a linked page's body lives on the run's first page, never here
             body = "" if idx in self._links else self._notes.get(idx, "").strip()
+            # Coalesce the maximal run of adjacent pages carrying the SAME
+            # attributes and no body into one range marker — the fact is about
+            # the run (a linked run, a hidden block), not about each page. A
+            # BOOKMARK ends a range in both directions: it names one page, and
+            # a range would claim its name for every page in the span.
+            if attrs and not body and idx not in self._bookmarks:
+                while (i + 1 < len(pages) and pages[i + 1] == last + 1
+                       and pages[i + 1] not in self._bookmarks
+                       and self._marker_attrs(pages[i + 1]) == attrs
+                       and not self._page_body(pages[i + 1])):
+                    i += 1
+                    last = pages[i]
             i += 1
             if not attrs and not body:
                 continue
@@ -9818,6 +9876,22 @@ class NotesModel:
         embed = f"![[{self.pdf_name}]]\n\n" if self.pdf_name else ""
         return embed + body
 
+    def _marker_attrs(self, idx):
+        """The attribute text of one page's marker. One builder, so the writer
+        and the range test can never disagree about what a page carries."""
+        attrs = ""
+        if idx in self._links:
+            attrs += " continued"
+        if idx in self._hidden:
+            attrs += " hidden"
+        if idx in self._bookmarks:
+            name = self._bookmarks[idx]
+            attrs += f' bookmark="{_esc_marker(name)}"' if name else " bookmark"
+        return attrs
+
+    def _page_body(self, idx):
+        return "" if idx in self._links else self._notes.get(idx, "").strip()
+
     def set_from_text(self, raw):
         """Replace the whole model from a sidecar's text — the way back from
         the full-notes view, where the sheet IS the file. Text with no page
@@ -9826,6 +9900,7 @@ class NotesModel:
         parsed = parse_note_sections(raw)
         self._notes, self._links = parsed.sections, set(parsed.linked)
         self._bookmarks = dict(parsed.bookmarks)
+        self._hidden = set(parsed.hidden)
         self._normalize()
 
     def save(self, path):
