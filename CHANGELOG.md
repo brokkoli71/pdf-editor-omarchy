@@ -1,4 +1,122 @@
-## [0.5.0] - 2026-07-17 — Pictures, Copy, Paste
+## [0.6.0] - 2026-08-11 — Ink and Input
+
+### 🚀 Features
+
+- *(ink)* Shape recognition on dwell + non-uniform lasso resize (rows 121, 122)
+- *(import)* Merge dropped documents into chapters (row 123)
+- *(import)* Sidebar-wide drops, text-mode parity, new defaults (rows 123, 124)
+- *(lasso)* The selection keeps its loop, a chip toggles the resize box (row 125)
+- *(lasso)* Circle to lasso — press and hold the stroke you just drew (row 126)
+- *(ink)* The dwell recognises polygons, and a circle is actually round (row 127)
+- *(ink)* Open paths of lines, and a snapped shape comes back adjustable (row 127)
+- *(ink)* Movable control points on a selected shape (row 127)
+- *(ink)* Welding control points, live last point, all selected shapes (row 127)
+- *(ink)* Snap to edges, and live magnets while the pen still holds a shape (row 127)
+- *(ink)* The live shape snaps to its own points and edges too (row 127)
+- *(ink)* Snap onto freehand ink as well (row 127)
+- *(notes)* Notes that continue across pages (row 129)
+- *(input)* The toolbar binds buttons; per-press logging to see it (row 132)
+- *(input)* Clean defaults, thumb pans, hold-to-borrow removed (row 132)
+- *(input)* Links follow the table, stripes follow the modifiers, notes runs cascade
+- *(notes)* Bookmark pages, jump to them, and reopen where you left off
+- *(input)* A stylus's ends are mouse buttons, and a finger pans
+- *(cli)* --new and --new-text start on a blank document
+- *(lasso)* A delete cross on the selection, and taps that never draw
+- *(ink)* A pen stroke that keeps its shape, and maths that reads like maths
+- *(notes)* Per-mode button tables, nested scripts, and runs written as ranges
+- *(modes)* The divider is the way between the modes, and comments stay out of the way
+- *(notes)* Number sets, ruled pages that stay ruled, recents on a key
+- *(ink)* The line is smoothed as you draw it, and a dot is round
+- *(ink)* The pen you picked is the pen you get back
+- *(ink)* A capture carries the clock, so prediction can be graded
+- *(ink)* A capture names its device, and the replay leads with the rate
+- *(extras)* Read a device's raw report rate without libinput (row 147)
+- *(ink)* The pen draws at its own rate, not the frame's
+- *(extras)* Measure end-to-end pen lag by chasing a moving dot (row 147)
+- *(extras)* The latency probe follows a circle, and fits in 2D
+- *(extras)* --inject-lag, so the probe can prove its own deltas
+- *(ink)* A capture counts frames as well as pen samples
+- *(bookmarks)* Name one as you make it, and find them in the outline
+- *(reload)* Ctrl+R brings back every tab and the view you were reading in
+- *(bookmarks)* The second click renames, and F2 renames in the outline
+- *(outline)* Show where you are, and what page each entry starts on
+- *(pages)* Hide pages, skipped when paging, presenting and exporting
+- *(outline)* A position line between the entries you are between
+
+### 🐛 Bug Fixes
+
+- *(lasso)* End the selection on a press elsewhere; stop the post-conversion drag erasing
+- *(lasso)* A tap that dismisses the selection no longer leaves a dot
+- *(ink)* Ghost line from the snap label to the snap ring; row 129 not planned
+- *(notes)* A click no longer jumps the caret and selects to the end (row 128)
+- *(text)* Stop the sheet scrolling to the top under the click (row 128)
+- *(ideas)* Repair row 118's quoting so the file parses as CSV again
+- *(input)* Paint the binding stripes, and let the pen popover shrink
+- *(input)* The stripe is the only signal, and it follows a left bind
+- *(ui)* Point the pen popover arrow at its button
+- *(input)* The table decides the right button, not the button number
+- *(modes)* The page slides out and back in, instead of never leaving
+- *(text)* Ink keeps its paragraph when the sheet's text is replaced
+- *(modes)* The collapsed page edge is wide enough to grab
+- *(text)* A drawing moves as one when the sheet's text shifts
+- *(notes)* Only the symbol you touch goes back to being a command
+- *(notes)* Marked text opens in full, and a command eats its last space
+- *(notes)* A script eats its space too, and triple-click takes the line
+- *(ink)* Only a motion event is asked for its history
+- *(extras)* The latency probe closed itself after one frame
+- *(ink)* The prediction damping is a time constant, not a per-event weight
+- *(ink)* A stroke on a text page keeps the shape it was drawn with
+- *(notes)* A PDF with no sidecar opens with no empty slot beside it
+- *(input)* A second finger stops the first from drawing, until every finger lifts
+- *(input)* The finger counter crashed on a NULL event, so it never counted
+- *(input)* The sheet's surface origin unpacked a point as a triple
+- *(input)* The sheet's pinch moves once a frame, and the fingers stay put
+- *(bookmarks)* Enter makes the bookmark, Escape makes nothing
+- *(bookmarks)* Double-click renames, and two popover criticals
+- *(import)* An inserted chapter keeps its hidden pages
+- *(bookmarks)* Clicking away from a rename no longer floods the log
+
+### 💼 Other
+
+- *(input)* Resolve every press through one binding table (row 132)
+- *(input)* Dump the table and the stripe mapping on every refresh
+- *(pages)* The model half of hidden pages (row 158)
+
+### 🚜 Refactor
+
+- *(text)* Route the sheet's presses through the same table (row 132)
+
+### 📚 Documentation
+
+- *(claude)* Trim the changelog out of CLAUDE.md, add two comment conventions
+- *(claude)* Record polygon recognition and the rect-vs-polygon rule
+- *(claude)* Correct the sidemark.py line count (12.6k -> 16.7k)
+- Drop shortcuts that no longer exist, correct the tool model
+- Point the next session at the validation pass
+- *(ink)* Live smoothing is accepted, so prediction is unblocked
+- *(ink)* The pen's samples arrive at half a finger's rate (row 147)
+- *(ink)* The pen is 133 Hz and we discard 78% of it (row 147)
+- *(ink)* The pen lag is ~110 ms and most of it is below the app
+- Point the next session at the stylus block
+- Hand the evening's check a list for the three fixes
+- The stylus block is verified, and a survivor finger is row 151
+
+### ⚡ Performance
+
+- *(ink)* Committed strokes are a cached layer, not a per-frame repaint
+
+### 🧪 Testing
+
+- *(text)* Stop the row-128 scroll guard failing under full-run load
+- *(ink)* Make the eraser test able to fail
+
+### ⚙️ Miscellaneous Tasks
+
+- *(aur)* Bump pkgver to 0.5.0.r0.g8e2ed12
+- *(aur)* Bump sidemark (fixed release) to 0.5.0
+- *(aur)* Regenerate .SRCINFO for the 0.5.0 bump
+- Run the suite through pytest, or its isolation never applies
+## [0.5.0] - 2026-07-17
 
 ### 🚀 Features
 
