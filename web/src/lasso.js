@@ -6,9 +6,12 @@
 
 export const LASSO_CHIP_SIZE = 16.0;   // the chip's side, in screen px
 export const LASSO_CHIP_GAP = 6.0;     // clearance from the box's TL handle
-export const HANDLE_SIZE = 8.0;
-export const ROTATE_STALK = 22.0;      // the knob's distance above the box
-export const ROTATE_SNAP_DEG = 15.0;
+export const LASSO_PAD = 5.0;          // slack between the ink and the frame
+export const HANDLE_HIT = 8.0;         // how close counts as grabbing a handle
+export const ROTATE_HANDLE_GAP = 18.0; // px from the box's top edge to the knob
+export const ROTATE_SNAP_DEG = 15.0;   // Shift snaps to this
+export const DUPLICATE_OFFSET = 14.0;  // screen px, so a copy is visible at any
+                                       // zoom
 
 /** Even-odd ray-cast test: is (px, py) inside the polygon? */
 export function pointInPolygon(px, py, poly) {
@@ -183,6 +186,34 @@ export function selectionBbox(strokes) {
 /** Scale a point about an anchor, per axis. */
 export function scalePoint(p, fx, fy, ax, ay) {
   return [ax + (p[0] - ax) * fx, ay + (p[1] - ay) * fy];
+}
+
+/** Centre of the rotate knob, on a stalk above the box's top edge. */
+export function rotateKnobCentre(x0, y0, x1, pad = LASSO_PAD) {
+  return [(x0 + x1) / 2, y0 - pad - ROTATE_HANDLE_GAP];
+}
+
+export function rotateKnobHit(kx, ky, px, py, hit = HANDLE_HIT) {
+  return Math.hypot(px - kx, py - ky) <= hit;
+}
+
+/** Paint the rotate knob and its stalk. */
+export function drawRotateKnob(ctx, x0, y0, x1, accent, pad = LASSO_PAD) {
+  const [kx, ky] = rotateKnobCentre(x0, y0, x1, pad);
+  ctx.save();
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 1.2;
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(kx, y0 - pad);
+  ctx.lineTo(kx, ky);
+  ctx.stroke();
+  ctx.fillStyle = "#ffffff";
+  ctx.beginPath();
+  ctx.arc(kx, ky, 4.5, 0, 2 * Math.PI);
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
 }
 
 /** Rotate a point about a centre. */

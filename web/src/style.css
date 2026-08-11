@@ -96,9 +96,16 @@ body {
   flex: none;
 }
 
-.hb-start { justify-self: start; padding-left: 6px; }
+.hb-start, .hb-end { display: flex; align-items: center; gap: 2px; min-width: 0; }
+.hb-start { justify-self: start; padding-left: 2px; }
 .hb-center { justify-self: center; }
-.hb-end { justify-self: end; display: flex; gap: 2px; }
+.hb-end { justify-self: end; }
+
+/* the title must give way before the buttons do, not push them into a new row */
+.hb-start .title {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  margin-left: 4px; min-width: 0;
+}
 
 .title { font-weight: 700; font-size: 14px; }
 /* unsaved work is marked on the title, the way a document window does it */
@@ -124,7 +131,13 @@ button.small { padding: 3px 9px; min-height: 26px; font-size: 13px; }
 button:disabled { opacity: .4; cursor: default; }
 button:disabled:hover { background: transparent; }
 
-.icon-btn { display: grid; place-items: center; width: 34px; padding: 0; }
+.icon-btn {
+  display: inline-grid;      /* grid is block-level; inline-grid stays in the row */
+  place-items: center;
+  width: 34px;
+  flex: none;
+  padding: 0;
+}
 .icon-btn svg { width: 16px; height: 16px; }
 
 /* linked button group, as libadwaita links a segmented row */
@@ -141,6 +154,7 @@ button:disabled:hover { background: transparent; }
 /* ── the tool bar as a binding surface ───────────────────────────────────── */
 
 .tool-btn {
+  flex: none;
   width: 38px;
   height: 32px;
   display: grid;

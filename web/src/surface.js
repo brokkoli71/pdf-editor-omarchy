@@ -13,7 +13,8 @@ import {
   pointInPolygon, lassoHandlePoints, lassoHandleAnchor, lassoScaleFactors,
   lassoHandleCursor, lassoChipCentre, lassoChipHit, lassoDeleteCentre,
   lassoDeleteHit, drawLassoChip, drawLassoDelete, mergeSelection, selectionBbox,
-  scalePoint, HANDLE_SIZE,
+  scalePoint, rotatePoint, rotateKnobCentre, rotateKnobHit, drawRotateKnob,
+  LASSO_PAD, HANDLE_HIT, ROTATE_SNAP_DEG, DUPLICATE_OFFSET,
 } from "./lasso.js";
 
 export const PAGE_W = 595.0, PAGE_H = 842.0;   // A4 in document units, the size
@@ -405,7 +406,7 @@ export class Surface {
       this.requestDraw();
       return;
     }
-    if (a.tool === "move" || a.tool === "resize") {
+    if (a.tool === "move" || a.tool === "resize" || a.tool === "rotate") {
       this._transformSelection(a, dx, dy);
       a.lastView = [e.offsetX, e.offsetY];
       return;
@@ -466,7 +467,7 @@ export class Surface {
     } else if (a.tool === "lasso") {
       const { shift } = this._chordState(e);
       this._finishLasso(a.pts, shift);
-    } else if (a.tool === "move" || a.tool === "resize") {
+    } else if (a.tool === "move" || a.tool === "resize" || a.tool === "rotate") {
       this._commitTransform(a);
     }
     this.requestDraw();
@@ -511,7 +512,7 @@ export class Surface {
     }
     const b = this._selectionBbox();
     if (!b) return false;
-    const pad = HANDLE_SIZE / this.zoom;
+    const pad = LASSO_PAD / this.zoom;
     return px >= b[0] - pad && px <= b[2] + pad
         && py >= b[1] - pad && py <= b[3] + pad;
   }
@@ -519,10 +520,10 @@ export class Surface {
   _handleAt(sx, sy) {
     const box = this._selectionScreenBox();
     if (!box) return null;
-    const pts = lassoHandlePoints(box[0], box[1], box[2], box[3], HANDLE_SIZE);
+    const pts = lassoHandlePoints(box[0], box[1], box[2], box[3], LASSO_PAD);
     for (let i = 0; i < pts.length; i++) {
-      if (Math.abs(sx - pts[i][0]) <= HANDLE_SIZE
-          && Math.abs(sy - pts[i][1]) <= HANDLE_SIZE) return i;
+      if (Math.abs(sx - pts[i][0]) <= HANDLE_HIT
+          && Math.abs(sy - pts[i][1]) <= HANDLE_HIT) return i;
     }
     return null;
   }
@@ -542,8 +543,8 @@ export class Surface {
   _selectionPress(e, dx, dy) {
     const box = this._selectionScreenBox();
     if (!box) return false;
-    const [chx, chy] = lassoChipCentre(box[0], box[1], HANDLE_SIZE);
-    const [dlx, dly] = lassoDeleteCentre(box[0], box[1], HANDLE_SIZE);
+    const [chx, chy] = lassoChipCentre(box[0], box[1], LASSO_PAD);
+    const [dlx, dly] = lassoDeleteCentre(box[0], box[1], LASSO_PAD);
 
     // ANY tap target on a canvas must kill the REST of the gesture, not just
     // consume the press: a pen tap always jitters, and the drawing branch is
@@ -565,9 +566,17 @@ export class Surface {
       pts: [], press: [], erased: [],
     };
     if (this.selectionBoxed) {
+      const bbox = this._selectionBbox();
+      const [kx, ky] = rotateKnobCentre(box[0], box[1], box[2]);
+      if (rotateKnobHit(kx, ky, e.offsetX, e.offsetY)) {
+        const cx = (bbox[0] + bbox[2]) / 2, cy = (bbox[1] + bbox[3]) / 2;
+        this.active = { ...base, tool: "rotate", centre: [cx, cy],
+                        startAngle: Math.atan2(dy - cy, dx - cx) };
+        return true;
+      }
       const handle = this._handleAt(e.offsetX, e.offsetY);
       if (handle !== null) {
-        this.active = { ...base, tool: "resize", handle, bbox: this._selectionBbox() };
+        this.active = { ...base, tool: "resize", handle, bbox };
         return true;
       }
     }
@@ -633,7 +642,7 @@ export class Surface {
 
   duplicateSelected() {
     if (!this.hasSelection()) return;
-    const offset = 12;
+    const offset = DUPLICATE_OFFSET / this.zoom;
     const copies = this.selected.map((s) => ({
       ...s,
       pts: s.pts.map((p) => [p[0] + offset, p[1] + offset]),
@@ -658,6 +667,21 @@ export class Surface {
       }
       if (a.before[0]?.loop) {
         this.selectionLoop = a.before[0].loop.map((p) => [p[0] + ox, p[1] + oy]);
+      }
+    } else if (a.tool === "rotate") {
+      const [cx, cy] = a.centre;
+      let angle = Math.atan2(dy - cy, dx - cx) - a.startAngle;
+      if (this._heldMods.shift) {
+        // Shift snaps the TOTAL angle, not the delta — snapping the delta would
+        // make the result depend on where you grabbed the knob
+        const step = (ROTATE_SNAP_DEG * Math.PI) / 180;
+        angle = Math.round(angle / step) * step;
+      }
+      for (const rec of a.before) {
+        rec.stroke.pts = rec.pts.map((p) => rotatePoint(p, angle, cx, cy));
+      }
+      if (a.before[0]?.loop) {
+        this.selectionLoop = a.before[0].loop.map((p) => rotatePoint(p, angle, cx, cy));
       }
     } else {
       const { mode, anchor } = lassoHandleAnchor(a.handle, a.bbox);
@@ -992,7 +1016,7 @@ export class Surface {
       ctx.stroke();
     } else {
       const [x0, y0, x1, y1] = box;
-      const p = HANDLE_SIZE;
+      const p = LASSO_PAD;
       ctx.setLineDash([4, 3]);
       ctx.strokeRect(x0 - p, y0 - p, (x1 - x0) + p * 2, (y1 - y0) + p * 2);
       ctx.setLineDash([]);
@@ -1003,12 +1027,13 @@ export class Surface {
         ctx.fill();
         ctx.stroke();
       }
+      drawRotateKnob(ctx, x0, y0, x1, accent);
     }
     ctx.restore();
 
-    const [chx, chy] = lassoChipCentre(box[0], box[1], HANDLE_SIZE);
+    const [chx, chy] = lassoChipCentre(box[0], box[1], LASSO_PAD);
     drawLassoChip(ctx, chx, chy, this.selectionBoxed, accent);
-    const [dlx, dly] = lassoDeleteCentre(box[0], box[1], HANDLE_SIZE);
+    const [dlx, dly] = lassoDeleteCentre(box[0], box[1], LASSO_PAD);
     drawLassoDelete(ctx, dlx, dly);
   }
 
@@ -1037,6 +1062,7 @@ export class Surface {
     if (drawing && a.device === "pen") this.el.style.cursor = "none";
     else if (a && a.tool === "pan") this.el.style.cursor = "grabbing";
     else if (a && a.tool === "move") this.el.style.cursor = "grabbing";
+    else if (a && a.tool === "rotate") this.el.style.cursor = "grabbing";
     else this.el.style.cursor = "crosshair";
   }
 }
