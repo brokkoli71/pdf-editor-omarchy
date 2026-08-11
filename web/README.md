@@ -42,6 +42,18 @@ constants.
   started — and the revocation armed by the capture device, never the touch
   count, so a resting palm cannot eat a pen stroke.
 - Pen, highlighter, eraser, pan, zoom-to-region; undo/redo; the pen popover.
+- **The lasso** — select by loop, move, resize on 8 handles, rotate (Shift snaps
+  to 15°), `Ctrl+D`, `Del`. A selection wears the LOOP it was drawn with and
+  that is the grab region; the chip switches to the box, the red cross deletes.
+  One undo entry per gesture.
+- **The extended dwell** — hold still mid-stroke and the freehand line becomes a
+  clean rectangle, ellipse, polygon or line, with a label naming what you will
+  get. A line inside a rectangle becomes a GRID DIVIDER and re-spaces its
+  siblings to equal cells.
+- **Circle to lasso** — draw a loop, lift, then press and hold on it and it
+  becomes the selection. The pen stays in your hand.
+- **Saving** — `Ctrl+S` writes the PDF with the ink in it as real annotations,
+  plus the `.md` sidecar. In place on Chromium, a download elsewhere.
 - **PDFs** — open one or drop it; pages flip one at a time as they do on the
   desktop, with ink stored per page. A sidebar switches Pages/Outline, and the
   outline carries the "you are here" rule. Drop several files at once and they
@@ -88,16 +100,15 @@ Safari is not supported and is not being tested.
 
 Scope limits, not oversights:
 
-- **No saving.** Nothing is written to disk — reload and the work is gone. The
-  `.md` sidecar format is fully implemented (`notes-model.js`), so this is a
-  file-handle question, not a format one.
-- **Lasso, text cursor and anchor** stay in the table and in the bar — removing
-  them would change the binding model — but a press that resolves to one does
-  nothing here. They are marked in the tooltip.
-- **No shape snap** (the extended dwell) and **no prediction**. Prediction is
-  settled: it was graded against 133 Hz captured ink and recovers ~10% of the
-  lag error at best, negative past 40 ms. `getPredictedEvents()` is the same
-  guess with a vendor's name on it — don't reach for it.
+- **Text cursor and anchor** stay in the table and in the bar — removing them
+  would change the binding model — but a press that resolves to one does nothing
+  here. They are marked in the tooltip.
+- **No prediction.** Settled: it was graded against 133 Hz captured ink and
+  recovers ~10% of the lag error at best, negative past 40 ms.
+  `getPredictedEvents()` is the same guess with a vendor's name on it — don't
+  reach for it.
+- **No pasted images**, no control points or welding on a selected shape, no
+  text cursor, no anchors/callouts.
 - **No text-first mode**, no bookmarks, no wiki links, no presenter or share.
 
 ## Conformance
@@ -121,6 +132,9 @@ exporters under `extras/`, three runners under `test/`:
 | `merge.mjs` | — | chapters, ink re-keying, insert-at-gap |
 | `notes.mjs` | 282 | 12 sidecar shapes, byte-identical round trips |
 | `math.mjs` | 226 | 37 lines of maths source |
+| `lasso.mjs` | 184 | handle points, anchors, scale factors, chip, polygon |
+| `shapes.mjs` | 100 | 13 strokes through the recogniser |
+| `inkpdf.mjs` | — | annots, appearance, profile, regeneration, foreign ink |
 
 The ink vectors are **real captured strokes** from `notes/*.jsonl` — the same
 hand and digitiser the constants were tuned against. The oracle earned its place
@@ -133,3 +147,24 @@ vanished when the exporter's precision went up.
 
 Re-run it after any edit to `src/ink.js`. It is what tells you whether you
 changed the shape of the ink or just the code.
+
+**Export rounding is load-bearing.** Each exporter rounds its inputs FIRST and
+derives every expected output from exactly the points it publishes. Rounding
+after the fact feeds the port slightly different input than the oracle used —
+invisible for continuous outputs, but it flips DISCRETE decisions (it changed
+which point RDP called a corner on a near-tie) and the port gets blamed for the
+exporter's arithmetic.
+
+## Verifying gestures
+
+The conformance suites cover geometry, not wiring — and wiring is where the real
+bugs live. Gestures are checked by constructing a real `Surface` and dispatching
+real `PointerEvent`s at it, so the actual press router is under test and the app
+needs no debug hooks. Two things that harness taught, both of which will bite
+again:
+
+- **Pin the view first.** `draw()` re-fits on its first frame, so an `await`
+  between computing a screen coordinate and pressing it lets a frame callback
+  move the target out from under the test.
+- A synthetic event has no `getCoalescedEvents()`, which is why the reader
+  falls back to `[e]` rather than assuming the method exists.
