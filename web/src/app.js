@@ -15,6 +15,7 @@ import { NotesView } from "./notes.js";
 import { NotesModel } from "./notes-model.js";
 import { saveDocument, openWithPicker, canSaveInPlace } from "./save.js";
 import { saveSession, loadSession } from "./session.js";
+import { Search } from "./search.js";
 
 // ── settings (the settings.json analogue) ────────────────────────────────────
 
@@ -152,6 +153,16 @@ const sidebar = new Sidebar(document.getElementById("sidebar"), {
   onDeletePage: (index) => removePage(index),
 });
 
+const search = new Search(
+  { get pageCount() { return surface.doc ? surface.doc.pageCount : 0; },
+    getPage: (i) => surface.doc.page(i) },
+  {
+    onUpdate: () => refreshSearch(),
+    onGoTo: (m) => { if (m.page !== surface.pageIndex) surface.setPage(m.page);
+                     else surface.requestDraw(); },
+  });
+surface.searchRects = (page) => search.rectsOn(page);
+
 const toolStrips = new Map();   // tool → [strip elements]
 
 buildToolbar(document.getElementById("toolbar"));
@@ -161,6 +172,7 @@ wirePopover();
 wireKeys();
 wireDocument();
 wireDivider();
+wireSearch();
 refreshToolBindings();
 refreshUndo();
 
@@ -215,6 +227,10 @@ async function setDoc(doc, title) {
   sidebar.setDoc(doc);
   sidebar.setPage(0);
   notes.setModel(doc.notes);
+  search.stop();
+  search.clearCache();
+  search.matches = [];
+  search.current = null;
   syncPageChrome();
   refreshUndo();
   // setDoc runs through the change callback on its way in; what it just loaded
@@ -495,6 +511,57 @@ async function insertPagesFromPicker() {
     input.value = "";
   };
   input.click();
+}
+
+// ── search ───────────────────────────────────────────────────────────────────
+
+function refreshSearch() {
+  const entry = document.getElementById("search-entry");
+  const count = document.getElementById("search-count");
+  const n = search.matches.length;
+  // the trailing ellipsis is how the count says it is still climbing
+  count.textContent = !search.query ? ""
+    : n ? `${search.index} of ${n}${search.scanning ? "…" : ""}`
+        : (search.scanning ? "…" : "No results");
+  // "not found" WAITS for the scan to finish, or every long document flashes
+  // red at a term that is in it
+  entry.classList.toggle("not-found", !!search.query && !n && !search.scanning);
+  surface.requestDraw();
+}
+
+function showSearch() {
+  const bar = document.getElementById("searchbar");
+  const entry = document.getElementById("search-entry");
+  bar.hidden = false;
+  entry.focus();
+  // grab_focus selects only when focus ARRIVES, so this is here for the case
+  // the feature is FOR: pressing Ctrl+F with the caret already in the entry
+  entry.select();
+  if (entry.value) search.setQuery(entry.value, surface.pageIndex);
+}
+
+function hideSearch() {
+  document.getElementById("searchbar").hidden = true;
+  // keep the TEXT and drop the results, so reopening and pressing Enter
+  // re-runs the search instead of stepping through nothing
+  search.stop();
+  search.matches = [];
+  search.current = null;
+  search.query = "";
+  surface.requestDraw();
+  surface.el.focus?.();
+}
+
+function wireSearch() {
+  const entry = document.getElementById("search-entry");
+  entry.addEventListener("input", () => search.setQuery(entry.value, surface.pageIndex));
+  entry.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); search.step(e.shiftKey ? -1 : 1); }
+    else if (e.key === "Escape") { e.preventDefault(); hideSearch(); }
+  });
+  document.getElementById("search-next").addEventListener("click", () => search.step(1));
+  document.getElementById("search-prev").addEventListener("click", () => search.step(-1));
+  document.getElementById("search-close").addEventListener("click", hideSearch);
 }
 
 function wireDocument() {
@@ -808,6 +875,9 @@ function wireKeys() {
     if ((e.ctrlKey || e.metaKey) && key === "z") {
       e.preventDefault();
       if (e.shiftKey) surface.redo(); else surface.undo();
+    } else if ((e.ctrlKey || e.metaKey) && key === "f") {
+      e.preventDefault();
+      showSearch();
     } else if ((e.ctrlKey || e.metaKey) && key === "s") {
       e.preventDefault();
       doSave({ reask: e.shiftKey });          // Ctrl+Shift+S is Save As
@@ -829,6 +899,7 @@ function wireKeys() {
         surface.duplicateSelected();
       }
     } else if (key === "escape") {
+      if (!document.getElementById("searchbar").hidden) hideSearch();
       surface.clearSelection();
     } else if (key === "pagedown" || key === "arrowright") { surface.flipPage(1); }
     else if (key === "pageup" || key === "arrowleft") { surface.flipPage(-1); }

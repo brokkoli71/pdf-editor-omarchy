@@ -51,6 +51,23 @@
   </div>
 </header>
 
+<!-- Above BOTH modes on purpose: a search bar living inside the page column is
+     unreachable the moment the notes take the window, and the handler runs
+     while revealing something nobody can see. -->
+<div class="searchbar" id="searchbar" hidden>
+  <input type="search" id="search-entry" placeholder="Find in document" aria-label="Find in document">
+  <span class="search-count" id="search-count"></span>
+  <button class="flat icon-btn" id="search-prev" title="Previous match (Shift+Enter)" aria-label="Previous match">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 10l4-4 4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </button>
+  <button class="flat icon-btn" id="search-next" title="Next match (Enter)" aria-label="Next match">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </button>
+  <button class="flat icon-btn" id="search-close" title="Close (Esc)" aria-label="Close search">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+  </button>
+</div>
+
 <main id="body">
   <aside id="sidebar" hidden>
     <div class="linked side-switch" id="side-switch" hidden>

@@ -135,6 +135,9 @@ export class Surface {
     this._frame = null;
     this._layer = null;         // cached committed ink
     this._layerKey = null;
+    // rects to highlight, asked for per page — the search owns the results, the
+    // canvas only paints them
+    this.searchRects = null;
 
     this._install();
   }
@@ -1108,6 +1111,7 @@ export class Surface {
       ctx.restore();
     }
 
+    this._drawSearchHits(ctx);
     this._ensureLayer();
     ctx.drawImage(this._layer, 0, 0, this.cssW, this.cssH);
 
@@ -1116,6 +1120,26 @@ export class Surface {
     this._drawLassoPath(ctx);
     this._drawSelection(ctx);
     this._drawZoomMarquee(ctx);
+  }
+
+  /** Search highlights sit UNDER the ink: they mark what the page says, and
+   * covering your own annotation with a yellow box would hide the thing you
+   * were most likely looking for. */
+  _drawSearchHits(ctx) {
+    if (!this.searchRects) return;
+    const hits = this.searchRects(this.pageIndex);
+    if (!hits || !hits.length) return;
+    ctx.save();
+    ctx.translate(this.offX, this.offY);
+    ctx.scale(this.zoom, this.zoom);
+    for (const { rect, current } of hits) {
+      const [x, y, w, h] = rect;
+      // PDF user space is y-UP from the bottom-left; document units are y-down
+      ctx.fillStyle = current ? "rgba(255, 163, 72, 0.55)"
+                              : "rgba(255, 214, 102, 0.42)";
+      ctx.fillRect(x, this.pageH - y - h, w, h);
+    }
+    ctx.restore();
   }
 
   _drawLive(ctx) {
