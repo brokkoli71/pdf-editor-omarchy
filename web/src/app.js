@@ -875,6 +875,16 @@ function wireKeys() {
     if ((e.ctrlKey || e.metaKey) && key === "z") {
       e.preventDefault();
       if (e.shiftKey) surface.redo(); else surface.undo();
+    } else if ((e.ctrlKey || e.metaKey) && key === "c") {
+      // App-level keys belong on the WINDOW so they fire whatever has focus,
+      // and the window asks the surface rather than the surface owning the key.
+      // The editor keeps Ctrl+C while the caret is in it.
+      if (surface.hasTextSelection() && !typingInNotes()) {
+        e.preventDefault();
+        navigator.clipboard.writeText(surface.selectedText)
+          .then(() => toast("Copied"))
+          .catch(() => toast("Could not copy"));
+      }
     } else if ((e.ctrlKey || e.metaKey) && key === "f") {
       e.preventDefault();
       showSearch();

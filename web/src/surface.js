@@ -11,6 +11,8 @@ import { drawInkStroke, strokeHit, rgbCss } from "./draw.js";
 import { BTN_FINGER, buttonForEvent, chordId } from "./bindings.js";
 import { recognizeShape, snapGridDivider, respaceDividers, polylineIsClosed,
          SNAP_LABELS } from "./shapes.js";
+import { pageWords, nearestWord, wordsBetween, wordsInRect,
+         selectionText, selectionRects } from "./textlayer.js";
 import {
   pointInPolygon, lassoHandlePoints, lassoHandleAnchor, lassoScaleFactors,
   lassoHandleCursor, lassoChipCentre, lassoChipHit, lassoDeleteCentre,
@@ -33,7 +35,7 @@ export const STRAIGHT_HOLD_MS = 500;   // hold still this long mid-stroke to sna
 export const CIRCLE_LASSO_HOLD_MS = 500;
 
 export const IMPLEMENTED_TOOLS = new Set(["pen", "highlighter", "eraser", "pan",
-                                          "zoom", "lasso"]);
+                                          "zoom", "lasso", "text"]);
 
 /** How many fingers are on the glass — and whether THIS hand ever had two.
  *
@@ -135,6 +137,10 @@ export class Surface {
     this._frame = null;
     this._layer = null;         // cached committed ink
     this._layerKey = null;
+    // the caret's word selection on this page
+    this.textSelection = [];
+    this._words = new Map();       // page → words, extracted on demand
+    this.textStyle = "reading";    // "reading" | "rect"
     // rects to highlight, asked for per page — the search owns the results, the
     // canvas only paints them
     this.searchRects = null;
@@ -152,6 +158,8 @@ export class Surface {
 
   async setDoc(doc, page = 0) {
     this.doc = doc;
+    this._words.clear();
+    this.textSelection = [];
     this.undoStack.length = 0;
     this.redoStack.length = 0;
     await this.setPage(page, { fit: true });
@@ -167,6 +175,7 @@ export class Surface {
       // strokes nobody can see — a delete that removes something invisible.
       this.clearSelection();
       this._clearSnap();
+      this.textSelection = [];
     }
     this.pageIndex = index;
     [this.pageW, this.pageH] = await this.doc.pageSize(index);
@@ -378,6 +387,17 @@ export class Surface {
       touchStrokes: [],
     };
     this._clearSnap();
+    if (tool === "text") {
+      // a fresh press starts a new selection; the words may still be loading,
+      // in which case the drag simply catches up when they arrive
+      this.textSelection = [];
+      this.active.cur = [dx, dy];
+      this._wordsFor(this.pageIndex).then(() => {
+        if (this.active && this.active.tool === "text") {
+          this._updateTextSelection(this.active);
+        }
+      });
+    }
     if (tool === "eraser") this._eraseAt(dx, dy);
     if (tool === "pen" || tool === "highlighter") {
       this._armSnapTimer();
@@ -439,6 +459,12 @@ export class Surface {
     if (a.tool === "zoom") {
       a.lastView = [e.offsetX, e.offsetY];
       this.requestDraw();
+      return;
+    }
+    if (a.tool === "text") {
+      a.cur = [dx, dy];
+      this._updateTextSelection(a);
+      a.lastView = [e.offsetX, e.offsetY];
       return;
     }
     if (a.tool === "move" || a.tool === "resize" || a.tool === "rotate") {
@@ -611,6 +637,12 @@ export class Surface {
       }
     } else if (a.tool === "zoom") {
       this._zoomToRegion(a.startView, [e.offsetX, e.offsetY]);
+    } else if (a.tool === "text") {
+      // a CLICK places the caret, it does not select — without this every
+      // stray tap leaves a word highlighted behind it
+      const moved = Math.hypot(e.offsetX - a.startView[0],
+                               e.offsetY - a.startView[1]);
+      if (moved < 3) this.clearTextSelection();
     } else if (a.tool === "lasso") {
       const { shift } = this._chordState(e);
       this._finishLasso(a.pts, shift);
@@ -633,6 +665,47 @@ export class Surface {
       this.active = null;
       this._updateCursor();
     }
+  }
+
+  // ── the caret ──────────────────────────────────────────────────────────────
+
+  /** The page's words, extracted once. A page with no text layer (a scan)
+   * yields none, and the caret then simply selects nothing rather than
+   * pretending. */
+  async _wordsFor(page) {
+    if (this._words.has(page)) return this._words.get(page);
+    let words = [];
+    try {
+      words = await pageWords(await this.doc.page(page), this.pageH);
+    } catch { words = []; }
+    this._words.set(page, words);
+    this.requestDraw();
+    return words;
+  }
+
+  get selectedText() { return selectionText(this.textSelection); }
+
+  hasTextSelection() { return this.textSelection.length > 0; }
+
+  clearTextSelection() {
+    if (!this.textSelection.length) return;
+    this.textSelection = [];
+    this.requestDraw();
+  }
+
+  _updateTextSelection(a) {
+    const words = this._words.get(this.pageIndex);
+    if (!words || !words.length) return;
+    if (this.textStyle === "rect") {
+      this.textSelection = wordsInRect(words, a.start[0], a.start[1],
+                                       a.cur[0], a.cur[1]);
+    } else {
+      const from = a.anchorWord ?? nearestWord(words, a.start[0], a.start[1]);
+      a.anchorWord = from;
+      const to = nearestWord(words, a.cur[0], a.cur[1]);
+      this.textSelection = wordsBetween(words, from, to);
+    }
+    this.requestDraw();
   }
 
   // ── the lasso selection ────────────────────────────────────────────────────
@@ -1112,6 +1185,7 @@ export class Surface {
     }
 
     this._drawSearchHits(ctx);
+    this._drawTextSelection(ctx);
     this._ensureLayer();
     ctx.drawImage(this._layer, 0, 0, this.cssW, this.cssH);
 
@@ -1120,6 +1194,20 @@ export class Surface {
     this._drawLassoPath(ctx);
     this._drawSelection(ctx);
     this._drawZoomMarquee(ctx);
+  }
+
+  /** The caret's selection, one band per LINE — a row of per-word stamps reads
+   * as a list rather than as a passage of text. */
+  _drawTextSelection(ctx) {
+    if (!this.textSelection.length) return;
+    ctx.save();
+    ctx.translate(this.offX, this.offY);
+    ctx.scale(this.zoom, this.zoom);
+    ctx.fillStyle = "rgba(53, 132, 228, 0.30)";
+    for (const [x, y, w, h] of selectionRects(this.textSelection)) {
+      ctx.fillRect(x, y, w, h);
+    }
+    ctx.restore();
   }
 
   /** Search highlights sit UNDER the ink: they mark what the page says, and
@@ -1287,6 +1375,7 @@ export class Surface {
     else if (a && a.tool === "pan") this.el.style.cursor = "grabbing";
     else if (a && a.tool === "move") this.el.style.cursor = "grabbing";
     else if (a && a.tool === "rotate") this.el.style.cursor = "grabbing";
+    else if (a && a.tool === "text") this.el.style.cursor = "text";
     else this.el.style.cursor = "crosshair";
   }
 }
