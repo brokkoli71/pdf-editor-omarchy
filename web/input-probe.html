@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Sidemark — input probe</title>
+<link rel="stylesheet" href="src/style.css">
+<style>
+  body { padding: 0; }
+  .probe { display: flex; height: 100%; min-height: 0; }
+  .readout { width: 340px; flex: none; overflow-y: auto; padding: 14px;
+             border-right: 1px solid var(--separator); background: var(--window-bg); }
+  .pad { flex: 1; background: var(--view-bg); touch-action: none; cursor: crosshair; }
+  h1 { font-size: 15px; margin: 0 0 4px; }
+  h2 { font-size: 12px; color: var(--dim); margin: 16px 0 4px; text-transform: uppercase;
+       letter-spacing: .04em; }
+  p.note { font-size: 12px; color: var(--dim); margin: 0 0 8px; line-height: 1.45; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  td { padding: 3px 0; vertical-align: top; }
+  td.k { color: var(--dim); width: 52%; }
+  td.v { text-align: right; font-variant-numeric: tabular-nums; }
+  .yes { color: #2ec27e; } .no { color: #e01b24; }
+  .big { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div class="probe">
+  <div class="readout">
+    <h1>Input probe</h1>
+    <p class="note">Draw on the panel with the input you care about — pen, finger,
+    mouse. Everything below is measured from the events this browser actually
+    delivers, not from what it claims to support.</p>
+
+    <h2>This browser</h2>
+    <table>
+      <tr><td class="k">Engine</td><td class="v" id="ua">—</td></tr>
+      <tr><td class="k">getCoalescedEvents()</td><td class="v" id="cap-coalesced">—</td></tr>
+      <tr><td class="k">getPredictedEvents()</td><td class="v" id="cap-predicted">—</td></tr>
+      <tr><td class="k">Pointer pressure</td><td class="v" id="cap-pressure">—</td></tr>
+      <tr><td class="k">File System Access</td><td class="v" id="cap-fs">—</td></tr>
+      <tr><td class="k">Device pixel ratio</td><td class="v" id="cap-dpr">—</td></tr>
+    </table>
+
+    <h2>Last stroke</h2>
+    <table>
+      <tr><td class="k">Pointer type</td><td class="v" id="s-type">—</td></tr>
+      <tr><td class="k">Button identity</td><td class="v" id="s-btn">—</td></tr>
+      <tr><td class="k">pointermove events</td><td class="v" id="s-events">—</td></tr>
+      <tr><td class="k">Samples after coalescing</td><td class="v" id="s-samples">—</td></tr>
+      <tr><td class="k">Samples per event</td><td class="v" id="s-ratio">—</td></tr>
+      <tr><td class="k">Pressure range</td><td class="v" id="s-press">—</td></tr>
+      <tr><td class="k">Tilt reported</td><td class="v" id="s-tilt">—</td></tr>
+    </table>
+
+    <h2>Sample rate</h2>
+    <p class="note">The number that decides ink quality. The desktop app measured
+    this panel at <strong>133 Hz</strong> at the device and only 30 Hz reaching
+    the canvas before coalesced events were recovered.</p>
+    <div class="big"><span id="s-hz">—</span> Hz</div>
+    <table>
+      <tr><td class="k">…without coalescing</td><td class="v" id="s-hz-raw">—</td></tr>
+      <tr><td class="k">Spacing ÷ feature size</td><td class="v" id="s-ratio-feat">—</td></tr>
+    </table>
+    <p class="note" id="verdict"></p>
+  </div>
+  <canvas class="pad" id="pad"></canvas>
+</div>
+
+<script type="module">
+import { inkFeatureSize } from "./src/ink.js";
+import { buttonForEvent, BUTTON_NAMES } from "./src/bindings.js";
+
+const $ = (id) => document.getElementById(id);
+const yn = (ok) => `<span class="${ok ? "yes" : "no"}">${ok ? "yes" : "no"}</span>`;
+
+$("ua").textContent = navigator.userAgent.includes("Firefox") ? "Gecko (Firefox)"
+  : navigator.userAgent.includes("Chrome") ? "Blink (Chrome/Edge)"
+  : navigator.userAgent.includes("Safari") ? "WebKit (Safari)" : "unknown";
+$("cap-coalesced").innerHTML = yn("getCoalescedEvents" in PointerEvent.prototype);
+$("cap-predicted").innerHTML = yn("getPredictedEvents" in PointerEvent.prototype);
+$("cap-pressure").innerHTML = yn("pressure" in PointerEvent.prototype);
+$("cap-fs").innerHTML = yn("showSaveFilePicker" in window);
+$("cap-dpr").textContent = String(window.devicePixelRatio || 1);
+
+const pad = $("pad");
+const ctx = pad.getContext("2d");
+let stroke = null;
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  pad.width = Math.round(pad.clientWidth * dpr);
+  pad.height = Math.round(pad.clientHeight * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener("resize", resize);
+requestAnimationFrame(resize);
+
+pad.addEventListener("pointerdown", (e) => {
+  pad.setPointerCapture(e.pointerId);
+  ctx.clearRect(0, 0, pad.clientWidth, pad.clientHeight);
+  stroke = {
+    id: e.pointerId, type: e.pointerType,
+    btn: BUTTON_NAMES[buttonForEvent(e)] || "?",
+    events: 0, samples: [], press: [], tilt: false,
+    t0: e.timeStamp, t1: e.timeStamp,
+  };
+  ctx.strokeStyle = getComputedStyle(document.body).color;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(e.offsetX, e.offsetY);
+});
+
+pad.addEventListener("pointermove", (e) => {
+  if (!stroke || e.pointerId !== stroke.id) return;
+  stroke.events++;
+  const coalesced = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+  for (const s of (coalesced.length ? coalesced : [e])) {
+    stroke.samples.push([s.offsetX, s.offsetY]);
+    stroke.press.push(s.pressure);
+    if (s.tiltX || s.tiltY) stroke.tilt = true;
+    ctx.lineTo(s.offsetX, s.offsetY);
+  }
+  stroke.t1 = e.timeStamp;
+  ctx.stroke();
+});
+
+pad.addEventListener("pointerup", () => {
+  if (!stroke) return;
+  const s = stroke;
+  stroke = null;
+  const secs = (s.t1 - s.t0) / 1000;
+  const n = s.samples.length;
+  $("s-type").textContent = s.type;
+  $("s-btn").textContent = s.btn;
+  $("s-events").textContent = String(s.events);
+  $("s-samples").textContent = String(n);
+  $("s-ratio").textContent = s.events ? (n / s.events).toFixed(2) : "—";
+  const lo = Math.min(...s.press), hi = Math.max(...s.press);
+  $("s-press").textContent = n ? `${lo.toFixed(2)} – ${hi.toFixed(2)}` : "—";
+  $("s-tilt").innerHTML = yn(s.tilt);
+
+  const hz = secs > 0.05 ? n / secs : 0;
+  const hzRaw = secs > 0.05 ? s.events / secs : 0;
+  $("s-hz").textContent = hz ? hz.toFixed(0) : "—";
+  $("s-hz-raw").textContent = hzRaw ? `${hzRaw.toFixed(0)} Hz` : "—";
+
+  // The statistic that answers "is this fixable in software, or is the
+  // hardware just too coarse?" — above ~0.25 the digitiser is undersampling
+  // the writing and interpolation is carrying the result; below ~0.06 it is
+  // oversampling and any roughness left is tremor.
+  let ratio = null;
+  if (n > 2) {
+    let len = 0;
+    for (let i = 1; i < n; i++) {
+      len += Math.hypot(s.samples[i][0] - s.samples[i - 1][0],
+                        s.samples[i][1] - s.samples[i - 1][1]);
+    }
+    const feature = inkFeatureSize(s.samples);
+    if (feature > 0) ratio = (len / (n - 1)) / feature;
+  }
+  $("s-ratio-feat").textContent = ratio === null ? "—" : ratio.toFixed(3);
+  $("verdict").textContent = ratio === null ? ""
+    : ratio > 0.25 ? "Undersampled — interpolation is carrying this; write bigger."
+    : ratio < 0.06 ? "Oversampled — any roughness left is tremor, so denoising is the lever."
+    : "Reasonable sampling.";
+});
+</script>
+</body>
+</html>
