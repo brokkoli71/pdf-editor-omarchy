@@ -9,7 +9,8 @@ import {
 } from "./ink.js";
 import { drawInkStroke, strokeHit, rgbCss } from "./draw.js";
 import { BTN_FINGER, buttonForEvent, chordId } from "./bindings.js";
-import { recognizeShape, SNAP_LABELS } from "./shapes.js";
+import { recognizeShape, snapGridDivider, respaceDividers, SNAP_LABELS }
+  from "./shapes.js";
 import {
   pointInPolygon, lassoHandlePoints, lassoHandleAnchor, lassoScaleFactors,
   lassoHandleCursor, lassoChipCentre, lassoChipHit, lassoDeleteCentre,
@@ -479,6 +480,13 @@ export class Surface {
     } else {
       ({ kind, pts } = recognizeShape(a.pts));
     }
+    if (kind === "line") {
+      // a straight line inside a rectangle already on the page is a GRID
+      // DIVIDER, not a line — the rectangle is found geometrically, so this
+      // works on any box-like stroke and survives a reload
+      const div = snapGridDivider(this.strokes, pts[0], pts[pts.length - 1]);
+      if (div) ({ kind, pts } = div);
+    }
     this._straightMode = true;
     this._snapKind = kind;
     this._snapLabel = SNAP_LABELS[kind];
@@ -800,6 +808,19 @@ export class Surface {
       flat,
     };
     this.strokes.push(stroke);
+    if (this._snapKind === "vdiv" || this._snapKind === "hdiv") {
+      // committing a divider re-spaces its siblings to equal cells, and the
+      // whole gesture is ONE undo entry: remove the new divider, restore the
+      // siblings to where they were
+      const sibs = respaceDividers(this.strokes, stroke, this._snapKind === "vdiv");
+      if (sibs && sibs.length) {
+        this._pushUndo({ type: "grid", page: this.pageIndex, stroke, siblings: sibs });
+        this._appendToLayer(stroke);
+        this.invalidateLayer();      // the siblings moved, so the layer is stale
+        this.onChange();
+        return;
+      }
+    }
     this._pushUndo({ type: "draw", page: this.pageIndex, stroke });
     this._appendToLayer(stroke);
     this.onChange();
@@ -871,6 +892,10 @@ export class Surface {
         rec.stroke.pts = rec.pts.map((p) => [p[0], p[1]]);
         rec.stroke.width = rec.width;
       }
+    } else if (op.type === "grid") {
+      const i = strokes.lastIndexOf(op.stroke);
+      if (i >= 0) strokes.splice(i, 1);
+      for (const rec of op.siblings) rec.stroke.pts = rec.before.map((p) => p.slice());
     }
     // a stale loop after an undone move is impossible only because undo clears
     // the selection — do not remove this
@@ -899,6 +924,9 @@ export class Surface {
         rec.stroke.pts = op.after[i].pts.map((p) => [p[0], p[1]]);
         rec.stroke.width = op.after[i].width;
       });
+    } else if (op.type === "grid") {
+      strokes.push(op.stroke);
+      for (const rec of op.siblings) rec.stroke.pts = rec.after.map((p) => p.slice());
     }
     this.clearSelection();
     this.undoStack.push(op);

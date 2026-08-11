@@ -242,5 +242,97 @@ export function evenDividerPositions(lo, hi, count) {
  * needs an entry — a missing one is an error mid-gesture. */
 export const SNAP_LABELS = {
   line: "Line", path: "Path", rect: "Rectangle", ellipse: "Ellipse",
-  polygon: "Polygon", grid: "Grid",
+  polygon: "Polygon", vdiv: "Divider", hdiv: "Divider",
 };
+
+// ── grid dividers ────────────────────────────────────────────────────────────
+//
+// A straight line drawn inside a rectangle already on the page becomes a
+// full-span divider at its even grid slot, and its siblings re-space to equal
+// cells. Rectangles are found GEOMETRICALLY (rectBboxOf), so this survives a
+// save and reload and needs no stored tag — which is also why `rect` has to win
+// its own case in recognizeShape on angle rather than on fit.
+
+/** The smallest rectangle-stroke whose interior contains (x, y), or null. */
+export function rectContaining(strokes, x, y) {
+  let best = null, bestArea = null;
+  for (const st of strokes) {
+    const bb = rectBboxOf(st.pts);
+    if (!bb) continue;
+    const [minx, miny, maxx, maxy] = bb;
+    if (minx < x && x < maxx && miny < y && y < maxy) {
+      const area = (maxx - minx) * (maxy - miny);
+      if (bestArea === null || area < bestArea) { best = bb; bestArea = area; }
+    }
+  }
+  return best;
+}
+
+/** Existing full-span dividers of the given orientation inside `rect` —
+ * 2-point straight lines spanning it. */
+export function dividersInRect(strokes, rect, vertical) {
+  const [minx, miny, maxx, maxy] = rect;
+  const tol = 0.08 * Math.hypot(maxx - minx, maxy - miny);
+  const out = [];
+  for (const st of strokes) {
+    const pts = st.pts;
+    if (!pts || pts.length !== 2) continue;
+    const [[ax, ay], [bx, by]] = pts;
+    if (vertical) {
+      if (Math.abs(ax - bx) <= tol && minx - tol < ax && ax < maxx + tol
+          && Math.abs(Math.min(ay, by) - miny) <= tol
+          && Math.abs(Math.max(ay, by) - maxy) <= tol) out.push(st);
+    } else if (Math.abs(ay - by) <= tol && miny - tol < ay && ay < maxy + tol
+               && Math.abs(Math.min(ax, bx) - minx) <= tol
+               && Math.abs(Math.max(ax, bx) - maxx) <= tol) {
+      out.push(st);
+    }
+  }
+  return out;
+}
+
+/** If the straight segment p0→p1 lies inside a rectangle on the page, snap it
+ * to a full-span divider at its even grid slot: `{kind, pts}` with kind "vdiv"
+ * or "hdiv". Siblings are re-spaced at COMMIT, not here. */
+export function snapGridDivider(strokes, p0, p1) {
+  const vertical = Math.abs(p1[1] - p0[1]) >= Math.abs(p1[0] - p0[0]);
+  const mx = (p0[0] + p1[0]) / 2, my = (p0[1] + p1[1]) / 2;
+  const rect = rectContaining(strokes, mx, my);
+  if (!rect) return null;
+  const [minx, miny, maxx, maxy] = rect;
+  const sibs = dividersInRect(strokes, rect, vertical);
+  if (vertical) {
+    const positions = sibs.map((s) => s.pts[0][0]).concat([mx]).sort((a, b) => a - b);
+    const rank = positions.indexOf(mx);
+    const slot = evenDividerPositions(minx, maxx, sibs.length + 1)[
+      Math.min(rank < 0 ? sibs.length : rank, sibs.length)];
+    return { kind: "vdiv", pts: [[slot, miny], [slot, maxy]] };
+  }
+  const positions = sibs.map((s) => s.pts[0][1]).concat([my]).sort((a, b) => a - b);
+  const rank = positions.indexOf(my);
+  const slot = evenDividerPositions(miny, maxy, sibs.length + 1)[
+    Math.min(rank < 0 ? sibs.length : rank, sibs.length)];
+  return { kind: "hdiv", pts: [[minx, slot], [maxx, slot]] };
+}
+
+/** Re-space every divider of `newStroke`'s orientation inside its rectangle to
+ * equal cells. Returns the sibling records for the undo entry — the whole
+ * gesture is ONE entry: remove the new divider, restore the siblings. */
+export function respaceDividers(strokes, newStroke, vertical) {
+  const [a, b] = newStroke.pts;
+  const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+  const rect = rectContaining(strokes, mx, my);
+  if (!rect) return null;
+  const [minx, miny, maxx, maxy] = rect;
+  const sibs = dividersInRect(strokes, rect, vertical);   // includes the new one
+  const old = new Map();
+  for (const s of sibs) if (s !== newStroke) old.set(s, s.pts.map((p) => p.slice()));
+  const positions = evenDividerPositions(vertical ? minx : miny,
+                                         vertical ? maxx : maxy, sibs.length);
+  sibs.forEach((s, i) => {
+    const pos = positions[i];
+    s.pts = vertical ? [[pos, miny], [pos, maxy]] : [[minx, pos], [maxx, pos]];
+  });
+  return sibs.filter((s) => s !== newStroke)
+    .map((s) => ({ stroke: s, before: old.get(s), after: s.pts.map((p) => p.slice()) }));
+}
