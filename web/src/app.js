@@ -227,14 +227,31 @@ function wireDivider() {
   const stage = document.getElementById("stage");
   let dragging = false;
 
-  const apply = (x) => {
+  // Past this, the page has nowhere useful left to be and the notes take the
+  // window: the divider is the way BETWEEN the modes (row 130).
+  const FULL_AT = 0.06;
+
+  const apply = (x, { remember = true } = {}) => {
     const r = paned.getBoundingClientRect();
-    const frac = Math.max(0.15, Math.min(0.92, (x - r.left) / r.width));
-    stage.style.flexBasis = `${(frac * 100).toFixed(2)}%`;
-    store.set("pane_fraction", frac);
+    let frac = Math.max(0, Math.min(0.94, (x - r.left) / r.width));
+    if (frac < FULL_AT) frac = 0;
+    setSplit(frac, { remember });
+  };
+
+  const setSplit = (frac, { remember = true } = {}) => {
+    const full = frac <= 0;
+    stage.style.flexBasis = full ? "0%" : `${(frac * 100).toFixed(2)}%`;
+    document.getElementById("paned").classList.toggle("full-notes", full);
+    // A VIEW state, never a conversion: the PDF is still there behind the
+    // sheet, its notes are still per page, and nothing is written either way —
+    // so a drag that crosses the line and comes back leaves no trace.
+    notes.setFull(full);
+    if (remember && !full) store.set("pane_fraction", frac);
+    store.set("full_notes", full);
     surface.fit();
     surface.requestDraw();
   };
+  wireDivider.setSplit = setSplit;
 
   divider.addEventListener("pointerdown", (e) => {
     dragging = true;
@@ -253,6 +270,20 @@ function wireDivider() {
   if (typeof saved === "number" && saved > 0.1 && saved < 0.95) {
     stage.style.flexBasis = `${(saved * 100).toFixed(2)}%`;
   }
+  // The view is remembered per session for the same reason the desktop keeps it
+  // in recent.json: it is a view state about a document, and looking at one
+  // must not change a file.
+  if (store.get("full_notes")) {
+    requestAnimationFrame(() => setSplit(0, { remember: false }));
+  }
+
+  // The collapsed handle is the ONLY way back, so it wears a wide, visible
+  // grip — at the default width it would be a few pixels hard against the
+  // window edge.
+  divider.addEventListener("dblclick", () => {
+    const full = document.getElementById("paned").classList.contains("full-notes");
+    setSplit(full ? (store.get("pane_fraction") || 0.62) : 0, { remember: false });
+  });
 }
 
 /** The page counter and the pager belong to the WINDOW, not to the page, so

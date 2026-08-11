@@ -317,6 +317,25 @@ button:disabled:hover { background: transparent; }
 }
 #divider:hover, #divider.dragging { background: var(--accent-bg); }
 
+/* Collapsed, the handle is the only way back to the page, so it wears a wide
+   visible grip instead of a few pixels hard against the window edge. */
+#paned.full-notes > #stage { flex-basis: 0 !important; overflow: hidden; }
+#paned.full-notes > #divider {
+  width: 14px;
+  background: var(--window-bg);
+  border-right: 1px solid var(--separator);
+  display: grid;
+  place-items: center;
+}
+#paned.full-notes > #divider::before {
+  content: "";
+  width: 4px; height: 34px;
+  border-radius: 2px;
+  background: var(--dim);
+  opacity: .5;
+}
+#paned.full-notes > #divider:hover::before { opacity: 1; }
+
 #notes {
   flex: 1;
   min-width: 0;

@@ -148,6 +148,7 @@ export class NotesView {
   constructor(host, opts = {}) {
     this.model = null;
     this.page = 0;
+    this.full = false;          // the whole sidecar, rather than one page
     this.onDirty = opts.onDirty || (() => {});
     this._loading = false;
 
@@ -183,7 +184,31 @@ export class NotesView {
     if (this.model && this.model !== model) this.commit();
     this.model = model;
     this.page = 0;
+    this.full = false;
     this.showPage(0);
+  }
+
+  /** FULL-NOTES view (row 130): the sheet shows the whole sidecar — markers and
+   * all — instead of one page's body. That is the only way one buffer can hold
+   * a per-page model, and it is what the divider dragged to full width gives
+   * you.
+   *
+   * A VIEW state, never a conversion: nothing is written either way, so a drag
+   * that crosses the line and comes back leaves no trace. */
+  setFull(on) {
+    if (!this.model || on === this.full) return;
+    this.commitFull();                 // write the view being left
+    this.full = on;
+    const text = on ? this.model.toText() : this.model.get(this.page);
+    this._fill(text);
+  }
+
+  /** Commit whichever view is on screen. The two paths have to say which they
+   * mean — parsing a per-page buffer as a whole file would eat the markers. */
+  commitFull() {
+    if (!this.model) return;
+    if (this.full) this.model.setFromText(this.view.state.doc.toString());
+    else this.commit();
   }
 
   /** Write the buffer back to the page it belongs to. Goes to the run's first
@@ -192,6 +217,7 @@ export class NotesView {
    * model's internals. */
   commit() {
     if (!this.model) return;
+    if (this.full) { this.commitFull(); return; }
     this.model.set(this.page, this.view.state.doc.toString().trim());
   }
 
@@ -201,7 +227,13 @@ export class NotesView {
     if (!this.model) return;
     if (page !== this.page) this.commit();
     this.page = page;
-    const text = this.model.get(page);
+    // in the full view the sheet is the whole file, so a page change moves the
+    // canvas and leaves the text alone
+    if (this.full) return;
+    this._fill(this.model.get(page));
+  }
+
+  _fill(text) {
     this._loading = true;      // our own fill must not mark the file dirty
     this.view.dispatch({
       changes: { from: 0, to: this.view.state.doc.length, insert: text },
@@ -211,7 +243,7 @@ export class NotesView {
   }
 
   _onEdit() {
-    this.commit();
+    this.commitFull();
     this.onDirty();
   }
 
