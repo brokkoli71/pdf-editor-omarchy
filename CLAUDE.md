@@ -656,6 +656,67 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   where the verb lives — the header button when there is room, the ☰ menu entry
   when the header has collapsed, never both — and `_new_bookmark_list` is the
   single builder behind both list widgets. PDF-only.
+  - **Making one and destroying one are both a moment, and both are handled
+    there** (row 152). Adding opens the name field with the derived label in it
+    and SELECTED (`_prompt_bookmark_name`), so the first keystroke replaces it
+    — a bookmark you must go and rename later is one you name never. The mark
+    is stored on the CLICK and the popup only edits it, which is what keeps
+    Ctrl+B a one-key verb: dismiss the popup and you still have a bookmark.
+    Committing the suggestion unchanged stores NO name, or the derived label
+    would freeze into the file. Removing asks first, through one confirmation
+    every path routes into (`_drop_bookmark` asks, `_do_drop_bookmark` acts) —
+    with no "don't ask again", unlike the page-drop dialog: the name is stored
+    nowhere else, and an opt-out is one stray click from losing the guard for
+    good. A cancel must re-sync the header toggle, which already flipped
+    itself on the click that opened the dialog.
+  - **Bookmarks are outline entries too, and can BE the outline** (row 153).
+    The Outline/Pages switch appears when the document has a TOC *or*
+    bookmarks — a lecture deck rarely has a TOC and is exactly what you
+    bookmark your way around — and a "Bookmarks" tick-box appears beside it
+    only when there are some (persisted app-wide as `outline_bookmarks`). They
+    are **merged INTO the outline's own order**, never sorted with it: each one
+    is emitted before the first entry starting after its page, and a bookmark
+    on the same page as an entry follows it. Re-sorting the whole list by page
+    looks identical on a well-formed outline and silently hands a chapter drag
+    the wrong span on one whose entries are out of page order, because
+    `chapter_no` indexes `chapter_spans` in TOC order.
+- **Search finds the FIRST match synchronously and the rest in the background
+  (rows 154 + 155).** A keystroke may spend `SEARCH_SYNC_MS`; the remaining
+  pages go to the idle loop in `SEARCH_CHUNK_MS` slices — scanning every page
+  before returning is most of a second per character on a large PDF, and the
+  next keystroke throws it all away. Pages are scanned from where you ARE,
+  forwards, then wrapping, so the first hit found is the one you would have
+  gone to anyway. What holds it up:
+  - **The match list is ordered by PAGE and rebuilt as hits arrive**, never in
+    the order the scan found them, and the current match is re-found by
+    IDENTITY (`_rebuild_search_matches`) — a hit landing ahead of it renumbers
+    the label without moving you.
+  - **The count says when it is still climbing** (a trailing `…`) and **"not
+    found" waits for the scan to finish**, or every long document flashes red
+    at a term that is in it.
+  - **Stepping off the end of a partial result set finishes the scan first**
+    (`_step_search` → `_finish_search_scan`): wrapping to match 1 with pages
+    unread silently skips everything between here and the end.
+  - A tail of `SEARCH_SYNC_TAIL` pages is finished on the spot — deferring it
+    costs more than doing it, and it keeps an ordinary document's count final
+    the moment you stop typing.
+  - **The idle slice reads its state through the ACTIVE-session proxies**, so
+    it parks when its tab goes to the back and `_activate_session` restarts it
+    (`_scan_session` is the check). Without that, a background tab's scan
+    writes its hits into the front document's table.
+  - **Ctrl+F keeps the term and SELECTS it** rather than clearing: typing
+    replaces it, Enter searches it again. `grab_focus` selects only when focus
+    ARRIVES, so the explicit `select_region` is there for the case the feature
+    is *for* — pressing Ctrl+F with the caret already in the entry. `_hide_search`
+    keeps the text and drops the results, which is why Enter on a reopened bar
+    re-runs the search instead of stepping through nothing.
+- **The page counter and the bookmark toggle belong to the WINDOW, not the tab**
+  (row 156), so `_sync_page_chrome()` is the one place that points them at the
+  active document's page — called by the canvas's page-change callback *and* by
+  `_activate_session`. Every structural change (add, delete, insert, reorder,
+  merge) fires the callback through `PDFCanvas._load_page`, so those were never
+  the problem; a TAB SWITCH changes which page is in front without any page
+  changing, and so fires nothing at all.
 - **Reopen where you left off** lives in `recent.json` (`_recent_page` /
   `_remember_recent_page`), NOT the sidecar: a sidecar appears only once you
   write something, and storing the reading position there would drop a `.md`

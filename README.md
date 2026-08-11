@@ -38,7 +38,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Callout boxes** (`Ctrl+Alt+drag`) — an anchor plus its note paragraph rendered in a box on the PDF, arrow included; drag the anchor or the box to reposition. Renders the same inline math and Markdown as the notes; included in exports
 - **Standalone text boxes** (`Ctrl+Alt+right-click`) — drop typed text straight on the page, no anchor; edit it in the notes panel, drag it to reposition; included in exports
 - **Notes that run over several pages** — tick **Continue from page N** in the notes header and this page shares the previous page's notes, so a thought started on slide 12 keeps going on 13 and 14 without copying anything. One tick carries on through the blank pages that follow, stopping where notes already exist; unticking splits the run from that page onwards
-- **Bookmarks** — mark a page with the bookmark button (or `Ctrl+B`) and hold the button for a list of every mark to jump to; rename any of them. Sidemark also reopens each document on the page you last read
+- **Bookmarks** — mark a page with the bookmark button (or `Ctrl+B`) and name it straight away in the field that opens; hold the button for a list of every mark to jump to. Your bookmarks appear in the outline with a ★ (tick "Bookmarks" there to hide them), so a deck with no outline of its own still gets one. Sidemark also reopens each document on the page you last read
 - **Date / time snippets** — type `/date`, `/time`, or `/now` then Space to expand
 - **Choose where notes live** — each PDF gets a `<filename>-notes.md` sidecar, created only once you actually write something; pick **Notes file…** from the ☰ menu to point several PDFs at one shared Markdown file (remembered per PDF)
 - **Slide between the two modes** — drag the notes divider all the way left and your notes become one full sheet you can write on; the page is still there behind it, so drag the same edge back out and it slides in again. Nothing is converted or written, so an accidental drag costs nothing, and each document reopens in the view you left it in
@@ -231,7 +231,7 @@ plain `[[…]]` text, so links round-trip through Obsidian.
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+F` | Open search bar (searches the PDF text **and** the Markdown notes) |
+| `Ctrl+F` | Open search bar (searches the PDF text **and** the Markdown notes); press it again to select the term you last searched for |
 | `Enter` / `↓` | Next match |
 | `↑` | Previous match |
 | `Escape` | Close search |

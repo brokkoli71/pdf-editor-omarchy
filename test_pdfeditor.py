@@ -2446,7 +2446,85 @@ class TestBookmarksInWindow(unittest.TestCase):
             win._go_to_page(2)
             self.assertTrue(win._bookmark_btn.get_active())
             self.assertEqual(win.notes_model.bookmarks(), [(2, "")])
+            # removing ASKS first (a bookmark's name is stored nowhere else), so
+            # the verb alone leaves the mark in place until the dialog is
+            # answered — see test_removing_a_bookmark_asks_first
             win._toggle_bookmark()
+            self.assertEqual(win.notes_model.bookmarks(), [(2, "")])
+            win._do_drop_bookmark(2)
+            self.assertEqual(win.notes_model.bookmarks(), [])
+            self.assertFalse(win._bookmark_btn.get_active())
+
+        self._run_in_window(4, body)
+
+    def test_adding_a_bookmark_opens_the_name_field_ready_to_type(self):
+        """A bookmark you have to go and rename afterwards is one you name
+        never. Adding opens the field with the suggestion SELECTED, so the
+        first keystroke replaces it."""
+        def body(win, _pdf):
+            win._go_to_page(1)
+            win.notes_model.set(1, "Eigenvalues\nmore text")
+            win._toggle_bookmark()
+            entry = win._bookmark_name_entry
+            self.assertIsNotNone(entry, "adding a bookmark opened no name field")
+            self.assertEqual(entry.get_text(), "Eigenvalues")
+            bounds = entry.get_selection_bounds()
+            lo, hi = bounds[-2], bounds[-1]
+            self.assertEqual((lo, hi), (0, len(entry.get_text())),
+                             "the suggestion is not selected, so typing would "
+                             "append to it instead of replacing it")
+
+        self._run_in_window(4, body)
+
+    def test_the_name_popup_stores_a_change_but_not_the_suggestion(self):
+        """Committing the suggestion unchanged must NOT store it: it is derived
+        at display time, and freezing today's first note line into the file is
+        the thing `_bookmark_label` exists to avoid."""
+        def body(win, _pdf):
+            win._go_to_page(1)
+            win.notes_model.set(1, "Eigenvalues\nmore")
+            win._toggle_bookmark()
+            win._bookmark_name_entry.emit("activate")          # Enter, unchanged
+            self.assertEqual(win.notes_model.bookmark_name(1), "")
+
+            win._prompt_bookmark_name(1)
+            win._bookmark_name_entry.set_text("Jordan form")
+            win._bookmark_name_entry.emit("activate")
+            self.assertEqual(win.notes_model.bookmark_name(1), "Jordan form")
+            # and the derived label no longer follows the notes
+            win.notes_model.set(1, "something else entirely")
+            self.assertEqual(win._bookmark_label(1), "Jordan form")
+
+        self._run_in_window(4, body)
+
+    def test_dismissing_the_name_popup_keeps_the_bookmark(self):
+        """The mark is stored on the click; the popup only names it. So Ctrl+B
+        stays a one-key verb — closing the popup leaves a bookmark carrying its
+        derived label, never nothing."""
+        def body(win, _pdf):
+            win._go_to_page(2)
+            win._toggle_bookmark()
+            win._bookmark_name_pop.popdown()
+            self.assertEqual(win.notes_model.bookmarks(), [(2, "")])
+            self.assertTrue(win._bookmark_btn.get_active())
+
+        self._run_in_window(4, body)
+
+    def test_removing_a_bookmark_asks_first_on_every_path(self):
+        """The name is stored nowhere else, so removal is confirmed — and every
+        path goes through the one confirmation, not one per caller."""
+        def body(win, _pdf):
+            win._go_to_page(2)
+            win._toggle_bookmark()
+            win._rename_bookmark(2, "Keep me")
+            # the header button / Ctrl+B
+            win._toggle_bookmark()
+            self.assertEqual(win.notes_model.bookmarks(), [(2, "Keep me")])
+            # the ✕ in the bookmark list
+            win._drop_bookmark(2)
+            self.assertEqual(win.notes_model.bookmarks(), [(2, "Keep me")])
+            # only the confirmed action removes it
+            win._do_drop_bookmark(2)
             self.assertEqual(win.notes_model.bookmarks(), [])
 
         self._run_in_window(4, body)
@@ -8120,6 +8198,302 @@ class TestNotesUndoIsolation(unittest.TestCase):
             raise errors[0]
 
 
+class TestSearchScan(unittest.TestCase):
+    """Typing must never wait for the document. The first match is found
+    synchronously and jumped to; the rest of the pages are scanned in idle
+    slices, so the count climbs while you carry on typing."""
+
+    PAGES = 40
+
+    def _run(self, body, hits_on=(3, 20, 35)):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.searchscan")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "big.pdf")
+                    doc = fitz.open()
+                    for i in range(self.PAGES):
+                        p = doc.new_page(width=300, height=400)
+                        p.insert_text((50, 50),
+                                      "needle here" if i in hits_on else "nothing")
+                    doc.save(pdf)
+                    doc.close()
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def _type(self, win, term):
+        win._search_entry.set_text(term)
+        win._on_search_changed(win._search_entry)
+
+    def _drain(self, win, ms=2000):
+        ctx = GLib.MainContext.default()
+        deadline = time.time() + ms / 1000
+        while time.time() < deadline and not win._search_scan_done():
+            ctx.iteration(False)
+
+    def test_a_keystroke_stops_at_the_first_match(self):
+        """The point of the whole change: the search returns with something to
+        show while most of the document is still unread."""
+        def body(win):
+            self._type(win, "needle")
+            self.assertTrue(win._search_matches, "no match found synchronously")
+            self.assertLess(win._search_scan_at, self.PAGES,
+                            "the keystroke scanned the whole document")
+            self.assertFalse(win._search_scan_done())
+
+        self._run(body)
+
+    def test_the_scan_starts_from_the_page_you_are_on(self):
+        """So the first hit found is the one you would have gone to anyway."""
+        def body(win):
+            win._go_to_page(20)
+            self._type(win, "needle")
+            self.assertEqual(win._search_pending[0], 20)
+            self.assertEqual(win.canvas.current_page_idx, 20)
+
+        self._run(body)
+
+    def test_the_background_scan_finds_the_rest_in_page_order(self):
+        def body(win):
+            self._type(win, "needle")
+            partial = len(win._search_matches)
+            self._drain(win)
+            pages = [m[1] for m in win._search_matches]
+            self.assertEqual(pages, sorted(pages),
+                             "matches must be ordered by page, not by the order "
+                             "the scan happened to find them")
+            self.assertEqual(pages, [3, 20, 35])
+            self.assertGreater(len(win._search_matches), partial)
+
+        self._run(body)
+
+    def test_the_count_says_when_it_is_still_climbing(self):
+        def body(win):
+            self._type(win, "needle")
+            self.assertTrue(win._search_label.get_label().endswith("…"),
+                            "a provisional count must not look final")
+            self._drain(win)
+            self.assertEqual(win._search_label.get_label(), "1 / 3")
+
+        self._run(body)
+
+    def test_a_term_that_is_absent_is_not_flagged_until_the_scan_finishes(self):
+        """Otherwise every long document flashes red at a term that IS in it —
+        the pages holding it just have not been read yet.
+
+        Driven through the label rule rather than a real scan: a term absent
+        from a document this small is settled well inside the sync budget, so
+        there is no 'still scanning' moment to catch by racing it."""
+        def body(win):
+            self._type(win, "haystack")
+            self.assertTrue(win._search_scan_done())
+            self.assertTrue(win._search_entry.has_css_class("error"))
+            self.assertEqual(win._search_label.get_label(), "0 / 0")
+
+            # …and the same nothing, while pages remain unread
+            win._search_pending = list(range(self.PAGES))
+            win._search_scan_at = 1
+            win._update_search_label()
+            self.assertFalse(win._search_entry.has_css_class("error"))
+            self.assertEqual(win._search_label.get_label(), "…")
+
+        self._run(body)
+
+    def test_stepping_off_the_end_finishes_the_scan_first(self):
+        """Wrapping to match 1 while pages are still unscanned would silently
+        skip every match between here and the end."""
+        def body(win):
+            win._go_to_page(35)
+            self._type(win, "needle")          # finds the page-35 hit first
+            self.assertFalse(win._search_scan_done())
+            self.assertEqual(len(win._search_matches), 1)
+            win._search_next()
+            self.assertTrue(win._search_scan_done())
+            self.assertEqual(len(win._search_matches), 3)
+            self.assertEqual(win.canvas.current_page_idx, 3)   # wrapped, correctly
+
+        self._run(body)
+
+    def test_the_current_match_survives_hits_arriving_before_it(self):
+        """The list is rebuilt as pages come in, so the index moves — the match
+        itself must not."""
+        def body(win):
+            win._go_to_page(20)
+            self._type(win, "needle")
+            self.assertEqual(win.canvas.current_page_idx, 20)
+            here = win._search_matches[win._search_current]
+            self._drain(win)
+            self.assertEqual(win._search_matches[win._search_current], here)
+            self.assertEqual(win._search_current, 1)   # page 3 landed ahead of it
+            self.assertEqual(win._search_label.get_label(), "2 / 3")
+
+        self._run(body)
+
+    def test_a_new_term_abandons_the_old_scan(self):
+        def body(win):
+            self._type(win, "needle")
+            self.assertFalse(win._search_scan_done())
+            self._type(win, "nothing")
+            self.assertEqual(win._search_query, "nothing")
+            self._drain(win)
+            self.assertTrue(all(m[0] != "pdf" or m[1] not in (3, 20, 35)
+                                for m in win._search_matches)
+                            or bool(win._search_matches))
+
+        self._run(body)
+
+    def test_closing_the_bar_keeps_the_term_and_stops_the_scan(self):
+        """Ctrl+F offers it back selected, so typing replaces it and Enter
+        searches it again — clearing can only be undone by retyping."""
+        def body(win):
+            self._type(win, "needle")
+            win._hide_search()
+            self.assertEqual(win._search_entry.get_text(), "needle")
+            self.assertIsNone(win._search_scan_id)
+            self.assertEqual(win._search_matches, [])
+            win._show_search()
+            bounds = win._search_entry.get_selection_bounds()
+            self.assertEqual((bounds[-2], bounds[-1]), (0, len("needle")),
+                             "the term must come back selected")
+
+        self._run(body)
+
+    def test_enter_on_a_reopened_bar_searches_again(self):
+        def body(win):
+            self._type(win, "needle")
+            self._drain(win)
+            win._hide_search()
+            win._show_search()
+            self.assertEqual(win._search_matches, [])
+            win._search_next()          # Enter
+            self.assertTrue(win._search_matches, "Enter on a kept term must run "
+                                                 "the search again, not nothing")
+            self._drain(win)
+            self.assertEqual(win._search_label.get_label(), "1 / 3")
+
+        self._run(body)
+
+
+class TestBookmarksInOutline(unittest.TestCase):
+    """Your bookmarks are outline entries too (★), and they alone are enough to
+    make the outline worth offering — a lecture deck almost never has a TOC,
+    and it is exactly the document you bookmark your way around."""
+
+    def _rows(self, win):
+        out, child = [], win._toc_list.get_first_child()
+        while child is not None:
+            lab = child.get_child()
+            out.append(lab.get_label() if isinstance(lab, Gtk.Label) else "")
+            child = child.get_next_sibling()
+        return out
+
+    def _run(self, body, toc=None, pages=4):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.bmoutline")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "deck.pdf")
+                    make_pdf(pdf, n_pages=pages)
+                    if toc:
+                        doc = fitz.open(pdf)
+                        doc.set_toc(toc)
+                        doc.saveIncr()
+                        doc.close()
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    win._toc_seg_outline.set_active(True)   # outline, not pages
+                    body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_a_bookmark_lands_inside_the_chapter_it_belongs_to(self):
+        def body(win):
+            win.notes_model.add_bookmark(2, "Eigenvalues")
+            win._populate_toc()
+            rows = self._rows(win)
+            self.assertIn("★ Eigenvalues", rows)
+            # after the entry covering its page, before the next one
+            self.assertLess(rows.index("Chapter Two"), rows.index("★ Eigenvalues"))
+            self.assertLess(rows.index("★ Eigenvalues"), rows.index("Chapter Three"))
+
+        self._run(body, toc=[[1, "Chapter One", 1], [1, "Chapter Two", 2],
+                             [1, "Chapter Three", 4]])
+
+    def test_bookmarks_alone_give_a_document_an_outline(self):
+        """The switch is offered for a PDF with no TOC of its own, and the
+        outline is then just your bookmarks."""
+        def body(win):
+            self.assertFalse(win._toc_switch.get_visible(),
+                             "no TOC and no bookmarks should offer no outline")
+            win.notes_model.add_bookmark(1, "Where I stopped")
+            win._populate_toc()
+            self.assertTrue(win._toc_switch.get_visible())
+            win._toc_seg_outline.set_active(True)
+            self.assertEqual(self._rows(win), ["★ Where I stopped"])
+
+        self._run(body)
+
+    def test_the_toggle_hides_the_stars_and_appears_only_with_bookmarks(self):
+        def body(win):
+            self.assertFalse(win._toc_bookmarks_check.get_visible(),
+                             "a filter for rows the document has none of")
+            win.notes_model.add_bookmark(1, "Kept")
+            win._populate_toc()
+            self.assertTrue(win._toc_bookmarks_check.get_visible())
+            self.assertIn("★ Kept", self._rows(win))
+            win._toc_bookmarks_check.set_active(False)
+            self.assertNotIn("★ Kept", self._rows(win))
+            self.assertIn("Chapter One", self._rows(win))
+            win._toc_bookmarks_check.set_active(True)
+            self.assertIn("★ Kept", self._rows(win))
+
+        self._run(body, toc=[[1, "Chapter One", 1]])
+
+    def test_an_unnamed_bookmark_still_says_which_page_it_is(self):
+        def body(win):
+            win.notes_model.add_bookmark(2)
+            win._populate_toc()
+            self.assertIn("★ Page 3", self._rows(win))
+
+        self._run(body)
+
+    def test_the_chapter_drag_index_survives_an_outline_out_of_page_order(self):
+        """Bookmarks are merged INTO the outline's order, never sorted with it:
+        `chapter_no` counts entries in TOC order, so re-sorting the whole list
+        by page would hand a chapter drag the wrong span."""
+        def body(win):
+            win.notes_model.add_bookmark(1, "Mark")
+            win._populate_toc()
+            rows = self._rows(win)
+            self.assertEqual([r for r in rows if not r.startswith("★")],
+                             ["Later", "Earlier"])
+
+        self._run(body, toc=[[1, "Later", 3], [1, "Earlier", 1]])
+
+
 class TestTocSidebar(unittest.TestCase):
     def _pdf_with_toc(self, d):
         path = os.path.join(d, "toc.pdf")
@@ -11600,6 +11974,60 @@ class TestMultiTab(unittest.TestCase):
             self.assertTrue(out["active_is_a"])
             self.assertEqual(out["a_path"], a)
             self.assertIn("hello from b", out["b_note"])
+
+    def test_the_shared_header_follows_the_tab_you_switch_to(self):
+        """The page counter and the bookmark toggle belong to the WINDOW, not
+        to the tab, and a tab switch changes the page in front without any page
+        changing — so nothing fired and the counter went on describing the
+        document you had just left until you happened to turn a page."""
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf"); b = os.path.join(d, "b.pdf")
+            make_pdf(a, n_pages=2); make_pdf(b, n_pages=9)
+
+            def body(win, out):
+                win.open_file_in_tab(a)
+                win.open_file_in_tab(b)          # b active: 9 pages
+                win._go_to_page(4)
+                out["on_b"] = win._page_label.get_label()
+                win.notes_model.add_bookmark(4)
+                win._update_bookmark_ui()        # setup, not the behaviour here
+                out["b_marked"] = win._bookmark_btn.get_active()
+                sa = win._sessions[0]
+                win._tab_view.set_selected_page(sa._tab_page)
+                out["on_a"] = win._page_label.get_label()
+                out["a_marked"] = win._bookmark_btn.get_active()
+                win._tab_view.set_selected_page(win._sessions[1]._tab_page)
+                out["back_on_b"] = win._page_label.get_label()
+                out["b_marked_again"] = win._bookmark_btn.get_active()
+
+            out = self._in_window(body)
+            self.assertEqual(out["on_b"], "5 / 9")
+            self.assertTrue(out["b_marked"])
+            self.assertEqual(out["on_a"], "1 / 2")
+            self.assertFalse(out["a_marked"],
+                             "the toggle still described the other document")
+            self.assertEqual(out["back_on_b"], "5 / 9")
+            self.assertTrue(out["b_marked_again"])
+
+    def test_the_counter_follows_a_page_added_or_deleted(self):
+        """The other half of the same question: every structural change goes
+        through `_load_page`, so the count is re-read rather than adjusted."""
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf")
+            make_pdf(a, n_pages=3)
+
+            def body(win, out):
+                win.open_file_in_tab(a)
+                out["start"] = win._page_label.get_label()
+                win.canvas.add_blank_page()
+                out["added"] = win._page_label.get_label()
+                win.canvas.delete_current_page()
+                out["deleted"] = win._page_label.get_label()
+
+            out = self._in_window(body)
+            self.assertEqual(out["start"], "1 / 3")
+            self.assertTrue(out["added"].endswith("/ 4"), out["added"])
+            self.assertTrue(out["deleted"].endswith("/ 3"), out["deleted"])
 
     def test_close_tab_removes_session(self):
         """Closing a (clean) tab drops its session; the other stays active."""

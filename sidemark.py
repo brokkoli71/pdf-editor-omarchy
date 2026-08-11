@@ -14174,6 +14174,7 @@ class DocumentSession:
         "notes_model", "_undo_timeline", "_redo_timeline", "_notes_burst_open",
         "_burst_base", "_anchor_line_nos", "_anchor_para_ends", "_search_hits",
         "_note_hits", "_search_matches", "_search_current", "_presenter",
+        "_search_query", "_search_pending", "_search_scan_at", "_search_scan_id",
         "_last_anchor_mark", "_link_hint_shown", "_saved_pane_pos", "_pane_anim",
         "_thumb_idle_id", "_current_thumb_row", "_thumb_centred_page",
         "_drag_export_dir",
@@ -14185,7 +14186,8 @@ class DocumentSession:
         "_notes_link_check", "_notes_link_hint",
         "_search_revealer", "_search_entry", "_search_label", "_paned",
         "_toc_list", "_toc_scroll", "_toc_revealer", "_toc_switch",
-        "_toc_seg_outline", "_toc_seg_pages", "content", "_body", "_text_page",
+        "_toc_seg_outline", "_toc_seg_pages", "_toc_bookmarks_check",
+        "content", "_body", "_text_page",
         "_sheet_box",
     )
 
@@ -14206,6 +14208,12 @@ class DocumentSession:
         self._note_hits = {}
         self._search_matches = []
         self._search_current = -1
+        # the background page scan (see _on_search_changed): the term being
+        # scanned for, the pages still to do and how far into them we are
+        self._search_query = ""
+        self._search_pending = []
+        self._search_scan_at = 0
+        self._search_scan_id = None
         self._presenter = None
         self._last_anchor_mark = None
         self._link_hint_shown = False
@@ -14242,6 +14250,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._bookmark_updating = False     # the same guard for the bookmark toggle
         self._bookmark_lists = []           # every live copy of the list widget
         self._bookmark_pop = None
+        self._bookmark_name_pop = None      # the "name this bookmark" popup
+        self._bookmark_name_entry = None
+        self._toc_bookmarks_updating = False  # guards the ★-filter box
         # set while a document is loading: the load fires a page-0 change, and
         # remembering THAT would erase the position we are about to restore
         self._restoring_page = False
@@ -14282,6 +14293,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # ("note", page, start_offset, end_offset)
         self._search_matches = []
         self._search_current = -1   # index into _search_matches
+        self._search_query = ""     # the term the page scan is running for
+        self._search_pending = []   # pages still to scan, current page first
+        self._search_scan_at = 0    # how far into _search_pending we are
+        self._search_scan_id = None # the idle source doing the scanning
+        self._scan_session = None   # the session that idle belongs to
 
         theme = _load_theme()
         bg = _hex_to_rgb(theme["background"])
@@ -15568,8 +15584,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._toc_switch.append(s._toc_seg_outline)
         s._toc_switch.append(s._toc_seg_pages)
         s._toc_switch.set_visible(False)
+        # Bookmarks ⇄ outline filter, shown only when this document HAS
+        # bookmarks: a tick-box for a kind of row the document contains none of
+        # is a promise of something that is not there.
+        s._toc_bookmarks_check = Gtk.CheckButton(label="Bookmarks")
+        s._toc_bookmarks_check.set_active(
+            _load_settings().get("outline_bookmarks", True))
+        s._toc_bookmarks_check.set_tooltip_text(
+            "Show your bookmarks (★) in the outline")
+        s._toc_bookmarks_check.set_margin_start(10)
+        s._toc_bookmarks_check.set_margin_end(8)
+        s._toc_bookmarks_check.set_margin_bottom(4)
+        s._toc_bookmarks_check.set_visible(False)
+        s._toc_bookmarks_check.connect(
+            "toggled", lambda *a: s.win._on_toc_bookmarks_toggled(*a))
         toc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         toc_box.append(s._toc_switch)
+        toc_box.append(s._toc_bookmarks_check)
         toc_box.append(s._toc_scroll)
         s._toc_revealer = Gtk.Revealer()
         s._toc_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
@@ -16166,14 +16197,54 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         self._mark_dirty()
         self._refresh_bookmark_lists()
+        # the name is on screen in the outline too (row 153), and a ★ row still
+        # showing the old one is the same stale-chrome bug as row 156
+        self._populate_toc()
 
     def _drop_bookmark(self, idx):
+        """Remove a bookmark, after asking.
+
+        Every removal path comes through here (the button, Ctrl+B, the ✕ in the
+        list), so there is one confirmation and not three. Deliberately WITHOUT
+        a 'don't ask again': the guard exists because removing destroys a name
+        that is stored nowhere else, and an opt-out is one stray click away from
+        removing the guard for good. An UNNAMED bookmark still asks — the page
+        it marks is the thing being lost, and a dialog that appears only
+        sometimes is one you stop reading."""
+        if not self.notes_model.is_bookmarked(idx):
+            return
+        name = self.notes_model.bookmark_name(idx)
+        shown = self._bookmark_label(idx)
+        body = (f"“{shown}” on page {idx + 1}." if shown
+                else f"The bookmark on page {idx + 1}.")
+        if name:
+            body += " The name you gave it is removed with it."
+        dialog = Adw.AlertDialog.new("Remove bookmark?", body)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("remove", "Remove")
+        dialog.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        def on_resp(_d, resp):
+            if resp == "remove":
+                self._do_drop_bookmark(idx)
+            else:
+                # the header toggle already flipped itself on the click that got
+                # here — a cancel has to put it back, or the button says
+                # "unbookmarked" about a page that still is
+                self._update_bookmark_ui()
+
+        dialog.connect("response", on_resp)
+        dialog.present(self)
+
+    def _do_drop_bookmark(self, idx):
         if not self.notes_model.remove_bookmark(idx):
             return
         self._mark_dirty()
         self._populate_toc()
         self._update_bookmark_ui()
         self._refresh_bookmark_lists()
+        self._toast(f"Bookmark removed from page {idx + 1}")
 
     def _attach_bookmark_popover(self, button):
         """Long-press the bookmark button for the add/remove verb plus the full
@@ -16331,6 +16402,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 else "")
         self._set_file_title(name, s._path or s._notes_path)
         self._update_header_for_mode()   # also re-measures header collapse
+        # the page counter and the bookmark toggle are the window's, not the
+        # tab's — nothing fires a page change when the page in front is simply
+        # a different document's
+        self._sync_page_chrome()
+        # a background page scan belongs to the document it was started on, but
+        # it reads its state through the ACTIVE-session proxies — so it parks
+        # itself when its tab goes to the back (see _search_scan_step) and is
+        # picked up here when the tab comes forward again
+        self._resume_search_scan()
 
     def _new_tab(self):
         """Create a fresh document session in a new tab and make it active."""
@@ -16852,11 +16932,33 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     # ── page & notes handshake ────────────────────────────────────────────────
 
+    def _sync_page_chrome(self):
+        """Re-point the SHARED header at the active document's current page.
+
+        The page counter and the bookmark toggle belong to the WINDOW, not to
+        the tab, so anything that changes which page is in front has to come
+        through here. Turning the page, adding or deleting one, reordering and
+        merging all go via `_load_page`, which fires `on_page_changed` — but
+        SWITCHING TABS changes the page in front without any page changing, so
+        it fires nothing at all. That is the one that read "155 / 800" over a
+        different document until you happened to turn a page."""
+        text_mode = self._text_mode
+        doc = self.canvas.document if self.canvas is not None else None
+        if doc is None or text_mode:
+            # a text-first page is one endless sheet: there is no page N of M
+            self._page_label.set_label("—")
+        else:
+            self._page_label.set_label(
+                f"{self.canvas.current_page_idx + 1} / {self.canvas.n_pages}")
+        self._update_bookmark_ui()
+
     def _on_page_changed(self, idx, n):
-        self._page_label.set_label(f"{idx + 1} / {n}")
+        # the counter and the bookmark toggle come from the one place that
+        # knows how to point the shared header at a page (`_sync_page_chrome`),
+        # so a tab switch and a page turn can never disagree about them
+        self._sync_page_chrome()
         self._restore_note()
         self._update_search_canvas()
-        self._update_bookmark_ui()
         self._remember_page(idx)
         if self._toc_thumbs and self._toc_revealer.get_reveal_child():
             self._select_thumb(idx)
@@ -16912,17 +17014,90 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         return title or ""
 
     def _toggle_bookmark(self):
-        """The button's whole verb: click adds, click again removes."""
+        """The button's whole verb: click adds, click again removes.
+
+        Adding OPENS THE NAME POPUP with the field selected, so the one gesture
+        is "mark this page and say what it is" — a bookmark you had to go and
+        rename afterwards is one you name never. The mark is stored FIRST and
+        the popup only edits it, which is what keeps Ctrl+B a one-key verb:
+        dismissing the popup leaves a bookmark carrying its derived label, not
+        nothing. Removing asks first (`_drop_bookmark`) — it destroys a name
+        that exists nowhere else."""
         if not self._can_bookmark():
             return
         idx = self.canvas.current_page_idx
-        added = self.notes_model.toggle_bookmark(idx)
+        if self.notes_model.is_bookmarked(idx):
+            self._drop_bookmark(idx)
+            return
+        self.notes_model.add_bookmark(idx)
         self._mark_dirty()
         self._populate_toc()
         self._update_bookmark_ui()
         self._refresh_bookmark_lists()
-        self._toast(f"Bookmarked page {idx + 1}" if added
-                    else f"Bookmark removed from page {idx + 1}")
+        self._toast(f"Bookmarked page {idx + 1}")
+        self._prompt_bookmark_name(idx)
+
+    def _prompt_bookmark_name(self, idx):
+        """Name a just-added bookmark, without a trip to the list.
+
+        A popover rather than a modal, for `_begin_rename`'s reason: this is a
+        one-word edit. It is anchored to whichever chrome is actually on screen
+        — the header button collapses into the ☰ menu on a narrow window
+        (`_sync_bookmark_chrome`), and a popover parented to an unmapped widget
+        simply never appears."""
+        anchor = next((w for w in (getattr(self, "_bookmark_btn", None),
+                                   getattr(self, "_menu_btn", None))
+                       if w is not None and w.get_visible()), None)
+        if anchor is None:
+            return
+        pop = Gtk.Popover()
+        pop.set_parent(anchor)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_start(10); box.set_margin_end(10)
+        box.set_margin_top(10); box.set_margin_bottom(10)
+        title = Gtk.Label(label=f"Name the bookmark on page {idx + 1}", xalign=0)
+        title.add_css_class("heading")
+        box.append(title)
+        entry = Gtk.Entry()
+        entry.set_width_chars(28)
+        # pre-filled with the DERIVED label and selected, so typing replaces it
+        # and Enter alone keeps it — the field is never an empty box you must
+        # think of something for
+        entry.set_text(self._bookmark_label(idx))
+        hint = Gtk.Label(
+            label="Enter to save · Esc keeps the suggested name", xalign=0)
+        hint.add_css_class("dim-label")
+        hint.add_css_class("caption")
+
+        def commit():
+            text = entry.get_text().strip()
+            # storing the derived label would freeze today's first note line
+            # into the file; only a real change becomes a stored name
+            self._rename_bookmark(
+                idx, "" if text == self._bookmark_label(idx, "") else text)
+            pop.popdown()
+
+        entry.connect("activate", lambda _e: commit())
+        box.append(entry)
+        box.append(hint)
+        pop.set_child(box)
+        # the live popup, so the rest of the window (and the tests) can see what
+        # is being named without walking the popover's children
+        self._bookmark_name_pop = pop
+        self._bookmark_name_entry = entry
+
+        def closed(_p):
+            if self._bookmark_name_pop is pop:
+                self._bookmark_name_pop = None
+                self._bookmark_name_entry = None
+            pop.unparent()
+
+        pop.connect("closed", closed)
+        pop.popup()
+        # after popup(), or the popover's own focus handling takes the selection
+        # away again and the first keystroke appends instead of replacing
+        entry.grab_focus()
+        entry.select_region(0, -1)
 
     def _on_bookmark_toggled(self, btn):
         """The checkbox IS the page's boolean — but `_update_bookmark_ui`
@@ -17613,13 +17788,20 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if self.canvas.document is None:
             self._toc_thumbs = False
             self._toc_switch.set_visible(False)
+            self._toc_bookmarks_check.set_visible(False)
             self._toc_btn.set_active(False)   # also hides the revealer
             self._toc_btn.set_tooltip_text("No document open")
             return
-        # with a TOC the user can flip between outline and thumbnails;
+        # YOUR bookmarks are outline entries too, so they alone are enough to
+        # make the outline worth offering: a lecture deck almost never carries a
+        # TOC, which is exactly the document you bookmark your way around.
+        marks = self.notes_model.bookmarks() if self._can_bookmark() else []
+        has_outline = self._has_toc or bool(marks)
+        # with an outline the user can flip between it and thumbnails;
         # without one, thumbnails are the only view
-        self._toc_switch.set_visible(self._has_toc)
-        self._toc_thumbs = not self._has_toc or self._toc_seg_pages.get_active()
+        self._toc_switch.set_visible(has_outline)
+        self._toc_thumbs = not has_outline or self._toc_seg_pages.get_active()
+        self._toc_bookmarks_check.set_visible(bool(marks) and not self._toc_thumbs)
         if self._toc_thumbs:
             self._populate_thumbnails()
             # sidebar hugs the thumbnails (margins + row padding)
@@ -17643,7 +17825,52 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # dragging its row moves that whole RANGE (row 123)
             spans = chapter_spans(normalize_toc(toc), self.canvas.n_pages)
             chapter_no = 0
+            show_marks = (bool(marks)
+                          and self._toc_bookmarks_check.get_active())
+            # Bookmarks are merged INTO the outline's own order rather than
+            # sorted with it: a bookmark goes just before the first entry that
+            # starts after its page, so it lands inside the chapter it belongs
+            # to. Re-sorting everything by page would look identical on a
+            # well-formed outline and silently renumber the chapters of one
+            # whose entries are not in page order — and `chapter_no` (the drag
+            # index into `spans`) counts entries in TOC order.
+            pending = list(marks) if show_marks else []
+            mi = 0
+            level_here = 0      # the depth of the last outline entry passed
+
+            def emit_marks_before(page_limit):
+                nonlocal mi
+                while mi < len(pending) and pending[mi][0] < page_limit:
+                    idx, name = pending[mi]
+                    mi += 1
+                    # the ★ is the whole signal that the text is YOURS and not
+                    # the document's — an indistinguishable row would have the
+                    # outline claiming a title the PDF never contained
+                    text = self._bookmark_label(idx, name)
+                    lab = Gtk.Label(
+                        label="★ " + (text or f"Page {idx + 1}"), xalign=0)
+                    lab.add_css_class("accent")
+                    lab.set_ellipsize(Pango.EllipsizeMode.END)
+                    lab.set_margin_start(8 + 14 * min(level_here, 3))
+                    lab.set_margin_end(8)
+                    lab.set_margin_top(4)
+                    lab.set_margin_bottom(4)
+                    r = Gtk.ListBoxRow()
+                    r.set_child(lab)
+                    r.toc_page = idx
+                    r._bookmark_idx = idx
+                    r.set_tooltip_text(
+                        f"Your bookmark on page {idx + 1}"
+                        + (f": {text}" if text else "")
+                        + " — click to jump (rename or remove it from the "
+                          "bookmark list, Ctrl+B)")
+                    self._toc_list.append(r)
+
             for level, title, page in toc:
+                # a bookmark on the SAME page as an outline entry follows it:
+                # the entry names the page, the bookmark names your place in it
+                emit_marks_before(max(0, page - 1))
+                level_here = max(0, level - 1) + 1
                 label = Gtk.Label(label=title.strip() or "—", xalign=0)
                 label.set_ellipsize(Pango.EllipsizeMode.END)
                 label.set_margin_start(8 + 14 * max(0, level - 1))
@@ -17663,7 +17890,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 row.set_tooltip_text(
                     tip + " (PageUp/PageDown to flip pages)")
                 self._toc_list.append(row)
-            self._toc_btn.set_tooltip_text("Toggle outline (Ctrl+T)")
+            emit_marks_before(self.canvas.n_pages + 1)   # the tail, and the
+            # whole list when the document has no outline of its own
+            self._toc_btn.set_tooltip_text(
+                "Toggle outline (Ctrl+T)" if self._has_toc else
+                "Toggle your bookmarks (Ctrl+T) — no outline in this document")
 
     # ── chapter reorder (dragging an outline row, row 123) ────────────────────
 
@@ -17731,6 +17962,26 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _on_toc_view_toggled(self, _btn):
         if self.canvas.document:
             self._populate_toc()
+
+    def _on_toc_bookmarks_toggled(self, btn):
+        """Show or hide the ★ rows. Persisted app-wide, like `show_comments`:
+        it is a preference about how you read, not a fact about one file — so
+        every tab's copy of the box follows, guarded because setting them is
+        what re-enters this handler."""
+        if self._toc_bookmarks_updating:
+            return
+        on = btn.get_active()
+        self._toc_bookmarks_updating = True
+        try:
+            _save_setting("outline_bookmarks", on)
+            for s in self._sessions:
+                if s._toc_bookmarks_check is not None:
+                    s._toc_bookmarks_check.set_active(on)
+        finally:
+            self._toc_bookmarks_updating = False
+        if self.canvas.document:
+            self._populate_toc()
+
 
     # ── page thumbnails (outline fallback) ────────────────────────────────────
 
@@ -20885,15 +21136,28 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "Search page…" if self._text_mode else "Search PDF & notes…")
         self._search_revealer.set_reveal_child(True)
         self._search_entry.grab_focus()
+        # Ctrl+F on a bar that already holds a term SELECTS it instead of
+        # clearing it: typing replaces it (what you want most of the time) and
+        # Enter searches it again (what you want the rest of the time). Clearing
+        # can only be undone by retyping. `grab_focus` selects only when focus
+        # ARRIVES — press Ctrl+F with the caret already in the entry and nothing
+        # would happen at all, which is the case this is here for.
+        if self._search_entry.get_text():
+            self._search_entry.select_region(0, -1)
 
     def _hide_search(self):
         self._search_revealer.set_reveal_child(False)
-        self._search_entry.set_text("")
+        # the term is KEPT, so the next Ctrl+F can offer it back selected; only
+        # the results are dropped (they are what costs memory and paints on the
+        # page). `_search_scan_id` must go first — an idle scan outliving its
+        # bar would repopulate the highlights it is being closed to remove.
+        self._stop_search_scan()
         self._search_hits = {}
         self._note_hits = {}
         self._search_matches = []
         self._search_current = -1
         self._search_label.set_label("")
+        self._search_entry.remove_css_class("error")
         self.canvas.search_rects = []
         self.canvas.search_current_rect = None
         self.canvas.queue_draw()
@@ -20907,13 +21171,38 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return True
         return False
 
+    # A keystroke may block for this long looking for the FIRST hit; the rest of
+    # the document is scanned in idle slices of SEARCH_CHUNK_MS. Both are well
+    # under a frame: what makes search feel slow is not the total work but a
+    # keystroke that waits for it. A page of dense text searches in well under a
+    # millisecond, so on a small PDF the whole scan still finishes before the
+    # sync budget is up and nothing is deferred at all.
+    SEARCH_SYNC_MS = 25
+    SEARCH_CHUNK_MS = 8
+    # a tail this short is finished on the spot rather than handed to the idle
+    # loop: deferring it would cost more than doing it, and it is what keeps an
+    # ordinary document's count final the moment you stop typing instead of
+    # settling an instant later
+    SEARCH_SYNC_TAIL = 8
+
     def _on_search_changed(self, entry):
+        """Type-ahead search. The FIRST match is found synchronously and jumped
+        to; the remaining pages are scanned in the background, so the count
+        keeps climbing while you carry on typing.
+
+        The whole point is that a keystroke never waits for the document: the
+        old version scanned every page of the PDF before it returned, which on a
+        400-page file is most of a second of dropped input PER CHARACTER — and
+        all of it thrown away by the next keystroke."""
         query = entry.get_text()
+        self._stop_search_scan()
         self._search_hits = {}
         self._note_hits = {}
         self._search_matches = []
         self._search_current = -1
+        self._search_query = query
         if not query:
+            self._search_entry.remove_css_class("error")
             self._search_label.set_label("")
             self.canvas.search_rects = []
             self.canvas.search_current_rect = None
@@ -20921,32 +21210,168 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         # Flush the open page's edits so the notes search sees current text.
         self._commit_note()
-        # PDF hits per page
-        if self.canvas.document:
-            for i in range(self.canvas.n_pages):
-                hits = self.canvas.document[i].search_for(query)
-                if hits:
-                    self._search_hits[i] = hits
-        # Notes hits per page (case-insensitive substring on the stored text)
+        # Notes hits per page (case-insensitive substring on the stored text).
+        # Never deferred: this is a dict of strings already in memory, and the
+        # notes are the half of the search the user can see changing.
         self._note_hits = self._find_note_matches(query)
-        # Unified list, ordered by page; within a page PDF hits then note hits
-        for i in sorted(set(self._search_hits) | set(self._note_hits)):
-            for j in range(len(self._search_hits.get(i, []))):
-                self._search_matches.append(("pdf", i, j))
-            for (s, e) in self._note_hits.get(i, []):
-                self._search_matches.append(("note", i, s, e))
-        if not self._search_matches:
-            self._search_label.set_label("0 / 0")
-            self._search_entry.add_css_class("error")
+        # Pages are scanned from where you ARE, forwards, then wrapping — so
+        # the first hit found is the one you would have gone to anyway, and the
+        # background half is filling in what is behind you.
+        if self.canvas.document is None:
+            self._search_pending = []
+        else:
+            n, cur = self.canvas.n_pages, self.canvas.current_page_idx
+            self._search_pending = [(cur + k) % n for k in range(n)]
+        self._search_scan_at = 0
+        self._scan_search_pages(self.SEARCH_SYNC_MS, stop_at_first=True)
+        if len(self._search_pending) - self._search_scan_at <= self.SEARCH_SYNC_TAIL:
+            self._scan_search_pages(self.SEARCH_SYNC_MS)
+        self._rebuild_search_matches()
+        if self._search_matches:
+            self._search_entry.remove_css_class("error")
+            cur = self.canvas.current_page_idx
+            start = next((k for k, m in enumerate(self._search_matches)
+                          if m[1] >= cur), 0)
+            self._go_to_match(start)
+        else:
             self.canvas.search_rects = []
             self.canvas.search_current_rect = None
             self.canvas.queue_draw()
+        self._start_search_scan()
+
+    def _scan_search_pages(self, budget_ms, stop_at_first=False):
+        """Search the next pages of `_search_pending`, within a time budget.
+        Returns True if any new hits were found."""
+        doc = self.canvas.document
+        if doc is None or not self._search_query:
+            self._search_scan_at = len(self._search_pending)
+            return False
+        t0 = time.monotonic()
+        found = False
+        while self._search_scan_at < len(self._search_pending):
+            i = self._search_pending[self._search_scan_at]
+            self._search_scan_at += 1
+            try:
+                hits = doc[i].search_for(self._search_query)
+            except Exception:
+                # a damaged page must cost its own hits, never the search
+                hits = []
+            if hits:
+                self._search_hits[i] = hits
+                found = True
+                if stop_at_first:
+                    break
+            if (time.monotonic() - t0) * 1000.0 >= budget_ms:
+                break
+        return found
+
+    def _search_scan_done(self):
+        return self._search_scan_at >= len(self._search_pending)
+
+    def _start_search_scan(self):
+        """Hand the rest of the document to the idle loop."""
+        if self._search_scan_done():
+            self._update_search_label()
+            return
+        if self._search_scan_id is None:
+            # whose scan this is, checked by every slice: only ever the active
+            # session's, because the state it reads is the active session's
+            self._scan_session = self._active_session
+            self._search_scan_id = GLib.idle_add(self._search_scan_step)
+        self._update_search_label()
+
+    def _stop_search_scan(self):
+        if self._search_scan_id is not None:
+            GLib.source_remove(self._search_scan_id)
+            self._search_scan_id = None
+        self._search_pending = []
+        self._search_scan_at = 0
+        self._search_query = ""
+
+    def _resume_search_scan(self):
+        """Restart a scan parked by a tab switch. Idempotent, and silent when
+        there is nothing to resume."""
+        s = self._active_session
+        if s is None or s._search_scan_id is not None:
+            return
+        if s._search_query and not self._search_scan_done():
+            self._start_search_scan()
+
+    def _search_scan_step(self):
+        """One idle slice of the background scan. Returning False here is what
+        stops the source, so `_search_scan_id` is cleared on the same path.
+
+        Every `self._search_*` read here goes through the active-session proxy,
+        so a scan whose tab is no longer in front would be scanning ITS pages
+        into ANOTHER document's hit table. It parks instead — the pending list
+        survives, and `_activate_session` starts it again."""
+        session = self._scan_session
+        if session is not None and session is not self._active_session:
+            session._search_scan_id = None
+            return False
+        found = self._scan_search_pages(self.SEARCH_CHUNK_MS)
+        if found:
+            # only when something new arrived: the flat list is rebuilt from
+            # scratch and the current match re-found by identity, which is not
+            # free on a query that matches thousands of times
+            self._rebuild_search_matches()
+            if self._search_current < 0 and self._search_matches:
+                # the sync slice found nothing, so nothing has been jumped to
+                # yet — the first hit the background finds is the one to show
+                self._search_entry.remove_css_class("error")
+                self._go_to_match(0)
+            else:
+                self._update_search_canvas()
+        if self._search_scan_done():
+            self._search_scan_id = None
+            self._update_search_label()
+            return False
+        self._update_search_label()
+        return True
+
+    def _rebuild_search_matches(self):
+        """Flatten the hit dicts into the ordered match list.
+
+        Ordered by page, and within a page PDF hits before note hits — never by
+        the order they were FOUND, which is the scan's order and starts wherever
+        you happened to be. The current match is re-found by identity, so a hit
+        landing ahead of it renumbers the label without moving you."""
+        cur = (self._search_matches[self._search_current]
+               if 0 <= self._search_current < len(self._search_matches) else None)
+        out = []
+        for i in sorted(set(self._search_hits) | set(self._note_hits)):
+            for j in range(len(self._search_hits.get(i, []))):
+                out.append(("pdf", i, j))
+            for (s, e) in self._note_hits.get(i, []):
+                out.append(("note", i, s, e))
+        self._search_matches = out
+        if cur is not None:
+            try:
+                self._search_current = out.index(cur)
+            except ValueError:
+                self._search_current = min(self._search_current, len(out) - 1)
+
+    def _update_search_label(self):
+        """`3 / 27` when the scan is finished, `3 / 27…` while it is still
+        running — the ellipsis is the whole difference between a count that is
+        final and one that is still climbing. "Not found" waits for the scan to
+        finish: flagging it early makes every long document flash red at a term
+        that is in it."""
+        n = len(self._search_matches)
+        scanning = not self._search_scan_done()
+        if not self._search_query:
+            self._search_label.set_label("")
+            return
+        if n == 0:
+            self._search_label.set_label("…" if scanning else "0 / 0")
+            if scanning:
+                self._search_entry.remove_css_class("error")
+            else:
+                self._search_entry.add_css_class("error")
             return
         self._search_entry.remove_css_class("error")
-        # Start from the first match on or after the current page (wraps after)
-        cur = self.canvas.current_page_idx
-        start = next((k for k, m in enumerate(self._search_matches) if m[1] >= cur), 0)
-        self._go_to_match(start)
+        self._search_label.set_label(
+            f"{self._search_current + 1} / {n}" + ("…" if scanning else ""))
 
     def _find_note_matches(self, query):
         """{page_idx: [(start, end), ...]} of query occurrences in the stored
@@ -20964,14 +21389,46 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         return out
 
     def _search_next(self):
-        if not self._search_matches:
-            return
-        self._go_to_match(self._search_current + 1)
+        self._step_search(+1)
 
     def _search_prev(self):
+        self._step_search(-1)
+
+    def _step_search(self, delta):
+        """Next/previous match, and the ONE place that knows the scan may not
+        have finished.
+
+        Two things it must do that a plain index step cannot. Enter on a bar
+        reopened with its old term (`_show_search` keeps the text) has no
+        results to step through, so it runs the search again — that is what
+        makes Enter "search this again" rather than a dead key. And stepping
+        off the end of a PARTIAL result set finishes the scan first: wrapping
+        to match 1 while pages are still unscanned would silently skip the
+        matches between here and the end."""
         if not self._search_matches:
+            if self._search_entry.get_text():
+                self._on_search_changed(self._search_entry)
             return
-        self._go_to_match(self._search_current - 1)
+        idx = self._search_current + delta
+        if not self._search_scan_done() and not 0 <= idx < len(self._search_matches):
+            self._finish_search_scan()
+            idx = self._search_current + delta
+        self._go_to_match(idx)
+
+    def _finish_search_scan(self):
+        """Run the background scan to completion, now. Only ever on an explicit
+        request for a match we do not have yet — the cost is the whole document,
+        which is exactly what the background scan exists to keep off a
+        keystroke."""
+        if self._search_scan_done():
+            return
+        if self._search_scan_id is not None:
+            GLib.source_remove(self._search_scan_id)
+            self._search_scan_id = None
+        while not self._search_scan_done():
+            self._scan_search_pages(1000)
+        self._rebuild_search_matches()
+        self._update_search_label()
 
     def _go_to_match(self, idx):
         n = len(self._search_matches)
@@ -20987,7 +21444,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._update_search_canvas()
         if match[0] == "note":
             self._select_note_match(match[2], match[3])
-        self._search_label.set_label(f"{self._search_current + 1} / {n}")
+        self._update_search_label()
 
     def _select_note_match(self, start, end):
         """Select a notes hit. _restore_note loads the raw stored text into the
