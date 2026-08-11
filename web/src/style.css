@@ -101,6 +101,10 @@ body {
 .hb-end { justify-self: end; display: flex; gap: 2px; }
 
 .title { font-weight: 700; font-size: 14px; }
+/* unsaved work is marked on the title, the way a document window does it */
+.title.dirty::after { content: " •"; color: var(--accent-bg); }
+button.suggested { background: var(--accent-bg); color: var(--accent-fg); }
+button.suggested:hover { background: color-mix(in srgb, var(--accent-bg) 88%, black); }
 
 button {
   font: inherit;

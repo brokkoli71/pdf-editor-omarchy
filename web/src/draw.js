@@ -39,29 +39,8 @@ export function drawInkStroke(ctx, pts, width, profile = null, grow = 0.0) {
     return;
   }
 
-  // unit normal at each point: the perpendicular of the averaged incoming and
-  // outgoing tangents, so an offset corner stays put instead of flaring
+  const { normals, half } = strokeGeometry(pts, width, profile, grow);
   const n = pts.length;
-  const normals = [];
-  for (let i = 0; i < n; i++) {
-    let tx = 0.0, ty = 0.0;
-    const legs = [];
-    if (i) legs.push([pts[i - 1], pts[i]]);
-    if (i < n - 1) legs.push([pts[i], pts[i + 1]]);
-    for (const [a, b] of legs) {
-      const dx = b[0] - a[0], dy = b[1] - a[1];
-      const d = Math.hypot(dx, dy);
-      if (d > 1e-12) { tx += dx / d; ty += dy / d; }
-    }
-    let d = Math.hypot(tx, ty);
-    if (d < 1e-12) { tx = 1.0; ty = 0.0; d = 1.0; }
-    normals.push([-ty / d, tx / d]);
-  }
-
-  const half = [];
-  for (let i = 0; i < n; i++) {
-    half.push((width * Math.max(i < profile.length ? profile[i] : 1.0, 0.02) + grow) / 2);
-  }
 
   ctx.beginPath();
   ctx.moveTo(pts[0][0] + normals[0][0] * half[0],
@@ -82,6 +61,73 @@ export function drawInkStroke(ctx, pts, width, profile = null, grow = 0.0) {
   ctx.arc(pts[0][0], pts[0][1], half[0], a0, a0 - Math.PI, true);
   ctx.closePath();
   ctx.fill();
+}
+
+/** The per-point normal and half-width a tapered stroke's outline is built
+ * from. Shared by the screen painter and the PDF export, so the ink you save
+ * cannot be a different shape from the ink you drew.
+ *
+ * The normal is the perpendicular of the AVERAGED incoming and outgoing
+ * tangents, so an offset corner stays put instead of flaring. */
+export function strokeGeometry(pts, width, profile, grow = 0.0) {
+  const n = pts.length;
+  const normals = [];
+  for (let i = 0; i < n; i++) {
+    let tx = 0.0, ty = 0.0;
+    const legs = [];
+    if (i) legs.push([pts[i - 1], pts[i]]);
+    if (i < n - 1) legs.push([pts[i], pts[i + 1]]);
+    for (const [a, b] of legs) {
+      const dx = b[0] - a[0], dy = b[1] - a[1];
+      const d = Math.hypot(dx, dy);
+      if (d > 1e-12) { tx += dx / d; ty += dy / d; }
+    }
+    let d = Math.hypot(tx, ty);
+    if (d < 1e-12) { tx = 1.0; ty = 0.0; d = 1.0; }
+    normals.push([-ty / d, tx / d]);
+  }
+  const half = [];
+  for (let i = 0; i < n; i++) {
+    const f = profile && i < profile.length ? profile[i] : 1.0;
+    half.push((width * Math.max(f, 0.02) + grow) / 2);
+  }
+  return { normals, half };
+}
+
+/** The closed outline of a tapered stroke as a plain polygon, caps tessellated.
+ *
+ * The canvas painter draws its caps as arcs; PDF has no arc operator, so this
+ * is the same outline with the two half-circles walked as segments. `CAP_STEPS`
+ * is high enough that the difference is well under a printer's dot. */
+const CAP_STEPS = 12;
+export function strokeOutline(pts, width, profile, grow = 0.0) {
+  if (pts.length < 2) return [];
+  const { normals, half } = strokeGeometry(pts, width, profile, grow);
+  const n = pts.length;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    out.push([pts[i][0] + normals[i][0] * half[i],
+              pts[i][1] + normals[i][1] * half[i]]);
+  }
+  // end cap: from the left offset round to the right one, the short way —
+  // through the direction the pen was travelling
+  let a0 = Math.atan2(normals[n - 1][1], normals[n - 1][0]);
+  for (let k = 1; k < CAP_STEPS; k++) {
+    const a = a0 - Math.PI * (k / CAP_STEPS);
+    out.push([pts[n - 1][0] + Math.cos(a) * half[n - 1],
+              pts[n - 1][1] + Math.sin(a) * half[n - 1]]);
+  }
+  for (let i = n - 1; i >= 0; i--) {
+    out.push([pts[i][0] - normals[i][0] * half[i],
+              pts[i][1] - normals[i][1] * half[i]]);
+  }
+  a0 = Math.atan2(-normals[0][1], -normals[0][0]);
+  for (let k = 1; k < CAP_STEPS; k++) {
+    const a = a0 - Math.PI * (k / CAP_STEPS);
+    out.push([pts[0][0] + Math.cos(a) * half[0],
+              pts[0][1] + Math.sin(a) * half[0]]);
+  }
+  return out;
 }
 
 /** Distance from a point to a segment — the eraser's question, and the same

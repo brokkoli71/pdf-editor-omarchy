@@ -12,6 +12,7 @@ import { Doc, mergeDocuments, insertDocuments } from "./doc.js";
 import { Sidebar } from "./sidebar.js";
 import { NotesView } from "./notes.js";
 import { NotesModel } from "./notes-model.js";
+import { saveDocument, openWithPicker, canSaveInPlace } from "./save.js";
 
 // ── settings (the settings.json analogue) ────────────────────────────────────
 
@@ -126,7 +127,7 @@ const bindings = Bindings.load(store);
 const heldMods = { ctrl: false, shift: false, alt: false };
 
 const surface = new Surface(document.getElementById("page"), pen, bindings, {
-  onChange: refreshUndo,
+  onChange: () => { refreshUndo(); markDirty(true); },
   onPageChange: (page) => {
     sidebar.setPage(page);
     notes.showPage(page);
@@ -134,7 +135,9 @@ const surface = new Surface(document.getElementById("page"), pen, bindings, {
   },
 });
 
-const notes = new NotesView(document.getElementById("notes"));
+const notes = new NotesView(document.getElementById("notes"), {
+  onDirty: () => markDirty(true),
+});
 
 const sidebar = new Sidebar(document.getElementById("sidebar"), {
   onGoToPage: (page) => surface.setPage(page),   // absolute nav, never a flip
@@ -176,6 +179,9 @@ async function setDoc(doc, title) {
   notes.setModel(doc.notes);
   syncPageChrome();
   refreshUndo();
+  // setDoc runs through the change callback on its way in; what it just loaded
+  // is by definition not an unsaved edit
+  markDirty(false);
 }
 
 /** The divider between the page and the notes. GtkPaned's position, by hand. */
@@ -225,13 +231,31 @@ function syncPageChrome() {
 }
 
 async function readFiles(files) {
-  const pdfs = [...files].filter((f) => /\.pdf$/i.test(f.name)
-    || f.type === "application/pdf");
-  const out = [];
-  for (const f of pdfs) {
-    out.push({ bytes: new Uint8Array(await f.arrayBuffer()), name: f.name });
+  const list = [...files];
+  const pdfs = [];
+  // A `.md` dropped alongside its PDF is that PDF's SIDECAR — the same pairing
+  // the desktop makes, where a document is a `.pdf` plus the `.md` beside it.
+  // Matching is by base name, which is the rule the file layout already
+  // encodes.
+  const sidecars = new Map();
+  for (const f of list) {
+    if (/\.md$/i.test(f.name)) {
+      sidecars.set(f.name.replace(/\.[^.]+$/, ""), await f.text());
+    }
   }
-  return out;
+  for (const f of list) {
+    if (!/\.pdf$/i.test(f.name) && f.type !== "application/pdf") continue;
+    pdfs.push({
+      bytes: new Uint8Array(await f.arrayBuffer()),
+      name: f.name,
+      notesText: sidecars.get(f.name.replace(/\.[^.]+$/, "")) ?? null,
+    });
+  }
+  // a `.md` on its own is a notes file for the document already open
+  if (!pdfs.length && sidecars.size && surface.doc) {
+    return { loneNotes: [...sidecars.values()][0] };
+  }
+  return pdfs;
 }
 
 /** One file OPENS; several MERGE into one document with a chapter per file.
@@ -239,21 +263,68 @@ async function readFiles(files) {
  * document whose outline names where each source began, not a pile of tabs. */
 async function openFiles(files) {
   const sources = await readFiles(files);
+  if (sources.loneNotes !== undefined) {
+    // a sidecar for the document already open
+    surface.doc.notes.setFromText(sources.loneNotes);
+    notes.setModel(surface.doc.notes);
+    notes.showPage(surface.pageIndex);
+    markDirty(false);
+    return toast("Notes loaded");
+  }
+  return openSources(sources);
+}
+
+/** `sources` are {bytes, name, handle?, notesText?} — one OPENS, several MERGE
+ * into one document with a chapter per file. */
+async function openSources(sources) {
   if (!sources.length) return toast("No PDFs in that drop");
   try {
     if (sources.length === 1) {
       const doc = await Doc.open(sources[0].bytes, sources[0].name);
+      if (sources[0].handle) doc.handles = { pdf: sources[0].handle };
+      if (sources[0].notesText) doc.notes.setFromText(sources[0].notesText);
       await setDoc(doc, sources[0].name);
-      toast(`Opened ${sources[0].name}`);
+      toast(sources[0].notesText ? `Opened ${sources[0].name} with its notes`
+                                 : `Opened ${sources[0].name}`);
       return;
     }
     const { bytes, chapters, ink } = await mergeDocuments(sources);
     const doc = await Doc.open(bytes, "Merged");
     doc.ink = ink;
     await setDoc(doc, `Merged — ${chapters.length} chapters`);
+    markDirty(true);      // a merge exists only in memory until it is saved
     toast(`Merged ${chapters.length} documents, a chapter each`);
   } catch (err) {
     toast(`Could not open: ${err.message}`);
+  }
+}
+
+// ── saving ───────────────────────────────────────────────────────────────────
+
+let dirty = false;
+
+function markDirty(on) {
+  if (dirty === on) return;
+  dirty = on;
+  const title = document.getElementById("doc-title");
+  title.classList.toggle("dirty", on);
+  document.getElementById("save-btn").classList.toggle("suggested", on);
+}
+
+async function doSave({ reask = false } = {}) {
+  if (!surface.doc) return;
+  const btn = document.getElementById("save-btn");
+  btn.disabled = true;
+  try {
+    const result = await saveDocument(surface.doc, { reask });
+    if (!result) return;                       // cancelled
+    markDirty(false);
+    const what = result.notes ? `${result.pdf} + ${result.notes}` : result.pdf;
+    toast(result.inPlace ? `Saved ${what}` : `Downloaded ${what}`);
+  } catch (err) {
+    toast(`Could not save: ${err.message}`);
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -278,7 +349,14 @@ async function importAt(files, gap) {
 
 function wireDocument() {
   const input = document.getElementById("file-input");
-  document.getElementById("open-btn").addEventListener("click", () => input.click());
+  document.getElementById("open-btn").addEventListener("click", async () => {
+    // The picker is preferred over <input type=file> because it hands back a
+    // HANDLE — which is what lets a later save write to the same file instead
+    // of dropping a copy in ~/Downloads.
+    const picked = canSaveInPlace ? await openWithPicker(true) : null;
+    if (picked === null) { if (!canSaveInPlace) input.click(); return; }
+    if (picked.length) openSources(picked);
+  });
   input.addEventListener("change", () => {
     if (input.files.length) openFiles(input.files);
     input.value = "";
@@ -290,6 +368,13 @@ function wireDocument() {
     if (!bar.hidden) sidebar.rebuild();
     surface.fit();
     surface.requestDraw();
+  });
+
+  document.getElementById("save-btn").addEventListener("click", () => doSave());
+  window.addEventListener("beforeunload", (e) => {
+    // nothing is written until you say so, so leaving with unsaved work has to
+    // be a deliberate act
+    if (dirty) { e.preventDefault(); e.returnValue = ""; }
   });
 
   document.getElementById("prev-page").addEventListener("click", () => surface.flipPage(-1));
@@ -568,6 +653,9 @@ function wireKeys() {
     if ((e.ctrlKey || e.metaKey) && key === "z") {
       e.preventDefault();
       if (e.shiftKey) surface.redo(); else surface.undo();
+    } else if ((e.ctrlKey || e.metaKey) && key === "s") {
+      e.preventDefault();
+      doSave({ reask: e.shiftKey });          // Ctrl+Shift+S is Save As
     } else if ((e.ctrlKey || e.metaKey) && key === "y") {
       e.preventDefault();
       surface.redo();

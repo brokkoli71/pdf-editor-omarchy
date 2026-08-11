@@ -24,7 +24,9 @@ export class Doc {
     // The `.md` sidecar's model. It belongs to the document, not to the editor:
     // the panel is a view of one page of it.
     this.notes = new NotesModel();
-    this.notes.pdfName = name || null;
+    // the `![[name.pdf]]` embed line names the PDF the notes belong to — only
+    // when there IS one, so an untitled blank does not claim a file
+    this.notes.pdfName = /\.pdf$/i.test(name || "") ? name : null;
     this.outline = [];           // [{title, page, level}]
     this._pageCache = new Map(); // page index → pdf.js PDFPageProxy
     this._sizeCache = new Map();
