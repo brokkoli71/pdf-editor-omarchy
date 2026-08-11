@@ -27,24 +27,15 @@ export const PAGE_W = 595.0, PAGE_H = 842.0;   // A4 in document units, the size
 // Tools this prototype implements. The others stay in the table and in the bar
 // — removing them would change the binding model, which is not ours to change —
 // but a press that resolves to one of them does nothing here.
-// The page is rendered ABOVE the resolution it is shown at and scaled down, so
-// glyph edges get the benefit of oversampling instead of landing on whatever
-// pixel grid the zoom happens to produce.
+// The page is rasterised at EXACTLY the resolution it is shown at, and blitted
+// 1:1. Supersampling was tried and measured and is worse: rendering at 1x, 2x
+// and 3x and scaling down scored 5.13, 5.12 and 5.01 on edge contrast through a
+// band of text — the rasteriser antialiases ONTO THE PIXEL GRID, and a smooth
+// downscale can only blur what it had already placed exactly.
 //
-// 3x rather than 2x because the cost turned out not to be where it looked:
-// measured on an A4 page at fit, rasterising took 17 ms at 1x, 17 ms at 2x and
-// 17 ms at 3x, reaching 21 ms only at 4x. The time goes on parsing the page,
-// not on filling pixels, so the first few factors are nearly free. What does
-// grow is MEMORY — 3 MB, 11 MB, 24 MB, 43 MB — and that is what picks the
-// number: 4x doubles the bitmap for a difference the eye cannot find.
-export const RENDER_SUPERSAMPLE = 3;
-// …but a big page at a deep zoom would ask for a bitmap that costs more memory
-// than it is worth, so the factor gives way rather than the resolution: the
-// budget can pull it back to 1:1 and never below.
-export const RENDER_PIXEL_BUDGET = 24e6;
-// A canvas past this on either side is refused by the browser and comes back
-// BLANK rather than throwing, so deep zoom would lose the page entirely. The
-// floor at 1:1 gives way here: a slightly soft page beats no page.
+// What actually costs sharpness is sub-pixel misalignment: the same 1x render
+// blitted half a pixel off scored 4.54, an 11% loss. So everything below is
+// about landing on whole device pixels, not about making more of them.
 export const MAX_RENDER_SIDE = 8192;
 
 export const STRAIGHT_HOLD_MS = 500;   // hold still this long mid-stroke to snap
@@ -217,19 +208,28 @@ export class Surface {
     this.setPage(next, { fit: false });
   }
 
-  /** Device pixels per document unit to rasterise at — the display scale times
-   * the supersample factor, pulled back if that would exceed the budget. */
+  /** Device pixels per document unit to rasterise at: exactly what will be
+   * shown, so the blit is 1:1 and nothing is resampled. */
   _renderScale() {
     const dpr = window.devicePixelRatio || 1;
-    const base = this.zoom * dpr;
-    let scale = base * RENDER_SUPERSAMPLE;
-    const px = this.pageW * scale * this.pageH * scale;
-    if (px > RENDER_PIXEL_BUDGET) {
-      scale = Math.max(base, scale * Math.sqrt(RENDER_PIXEL_BUDGET / px));
-    }
+    let scale = this.zoom * dpr;
+    // …except past the canvas size limit, where an over-large bitmap comes back
+    // BLANK rather than throwing. A soft page beats no page.
     const side = Math.max(this.pageW, this.pageH) * scale;
     if (side > MAX_RENDER_SIDE) scale *= MAX_RENDER_SIDE / side;
     return scale;
+  }
+
+  /** Put the page's origin on a whole DEVICE pixel.
+   *
+   * A fractional origin makes the blit land between pixels, and the filter then
+   * smears an image that was rasterised perfectly — measured at an 11% loss of
+   * edge contrast, which is most of "not quite sharp". The cost is that a pan
+   * moves in device-pixel steps, which at any real dpr is invisible. */
+  _snapView() {
+    const dpr = window.devicePixelRatio || 1;
+    this.offX = Math.round(this.offX * dpr) / dpr;
+    this.offY = Math.round(this.offY * dpr) / dpr;
   }
 
   async _renderPage() {
@@ -259,6 +259,7 @@ export class Surface {
                          (this.cssH - m * 2) / this.pageH);
     this.offX = (this.cssW - this.pageW * this.zoom) / 2;
     this.offY = (this.cssH - this.pageH * this.zoom) / 2;
+    this._snapView();
     this.invalidateLayer();
     this._schedulePageRender();
   }
@@ -279,6 +280,7 @@ export class Surface {
     this.zoom = Math.max(0.05, Math.min(16, this.zoom * factor));
     this.offX = cx - dx * this.zoom;
     this.offY = cy - dy * this.zoom;
+    this._snapView();
     this.invalidateLayer();
     this._schedulePageRender();
     this.requestDraw();
@@ -287,6 +289,7 @@ export class Surface {
   panBy(dx, dy) {
     this.offX += dx;
     this.offY += dy;
+    this._snapView();
     this.invalidateLayer();
     this.requestDraw();
   }
@@ -1203,10 +1206,20 @@ export class Surface {
   draw() {
     const dpr = window.devicePixelRatio || 1;
     const ctx = this.ctx;
-    if (this.el.width !== Math.round(this.cssW * dpr)
-        || this.el.height !== Math.round(this.cssH * dpr)) {
-      this.el.width = Math.round(this.cssW * dpr);
-      this.el.height = Math.round(this.cssH * dpr);
+    // The backing store has to be a WHOLE number of device pixels AND the CSS
+    // box has to be exactly that many device pixels back. Sized from the parent
+    // and rounded independently, the two disagree by up to half a pixel at a
+    // fractional dpr — 1488x1430 against the 1429.5 actually needed — and the
+    // browser then rescales the entire canvas on every paint, so nothing on it
+    // is ever 1:1.
+    const host = this.el.parentElement || this.el;
+    const devW = Math.max(1, Math.round(host.clientWidth * dpr));
+    const devH = Math.max(1, Math.round(host.clientHeight * dpr));
+    if (this.el.width !== devW || this.el.height !== devH) {
+      this.el.width = devW;
+      this.el.height = devH;
+      this.el.style.width = `${devW / dpr}px`;
+      this.el.style.height = `${devH / dpr}px`;
       this.invalidateLayer();
       if (this._fitPending) { this._fitPending = false; this.fit(); }
     }
