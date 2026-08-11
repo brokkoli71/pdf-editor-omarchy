@@ -2338,14 +2338,25 @@ class TouchLatch:
     event carries; a consumer that needs widget coordinates takes the origin
     once per gesture (`TextPageView._surface_origin`) rather than converting
     per point.
+
+    `consume_extra` is for a surface that drives its own pinch: the SECOND and
+    further fingers are swallowed here, so nothing downstream ever sees them.
+    A `GtkGestureDrag` is single-point and simply ignores a second sequence —
+    which is not the same as denying it, so the sequence sailed past the sheet's
+    router into the `GtkTextView`, and the second finger of every pinch marked
+    text. The FIRST sequence is never consumed: the router is already holding
+    it, and swallowing its release would leave that drag live forever.
     """
 
-    def __init__(self, on_multi=None, on_move=None, on_end=None):
+    def __init__(self, on_multi=None, on_move=None, on_end=None,
+                 consume_extra=False):
         self._live = {}          # sequence -> (x, y), surface coords
         self.multi = False
         self.on_multi = on_multi
         self.on_move = on_move
         self.on_end = on_end
+        self.consume_extra = consume_extra
+        self._extra = set()      # sequences we are swallowing
 
     @property
     def count(self):
@@ -2378,7 +2389,8 @@ class TouchLatch:
         return (x, y) if ok else None
 
     def handle(self, event):
-        """Feed one event. Returns True if it changed anything."""
+        """Feed one event. Returns True if it should be CONSUMED — never for a
+        pointer, and only ever for an `extra` finger under `consume_extra`."""
         if event is None:
             # PyGObject hands a legacy controller a NULL event for some events
             # (the same trap as the pane-drag gesture). It crashed here, and an
@@ -2390,36 +2402,44 @@ class TouchLatch:
             return False        # a mouse or a pen: not a finger at all
         t = event.get_event_type()
         if t == Gdk.EventType.TOUCH_BEGIN:
+            extra = bool(self._live)     # something is already on the glass
             self._live[seq] = self._position(event)
+            if extra and self.consume_extra:
+                self._extra.add(seq)
             if len(self._live) >= 2 and not self.multi:
                 self.multi = True
                 if self.on_multi:
                     self.on_multi()
-                return True
         elif t == Gdk.EventType.TOUCH_UPDATE:
             if seq in self._live:
                 self._live[seq] = self._position(event)
                 if self.multi and self.on_move:
                     self.on_move()
-                return True
         elif t in (Gdk.EventType.TOUCH_END, Gdk.EventType.TOUCH_CANCEL):
             self._live.pop(seq, None)
-            if not self._live and self.multi:
-                # every finger is up: the next touch is a fresh hand
+            if not self._live:
+                # every finger is up: the next touch is a fresh hand. `on_end`
+                # fires for a ONE-finger hand too — it is "the glass is
+                # empty", not "the pinch is over", and what a surface hangs on
+                # it (ink that is still revocable) has to end with any hand.
                 self.multi = False
                 if self.on_end:
                     self.on_end()
+            if seq in self._extra:
+                self._extra.discard(seq)
                 return True
-        return False
+        return seq in self._extra
 
 
-def attach_touch_latch(widget, on_multi=None, on_move=None, on_end=None):
+def attach_touch_latch(widget, on_multi=None, on_move=None, on_end=None,
+                       consume_extra=False):
     """Give `widget` a TouchLatch fed from a CAPTURE-phase legacy controller.
 
     Capture, and its own controller, for `track_barrel`'s reason: the gestures
     below take a sequence for themselves, so the raw touch stream is the only
-    place the count is honest. It never consumes the event — counting is all
-    it does.
+    place the count is honest. It consumes nothing unless `consume_extra` says
+    so — and then only the second and further fingers, which is how a surface
+    that drives its own pinch keeps them off everything below it.
 
     **Attach it BEFORE any other capture-phase controller on the same widget.**
     Controllers of one widget and one phase run in the order they were added,
@@ -2431,12 +2451,11 @@ def attach_touch_latch(widget, on_multi=None, on_move=None, on_end=None):
     controller. They are the same event, but the argument is the one PyGObject
     sometimes fails to marshal, so `get_current_event()` is the second chance.
     """
-    latch = TouchLatch(on_multi, on_move, on_end)
+    latch = TouchLatch(on_multi, on_move, on_end, consume_extra)
     ctrl = Gtk.EventControllerLegacy()
     ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-    ctrl.connect("event", lambda c, ev: (latch.handle(ev or
-                                                      c.get_current_event()),
-                                         False)[1])
+    ctrl.connect("event",
+                 lambda c, ev: latch.handle(ev or c.get_current_event()))
     widget.add_controller(ctrl)
     return latch
 
@@ -11232,11 +11251,15 @@ class TextPageView(Gtk.Overlay):
         # controllers on one widget run in add order, and the router below
         # claims — which returns STOP and would hide the touches from a latch
         # added after it.
-        self._touch_zoom = None      # (spread, origin_x, origin_y) at begin
-        self._touch_pan = None       # the survivor's pan, after a finger lifts
-        self._touch = attach_touch_latch(self, self._on_touch_multi,
-                                         self._on_touch_move,
-                                         self._on_touch_end)
+        self._touch_zoom = None      # (spread, anchor) as of the last frame
+        self._touch_scroll = [0.0, 0.0]   # our own float scroll, unclamped
+        self._touch_origin = (0.0, 0.0)   # the sheet's top-left, surface coords
+        self._touch_n = 0            # fingers as of the last frame
+        self._touch_frame = None     # the tick callback while a hand is down
+        self._touch_strokes = []     # ink this hand committed, still revocable
+        self._touch = attach_touch_latch(self, self._on_touch_multi, None,
+                                         self._on_touch_end,
+                                         consume_extra=True)
 
         # ONE press router for the sheet (row 132). Capture phase on the
         # Overlay so it sees every press before both the ink overlay and the
@@ -11603,7 +11626,10 @@ class TextPageView(Gtk.Overlay):
         The PDF canvas' twin, and reached the same two ways — from the pinch
         gesture, and from the touch latch for when the pinch is starved and
         never begins. It abandons the stroke rather than committing it: the
-        first finger of a pinch never meant to draw."""
+        first finger of a pinch never meant to draw — and that includes what
+        it already COMMITTED during this hand, which is taken back off the
+        page here."""
+        self._drop_touch_strokes()
         self.current_stroke = []
         self._ink_ignoring = True   # the rest of this drag means nothing now
         self._press_tool = None
@@ -11664,55 +11690,119 @@ class TextPageView(Gtk.Overlay):
         tx, ty = native.get_surface_transform()
         return (res[0] + tx, res[1] + ty)
 
-    def _on_touch_multi(self):
-        """The second finger landed."""
-        self._on_second_finger()        # whatever the first was doing is over
-        self._touch_pan = None
-        self._touch_zoom = None
-        c, d = self._touch.centroid(), self._touch.spread()
-        if c is None or not d:
-            return
-        ox, oy = self._surface_origin()
-        self._pinch_base_zoom = self.zoom
-        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
-        self._pinch_base_scroll = (ha.get_value(), va.get_value())
-        self._pinch_center = (c[0] - ox, c[1] - oy)
-        self._touch_zoom = (d, ox, oy)
+    def _drop_touch_strokes(self):
+        """Take back the ink a finger of THIS hand already committed.
 
-    def _on_touch_move(self):
-        if self._touch_zoom is None:
+        Not an undo entry of its own: the whole point is that the mark was
+        never meant to exist, so its own `("add", …)` op goes with it — an
+        undo left behind would put back a stroke the user has already seen
+        vanish."""
+        dropped, self._touch_strokes = self._touch_strokes, []
+        if not dropped:
             return
-        d0, ox, oy = self._touch_zoom
-        if self._touch.count >= 2:
-            if self._touch_pan is not None:
-                # a finger came BACK after a lift — re-base on the new pair
-                # rather than measuring against a spread from before the pan
-                self._on_touch_multi()
-                return
-            c, d = self._touch.centroid(), self._touch.spread()
-            if c is None or not d:
-                return
-            self._apply_pinch(d / d0, c[0] - ox, c[1] - oy)
-            return
-        # One finger left of a pinch. It keeps PANNING until it lifts (the PDF
-        # canvas' `_post_pinch`): the hand is still on the glass, and handing
-        # the survivor back to a tool is the dot this whole latch is about.
+        drop = {id(s) for s in dropped}
+        self.strokes = [s for s in self.strokes if id(s) not in drop]
+        self._undo_ops = [op for op in self._undo_ops
+                          if not (op[0] == "add"
+                                  and all(id(s) in drop for s in op[1]))]
+        self.ink.queue_draw()
+        if self.on_ink_action:
+            self.on_ink_action()
+        if self.on_ink_changed:
+            self.on_ink_changed()
+
+    def _touch_anchor(self):
+        """Where the hand IS, in widget coords: the centroid of the fingers, or
+        the one finger left of a pinch. One anchor for both, so a lift changes
+        only how many fingers make it — never what the arithmetic does."""
         pts = self._touch.points
         if not pts:
+            return None
+        ox, oy = self._touch_origin
+        if len(pts) == 1:
+            return (pts[0][0] - ox, pts[0][1] - oy)
+        c = self._touch.centroid()
+        return (c[0] - ox, c[1] - oy)
+
+    def _on_touch_multi(self):
+        """The second finger landed: the hand owns the sheet until it lifts."""
+        self._on_second_finger()        # whatever the first was doing is over
+        self._touch_origin = self._surface_origin()
+        self._touch_n = self._touch.count
+        a = self._touch_anchor()
+        if a is None:
             return
         ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
-        if self._touch_pan is None:
-            self._touch_pan = (pts[0], ha.get_value(), va.get_value())
-            return
-        (px, py), h0, v0 = self._touch_pan
-        ha.set_value(h0 - (pts[0][0] - px))
-        va.set_value(v0 - (pts[0][1] - py))
+        self._touch_zoom = (self._touch.spread(), a)
+        self._touch_scroll = [ha.get_value(), va.get_value()]
+        if self._touch_frame is None:
+            self._touch_frame = self.add_tick_callback(self._on_touch_frame)
+
+    def _on_touch_frame(self, _widget, _clock):
+        """Move the sheet once per FRAME, from wherever the fingers are now.
+
+        Not once per touch event, which is what made this jump: a zoom on the
+        sheet is a font change and a full reflow, and the panel reports ~5×
+        faster than the sheet can lay out, so the events piled up and every one
+        of them queued its own deferred correction.
+
+        Two things keep the fingers on the paper. It is INCREMENTAL — each
+        frame measures against the last one, so a step that lands short cannot
+        keep dragging the whole gesture off. And it keeps its own float scroll
+        (`_touch_scroll`) instead of reading the adjustments back: the relayout
+        to a new zoom is async, so a scroll value set now is clamped against
+        the extent of the OLD zoom, and the sheet snapped to the top-left. The
+        accumulator is re-applied at the top of the next frame, by which time
+        the extent is real."""
+        if not self._touch.multi or self._touch_zoom is None:
+            self._touch_frame = None
+            return GLib.SOURCE_REMOVE
+        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+        h, v = self._touch_scroll
+        ha.set_value(h)                 # last frame's target, now that it fits
+        va.set_value(v)
+        a = self._touch_anchor()
+        if a is None:
+            return GLib.SOURCE_CONTINUE
+        d, d0 = self._touch.spread(), self._touch_zoom[0]
+        if self._touch.count != self._touch_n:
+            # a finger landed or lifted: re-base on the new hand rather than
+            # measuring this frame against a spread the hand no longer has
+            self._touch_n = self._touch.count
+            self._touch_zoom = (d, a)
+            return GLib.SOURCE_CONTINUE
+        c0x, c0y = self._touch_zoom[1]
+        f = 1.0
+        if d and d0:
+            old = self.zoom
+            self.set_zoom(old * d / d0)
+            f = self.zoom / old
+        # hold the content under the fingers while zooming, then follow them:
+        # the first two terms scale the anchored point, the last is the pan
+        h = (h + a[0]) * f - a[0] - (a[0] - c0x)
+        v = (v + a[1]) * f - a[1] - (a[1] - c0y)
+        self._touch_zoom = (d, a)
+        ha.set_value(h)
+        va.set_value(v)
+        if f == 1.0:
+            # a pure pan relayouts nothing, so the adjustment's own clamp is
+            # the truth — take it back, or panning past an edge builds up a
+            # debt the hand has to pay off before the sheet moves again
+            h, v = ha.get_value(), va.get_value()
+        self._touch_scroll = [h, v]
+        return GLib.SOURCE_CONTINUE
 
     def _on_touch_end(self):
         """The last finger lifted: the next touch is a fresh hand."""
         self._touch_zoom = None
-        self._touch_pan = None
+        self._touch_strokes = []
         self._ink_ignoring = False
+        if self._touch_frame is not None:
+            # stop here rather than leaving it to the callback's own exit: an
+            # unmapped sheet stops ticking, and a live id nothing will ever
+            # clear is a pinch that cannot start again
+            self.remove_tick_callback(self._touch_frame)
+            self._touch_frame = None
 
     # ── grab pan (PDF-canvas parity) ─────────────────────────────────────────
 
@@ -12109,6 +12199,10 @@ class TextPageView(Gtk.Overlay):
             self._on_second_finger()
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
             return
+        if self._touch.count <= 1:
+            # a fresh hand: ink an earlier one committed is now the user's,
+            # and a later pinch must not reach back and delete it
+            self._touch_strokes = []
         state = self._chord_state(gesture)
         btn = button_for_event(gesture.get_current_event(),
                                gesture.get_current_button(),
@@ -12192,6 +12286,15 @@ class TextPageView(Gtk.Overlay):
             self._press_tool = None
 
     def _press_end(self, gesture, dx, dy):
+        if self._touch.multi:
+            # Two fingers are on the glass, so this release is part of a pinch
+            # however it got here — including GTK cancelling the drag out from
+            # under us when another controller took the sequence, which fires
+            # `drag-end` with the tool still in hand and COMMITS the mark the
+            # first finger left. The guard belongs at the commit, not only at
+            # the touchdown: the hand decides, not the gesture that noticed.
+            self._on_second_finger()
+            return
         if self._rerase_press is not None:
             x, y = self._rerase_press
             self._rerase_press = None
@@ -12713,6 +12816,15 @@ class TextPageView(Gtk.Overlay):
             stroke["press"] = profile
         self.strokes.append(stroke)
         self._undo_ops.append(("add", [stroke]))
+        if self._capture_device == "touch" and self._touch.count:
+            # A FINGER drew this while it was still on the glass. GTK can end
+            # that drag early (another controller taking the sequence cancels
+            # it), so by the time a second finger lands the mark is already
+            # committed and abandoning the live stroke finds nothing to
+            # abandon — the ink stays on the page. Remember it, so the second
+            # finger can take it back out (row 150). `_capture_device` is what
+            # keeps a palm resting during a PEN stroke from arming this.
+            self._touch_strokes.append(stroke)
         self._redo_ops.clear()
         if self.on_ink_action:
             self.on_ink_action()

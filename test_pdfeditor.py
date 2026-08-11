@@ -650,7 +650,14 @@ class TestPinchZoom(unittest.TestCase):
         self.assertGreater(latch.spread(), near)   # the fingers moved apart
 
     def _sheet_touch(self, tp, kind, seq, x, y):
-        tp._touch.handle(self._touch(kind, seq, x, y))
+        return tp._touch.handle(self._touch(kind, seq, x, y))
+
+    @staticmethod
+    def _frame(tp):
+        """One frame of the sheet's touch driver. The real one is a tick
+        callback, which needs a frame clock a bare widget has not got — the
+        WIRING is not testable headless, the arithmetic it runs is."""
+        tp._on_touch_frame(None, None)
 
     def test_two_fingers_zoom_the_sheet_without_the_pinch_gesture(self):
         """Row 150. GestureZoom is starved on a text sheet — the press router
@@ -663,14 +670,45 @@ class TestPinchZoom(unittest.TestCase):
         a, b = object(), object()
         self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, a, 100.0, 100.0)
         self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, b, 200.0, 100.0)
+        self._frame(tp)
         self._sheet_touch(tp, Gdk.EventType.TOUCH_UPDATE, b, 300.0, 100.0)
+        self._frame(tp)
         self.assertGreater(tp.zoom, before)
         self._sheet_touch(tp, Gdk.EventType.TOUCH_UPDATE, b, 150.0, 100.0)
+        self._frame(tp)
         self.assertLess(tp.zoom, before)          # …and back the other way
         # the last lift ends the hand: the next touch starts a fresh pinch
         self._sheet_touch(tp, Gdk.EventType.TOUCH_END, a, 100.0, 100.0)
         self._sheet_touch(tp, Gdk.EventType.TOUCH_END, b, 150.0, 100.0)
         self.assertIsNone(tp._touch_zoom)
+
+    def test_the_fingers_stay_on_the_paper_while_zooming(self):
+        """What the user asked for in one assertion: both fingers should look
+        stationary. The point of the sheet under a finger has to still be
+        under it after the zoom — anchoring on anything else (the corner, the
+        viewport centre) is the 'it zooms to the top left' complaint."""
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text("alpha\n" * 400)
+        for adj in (tp.scroll.get_hadjustment(), tp.scroll.get_vadjustment()):
+            adj.set_upper(100000.0)
+            adj.set_page_size(500.0)
+            adj.set_value(400.0)
+        a, b = object(), object()
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, a, 200.0, 200.0)
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, b, 400.0, 400.0)
+        self._frame(tp)
+        # the sheet point under the centroid (300, 300) before the pinch
+        h0, v0 = tp._touch_scroll
+        under = (h0 + 300.0, v0 + 300.0)
+        # spread the fingers about that same centroid: it must not move
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_UPDATE, a, 100.0, 100.0)
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_UPDATE, b, 500.0, 500.0)
+        self._frame(tp)
+        f = tp.zoom / 1.0
+        self.assertAlmostEqual(f, 2.0, places=6)
+        h, v = tp._touch_scroll
+        self.assertAlmostEqual(h + 300.0, under[0] * f, places=3)
+        self.assertAlmostEqual(v + 300.0, under[1] * f, places=3)
 
     def test_the_survivor_of_a_sheet_pinch_pans(self):
         """One finger left of a pinch keeps panning until it lifts — the PDF
@@ -684,11 +722,103 @@ class TestPinchZoom(unittest.TestCase):
         a, b = object(), object()
         self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, a, 100.0, 300.0)
         self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, b, 200.0, 300.0)
+        self._frame(tp)
         self._sheet_touch(tp, Gdk.EventType.TOUCH_END, b, 200.0, 300.0)
+        self._frame(tp)                 # re-bases on the one finger left
         base = va.get_value()
-        self._sheet_touch(tp, Gdk.EventType.TOUCH_UPDATE, a, 100.0, 300.0)
         self._sheet_touch(tp, Gdk.EventType.TOUCH_UPDATE, a, 100.0, 250.0)
+        self._frame(tp)
         self.assertAlmostEqual(va.get_value(), base + 50.0, places=3)
+
+    def test_the_second_finger_never_reaches_the_text_view(self):
+        """A GtkGestureDrag is single-point: it IGNORES a second sequence,
+        which is not the same as denying it — so the second finger of every
+        pinch sailed past the sheet's router into the TextView and marked
+        text. The latch swallows it. The FIRST one must still get through, or
+        the drag holding it would never see its own release."""
+        tp = sidemark.TextPageView()
+        a, b = object(), object()
+        self.assertFalse(
+            self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, a, 10.0, 10.0))
+        self.assertTrue(
+            self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, b, 90.0, 10.0))
+        self.assertTrue(
+            self._sheet_touch(tp, Gdk.EventType.TOUCH_UPDATE, b, 95.0, 10.0))
+        self.assertFalse(
+            self._sheet_touch(tp, Gdk.EventType.TOUCH_UPDATE, a, 15.0, 10.0))
+        self.assertTrue(
+            self._sheet_touch(tp, Gdk.EventType.TOUCH_END, b, 95.0, 10.0))
+        self.assertFalse(
+            self._sheet_touch(tp, Gdk.EventType.TOUCH_END, a, 15.0, 10.0))
+
+    def test_a_release_during_a_pinch_commits_no_ink_on_the_sheet(self):
+        """Abandoning at the second touchdown is not enough: GTK can cancel
+        the first finger's drag out from under the router when another
+        controller takes the sequence, and that fires drag-end with the pen
+        still in hand — committing the mark the first finger left before the
+        pinch. Two fingers down means no commit, whatever route got here."""
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text("alpha\nbeta\n")
+        a, b = object(), object()
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, a, 100.0, 100.0)
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, b, 200.0, 100.0)
+        tp._press_tool = "pen"          # …as a cancelled drag leaves it
+        tp.current_stroke = [(10.0, 10.0), (20.0, 20.0), (30.0, 30.0)]
+        tp._on_press_end(mock.Mock(), 20.0, 20.0)
+        self.assertEqual(len(tp.strokes), 0)
+        self.assertEqual(tp.current_stroke, [])
+
+    def test_a_second_finger_takes_back_ink_the_first_already_committed(self):
+        """Abandoning the LIVE stroke only helps while it is still live. GTK
+        can end the first finger's drag early, so the mark is already on the
+        page — and the ink the finger drew has to come off it, undo entry and
+        all, or the pinch leaves exactly the stray mark it is here to stop."""
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text("alpha\nbeta\n")
+        a, b = object(), object()
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, a, 100.0, 100.0)
+        tp._capture_device = "touch"
+        tp._commit_stroke([(10.0, 10.0), (20.0, 20.0), (30.0, 25.0)])
+        self.assertEqual(len(tp.strokes), 1)
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, b, 200.0, 100.0)
+        self.assertEqual(len(tp.strokes), 0)
+        self.assertEqual(tp._undo_ops, [])   # not an undo away from coming back
+
+    def test_a_pen_stroke_survives_a_palm_and_a_pinch(self):
+        """The mirror of it: a resting palm IS a finger, so what says the ink
+        may be taken back is the device that DREW it, never the touch count."""
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text("alpha\nbeta\n")
+        a, b = object(), object()
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, a, 100.0, 100.0)
+        tp._capture_device = "stylus"
+        tp._commit_stroke([(10.0, 10.0), (20.0, 20.0), (30.0, 25.0)])
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, b, 200.0, 100.0)
+        self.assertEqual(len(tp.strokes), 1)
+
+    def test_a_pinch_cannot_reach_back_into_an_earlier_hand(self):
+        """The finger's ink is only revocable while the hand that drew it is
+        still on the glass. Lift, and it is the user's drawing."""
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text("alpha\nbeta\n")
+        a, b = object(), object()
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, a, 100.0, 100.0)
+        tp._capture_device = "touch"
+        tp._commit_stroke([(10.0, 10.0), (20.0, 20.0), (30.0, 25.0)])
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_END, a, 100.0, 100.0)
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, a, 100.0, 100.0)
+        self._sheet_touch(tp, Gdk.EventType.TOUCH_BEGIN, b, 200.0, 100.0)
+        self.assertEqual(len(tp.strokes), 1)
+
+    def test_a_pdf_canvas_swallows_no_finger(self):
+        """The canvas' own GestureZoom needs BOTH sequences to recognise, and
+        it works — so the swallowing is the sheet's alone."""
+        c = self._canvas()
+        a, b = object(), object()
+        self.assertFalse(
+            c._touch.handle(self._touch(Gdk.EventType.TOUCH_BEGIN, a)))
+        self.assertFalse(
+            c._touch.handle(self._touch(Gdk.EventType.TOUCH_BEGIN, b)))
 
     def test_the_surface_origin_survives_a_real_window(self):
         """The latch reports SURFACE coords and the pinch arithmetic wants

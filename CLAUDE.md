@@ -213,15 +213,46 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
         the **first** controller on both surfaces. Anything reading a raw event
         stream can be correct, unit-tested and never once run.
       - **The sheet's pinch is the latch's own arithmetic** (row 150): it keeps
-        each finger's POSITION beside the count, and `_on_touch_multi` /
-        `_on_touch_move` drive `_apply_pinch` from centroid + spread.
-        `GestureZoom` stays for the **touchpad**, which pinches with no touch
-        sequences at all, and stands down while the latch holds fingers — one
-        pinch, two ways in. Do NOT release the router's claim to feed the
-        gesture instead: the claim is what keeps the `TextView` off the press,
-        so releasing it gives the caret a click mid-pinch, which is the
-        symptom. Surface→widget conversion takes the origin ONCE per gesture
-        (`_surface_origin`); the scale ratio needs no conversion at all.
+        each finger's POSITION beside the count, and `_on_touch_frame` drives
+        zoom and pan from centroid + spread. `GestureZoom` stays for the
+        **touchpad**, which pinches with no touch sequences at all, and stands
+        down while the latch holds fingers — one pinch, two ways in. Do NOT
+        release the router's claim to feed the gesture instead: the claim is
+        what keeps the `TextView` off the press, so releasing it gives the
+        caret a click mid-pinch, which is the symptom. Four things the first
+        working version got wrong, all of them about the sheet being a
+        REFLOW and not a scale factor:
+        - **Once per FRAME, not once per event** (`add_tick_callback`). A zoom
+          here is a font change and a full relayout, and the panel reports
+          several times faster than that lays out.
+        - **The driver keeps its own float scroll** and re-applies it at the
+          top of the next frame. A `GtkAdjustment` clamps against the extent
+          of the layout it HAS, and the relayout to a new zoom is async — so
+          the value set during a zoom-in is clamped to the old extent, which
+          is the sheet snapping to the top-left. (The PDF canvas never meets
+          this: its offsets are plain floats.)
+        - **Incremental, measuring each frame against the last**, so a step
+          that lands short cannot drag the whole gesture off.
+        - **A lift RE-BASES rather than continuing** — one anchor
+          (`_touch_anchor`: the centroid, or the one finger left), so a lift
+          changes how many fingers make it and nothing else.
+      - **The second finger has to be SWALLOWED on the sheet**
+        (`consume_extra`): a `GtkGestureDrag` is single-point and *ignores* a
+        second sequence, which is not denying it, so it sailed past the router
+        into the `GtkTextView` and marked text. The FIRST sequence is never
+        consumed — the router holds it, and eating its release leaves that
+        drag live forever. The canvas swallows nothing: its `GestureZoom`
+        needs both sequences and works.
+      - **Abandoning at the touchdown is not enough** — GTK can cancel the
+        first finger's drag when another controller takes the sequence, which
+        fires `drag-end` with the tool still in hand. So the guard is also at
+        the COMMIT (`_press_end`: two fingers down means no commit, whatever
+        route got there), and ink a finger committed *earlier in this hand* is
+        taken back off the page with its undo op (`_touch_strokes` /
+        `_drop_touch_strokes`). Armed by `_capture_device == "touch"`, never by
+        the touch count — a palm resting during a PEN stroke must arm nothing —
+        and cleared when the glass empties or at any fresh press, so ink is
+        revocable only for the hand that drew it.
         *ceiling: with the finger unbound (or bound to `text`) the router
         DENIES, so the `TextView` takes the first sequence and its own touch
         text-selection popup can still appear under a pinch — the exit is to
