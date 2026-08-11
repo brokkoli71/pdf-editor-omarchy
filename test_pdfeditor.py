@@ -9480,15 +9480,26 @@ class TestNotesFontZoom(unittest.TestCase):
                     "notes view has its own scroll controller; the "
                     "ScrolledWindow will swallow Ctrl+scroll before it fires")
 
-            # ...and one must exist in the capture phase on an ancestor of the
-            # ScrolledWindow that holds the view
-            sw = view.get_parent()
-            if not isinstance(sw, Gtk.ScrolledWindow):
-                raise AssertionError(f"expected a ScrolledWindow, got {sw}")
-            anc = sw.get_parent()
-            caps = [c for c in anc.observe_controllers()
-                    if isinstance(c, Gtk.EventControllerScroll)
-                    and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE]
+            # ...and one must exist in the capture phase SOMEWHERE above the
+            # ScrolledWindow that holds the view. Walked, not indexed by
+            # get_parent(): whether GTK slips a Viewport between the view and
+            # its ScrolledWindow is a version detail (it differs between the
+            # GTK here and the one on CI), while "above the ScrolledWindow" is
+            # the invariant that makes the zoom reachable at all.
+            sw, w = None, view.get_parent()
+            while w is not None:
+                if isinstance(w, Gtk.ScrolledWindow):
+                    sw = w
+                    break
+                w = w.get_parent()
+            if sw is None:
+                raise AssertionError("the notes view is in no ScrolledWindow")
+            caps, anc = [], sw.get_parent()
+            while anc is not None and not caps:
+                caps = [c for c in anc.observe_controllers()
+                        if isinstance(c, Gtk.EventControllerScroll)
+                        and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE]
+                anc = anc.get_parent()
             if not caps:
                 raise AssertionError(
                     "no capture-phase scroll controller above the ScrolledWindow")

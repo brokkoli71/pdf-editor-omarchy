@@ -63,6 +63,14 @@ jobs:
           # so the suite must never write the settings.json of whoever runs it
           XDG_CONFIG_HOME: /tmp/sidemark-ci-config
           SIDEMARK_TEST: "1"
+          # The runner has no GPU, so GSK's default renderer runs on llvmpipe
+          # through EGL — and the log is full of "libEGL warning: failed to get
+          # driver name", "ZINK: vkCreateInstance failed" and "failed to create
+          # dri2 screen" before the process dies with "libwayland: error in
+          # client communication". The cairo renderer takes that whole stack out
+          # of the picture; the suite asserts on widget state, never on pixels,
+          # so nothing here needs the GPU path.
+          GSK_RENDERER: cairo
         # -v, not -q: the runner's process has died mid-suite ("libwayland:
         # error in client communication" — a hard crash in the GTK/Mesa
         # software stack), which kills it before pytest prints anything. With
