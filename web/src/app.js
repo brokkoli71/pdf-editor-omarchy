@@ -780,9 +780,9 @@ function wireDocument() {
   };
   document.getElementById("zoom-in").addEventListener("click", () => atCentre(1.25));
   document.getElementById("zoom-out").addEventListener("click", () => atCentre(1 / 1.25));
+  // The swatch is a COLOUR button, not a second way into the settings: opening
+  // the popover as well meant one click produced two surfaces at once.
   document.getElementById("pen-swatch").addEventListener("click", () => {
-    const pop = document.getElementById("pen-popover");
-    pop.hidden = false;
     document.getElementById("color-btn").click();
   });
 

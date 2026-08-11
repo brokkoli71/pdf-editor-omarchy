@@ -105,13 +105,14 @@ body {
 .hb-center { justify-self: center; display: flex; align-items: center; gap: 8px; }
 
 .swatch-btn {
-  width: 22px; height: 22px; flex: none; padding: 0;
+  /* `button`'s min-height is 30px and would win over `height`, which made this
+     a 22×30 oval instead of a dot */
+  width: 22px; height: 22px; min-height: 0;
+  flex: none; padding: 0;
   border-radius: 999px;
-  border: 1px solid rgb(34 33 29 / 25%);
-  box-shadow: inset 0 0 0 2px var(--headerbar-bg);
+  border: 1px solid rgb(34 33 29 / 30%);
 }
-.swatch-btn:hover { box-shadow: inset 0 0 0 2px var(--headerbar-bg),
-                                0 0 0 2px var(--btn-hover); }
+.swatch-btn:hover { box-shadow: 0 0 0 3px var(--btn-hover); }
 .hb-end { justify-self: end; }
 
 /* the title must give way before the buttons do, not push them into a new row */
