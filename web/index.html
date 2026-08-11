@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Sidemark — ink prototype</title>
+<link rel="stylesheet" href="src/style.css">
+</head>
+<body>
+
+<header class="headerbar">
+  <div class="hb-start">
+    <span class="title">Untitled</span>
+  </div>
+
+  <div class="hb-center">
+    <div class="linked" id="toolbar"></div>
+  </div>
+
+  <div class="hb-end">
+    <button class="flat icon-btn" id="undo-btn" title="Undo (Ctrl+Z)" aria-label="Undo">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 7h6.5a3.5 3.5 0 1 1 0 7H7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M5.5 4.2 2.8 7l2.7 2.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <button class="flat icon-btn" id="redo-btn" title="Redo (Ctrl+Shift+Z)" aria-label="Redo">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 7H6.5a3.5 3.5 0 1 0 0 7H9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M10.5 4.2 13.2 7l-2.7 2.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <button class="flat icon-btn" id="pen-btn" title="Pen settings" aria-label="Pen settings" aria-haspopup="dialog">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11.6 2.6a1.4 1.4 0 0 1 2 2L6.2 12 3 13l1-3.2z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="stage">
+  <canvas id="page" aria-label="Drawing page"></canvas>
+</main>
+
+<!-- the pen popover: the same rows as Sidemark's, minus the two settings this
+     prototype does not implement (Predict ahead, Shape snap) -->
+<div class="popover" id="pen-popover" role="dialog" aria-label="Pen settings" hidden>
+  <div class="popover-body">
+    <div class="linked" id="popover-toolbar"></div>
+
+    <label class="dim" for="width-scale">Width</label>
+    <div class="scale-row">
+      <input type="range" id="width-scale" min="0.3" max="5" step="0.1">
+      <output id="width-out"></output>
+    </div>
+
+    <div class="row">
+      <span class="dim grow">Color</span>
+      <input type="color" id="color-btn" aria-label="Pen colour">
+    </div>
+    <div class="swatches" id="swatches"></div>
+
+    <label class="dim" for="smooth-scale">Smoothing</label>
+    <div class="scale-row" title="How much freehand strokes are smoothed when you lift the pen">
+      <input type="range" id="smooth-scale" min="0" max="100" step="5">
+      <output id="smooth-out"></output>
+    </div>
+
+    <label class="dim" for="smear-scale">Smear trim</label>
+    <div class="scale-row" title="Cut the light smear a pen leaves as it lifts, so letters end cleanly instead of trailing into the next one. Only the END of a stroke is trimmed — the start is already clipped by the screen itself, and trimming that too would lose real ink.">
+      <input type="range" id="smear-scale" min="0" max="50" step="5">
+      <output id="smear-out"></output>
+    </div>
+
+    <label class="check" title="Recover the start of a stroke from where the pen was hovering just before it touched down, which the screen tracks anyway. These are real positions, not a guess.">
+      <input type="checkbox" id="hover-lead"> Lead-in from hover
+    </label>
+
+    <label class="check" title="Shape the line as you draw it, instead of only when you lift the pen. Off, the line never moves once drawn but re-forms on release; on, it is already the line you will keep, at the cost of the last stretch re-settling on each point the pen reports.">
+      <input type="checkbox" id="live-smooth"> Smooth while drawing
+    </label>
+
+    <hr>
+
+    <div class="row">
+      <span class="dim grow" id="bindings-label">Buttons</span>
+      <button class="flat small" id="reset-bindings">Reset</button>
+    </div>
+    <p class="hint">Click a tool with the button you want it on.</p>
+    <div id="bindings-list"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script type="module" src="src/app.js"></script>
+</body>
+</html>

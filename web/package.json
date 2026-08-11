@@ -1,0 +1,12 @@
+{
+  "name": "sidemark-web-prototype",
+  "private": true,
+  "type": "module",
+  "description": "Browser port prototype of Sidemark's ink pipeline. No build step, no dependencies.",
+  "scripts": {
+    "serve": "python3 -m http.server 8000",
+    "vectors": "../extras/export_ink_vectors.py > test/vectors.json",
+    "test": "node test/conformance.mjs",
+    "check": "node --check src/ink.js && node --check src/draw.js && node --check src/bindings.js && node --check src/surface.js && node --check src/app.js"
+  }
+}

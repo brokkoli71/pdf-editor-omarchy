@@ -1,0 +1,267 @@
+/* Adwaita, as libadwaita paints it — the named colours from its own palette, so
+   the prototype reads as the same app rather than a web page about it. */
+
+:root {
+  --window-bg: #fafafa;
+  --window-fg: rgb(0 0 6 / 80%);
+  --headerbar-bg: #ffffff;
+  --headerbar-border: rgb(0 0 6 / 12%);
+  --view-bg: #ffffff;
+  --card-bg: #ffffff;
+  --popover-bg: #ffffff;
+  --popover-shadow: 0 1px 2px rgb(0 0 0 / 12%), 0 6px 18px rgb(0 0 0 / 18%);
+  --accent-bg: #3584e4;
+  --accent-fg: #ffffff;
+  --dim: rgb(0 0 6 / 55%);
+  --btn-bg: rgb(0 0 6 / 8%);
+  --btn-hover: rgb(0 0 6 / 13%);
+  --btn-active: rgb(0 0 6 / 19%);
+  --separator: rgb(0 0 6 / 12%);
+  --surround: #ebe9e6;   /* the canvas surround, PDFCanvas.surround_color */
+  --radius: 8px;
+}
+
+:root:not([data-theme="light"]) {
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --window-bg: #242424;
+    --window-fg: #ffffff;
+    --headerbar-bg: #303030;
+    --headerbar-border: rgb(0 0 0 / 36%);
+    --view-bg: #1e1e1e;
+    --card-bg: rgb(255 255 255 / 8%);
+    --popover-bg: #383838;
+    --popover-shadow: 0 1px 2px rgb(0 0 0 / 36%), 0 6px 18px rgb(0 0 0 / 44%);
+    --dim: rgb(255 255 255 / 55%);
+    --btn-bg: rgb(255 255 255 / 10%);
+    --btn-hover: rgb(255 255 255 / 15%);
+    --btn-active: rgb(255 255 255 / 22%);
+    --separator: rgb(255 255 255 / 12%);
+    --surround: #1b1b1b;
+  }
+}
+
+:root[data-theme="dark"] {
+  --window-bg: #242424;
+  --window-fg: #ffffff;
+  --headerbar-bg: #303030;
+  --headerbar-border: rgb(0 0 0 / 36%);
+  --view-bg: #1e1e1e;
+  --card-bg: rgb(255 255 255 / 8%);
+  --popover-bg: #383838;
+  --popover-shadow: 0 1px 2px rgb(0 0 0 / 36%), 0 6px 18px rgb(0 0 0 / 44%);
+  --dim: rgb(255 255 255 / 55%);
+  --btn-bg: rgb(255 255 255 / 10%);
+  --btn-hover: rgb(255 255 255 / 15%);
+  --btn-active: rgb(255 255 255 / 22%);
+  --separator: rgb(255 255 255 / 12%);
+  --surround: #1b1b1b;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--window-bg);
+  color: var(--window-fg);
+  font-family: Cantarell, "Adwaita Sans", Inter, system-ui, -apple-system,
+               "Segoe UI", sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ── header bar ──────────────────────────────────────────────────────────── */
+
+.headerbar {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 6px;
+  min-height: 47px;
+  padding: 0 6px;
+  background: var(--headerbar-bg);
+  border-bottom: 1px solid var(--headerbar-border);
+  flex: none;
+}
+
+.hb-start { justify-self: start; padding-left: 6px; }
+.hb-center { justify-self: center; }
+.hb-end { justify-self: end; display: flex; gap: 2px; }
+
+.title { font-weight: 700; font-size: 14px; }
+
+button {
+  font: inherit;
+  color: inherit;
+  border: none;
+  background: var(--btn-bg);
+  border-radius: 6px;
+  padding: 5px 10px;
+  min-height: 30px;
+  cursor: pointer;
+}
+button:hover { background: var(--btn-hover); }
+button:active { background: var(--btn-active); }
+button.flat { background: transparent; }
+button.flat:hover { background: var(--btn-hover); }
+button.small { padding: 3px 9px; min-height: 26px; font-size: 13px; }
+button:disabled { opacity: .4; cursor: default; }
+button:disabled:hover { background: transparent; }
+
+.icon-btn { display: grid; place-items: center; width: 34px; padding: 0; }
+.icon-btn svg { width: 16px; height: 16px; }
+
+/* linked button group, as libadwaita links a segmented row */
+.linked { display: flex; }
+.linked > button {
+  border-radius: 0;
+  margin: 0;
+  position: relative;
+}
+.linked > button:first-child { border-radius: 6px 0 0 6px; }
+.linked > button:last-child { border-radius: 0 6px 6px 0; }
+.linked > button + button { box-shadow: inset 1px 0 0 var(--separator); }
+
+/* ── the tool bar as a binding surface ───────────────────────────────────── */
+
+.tool-btn {
+  width: 38px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  overflow: hidden;
+}
+.tool-btn svg { width: 17px; height: 17px; pointer-events: none; }
+.tool-btn.unavailable { opacity: .35; }
+
+/* The stripes are a LIVE readout, and they are the ONLY signal: holding a
+   modifier repaints them from the chord table, so the bar always shows what
+   each button would do right now. An unbound chord shows nothing, because that
+   is what pressing it would do. There is no second highlight. */
+.strip {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 3px;
+  display: flex;
+  pointer-events: none;   /* untargetable, so it never eats the binding click */
+}
+.strip > i { flex: 1; }
+
+/* ── the page ────────────────────────────────────────────────────────────── */
+
+#stage {
+  flex: 1;
+  min-height: 0;
+  background: var(--surround);
+  position: relative;
+}
+
+#page {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: crosshair;
+  /* stops the browser's own pan/zoom taking the gesture before a pointer event
+     is ever delivered — without it a finger scrolls the page instead of
+     reaching the router */
+  touch-action: none;
+}
+
+/* ── popover ─────────────────────────────────────────────────────────────── */
+
+.popover {
+  position: absolute;
+  top: 52px;
+  right: 8px;
+  z-index: 20;
+  width: 288px;
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
+  background: var(--popover-bg);
+  border-radius: 12px;
+  box-shadow: var(--popover-shadow);
+  border: 1px solid var(--separator);
+}
+.popover[hidden] { display: none; }
+.popover-body { padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+
+.dim { color: var(--dim); font-size: 13px; }
+.grow { flex: 1; }
+.row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.popover label.dim { margin-top: 6px; }
+
+.scale-row { display: flex; align-items: center; gap: 8px; }
+.scale-row output {
+  font-size: 12px; color: var(--dim); min-width: 30px; text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+input[type="range"] {
+  flex: 1;
+  accent-color: var(--accent-bg);
+  height: 20px;
+}
+input[type="color"] {
+  width: 44px; height: 28px; padding: 2px;
+  border: 1px solid var(--separator); border-radius: 6px;
+  background: var(--btn-bg); cursor: pointer;
+}
+
+.swatches { display: flex; gap: 5px; margin-top: 4px; }
+.swatches button {
+  width: 26px; height: 26px; border-radius: 999px; padding: 0;
+  border: 1px solid rgb(0 0 0 / 20%);
+}
+
+.check { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 14px; }
+.check input { accent-color: var(--accent-bg); width: 16px; height: 16px; }
+
+hr { border: none; border-top: 1px solid var(--separator); margin: 10px 0 2px; width: 100%; }
+
+.hint { margin: 2px 0 6px; font-size: 12px; color: var(--dim); }
+
+/* the bindings list — the discovery surface, and the only way to CLEAR a
+   binding: a chord-click can move one, never remove it */
+.binding {
+  display: flex; align-items: center; gap: 8px;
+  padding: 3px 0;
+}
+.binding .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+.binding .chord { font-size: 13px; min-width: 92px; }
+.binding .tool { font-size: 13px; color: var(--dim); flex: 1; }
+.binding button {
+  background: transparent; padding: 2px 6px; min-height: 22px;
+  font-size: 12px; color: var(--dim); border-radius: 5px;
+}
+.binding button:hover { background: var(--btn-hover); color: inherit; }
+
+/* ── toast ───────────────────────────────────────────────────────────────── */
+
+.toast {
+  position: absolute;
+  bottom: 20px; left: 50%; transform: translateX(-50%);
+  background: var(--popover-bg);
+  border: 1px solid var(--separator);
+  box-shadow: var(--popover-shadow);
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-size: 13px;
+  z-index: 30;
+  pointer-events: none;
+}
+.toast[hidden] { display: none; }
