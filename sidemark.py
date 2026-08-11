@@ -19113,6 +19113,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             marks.update({at + idx: name
                           for idx, name in result.bookmarks.items()})
             self.notes_model.set_bookmarks(marks)
+        if result.hidden:
+            # a chapter keeps the slides its author had set aside (row 158) —
+            # every other per-page fact on this path is carried over, and one
+            # that silently is not is how an imported deck comes back longer
+            # than the file it came from
+            self.notes_model.set_hidden_pages(
+                self.notes_model.hidden_pages()
+                | {at + idx for idx in result.hidden})
         for idx, images in images_from_sidecar(
                 {"version": 1, "images": result.images}).items():
             self.canvas.all_images.setdefault(at + idx, []).extend(images)

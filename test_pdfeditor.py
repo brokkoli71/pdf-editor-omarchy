@@ -16656,6 +16656,40 @@ class TestMergeImportInWindow(unittest.TestCase):
                 self.assertEqual(win.canvas.get_toc(), [[1, "extra", 2]])
             self._run_in_window(body)
 
+    def test_an_inserted_chapter_keeps_its_bookmarks_and_hidden_pages(self):
+        """Every per-page fact travels with the chapter. One that silently does
+        not is how an imported deck comes back longer than the file it came
+        from — and the hidden flag was exactly that until this test."""
+        with tempfile.TemporaryDirectory() as d:
+            host = os.path.join(d, "host.pdf")
+            make_pdf(host, n_pages=2)
+            extra = os.path.join(d, "extra.pdf")
+            make_pdf(extra, n_pages=3)
+            src = NotesModel()
+            src.pdf_name = "extra.pdf"
+            src.add_bookmark(1, "Imported mark")
+            src.set_page_hidden(2, True)
+            src.save(notes_path_for(extra))
+            merged = os.path.join(d, "tmp-merged.pdf")
+            result = sidemark.merge_documents(
+                [sidemark.MergeSource(extra)], merged, write_sidecars=False)
+
+            def body(win):
+                win._do_open_file(host)
+                win.notes_model.add_bookmark(0, "Host mark")
+                win.notes_model.set_page_hidden(1, True)
+                win._apply_merge_insert(merged, result, gap=1)
+
+                self.assertEqual(win.canvas.n_pages, 5)
+                # the host's own marks moved down with their pages …
+                self.assertEqual(win.notes_model.bookmark_name(0), "Host mark")
+                self.assertIn(4, win.notes_model.hidden_pages())
+                # … and the imported ones landed on the imported pages
+                self.assertEqual(win.notes_model.bookmark_name(2),
+                                 "Imported mark")
+                self.assertIn(3, win.notes_model.hidden_pages())
+            self._run_in_window(body)
+
     def test_dropping_several_files_asks_instead_of_opening_one(self):
         """One file opens straight away; several must ASK — that is also how
         the merge is discovered."""
