@@ -27,14 +27,18 @@ jobs:
             libgtk-4-1 libadwaita-1-0 \
             libgtksourceview-5-0 \
             weston
-          pip install pymupdf
+          # pytest is NOT optional here: conftest.py's autouse fixture is what
+          # resets settings.json between tests, and running the suite through
+          # plain unittest silently loses it (see the Run tests step).
+          pip install pymupdf pytest
 
       - name: Start headless Wayland compositor
         run: |
           mkdir -p /tmp/xrt
           chmod 700 /tmp/xrt
           XDG_RUNTIME_DIR=/tmp/xrt \
-            weston --backend=headless --socket=wayland-ci --idle-time=0 &
+            weston --backend=headless --socket=wayland-ci --idle-time=0 \
+            >/tmp/weston-ci.log 2>&1 &
           for i in $(seq 10); do
             [ -S /tmp/xrt/wayland-ci ] && break
             sleep 0.5
@@ -43,13 +47,31 @@ jobs:
           echo "XDG_RUNTIME_DIR=/tmp/xrt"  >> "$GITHUB_ENV"
           echo "WAYLAND_DISPLAY=wayland-ci" >> "$GITHUB_ENV"
 
+      # Through PYTEST, exactly as run_tests.sh does, and never `python3
+      # test_pdfeditor.py`. conftest.py carries an autouse fixture that deletes
+      # settings.json after every test, and the plain unittest runner does not
+      # load conftest at all — so `Bindings.save()` (which writes on every
+      # rebind) leaked one test's button table into every window built after
+      # it, and a saved pen setting leaked into "nothing saved" tests. That
+      # made CI fail on 3–4 tests that pass locally, with the failing SET
+      # moving around as the order shifted. No `-m` filter: CI runs every
+      # tier, which is what run_tests.sh --full means.
       - name: Run tests
         env:
           GDK_BACKEND: wayland
           # a throwaway config home: Bindings.save() persists on every rebind,
           # so the suite must never write the settings.json of whoever runs it
           XDG_CONFIG_HOME: /tmp/sidemark-ci-config
-        run: python3 test_pdfeditor.py -v
+          SIDEMARK_TEST: "1"
+        run: python3 -m pytest test_pdfeditor.py -q -rf --tb=short
+
+      # The compositor has died mid-run before ("Error flushing display: Broken
+      # pipe"), which kills the process before any summary is printed — the run
+      # then reports failures with no tracebacks at all. Its log is the only
+      # evidence of that, so keep it.
+      - name: Compositor log (on failure)
+        if: failure()
+        run: cat /tmp/weston-ci.log || true
 
   # Install script — verifies files land in the right places and uninstall cleans up.
   # Ubuntu is covered here; Arch and Fedora are covered by install.yml.
