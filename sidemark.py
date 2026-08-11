@@ -16005,7 +16005,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Ctrl+S",        "Save"),
             ("Ctrl+Shift+S",  "Save as…"),
             ("Ctrl+E",        "Export PDF with notes"),
-            ("Ctrl+R",        "Reload (new instance)"),
+            ("Ctrl+R",        "Reload (new instance, same tabs)"),
             ("Ctrl+\\",       "Toggle notes"),
             ("Notes panel",   None),
             ("Ctrl++ / Ctrl+-", "Bigger / smaller notes font"),
@@ -21031,6 +21031,76 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if after:
             after()
 
+    def session_state(self):
+        """What Ctrl+R has to put back: EVERY tab, and the view you were
+        reading in — not just the document that happened to be in front.
+
+        A tab with no file cannot be named to the new process and is dropped
+        (an untitled blank has nothing on disk to reopen); the rest keep their
+        page. The view state is the window's, not a document's, which is why it
+        sits beside the tab list rather than in each entry."""
+        tabs = []
+        active = 0
+        for s in self._sessions:
+            path = s._path or s._notes_path
+            if not path or not os.path.exists(path):
+                continue
+            if s is self._active_session:
+                active = len(tabs)
+            tabs.append({
+                "path": os.path.abspath(path),
+                # a text-first page is one sheet: it has no page to come back to
+                "page": (s.canvas.current_page_idx
+                         if s._path and s.canvas is not None else 0),
+            })
+        return {
+            "tabs": tabs,
+            "active": active,
+            "outline": bool(self._toc_revealer
+                            and self._toc_revealer.get_reveal_child()),
+            "outline_view": ("pages" if self._toc_seg_pages.get_active()
+                             else "outline"),
+            "notes": bool(self._notes_box and self._notes_box.get_visible()),
+            "pane": (self._paned.get_position() if self._paned else 0),
+            "width": self.get_width(),
+            "height": self.get_height(),
+            "maximized": self.is_maximized(),
+        }
+
+    def apply_view_state(self, state):
+        """Put back the view `session_state()` recorded.
+
+        The pane split is applied from a LOW-priority idle, and that is not
+        cosmetic: `_init_pane_position` is a realize-time idle that applies the
+        default 62% split, so anything setting the position before it runs is
+        simply overwritten. Low priority is what puts us after it.
+
+        The outline view choice is applied to every tab, not just the active
+        one: it is a preference about how you are reading, and a tab that
+        disagreed with the one beside it would look like the setting failed."""
+        for s in self._sessions:
+            if s._toc_seg_pages is None:
+                continue
+            if state.get("outline_view") == "outline":
+                s._toc_seg_outline.set_active(True)
+            else:
+                s._toc_seg_pages.set_active(True)
+        # the notes panel first: the divider's resting place depends on whether
+        # there is a panel to make room for
+        if self._notes_toggle is not None:
+            self._notes_toggle.set_active(bool(state.get("notes", True)))
+        if self.canvas.document is not None:
+            self._toc_btn.set_active(bool(state.get("outline")))
+        pos = int(state.get("pane") or 0)
+        if pos > 0:
+            def place():
+                self._mark_pane_programmatic()
+                self._paned.set_position(pos)
+                self._saved_pane_pos = pos
+                return GLib.SOURCE_REMOVE
+
+            GLib.idle_add(place, priority=GLib.PRIORITY_LOW)
+
     def _reload(self):
         # A text-first page has no PDF — its document IS the .md — so follow
         # whichever file this tab actually holds, the same way _update_tab_title
@@ -21038,16 +21108,36 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         path = self._path or self._notes_path
         if not path:
             return
+
         def do_reload():
             # Spawn a *standalone* process (SIDEMARK_STANDALONE bypasses the
             # single instance) so the reload actually re-reads the code from
             # disk instead of forwarding to this still-running process.
             env = dict(os.environ, SIDEMARK_STANDALONE="1")
-            argv = [sys.executable, os.path.abspath(__file__), path]
-            if self._path:   # only a PDF has a page to come back to
-                argv += ["--page", str(self.canvas.current_page_idx)]
+            argv = [sys.executable, os.path.abspath(__file__)]
+            state = self.session_state()
+            # The state goes through a FILE, not argv: it is a structure (a tab
+            # list, each with its page, plus the window's view state), and the
+            # alternative is a multi-tab command line — a public contract to
+            # keep for ever, for a flag whose only caller is this one. The child
+            # deletes it, and a child that never starts leaves one small file in
+            # the temp dir rather than a lost session.
+            try:
+                fd, statefile = tempfile.mkstemp(prefix="sidemark-session-",
+                                                 suffix=".json")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(state, f)
+                argv += ["--restore", statefile]
+            except OSError:
+                # never lose the reload itself over the state: fall back to the
+                # single document that was in front
+                logger.warning("could not write reload state", exc_info=True)
+                argv.append(path)
+                if self._path:
+                    argv += ["--page", str(self.canvas.current_page_idx)]
             subprocess.Popen(argv, env=env)
             self.destroy()
+
         if self._dirty:
             self._ask_save_then(do_reload)
         else:
@@ -21660,13 +21750,18 @@ class PDFEditorApp(Adw.Application):
         """Pull a file path, --page N and --new/--new-text out of one launch's
         arguments (argv without the program name). Unknown flags are ignored.
 
-        Returns (path, page, new), where `new` is None, "pdf" or "text". A
-        path wins over --new: naming a file and asking for a blank one is
+        Returns (path, page, new, restore), where `new` is None, "pdf" or
+        "text" and `restore` is the session file Ctrl+R left for us. A path
+        wins over --new: naming a file and asking for a blank one is
         contradictory, and opening the file you named is the safe reading."""
-        path, page, new = None, 0, None
+        path, page, new, restore = None, 0, None, None
         i = 0
         while i < len(args):
             a = args[i]
+            if a == "--restore" and i + 1 < len(args):
+                restore = args[i + 1]
+                i += 2
+                continue
             if a == "--page" and i + 1 < len(args):
                 try:
                     page = max(0, int(args[i + 1]))
@@ -21688,14 +21783,17 @@ class PDFEditorApp(Adw.Application):
             if not a.startswith("-") and path is None:
                 path = a
             i += 1
-        return path, page, (None if path else new)
+        return path, page, (None if path else new), restore
 
     def do_command_line(self, command_line):
         """Every launch (this process or a forwarded one from a second
         invocation) lands here in the single primary instance; open the file it
         names — as a tab in the window you were last using, or a new window."""
         args = command_line.get_arguments()
-        path, page, new = self._parse_open_args(args[1:])
+        path, page, new, restore = self._parse_open_args(args[1:])
+        if restore:
+            self.restore_session_file(restore)
+            return 0
         if path and not os.path.isabs(path):
             cwd = command_line.get_cwd()
             if cwd:
@@ -21721,6 +21819,52 @@ class PDFEditorApp(Adw.Application):
                 msg = f"opened ‘{os.path.basename(path)}’ in a new window."
             command_line.print_literal(f"Sidemark is already running — {msg}\n")
         return 0
+
+    def restore_session_file(self, statefile):
+        """`--restore`: rebuild the window Ctrl+R just replaced.
+
+        The file is consumed — read once and deleted, whatever happens — so a
+        stale session can never be restored twice or linger in the temp dir. A
+        state we cannot read is not fatal: an empty window is a poor reload, a
+        crash on startup is a worse one."""
+        state = None
+        try:
+            with open(statefile, encoding="utf-8") as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            logger.warning("unreadable reload state: %s", statefile, exc_info=True)
+        finally:
+            try:
+                os.unlink(statefile)
+            except OSError:
+                pass
+        if not isinstance(state, dict) or not state.get("tabs"):
+            self.open_new_window()
+            return
+        self.restore_session(state)
+
+    def restore_session(self, state):
+        win = PDFEditorWindow(self)
+        if state.get("width") and state.get("height"):
+            win.set_default_size(int(state["width"]), int(state["height"]))
+        if state.get("maximized"):
+            win.maximize()
+        win.present()
+        tabs = [t for t in state.get("tabs", [])
+                if isinstance(t, dict) and t.get("path")
+                and os.path.isfile(t["path"])]
+        for tab in tabs:
+            # the first open reuses the pristine scratchpad tab, the rest add
+            # one each — the same path a user's own File▸Open takes
+            win.open_file_in_tab(tab["path"])
+            page = int(tab.get("page") or 0)
+            if page > 0:
+                win._go_to_page(page)
+        if not tabs:
+            return
+        active = max(0, min(int(state.get("active") or 0), len(win._sessions) - 1))
+        win._tab_view.set_selected_page(win._sessions[active]._tab_page)
+        win.apply_view_state(state)
 
     def do_activate(self):
         # bare activation (e.g. via D-Bus) with no command line → empty window
@@ -21808,7 +21952,7 @@ def main():
     # Fail fast on a named file that doesn't exist, before we hand the launch
     # off to the (possibly already-running) primary instance. Checked here so
     # the error surfaces on the launching terminal with its own cwd.
-    path, _page, _new = PDFEditorApp._parse_open_args(args)
+    path, _page, _new, _restore = PDFEditorApp._parse_open_args(args)
     if path and not os.path.isfile(path):
         print(f"File not found: {path}", file=sys.stderr)
         sys.exit(1)

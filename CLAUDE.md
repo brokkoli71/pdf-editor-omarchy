@@ -738,6 +738,18 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   animation and a rebuild has no allocation yet, so at the instant you are
   asked every row reports y=0 and the adjustment has nothing to scroll — which
   is why the strip used to open at page 1 whatever page you were on.
+- **Ctrl+R reloads the CODE, so everything else has to be written down (row
+  157).** It spawns a standalone process, so `session_state()` records every
+  tab that has a file, the page each is on, which was active, and the window's
+  view state; `--restore` hands the child a temp JSON file, which is **consumed**
+  — read once and deleted whatever happens — so a stale session cannot come
+  back twice. Neither an unreadable state nor a file deleted since is fatal: a
+  poor reload beats a crash on startup. The divider position must be applied
+  from a **LOW-priority idle**, because `_init_pane_position` is a realize-time
+  idle applying the default 62% split and silently overwrites anything set
+  before it. A tab with no file (an untitled blank) is dropped — there is
+  nothing on disk to name — and multiple windows are out of scope: Ctrl+R
+  replaces the window it was pressed in.
 - Single-instance app (`Gio.Application`, `HANDLES_COMMAND_LINE`): a second
   launch forwards its argv to the primary, which opens the file as a tab in the
   last-used window (`_open_target`/`open_file_in_tab`). For manual testing

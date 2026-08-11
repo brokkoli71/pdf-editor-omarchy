@@ -10239,48 +10239,208 @@ class TestDragAndDrop(unittest.TestCase):
         self.assertTrue(result["file"])    # a real file drag is still accepted
 
 
+class TestReloadRestoresTheSession(unittest.TestCase):
+    """Ctrl+R spawns a fresh process, so everything it should bring back has to
+    be written down first: EVERY tab and its page, plus the view you were
+    reading in — not just the document that happened to be in front."""
+
+    _seq = 0
+
+    def _in_app(self, body):
+        TestReloadRestoresTheSession._seq += 1
+        errors = []
+        app = PDFEditorApp()
+        app.set_application_id(
+            f"test.sidemark.reload{TestReloadRestoresTheSession._seq}")
+        app.set_flags(Gio.ApplicationFlags.NON_UNIQUE)
+
+        def on_activate(a):
+            try:
+                body(a)
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+
+    def test_the_state_names_every_tab_and_the_page_each_is_on(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf"); b = os.path.join(d, "b.pdf")
+            make_pdf(a, n_pages=4); make_pdf(b, n_pages=9)
+
+            def body(app):
+                win = PDFEditorWindow(app); win.present()
+                win.open_file_in_tab(a)
+                win._go_to_page(2)
+                win.open_file_in_tab(b)
+                win._go_to_page(6)
+                state = win.session_state()
+                self.assertEqual([t["path"] for t in state["tabs"]], [a, b])
+                self.assertEqual([t["page"] for t in state["tabs"]], [2, 6])
+                self.assertEqual(state["active"], 1)
+
+            self._in_app(body)
+
+    def test_a_tab_with_no_file_is_dropped_without_taking_the_others(self):
+        """An untitled blank has nothing on disk to reopen. It must not shift
+        the `active` index of the tabs that CAN come back."""
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf")
+            make_pdf(a, n_pages=2)
+
+            def body(app):
+                win = PDFEditorWindow(app); win.present()
+                win._new_tab()                       # untitled, no path
+                win.open_file_in_tab(a)
+                state = win.session_state()
+                self.assertEqual([t["path"] for t in state["tabs"]], [a])
+                self.assertEqual(state["active"], 0)
+
+            self._in_app(body)
+
+    def test_restoring_reopens_every_tab_on_its_own_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf"); b = os.path.join(d, "b.pdf")
+            make_pdf(a, n_pages=4); make_pdf(b, n_pages=9)
+            state = {"tabs": [{"path": a, "page": 3}, {"path": b, "page": 5}],
+                     "active": 0, "outline": False, "outline_view": "pages",
+                     "notes": True, "pane": 0}
+
+            def body(app):
+                app.restore_session(state)
+                win = next(w for w in app.get_windows()
+                           if isinstance(w, PDFEditorWindow))
+                self.assertEqual([s._path for s in win._sessions], [a, b])
+                self.assertEqual([s.canvas.current_page_idx
+                                  for s in win._sessions], [3, 5])
+                self.assertIs(win._active_session, win._sessions[0])
+                # …and the shared header followed the tab it landed on (row 156)
+                self.assertEqual(win._page_label.get_label(), "4 / 4")
+
+            self._in_app(body)
+
+    def test_a_missing_file_is_skipped_rather_than_losing_the_session(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf")
+            make_pdf(a, n_pages=2)
+            state = {"tabs": [{"path": os.path.join(d, "gone.pdf"), "page": 0},
+                              {"path": a, "page": 1}],
+                     "active": 1}
+
+            def body(app):
+                app.restore_session(state)
+                win = next(w for w in app.get_windows()
+                           if isinstance(w, PDFEditorWindow))
+                self.assertEqual([s._path for s in win._sessions], [a])
+
+            self._in_app(body)
+
+    def test_the_view_state_comes_back(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf")
+            make_pdf(a, n_pages=3)
+
+            def body(app):
+                win = PDFEditorWindow(app); win.present()
+                win.open_file_in_tab(a)
+                win._toc_btn.set_active(True)
+                win._toc_seg_outline.set_active(True)
+                state = win.session_state()
+                self.assertTrue(state["outline"])
+                self.assertEqual(state["outline_view"], "outline")
+
+                app.restore_session(state)
+                back = [w for w in app.get_windows()
+                        if isinstance(w, PDFEditorWindow)][-1]
+                self.assertTrue(back._toc_revealer.get_reveal_child(),
+                                "the sidebar you had open came back closed")
+                self.assertTrue(back._toc_seg_outline.get_active())
+
+            self._in_app(body)
+
+    def test_the_state_file_is_read_once_and_deleted(self):
+        """Consumed, so a stale session cannot be restored twice or linger in
+        the temp dir — and an unreadable one is not fatal."""
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf")
+            make_pdf(a, n_pages=2)
+            statefile = os.path.join(d, "state.json")
+            with open(statefile, "w", encoding="utf-8") as f:
+                json.dump({"tabs": [{"path": a, "page": 1}], "active": 0}, f)
+
+            def body(app):
+                app.restore_session_file(statefile)
+                self.assertFalse(os.path.exists(statefile))
+                win = next(w for w in app.get_windows()
+                           if isinstance(w, PDFEditorWindow))
+                self.assertEqual([s._path for s in win._sessions], [a])
+
+            self._in_app(body)
+
+    def test_a_corrupt_state_file_still_opens_a_window(self):
+        with tempfile.TemporaryDirectory() as d:
+            statefile = os.path.join(d, "state.json")
+            with open(statefile, "w", encoding="utf-8") as f:
+                f.write("{not json at all")
+
+            def body(app):
+                app.restore_session_file(statefile)
+                self.assertFalse(os.path.exists(statefile))
+                self.assertTrue(any(isinstance(w, PDFEditorWindow)
+                                    for w in app.get_windows()),
+                                "a bad state file must not leave you with no "
+                                "window at all")
+
+            self._in_app(body)
+
+
 class TestSingleInstanceArgs(unittest.TestCase):
     """The single-instance app parses each launch's arguments (file + --page)
     in one place; a second launch forwards here."""
 
     def test_file_only(self):
         self.assertEqual(PDFEditorApp._parse_open_args(["a.pdf"]),
-                         ("a.pdf", 0, None))
+                         ("a.pdf", 0, None, None))
 
     def test_page_before_or_after_file(self):
         self.assertEqual(PDFEditorApp._parse_open_args(["--page", "3", "a.pdf"]),
-                         ("a.pdf", 3, None))
+                         ("a.pdf", 3, None, None))
         self.assertEqual(PDFEditorApp._parse_open_args(["a.pdf", "--page", "5"]),
-                         ("a.pdf", 5, None))
+                         ("a.pdf", 5, None, None))
 
     def test_verbose_and_unknown_flags_ignored(self):
         self.assertEqual(PDFEditorApp._parse_open_args(["-v", "a.pdf"]),
-                         ("a.pdf", 0, None))
+                         ("a.pdf", 0, None, None))
         self.assertEqual(PDFEditorApp._parse_open_args(["--frobnicate", "a.pdf"]),
-                         ("a.pdf", 0, None))
+                         ("a.pdf", 0, None, None))
 
     def test_bad_page_value_ignored(self):
         self.assertEqual(
             PDFEditorApp._parse_open_args(["--page", "nope", "a.pdf"]),
-            ("a.pdf", 0, None))
+            ("a.pdf", 0, None, None))
 
     def test_no_args(self):
-        self.assertEqual(PDFEditorApp._parse_open_args([]), (None, 0, None))
+        self.assertEqual(PDFEditorApp._parse_open_args([]), (None, 0, None, None))
 
     def test_new_asks_for_a_blank_document(self):
         self.assertEqual(PDFEditorApp._parse_open_args(["--new"]),
-                         (None, 0, "pdf"))
+                         (None, 0, "pdf", None))
         self.assertEqual(PDFEditorApp._parse_open_args(["--new-text"]),
-                         (None, 0, "text"))
+                         (None, 0, "text", None))
 
     def test_a_named_file_beats_new(self):
         """Naming a file AND asking for a blank one is contradictory; opening
         the file you named is the safe reading — the blank page is one click
         away in the ☰ menu, the file you meant might not be."""
         self.assertEqual(PDFEditorApp._parse_open_args(["--new", "a.pdf"]),
-                         ("a.pdf", 0, None))
+                         ("a.pdf", 0, None, None))
         self.assertEqual(PDFEditorApp._parse_open_args(["a.pdf", "--new-text"]),
-                         ("a.pdf", 0, None))
+                         ("a.pdf", 0, None, None))
 
 
 class TestReorderPages(unittest.TestCase):
@@ -13239,9 +13399,17 @@ class TestTextFirstMode(unittest.TestCase):
                     win._reload()
 
                 self.assertTrue(spawned, "Ctrl+R spawned no reload process")
-                self.assertIn(md, spawned[0])         # reopens THIS document
+                # the document travels in the --restore state file now (row
+                # 157), which is what carries the OTHER tabs and the view too
+                argv = spawned[0]
+                self.assertIn("--restore", argv)
+                statefile = argv[argv.index("--restore") + 1]
+                with open(statefile, encoding="utf-8") as f:
+                    state = json.load(f)
+                os.unlink(statefile)                  # the child would eat it
+                self.assertEqual([t["path"] for t in state["tabs"]], [md])
                 # a text page has no page number to return to
-                self.assertNotIn("--page", spawned[0])
+                self.assertEqual(state["tabs"][0]["page"], 0)
 
             self._run_in_window(body)
 
