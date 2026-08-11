@@ -14,7 +14,98 @@
 import {
   EditorView, EditorState, keymap, history, defaultKeymap, historyKeymap,
   indentWithTab, markdown, syntaxHighlighting, HighlightStyle, tags, placeholder,
+  Decoration, WidgetType, ViewPlugin, RangeSetBuilder,
 } from "../vendor/codemirror.js";
+import { renderSpans, scriptStyle, RENDERABLE_RE } from "./mathrender.js";
+
+// ── the live rendering ───────────────────────────────────────────────────────
+//
+// Each span that renders as something other than itself is REPLACED by a
+// widget showing the glyph, while the source stays in the document underneath.
+// Two rules decide what falls back to source, and they are different on
+// purpose:
+//
+//   * the CARET reveals only what it TOUCHES — the `\command` under it, the
+//     script it is inside — and the rest of the line stays rendered. A whole
+//     line reverting under a click moved every symbol on it just as you aimed
+//     at one.
+//   * a SELECTION reveals every line it covers, entirely. What you have
+//     selected is what you are about to cut or replace, and a selection whose
+//     text re-shaped itself as it grew is worse than lines that settle once.
+
+class GlyphWidget extends WidgetType {
+  constructor(text, cls) { super(); this.text = text; this.cls = cls; }
+  eq(other) { return other.text === this.text && other.cls === this.cls; }
+  toDOM() {
+    const span = document.createElement("span");
+    span.className = this.cls;
+    span.textContent = this.text;
+    return span;
+  }
+  ignoreEvent() { return false; }
+}
+
+class ScriptWidget extends WidgetType {
+  constructor(text, chain) { super(); this.text = text; this.chain = chain; }
+  eq(other) {
+    return other.text === this.text && other.chain.join() === this.chain.join();
+  }
+  toDOM() {
+    const { rise, scale } = scriptStyle(this.chain);
+    const span = document.createElement("span");
+    span.className = "sm-script";
+    span.textContent = this.text;
+    span.style.fontSize = `${(scale * 100).toFixed(1)}%`;
+    // relative to the BASE em, not to the shrunken one, which is what puts the
+    // `2` of `a_i^2` at the top of the i instead of the top of the a
+    span.style.verticalAlign = `${(rise / scale).toFixed(3)}em`;
+    return span;
+  }
+  ignoreEvent() { return false; }
+}
+
+function buildDecorations(view) {
+  const builder = new RangeSetBuilder();
+  const { state } = view;
+  const sel = state.selection.main;
+  // every line a non-empty selection covers shows its source, whole
+  const selFrom = sel.empty ? -1 : sel.from;
+  const selTo = sel.empty ? -1 : sel.to;
+
+  for (const { from, to } of view.visibleRanges) {
+    let pos = from;
+    while (pos <= to) {
+      const line = state.doc.lineAt(pos);
+      pos = line.to + 1;
+      if (!RENDERABLE_RE.test(line.text)) continue;   // plain prose renders as itself
+      // a selection touching this line at all reveals the whole line
+      if (selFrom >= 0 && selFrom <= line.to && selTo >= line.from) continue;
+
+      for (const span of renderSpans(line.text)) {
+        const a = line.from + span.from, b = line.from + span.to;
+        // the caret reveals only the expression it is INSIDE, edges included:
+        // standing at either end means you are still writing it
+        if (sel.empty && sel.head >= a && sel.head <= b) continue;
+        const widget = span.kind === "script"
+          ? new ScriptWidget(span.text, span.chain)
+          : new GlyphWidget(span.text, "sm-glyph");
+        builder.add(a, b, Decoration.replace({ widget }));
+      }
+    }
+  }
+  return builder.finish();
+}
+
+const liveMath = ViewPlugin.fromClass(class {
+  constructor(view) { this.decorations = buildDecorations(view); }
+  update(u) {
+    // the caret moving is enough to change what is rendered, so a selection
+    // change has to rebuild just as a document change does
+    if (u.docChanged || u.selectionSet || u.viewportChanged) {
+      this.decorations = buildDecorations(u.view);
+    }
+  }
+}, { decorations: (v) => v.decorations });
 
 /** Markdown highlighting, kept deliberately quiet.
  *
@@ -50,6 +141,7 @@ const theme = EditorView.theme({
     backgroundColor: "color-mix(in srgb, var(--accent-bg) 30%, transparent)",
   },
   ".cm-placeholder": { color: "var(--dim)" },
+  ".sm-script": { lineHeight: "0" },   // a lifted script must not open the line
 });
 
 export class NotesView {
@@ -68,6 +160,7 @@ export class NotesView {
           keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
           markdown(),
           syntaxHighlighting(mdHighlight),
+          liveMath,
           theme,
           EditorView.lineWrapping,
           placeholder("Notes for this page…"),

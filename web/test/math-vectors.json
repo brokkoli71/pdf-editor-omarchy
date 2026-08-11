@@ -1,0 +1,993 @@
+{
+ "cases": [
+  {
+   "raw": "Nothing to render here.",
+   "symbolize": "Nothing to render here.",
+   "symbolize_fragment": "Nothing to render here.",
+   "split": [
+    [
+     "Nothing to render here.",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": false
+  },
+  {
+   "raw": "\\alpha",
+   "symbolize": "α",
+   "symbolize_fragment": "α",
+   "split": [
+    [
+     "\\alpha",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\alpha x",
+   "symbolize": "αx",
+   "symbolize_fragment": "αx",
+   "split": [
+    [
+     "\\alpha x",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\alpha  x",
+   "symbolize": "α x",
+   "symbolize_fragment": "α x",
+   "split": [
+    [
+     "\\alpha  x",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\alpha + \\beta",
+   "symbolize": "α + β",
+   "symbolize_fragment": "α + β",
+   "split": [
+    [
+     "\\alpha + \\beta",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\cdot a",
+   "symbolize": "·a",
+   "symbolize_fragment": "·a",
+   "split": [
+    [
+     "\\cdot a",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "a \\le b",
+   "symbolize": "a ≤b",
+   "symbolize_fragment": "a ≤b",
+   "split": [
+    [
+     "a \\le b",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\alpha",
+   "symbolize": "α",
+   "symbolize_fragment": "α",
+   "split": [
+    [
+     "\\alpha",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\notacommand",
+   "symbolize": "\\notacommand",
+   "symbolize_fragment": "\\notacommand",
+   "split": [
+    [
+     "\\notacommand",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\R and \\realnum",
+   "symbolize": "ℝand ℝ",
+   "symbolize_fragment": "ℝand ℝ",
+   "split": [
+    [
+     "\\R and \\realnum",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\Real",
+   "symbolize": "\\Real",
+   "symbolize_fragment": "\\Real",
+   "split": [
+    [
+     "\\Real",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "x^2",
+   "symbolize": "x^2",
+   "symbolize_fragment": "x^2",
+   "split": [
+    [
+     "x^2",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 1,
+     "to": 3,
+     "body_end": 3,
+     "content": "2",
+     "chain": [
+      "sup"
+     ]
+    }
+   ],
+   "scripts_fragment": [
+    {
+     "from": 1,
+     "to": 3,
+     "chain": [
+      "sup"
+     ]
+    }
+   ],
+   "renderable": true
+  },
+  {
+   "raw": "a_i",
+   "symbolize": "a_i",
+   "symbolize_fragment": "a_i",
+   "split": [
+    [
+     "a_i",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 1,
+     "to": 3,
+     "body_end": 3,
+     "content": "i",
+     "chain": [
+      "sub"
+     ]
+    }
+   ],
+   "scripts_fragment": [
+    {
+     "from": 1,
+     "to": 3,
+     "chain": [
+      "sub"
+     ]
+    }
+   ],
+   "renderable": true
+  },
+  {
+   "raw": "a_i, b_j",
+   "symbolize": "a_i, b_j",
+   "symbolize_fragment": "a_i, b_j",
+   "split": [
+    [
+     "a_i, b_j",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 1,
+     "to": 3,
+     "body_end": 3,
+     "content": "i",
+     "chain": [
+      "sub"
+     ]
+    },
+    {
+     "from": 6,
+     "to": 8,
+     "body_end": 8,
+     "content": "j",
+     "chain": [
+      "sub"
+     ]
+    }
+   ],
+   "scripts_fragment": [
+    {
+     "from": 1,
+     "to": 3,
+     "chain": [
+      "sub"
+     ]
+    },
+    {
+     "from": 6,
+     "to": 8,
+     "chain": [
+      "sub"
+     ]
+    }
+   ],
+   "renderable": true
+  },
+  {
+   "raw": "a_ib",
+   "symbolize": "a_ib",
+   "symbolize_fragment": "a_ib",
+   "split": [
+    [
+     "a_ib",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 1,
+     "to": 4,
+     "body_end": 4,
+     "content": "ib",
+     "chain": [
+      "sub"
+     ]
+    }
+   ],
+   "scripts_fragment": [
+    {
+     "from": 1,
+     "to": 4,
+     "chain": [
+      "sub"
+     ]
+    }
+   ],
+   "renderable": true
+  },
+  {
+   "raw": "a_i b",
+   "symbolize": "a_i b",
+   "symbolize_fragment": "a_i b",
+   "split": [
+    [
+     "a_i b",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 1,
+     "to": 4,
+     "body_end": 3,
+     "content": "i",
+     "chain": [
+      "sub"
+     ]
+    }
+   ],
+   "scripts_fragment": [
+    {
+     "from": 1,
+     "to": 4,
+     "chain": [
+      "sub"
+     ]
+    }
+   ],
+   "renderable": true
+  },
+  {
+   "raw": "x^-1",
+   "symbolize": "x^-1",
+   "symbolize_fragment": "x^-1",
+   "split": [
+    [
+     "x^-1",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 1,
+     "to": 4,
+     "body_end": 4,
+     "content": "-1",
+     "chain": [
+      "sup"
+     ]
+    }
+   ],
+   "scripts_fragment": [
+    {
+     "from": 1,
+     "to": 4,
+     "chain": [
+      "sup"
+     ]
+    }
+   ],
+   "renderable": true
+  },
+  {
+   "raw": "x^{n+1}",
+   "symbolize": "x^{n+1}",
+   "symbolize_fragment": "x^{n+1}",
+   "split": [
+    [
+     "x^{n+1}",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 1,
+     "to": 7,
+     "body_end": 7,
+     "content": "n+1",
+     "chain": [
+      "sup"
+     ]
+    }
+   ],
+   "scripts_fragment": [
+    {
+     "from": 1,
+     "to": 7,
+     "chain": [
+      "sup"
+     ]
+    }
+   ],
+   "renderable": true
+  },
+  {
+   "raw": "a_i^2",
+   "symbolize": "a_i^2",
+   "symbolize_fragment": "a_i^2",
+   "split": [
+    [
+     "a_i^2",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 1,
+     "to": 3,
+     "body_end": 3,
+     "content": "i",
+     "chain": [
+      "sub"
+     ]
+    },
+    {
+     "from": 3,
+     "to": 5,
+     "body_end": 5,
+     "content": "2",
+     "chain": [
+      "sub",
+      "sup"
+     ]
+    }
+   ],
+   "scripts_fragment": [
+    {
+     "from": 1,
+     "to": 3,
+     "chain": [
+      "sub"
+     ]
+    },
+    {
+     "from": 3,
+     "to": 5,
+     "chain": [
+      "sub",
+      "sup"
+     ]
+    }
+   ],
+   "renderable": true
+  },
+  {
+   "raw": "a_i_j",
+   "symbolize": "a_i_j",
+   "symbolize_fragment": "a_i_j",
+   "split": [
+    [
+     "a_i_j",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 1,
+     "to": 3,
+     "body_end": 3,
+     "content": "i",
+     "chain": [
+      "sub"
+     ]
+    },
+    {
+     "from": 3,
+     "to": 5,
+     "body_end": 5,
+     "content": "j",
+     "chain": [
+      "sub",
+      "sub"
+     ]
+    }
+   ],
+   "scripts_fragment": [
+    {
+     "from": 1,
+     "to": 3,
+     "chain": [
+      "sub"
+     ]
+    },
+    {
+     "from": 3,
+     "to": 5,
+     "chain": [
+      "sub",
+      "sub"
+     ]
+    }
+   ],
+   "renderable": true
+  },
+  {
+   "raw": "a^t_i",
+   "symbolize": "a^t_i",
+   "symbolize_fragment": "a^t_i",
+   "split": [
+    [
+     "a^t_i",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 1,
+     "to": 3,
+     "body_end": 3,
+     "content": "t",
+     "chain": [
+      "sup"
+     ]
+    },
+    {
+     "from": 3,
+     "to": 5,
+     "body_end": 5,
+     "content": "i",
+     "chain": [
+      "sup",
+      "sub"
+     ]
+    }
+   ],
+   "scripts_fragment": [
+    {
+     "from": 1,
+     "to": 3,
+     "chain": [
+      "sup"
+     ]
+    },
+    {
+     "from": 3,
+     "to": 5,
+     "chain": [
+      "sup",
+      "sub"
+     ]
+    }
+   ],
+   "renderable": true
+  },
+  {
+   "raw": "a_i {}^2",
+   "symbolize": "a_i {}^2",
+   "symbolize_fragment": "a_i {}^2",
+   "split": [
+    [
+     "a_i {}^2",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 1,
+     "to": 3,
+     "body_end": 3,
+     "content": "i",
+     "chain": [
+      "sub"
+     ]
+    },
+    {
+     "from": 6,
+     "to": 8,
+     "body_end": 8,
+     "content": "2",
+     "chain": [
+      "sup"
+     ]
+    }
+   ],
+   "scripts_fragment": [
+    {
+     "from": 1,
+     "to": 3,
+     "chain": [
+      "sub"
+     ]
+    },
+    {
+     "from": 6,
+     "to": 8,
+     "chain": [
+      "sup"
+     ]
+    }
+   ],
+   "renderable": true
+  },
+  {
+   "raw": "x^\\alpha",
+   "symbolize": "x^α",
+   "symbolize_fragment": "x^α",
+   "split": [
+    [
+     "x^\\alpha",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\sum_{i=0}^{n} x_i",
+   "symbolize": "Σ_{i=0}^{n} x_i",
+   "symbolize_fragment": "Σ_{i=0}^{n} x_i",
+   "split": [
+    [
+     "\\sum_{i=0}^{n} x_i",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 4,
+     "to": 10,
+     "body_end": 10,
+     "content": "i=0",
+     "chain": [
+      "sub"
+     ]
+    },
+    {
+     "from": 10,
+     "to": 14,
+     "body_end": 14,
+     "content": "n",
+     "chain": [
+      "sub",
+      "sup"
+     ]
+    },
+    {
+     "from": 16,
+     "to": 18,
+     "body_end": 18,
+     "content": "i",
+     "chain": [
+      "sub"
+     ]
+    }
+   ],
+   "scripts_fragment": [
+    {
+     "from": 4,
+     "to": 10,
+     "chain": [
+      "sub"
+     ]
+    },
+    {
+     "from": 10,
+     "to": 14,
+     "chain": [
+      "sub",
+      "sup"
+     ]
+    },
+    {
+     "from": 16,
+     "to": 18,
+     "chain": [
+      "sub"
+     ]
+    }
+   ],
+   "renderable": true
+  },
+  {
+   "raw": "\\hat{x}",
+   "symbolize": "x̂",
+   "symbolize_fragment": "x̂",
+   "split": [
+    [
+     "\\hat{x}",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\bar{x}",
+   "symbolize": "x̄",
+   "symbolize_fragment": "x̄",
+   "split": [
+    [
+     "\\bar{x}",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\vec{A}",
+   "symbolize": "A⃗",
+   "symbolize_fragment": "A⃗",
+   "split": [
+    [
+     "\\vec{A}",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\hat{\\alpha}",
+   "symbolize": "α̂",
+   "symbolize_fragment": "α̂",
+   "split": [
+    [
+     "\\hat{\\alpha}",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\dot x",
+   "symbolize": "ẋ",
+   "symbolize_fragment": "ẋ",
+   "split": [
+    [
+     "\\dot x",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "`\\alpha` and \\beta",
+   "symbolize": "`\\alpha` and β",
+   "symbolize_fragment": "`\\alpha` and β",
+   "split": [
+    [
+     "`\\alpha`",
+     "code"
+    ],
+    [
+     " and \\beta",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "[[\\alpha]] and \\beta",
+   "symbolize": "[[\\alpha]] and β",
+   "symbolize_fragment": "[[\\alpha]] and β",
+   "split": [
+    [
+     "[[\\alpha]]",
+     "link"
+    ],
+    [
+     " and \\beta",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "[[file.pdf#page=3|the proof]]",
+   "symbolize": "[[file.pdf#page=3|the proof]]",
+   "symbolize_fragment": "[[file.pdf#page=3|the proof]]",
+   "split": [
+    [
+     "[[file.pdf#page=3|the proof]]",
+     "link"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "![[lecture.pdf]]",
+   "symbolize": "![[lecture.pdf]]",
+   "symbolize_fragment": "![[lecture.pdf]]",
+   "split": [
+    [
+     "![[lecture.pdf]]",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\alpha `code` \\beta",
+   "symbolize": "α `code` β",
+   "symbolize_fragment": "α `code` β",
+   "split": [
+    [
+     "\\alpha ",
+     "text"
+    ],
+    [
+     "`code`",
+     "code"
+    ],
+    [
+     " \\beta",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "*italic* and **bold**",
+   "symbolize": "*italic* and **bold**",
+   "symbolize_fragment": "*italic* and **bold**",
+   "split": [
+    [
+     "*italic* and **bold**",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "snake_case_name",
+   "symbolize": "snake_case_name",
+   "symbolize_fragment": "snake_case_name",
+   "split": [
+    [
+     "snake_case_name",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 5,
+     "to": 10,
+     "body_end": 10,
+     "content": "case",
+     "chain": [
+      "sub"
+     ]
+    },
+    {
+     "from": 10,
+     "to": 15,
+     "body_end": 15,
+     "content": "name",
+     "chain": [
+      "sub",
+      "sub"
+     ]
+    }
+   ],
+   "scripts_fragment": [
+    {
+     "from": 5,
+     "to": 10,
+     "chain": [
+      "sub"
+     ]
+    },
+    {
+     "from": 10,
+     "to": 15,
+     "chain": [
+      "sub",
+      "sub"
+     ]
+    }
+   ],
+   "renderable": true
+  },
+  {
+   "raw": "<!-- page:3 -->",
+   "symbolize": "<!-- page:3 -->",
+   "symbolize_fragment": "<!-- page:3 -->",
+   "split": [
+    [
+     "<!-- page:3 -->",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  }
+ ],
+ "symbols": {
+  "\\sum": "Σ",
+  "\\prod": "Π",
+  "\\int": "∫",
+  "\\alpha": "α",
+  "\\beta": "β",
+  "\\gamma": "γ",
+  "\\delta": "δ",
+  "\\epsilon": "ε",
+  "\\zeta": "ζ",
+  "\\eta": "η",
+  "\\theta": "θ",
+  "\\iota": "ι",
+  "\\kappa": "κ",
+  "\\lambda": "λ",
+  "\\mu": "μ",
+  "\\nu": "ν",
+  "\\xi": "ξ",
+  "\\pi": "π",
+  "\\rho": "ρ",
+  "\\sigma": "σ",
+  "\\tau": "τ",
+  "\\upsilon": "υ",
+  "\\phi": "φ",
+  "\\chi": "χ",
+  "\\psi": "ψ",
+  "\\omega": "ω",
+  "\\Gamma": "Γ",
+  "\\Delta": "Δ",
+  "\\Theta": "Θ",
+  "\\Lambda": "Λ",
+  "\\Xi": "Ξ",
+  "\\Pi": "Π",
+  "\\Sigma": "Σ",
+  "\\Phi": "Φ",
+  "\\Psi": "Ψ",
+  "\\Omega": "Ω",
+  "\\infty": "∞",
+  "\\approx": "≈",
+  "\\neq": "≠",
+  "\\leq": "≤",
+  "\\geq": "≥",
+  "\\le": "≤",
+  "\\ge": "≥",
+  "\\pm": "±",
+  "\\times": "×",
+  "\\div": "÷",
+  "\\cdot": "·",
+  "\\to": "→",
+  "\\gets": "←",
+  "\\mapsto": "↦",
+  "\\in": "∈",
+  "\\notin": "∉",
+  "\\subset": "⊂",
+  "\\supset": "⊃",
+  "\\cup": "∪",
+  "\\cap": "∩",
+  "\\emptyset": "∅",
+  "\\forall": "∀",
+  "\\exists": "∃",
+  "\\partial": "∂",
+  "\\nabla": "∇",
+  "\\R": "ℝ",
+  "\\realnum": "ℝ",
+  "\\N": "ℕ",
+  "\\natnum": "ℕ",
+  "\\Q": "ℚ",
+  "\\ratnum": "ℚ",
+  "\\Z": "ℤ",
+  "\\intnum": "ℤ",
+  "\\C": "ℂ",
+  "\\compnum": "ℂ"
+ },
+ "accents": {
+  "hat": "̂",
+  "bar": "̄",
+  "tilde": "̃",
+  "vec": "⃗",
+  "dot": "̇",
+  "ddot": "̈"
+ },
+ "max_depth": 3,
+ "scale": 0.65
+}
