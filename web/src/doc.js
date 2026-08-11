@@ -7,6 +7,7 @@
 import * as pdfjs from "../vendor/pdf.min.mjs";
 import { PDFDocument } from "../vendor/pdf-lib.esm.js";
 import { NotesModel } from "./notes-model.js";
+import { readInk } from "./inkpdf.js";
 
 pdfjs.GlobalWorkerOptions.workerSrc =
   new URL("../vendor/pdf.worker.min.mjs", import.meta.url).href;
@@ -34,11 +35,27 @@ export class Doc {
   }
 
   static async open(bytes, name) {
+    // Adopt any ink WE wrote and take it back out of the document before
+    // rendering. Without this the strokes are painted by pdf.js as annotation
+    // appearances while the model knows nothing about them — the file looks
+    // right and nothing on it can be erased, lassoed or undone. Stripping is
+    // what stops it then rendering twice, which is the desktop's image-layer
+    // trap in a different coat.
+    let ink = new Map();
+    try {
+      const lib = await PDFDocument.load(bytes, { ignoreEncryption: true });
+      ink = readInk(lib);
+      if (ink.size) bytes = await lib.save();
+    } catch {
+      // an unreadable document is pdf.js's problem to report, not ours; a file
+      // we cannot adopt ink from still opens
+    }
     const pdf = await pdfjs.getDocument({
       data: bytes.slice(0),      // pdf.js transfers the buffer; keep ours intact
       isEvalSupported: false,
     }).promise;
     const doc = new Doc(pdf, bytes, name);
+    doc.ink = ink;
     await doc._readOutline();
     return doc;
   }

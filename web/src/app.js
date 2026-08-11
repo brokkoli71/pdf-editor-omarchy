@@ -13,6 +13,7 @@ import { Sidebar } from "./sidebar.js";
 import { NotesView } from "./notes.js";
 import { NotesModel } from "./notes-model.js";
 import { saveDocument, openWithPicker, canSaveInPlace } from "./save.js";
+import { saveSession, loadSession } from "./session.js";
 
 // ── settings (the settings.json analogue) ────────────────────────────────────
 
@@ -130,16 +131,17 @@ const bindings = Bindings.load(store);
 const heldMods = { ctrl: false, shift: false, alt: false };
 
 const surface = new Surface(document.getElementById("page"), pen, bindings, {
-  onChange: () => { refreshUndo(); markDirty(true); },
+  onChange: () => { refreshUndo(); markDirty(true); rememberSession(); },
   onPageChange: (page) => {
     sidebar.setPage(page);
     notes.showPage(page);
     syncPageChrome();
+    rememberSession();
   },
 });
 
 const notes = new NotesView(document.getElementById("notes"), {
-  onDirty: () => markDirty(true),
+  onDirty: () => { markDirty(true); rememberSession(); },
 });
 
 const sidebar = new Sidebar(document.getElementById("sidebar"), {
@@ -162,15 +164,45 @@ refreshUndo();
 window.addEventListener("resize", () => { surface.fit(); surface.requestDraw(); });
 surface.requestDraw();
 
-// open on a blank A4 sheet, the same page `blank_pdf_file()` makes
-Doc.blank()
-  .then((doc) => setDoc(doc, "Untitled"))
+// Reopen where you left off; a blank A4 sheet when there is nothing to reopen.
+// A poor restore beats a failure to start, so anything unreadable falls through
+// to the blank page rather than stopping here.
+restoreSession()
+  .catch((err) => {
+    console.error("could not restore the last session", err);
+    return null;
+  })
+  .then((restored) => (restored ? null : Doc.blank().then((d) => setDoc(d, "Untitled"))))
   .catch((err) => {
     // A blank page that fails to appear is the whole app failing to start, so
     // it must say so rather than leaving an empty canvas that looks deliberate.
     console.error("could not create the blank page", err);
     toast(`Could not start: ${err.message}`);
   });
+
+async function restoreSession() {
+  const rec = await loadSession();
+  if (!rec) return false;
+  const doc = await Doc.open(rec.bytes, rec.name);
+  // the stored bytes were already stripped of our ink when they were saved, so
+  // the session's copy is the truth — adopting twice would double it
+  doc.ink = rec.ink;
+  if (rec.notes) doc.notes.setFromText(rec.notes);
+  // the handle rides along so save-in-place can resume; USING it needs a user
+  // gesture, so it is not touched until the first save
+  if (rec.handle) doc.handles = { pdf: rec.handle };
+  await setDoc(doc, rec.name);
+  if (rec.page) await surface.setPage(rec.page);
+  return true;
+}
+
+/** Written on a debounce, the way the desktop writes recent.json — often enough
+ * that a reload loses nothing, rarely enough that it costs nothing. */
+let sessionTimer = null;
+function rememberSession() {
+  clearTimeout(sessionTimer);
+  sessionTimer = setTimeout(() => saveSession(surface.doc, surface.pageIndex), 800);
+}
 
 // ── the document ─────────────────────────────────────────────────────────────
 
@@ -185,6 +217,7 @@ async function setDoc(doc, title) {
   // setDoc runs through the change callback on its way in; what it just loaded
   // is by definition not an unsaved edit
   markDirty(false);
+  rememberSession();
 }
 
 /** The divider between the page and the notes. GtkPaned's position, by hand. */

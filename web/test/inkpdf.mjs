@@ -8,7 +8,7 @@
 //   node test/inkpdf.mjs
 
 import { PDFDocument, PDFName, PDFString } from "../vendor/pdf-lib.esm.js";
-import { writeInk, INK_PROFILE_TAG } from "../src/inkpdf.js";
+import { writeInk, readInk, INK_PROFILE_TAG } from "../src/inkpdf.js";
 
 let failures = 0;
 function check(name, got, want) {
@@ -104,6 +104,55 @@ const flat = {
   writeInk(doc, new Map([[2, [tapered]]]));
   const perPage = doc.getPages().map((p) => p.node.Annots()?.size() ?? 0);
   check("only page 3 has ink", perPage, [0, 0, 1]);
+}
+
+// ── the ROUND TRIP: reopened ink must come back editable ────────────────────
+// The bug this guards is silent: without reading annotations back, a reopened
+// file SHOWS its ink (pdf.js paints the appearance streams) while the model
+// knows nothing about it, so nothing on the page can be erased, lassoed or
+// undone. It looks perfect and is dead.
+{
+  const doc = await makePdf(3);
+  writeInk(doc, new Map([[0, [tapered, flat]], [2, [tapered]]]));
+  const reloaded = await PDFDocument.load(await doc.save());
+  const ink = readInk(reloaded);
+
+  check("ink comes back on the right pages", [...ink.keys()].sort(), [0, 2]);
+  check("both strokes on page 1", ink.get(0)?.length, 2);
+
+  const back = ink.get(0)[0];
+  check("points survive", back.pts.map((p) => p.map((v) => Math.round(v * 100) / 100)),
+        tapered.pts);
+  check("profile survives", back.profile, tapered.profile);
+  check("width survives", back.width, tapered.width);
+  check("colour survives", back.color.map((v) => Math.round(v * 100) / 100),
+        tapered.color);
+
+  const backFlat = ink.get(0)[1];
+  check("a flat stroke stays flat", backFlat.profile, null);
+  check("its opacity survives", Math.round(backFlat.opacity * 100) / 100, flat.opacity);
+
+  // …and reading STRIPS, so the renderer cannot paint them a second time
+  check("annots removed after adoption", inkAnnots(reloaded).length, 0);
+
+  // a second round trip must not drift
+  writeInk(reloaded, ink);
+  const twice = readInk(await PDFDocument.load(await reloaded.save()));
+  check("stable across two round trips",
+        twice.get(0)[0].pts.map((p) => p.map((v) => Math.round(v * 100) / 100)),
+        tapered.pts);
+}
+
+// a foreign /Ink annotation is NOT adopted as ours, and stays on the page
+{
+  const doc = await makePdf();
+  const ctx = doc.context;
+  const foreign = ctx.obj({ Type: "Annot", Subtype: "Ink", Rect: [0, 0, 10, 10] });
+  foreign.set(PDFName.of("Contents"), PDFString.of("someone else's annotation"));
+  doc.getPages()[0].node.addAnnot(ctx.register(foreign));
+  const ink = readInk(doc);
+  check("foreign ink not adopted", ink.size, 0);
+  check("foreign ink left on the page", inkAnnots(doc).length, 1);
 }
 
 if (failures) {

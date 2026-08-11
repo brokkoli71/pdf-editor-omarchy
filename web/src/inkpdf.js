@@ -167,3 +167,97 @@ export function writeInk(doc, ink) {
   }
   return written;
 }
+
+/** Read OUR ink back out of a document, and strip it.
+ *
+ * This is the other half of the round trip, and without it a reopened file
+ * shows its ink but cannot edit it — the strokes render as annotations while
+ * the model knows nothing about them.
+ *
+ * Stripping is not optional: pdf.js paints annotation appearances onto the
+ * page, so ink left in the document would be drawn once by the renderer and
+ * once by us. Same trap as the desktop's image layer, which is taken back OUT
+ * of the open document after it is adopted.
+ *
+ * Only annotations carrying INK_PROFILE_TAG, or a bare /Ink we can parse, are
+ * claimed — and a foreign one is left alone if we cannot make a stroke of it.
+ * Losing the taper is a far better failure than refusing to open a file, so
+ * anything unparseable simply is not ink.
+ *
+ * Returns a Map of page index → strokes. */
+export function readInk(doc) {
+  const ink = new Map();
+  const pages = doc.getPages();
+  pages.forEach((page, index) => {
+    const annots = page.node.Annots();
+    if (!annots) return;
+    const pageH = page.getSize().height;
+    const strokes = [];
+    for (let i = annots.size() - 1; i >= 0; i--) {
+      const dict = page.node.context.lookup(annots.get(i));
+      if (!dict || !dict.get) continue;
+      if (dict.get(PDFName.of("Subtype"))?.asString?.() !== "/Ink") continue;
+      const stroke = strokeFromAnnot(dict, pageH);
+      if (!stroke) continue;
+      strokes.unshift(stroke);        // annots are walked backwards to remove
+      annots.remove(i);
+    }
+    if (strokes.length) ink.set(index, strokes);
+  });
+  return ink;
+}
+
+function numbersOf(arr) {
+  const out = [];
+  for (let i = 0; i < arr.size(); i++) {
+    const v = arr.get(i);
+    const n = v?.asNumber?.();
+    if (typeof n !== "number" || !Number.isFinite(n)) return null;
+    out.push(n);
+  }
+  return out;
+}
+
+function strokeFromAnnot(dict, pageH) {
+  const inkList = dict.get(PDFName.of("InkList"));
+  if (!inkList?.size?.()) return null;
+  const line = inkList.get(0);          // one polyline per stroke, as written
+  if (!line?.size) return null;
+  const flat = numbersOf(line);
+  if (!flat || flat.length < 2 || flat.length % 2) return null;
+
+  const pts = [];
+  for (let i = 0; i < flat.length; i += 2) pts.push([flat[i], pageH - flat[i + 1]]);
+  // a one-point stroke was written as its point twice; give it back as one
+  if (pts.length === 2 && pts[0][0] === pts[1][0] && pts[0][1] === pts[1][1]) {
+    pts.length = 1;
+  }
+
+  const colorArr = dict.get(PDFName.of("C"));
+  const color = colorArr?.size?.() === 3 ? numbersOf(colorArr) : null;
+  const bs = dict.get(PDFName.of("BS"));
+  const width = bs?.get?.(PDFName.of("W"))?.asNumber?.() ?? 2.0;
+  const opacity = dict.get(PDFName.of("CA"))?.asNumber?.() ?? 1.0;
+
+  // The width profile, stashed on /Contents by the writer. Guarded by a LENGTH
+  // match, so a mismatch loses the taper rather than shifting every width along
+  // the stroke.
+  let profile = null;
+  const contents = dict.get(PDFName.of("Contents"));
+  const text = contents?.decodeText?.() ?? String(contents?.asString?.() ?? "");
+  const at = text.indexOf(INK_PROFILE_TAG);
+  if (at >= 0) {
+    const parsed = text.slice(at + INK_PROFILE_TAG.length)
+      .replace(/\)$/, "").split(",").map(Number);
+    if (parsed.length === pts.length && parsed.every(Number.isFinite)) {
+      profile = parsed;
+    }
+  }
+  return {
+    pts, profile,
+    width: width > 0 ? width : 2.0,
+    color: color || [0, 0, 0],
+    opacity: opacity > 0 && opacity <= 1 ? opacity : 1.0,
+    flat: profile === null,
+  };
+}
