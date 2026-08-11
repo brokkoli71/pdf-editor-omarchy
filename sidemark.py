@@ -8126,6 +8126,18 @@ def merge_documents(sources, dest_path, keep_subchapters=True,
     return result
 
 
+def _drop_popover(pop):
+    """Unparent a popover once, from its own `closed` handler.
+
+    `unparent()` can itself emit `closed`, so the naive one-liner re-enters and
+    unparents a widget that no longer has a parent — which is
+    `gtk_widget_get_parent: assertion 'GTK_IS_WIDGET (widget)' failed` in the
+    terminal, once per dismissal. Every popover built on the fly goes through
+    here."""
+    if pop.get_parent() is not None:
+        pop.unparent()
+
+
 def attach_file_drop(text_view):
     """Let a file dropped on a text editor reach the window's open/import flow.
 
@@ -16208,6 +16220,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         child = box.get_first_child()
         while child is not None:
             nxt = child.get_next_sibling()
+            # a row mid-rename is about to be destroyed under its own entry:
+            # end the edit first so its focus-leave finds a spent token instead
+            # of reaching for widgets that are gone
+            if getattr(child, "_renaming", False):
+                child._finish_rename(False)
             box.remove(child)
             child = nxt
         marks = self.notes_model.bookmarks() if self._can_bookmark() else []
@@ -16314,11 +16331,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             row._rename_token = None
             row._renaming = False
             text = entry.get_text().strip()
-            # restore the row before committing: a commit repopulates the list
+            # Restore the row before committing: a commit repopulates the list
             # this row belongs to, and touching it afterwards is touching a
-            # widget that has been thrown away
-            row._row_box.remove(entry)
-            row._label_widget.set_visible(True)
+            # widget that has been thrown away.
+            #
+            # And the row may ALREADY be gone — a focus-leave is delivered after
+            # the fact, so removing the bookmark (or any refresh) can rebuild
+            # the list first. `remove()` on a box that no longer owns the child
+            # is `gtk_widget_get_parent: assertion 'GTK_IS_WIDGET' failed`, the
+            # critical this guard exists to stop.
+            if entry.get_parent() is row._row_box:
+                row._row_box.remove(entry)
+            if row._label_widget.get_parent() is not None:
+                row._label_widget.set_visible(True)
             if commit:
                 # committing the DERIVED label as a name would freeze today's
                 # first note line into the file; only a real change is stored
@@ -17134,10 +17159,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 s._presenter.close()
         self.destroy()
 
-    def _ask_save_then(self, callback):
+    def _ask_save_then(self, callback, title=None):
         dlg = Adw.AlertDialog.new(
             "Unsaved changes",
-            "Save before continuing?",
+            (f"Save “{title}” before continuing?" if title
+             else "Save before continuing?"),
         )
         dlg.add_response("discard", "Discard")
         dlg.add_response("cancel",  "Cancel")
@@ -17336,7 +17362,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             if self._bookmark_name_pop is pop:
                 self._bookmark_name_pop = None
                 self._bookmark_name_entry = None
-            pop.unparent()
+            _drop_popover(pop)
             # the header toggle flipped itself on the click that opened this;
             # a cancelled add has to put it back (nothing was ever stored)
             self._update_bookmark_ui()
@@ -18159,7 +18185,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     r.set_tooltip_text(
                         f"Your bookmark on page {idx + 1}"
                         + (f": {text}" if text else "")
-                        + " — click to jump, F2 to rename")
+                        + " — click to jump, double-click to rename, "
+                          "right-click for more")
                     self._toc_list.append(r)
 
             for level, title, page in toc:
@@ -18372,11 +18399,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                              lambda _b, act=action: (menu.popdown(), act()))
                 box.append(item)
             menu.set_child(box)
-            menu.connect("closed", lambda _p: menu.unparent())
+            menu.connect("closed", lambda _p: _drop_popover(menu))
             menu.popup()
 
         click.connect("pressed", pressed)
         row.add_controller(click)
+
+        # DOUBLE-CLICK renames. F2 still works, but only once the list has
+        # keyboard focus — and a single click activates the row, which jumps to
+        # the page and takes focus with it, so the key alone meant "click, click
+        # again, then F2". Double-click is the gesture that was already in your
+        # hand. (The row activates on the way, i.e. it jumps to the page it
+        # names, which is where you wanted to be anyway.)
+        dbl = Gtk.GestureClick()
+        dbl.set_button(Gdk.BUTTON_PRIMARY)
+        dbl.connect("pressed",
+                    lambda g, n, _x, _y: n == 2 and self._begin_rename(row))
+        row.add_controller(dbl)
 
     def _on_toc_key(self, _ctrl, keyval, _keycode, _state):
         """F2 renames the outline's selected ★ row in place. An outline row of
@@ -18535,7 +18574,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                                                 self._set_pages_hidden(pages, hiding)))
             box.append(item)
             menu.set_child(box)
-            menu.connect("closed", lambda _p: menu.unparent())
+            menu.connect("closed", lambda _p: _drop_popover(menu))
             menu.popup()
 
         click.connect("pressed", pressed)
@@ -21621,10 +21660,36 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             subprocess.Popen(argv, env=env)
             self.destroy()
 
-        if self._dirty:
-            self._ask_save_then(do_reload)
-        else:
-            do_reload()
+        # Every dirty TAB, not just the one in front: a reload replaces the
+        # whole window, so a tab you never looked at would lose its edits
+        # without ever being mentioned. Asked one tab at a time — each is a
+        # different file with a different answer, and "save all?" cannot offer
+        # "discard this one, keep that one".
+        self._ask_save_all_then(do_reload)
+
+    def _ask_save_all_then(self, callback, pending=None):
+        """Walk the dirty tabs, asking about each, then run `callback`.
+
+        Cancelling ANY of them abandons the whole thing — the alternative is
+        saving half a window's work and then reloading anyway, which is the one
+        outcome nobody asks for."""
+        if pending is None:
+            pending = [s for s in self._sessions if s._dirty]
+        if not pending:
+            callback()
+            return
+        session, rest = pending[0], pending[1:]
+        name = (os.path.basename(session._path or session._notes_path or "")
+                or "Untitled")
+        self._activate_session_tab(session)
+        self._ask_save_then(
+            lambda: self._ask_save_all_then(callback, rest), title=name)
+
+    def _activate_session_tab(self, session):
+        """Bring a tab to the front — so the dialog asking about a file is in
+        front of that file, not of whatever happened to be open."""
+        if session._tab_page is not None and session is not self._active_session:
+            self._tab_view.set_selected_page(session._tab_page)
 
     def _on_key(self, ctrl, keyval, keycode, state):
         if state & Gdk.ModifierType.CONTROL_MASK:

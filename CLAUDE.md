@@ -674,6 +674,16 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     nowhere else, and an opt-out is one stray click from losing the guard for
     good. A cancel must re-sync the header toggle, which already flipped
     itself on the click that opened the dialog.
+  - **A second click RENAMES, it does not remove.** The page is already marked,
+    so the useful verb is "say what this is" — the list opens scrolled to that
+    page with the name selected. A stray click on a toggle must not raise a
+    confirmation dialog. In the outline a **double-click** renames: F2 works
+    too, but only once the list has keyboard focus, and a single click
+    activates the row and takes focus with it, so by hand the key alone meant
+    "click, click again, then F2". A rename's **focus-leave is delivered after
+    the fact**, so `finish` is guarded by that edit's own token AND checks the
+    entry still has its box as parent — a list rebuilt in between otherwise
+    leaves it removing a child from a box that no longer owns it.
   - **Bookmarks are outline entries too, and can BE the outline** (row 153).
     The Outline/Pages switch appears when the document has a TOC *or*
     bookmarks — a lecture deck rarely has a TOC and is exactly what you
@@ -774,7 +784,11 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   idle applying the default 62% split and silently overwrites anything set
   before it. A tab with no file (an untitled blank) is dropped — there is
   nothing on disk to name — and multiple windows are out of scope: Ctrl+R
-  replaces the window it was pressed in.
+  replaces the window it was pressed in. It asks about **every dirty tab**, one
+  at a time, bringing each to the front first: a reload replaces the whole
+  window, so a tab you never looked at would lose its edits unmentioned, and a
+  single "save all?" cannot offer "discard this one, keep that one".
+  Cancelling any of them abandons the reload.
 - Single-instance app (`Gio.Application`, `HANDLES_COMMAND_LINE`): a second
   launch forwards its argv to the primary, which opens the file as a tab in the
   last-used window (`_open_target`/`open_file_in_tab`). For manual testing
@@ -909,7 +923,12 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 - **Wayland file DnD** needs `Gtk.DropTargetAsync` + a drag-motion handler
   returning an action, or the drop never fires (portal transfer).
 - **GTK4 popovers**: never popdown one popover and popup a sibling on the same
-  widget synchronously — defer to the "closed" signal.
+  widget synchronously — defer to the "closed" signal. And **tear one down with
+  `_drop_popover`, never a bare `unparent()` in its own `closed` handler**:
+  `unparent()` can itself emit `closed`, so the one-liner re-enters and
+  unparents a widget that no longer has a parent. That prints
+  `gtk_widget_get_parent: assertion 'GTK_IS_WIDGET (widget)' failed` and is not
+  fatal, which is exactly why it ships.
 - **cairo's `save()`/`restore()` does not save the PATH.** A painter that ends
   with `show_text()` leaves a current point behind, and the next `arc()` joins
   onto it with a straight line — which is how a ghost line appeared from the

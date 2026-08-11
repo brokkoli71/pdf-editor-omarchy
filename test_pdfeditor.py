@@ -10672,6 +10672,53 @@ class TestReloadRestoresTheSession(unittest.TestCase):
 
             self._in_app(body)
 
+    def test_every_dirty_tab_is_asked_about_before_reloading(self):
+        """A reload replaces the whole window, so a tab you never looked at
+        would lose its edits without ever being mentioned."""
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf"); b = os.path.join(d, "b.pdf")
+            make_pdf(a, n_pages=2); make_pdf(b, n_pages=2)
+
+            def body(app):
+                win = PDFEditorWindow(app); win.present()
+                win.open_file_in_tab(a)
+                win.open_file_in_tab(b)
+                for s in win._sessions:
+                    s._dirty = True
+                asked = []
+                # each answer is "save", which here just proceeds to the next
+                win._ask_save_then = lambda cb, title=None: (
+                    asked.append(title), cb())[1]
+                done = []
+                win._ask_save_all_then(lambda: done.append(True))
+                self.assertEqual(len(asked), 2, f"asked about {asked}")
+                self.assertEqual(sorted(x for x in asked if x),
+                                 ["a.pdf", "b.pdf"])
+                self.assertTrue(done, "the reload never ran")
+
+            self._in_app(body)
+
+    def test_a_cancelled_tab_abandons_the_whole_reload(self):
+        """Saving half a window's work and reloading anyway is the one outcome
+        nobody asks for."""
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf"); b = os.path.join(d, "b.pdf")
+            make_pdf(a, n_pages=2); make_pdf(b, n_pages=2)
+
+            def body(app):
+                win = PDFEditorWindow(app); win.present()
+                win.open_file_in_tab(a)
+                win.open_file_in_tab(b)
+                for s in win._sessions:
+                    s._dirty = True
+                # Cancel is simply never calling the continuation
+                win._ask_save_then = lambda cb, title=None: None
+                done = []
+                win._ask_save_all_then(lambda: done.append(True))
+                self.assertFalse(done, "a cancel must stop the reload")
+
+            self._in_app(body)
+
     def test_a_missing_file_is_skipped_rather_than_losing_the_session(self):
         with tempfile.TemporaryDirectory() as d:
             a = os.path.join(d, "a.pdf")
