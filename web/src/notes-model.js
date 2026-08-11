@@ -246,6 +246,83 @@ export class NotesModel {
     }
   }
 
+  /** Re-key notes after `count` pages were inserted at `idx`. */
+  shiftForInsert(idx, count = 1) {
+    const notes = {};
+    for (const [k, v] of Object.entries(this._notes)) {
+      const n = Number(k);
+      notes[n >= idx ? n + count : n] = v;
+    }
+    this._notes = notes;
+    this._links = new Set([...this._links].map((k) => (k >= idx ? k + count : k)));
+    // a bookmark marks a PAGE, so it just rides along — no adjacency rule to
+    // preserve and nothing the inserted pages could inherit
+    const bookmarks = {};
+    for (const [k, v] of Object.entries(this._bookmarks)) {
+      const n = Number(k);
+      bookmarks[n >= idx ? n + count : n] = v;
+    }
+    this._bookmarks = bookmarks;
+    // …and so does a hidden flag: the inserted pages are new and visible
+    this._hidden = new Set([...this._hidden].map((k) => (k >= idx ? k + count : k)));
+    // the new pages are blank and unlinked, so the run is broken anyway: cut
+    // the tail loose rather than let its text reach across the gap
+    this._links.delete(idx + count);
+  }
+
+  /** Drop the note of deleted page `idx`; re-key later pages.
+   *
+   * Deleting a run's START must hand the body to the next page IN the run —
+   * otherwise the whole run's text goes with the one page. */
+  shiftForDelete(idx) {
+    if (!this._links.has(idx) && this._links.has(idx + 1)) {
+      this._links.delete(idx + 1);
+      if ((this._notes[idx] || "").trim()) this._notes[idx + 1] = this._notes[idx];
+    }
+    const notes = {};
+    for (const [k, v] of Object.entries(this._notes)) {
+      const n = Number(k);
+      if (n === idx) continue;
+      notes[n > idx ? n - 1 : n] = v;
+    }
+    this._notes = notes;
+    this._links = new Set([...this._links].filter((k) => k !== idx)
+      .map((k) => (k > idx ? k - 1 : k)));
+    this._links.delete(0);
+    // the deleted page's bookmark goes with it: it marked THAT page, and
+    // handing it to a neighbour would silently point somewhere else
+    const bookmarks = {};
+    for (const [k, v] of Object.entries(this._bookmarks)) {
+      const n = Number(k);
+      if (n === idx) continue;
+      bookmarks[n > idx ? n - 1 : n] = v;
+    }
+    this._bookmarks = bookmarks;
+    this._hidden = new Set([...this._hidden].filter((k) => k !== idx)
+      .map((k) => (k > idx ? k - 1 : k)));
+  }
+
+  /** Re-key after pages were REORDERED. `oldToNew` maps each old index to its
+   * new one. A run that moved as a block keeps its links; one that was torn
+   * apart becomes plain unlinked pages — degrading to unlinked rather than
+   * re-linking two slides that were never related. */
+  reorder(oldToNew) {
+    const at = (k) => (oldToNew.has(k) ? oldToNew.get(k) : k);
+    const notes = {};
+    for (const [k, v] of Object.entries(this._notes)) notes[at(Number(k))] = v;
+    this._notes = notes;
+    const kept = new Set();
+    for (const k of this._links) {
+      if (at(k) === at(k - 1) + 1) kept.add(at(k));
+    }
+    this._links = new Set([...kept].filter((k) => k > 0));
+    const bookmarks = {};
+    for (const [k, v] of Object.entries(this._bookmarks)) bookmarks[at(Number(k))] = v;
+    this._bookmarks = bookmarks;
+    this._hidden = new Set([...this._hidden].map(at));
+    this._normalize();   // a torn-off page may now own text behind a link
+  }
+
   /** Re-key every per-page fact by a page offset — what the merge import needs
    * when a document becomes a chapter of a larger one. */
   shiftBy(offset) {

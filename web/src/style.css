@@ -275,6 +275,32 @@ button:disabled:hover { background: transparent; }
 .here-line::before { width: 10px; }
 .here-line::after { flex: 1; }
 
+.row.dragging { opacity: .4; }
+
+/* the page context menu */
+.page-menu {
+  position: fixed;
+  z-index: 40;
+  min-width: 150px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  background: var(--popover-bg);
+  border: 1px solid var(--separator);
+  border-radius: 10px;
+  box-shadow: var(--popover-shadow);
+}
+.page-menu button {
+  background: transparent;
+  text-align: left;
+  border-radius: 6px;
+  font-size: 13px;
+  min-height: 28px;
+  padding: 4px 8px;
+}
+.page-menu button:hover { background: var(--btn-hover); }
+.page-menu button.danger { color: rgb(224, 27, 36); }
+
 /* the sidebar drop gap */
 .row.gap-before::after {
   content: ""; position: absolute; left: 2px; right: 2px; top: -3px;

@@ -918,7 +918,15 @@ export class Surface {
   _zoomToRegion(from, to) {
     const x = Math.min(from[0], to[0]), y = Math.min(from[1], to[1]);
     const w = Math.abs(to[0] - from[0]), h = Math.abs(to[1] - from[1]);
-    if (w < 8 || h < 8) return;      // a click, not a region
+    if (w < 8 || h < 8) {
+      // A CLICK, not a region — so it means the other useful thing the zoom
+      // tool can do: back to the whole page. Dragging picks a region, clicking
+      // undoes every region you have picked, which is the only way back
+      // without a second binding.
+      this.fit();
+      this.requestDraw();
+      return;
+    }
     const f = Math.min(this.cssW / w, this.cssH / h);
     const cx = x + w / 2, cy = y + h / 2;
     this.zoomAt(f, cx, cy);                            // the centre stays put…

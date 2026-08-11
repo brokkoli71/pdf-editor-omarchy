@@ -9,10 +9,14 @@ export class Sidebar {
     this.root = root;
     this.onGoToPage = opts.onGoToPage;
     this.onDropFiles = opts.onDropFiles;
+    this.onMovePage = opts.onMovePage || (() => {});
+    this.onDeletePage = opts.onDeletePage || (() => {});
     this.doc = null;
     this.page = 0;
     this.view = "pages";
-    this._thumbCentred = null;   // "is this a new page or the same one?"
+    this._thumbCentred = null;
+    this._dragPage = null;
+    this._menu = null;   // "is this a new page or the same one?"
 
     this.switchEl = root.querySelector("#side-switch");
     this.listEl = root.querySelector("#side-list");
@@ -88,12 +92,68 @@ export class Sidebar {
       row.appendChild(label);
 
       row.addEventListener("click", () => this.onGoToPage(i));
+      this._makeReorderable(row, i);
       this.listEl.appendChild(row);
 
       // rendered lazily — a 400-page deck must not render 400 thumbnails to
       // show you the first screenful
       this._observe(row, holder, i);
     }
+  }
+
+  /** Drag a thumbnail to move its page. The drop lands at the GAP you are
+   * hovering, which is the same rule a file drop uses — one meaning for
+   * "between these two rows", whatever you are dragging. */
+  _makeReorderable(row, index) {
+    row.draggable = true;
+    row.addEventListener("dragstart", (e) => {
+      this._dragPage = index;
+      e.dataTransfer.effectAllowed = "move";
+      // some browsers refuse to start a drag with no payload
+      e.dataTransfer.setData("text/plain", String(index));
+      row.classList.add("dragging");
+    });
+    row.addEventListener("dragend", () => {
+      this._dragPage = null;
+      row.classList.remove("dragging");
+      this._markGap(null);
+    });
+    row.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      this._openPageMenu(e, index);
+    });
+  }
+
+  /** Right-click a page for the verbs that have nowhere else to live. */
+  _openPageMenu(e, index) {
+    this._closePageMenu();
+    const menu = document.createElement("div");
+    menu.className = "page-menu";
+    menu.style.left = `${e.clientX}px`;
+    menu.style.top = `${e.clientY}px`;
+    const add = (label, fn, danger = false) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      if (danger) b.classList.add("danger");
+      b.addEventListener("click", () => { this._closePageMenu(); fn(); });
+      menu.appendChild(b);
+    };
+    add("Go to page", () => this.onGoToPage(index));
+    if (index > 0) add("Move up", () => this.onMovePage(index, index - 1));
+    if (this.doc && index < this.doc.pageCount - 1) {
+      add("Move down", () => this.onMovePage(index, index + 1));
+    }
+    add("Delete page", () => this.onDeletePage(index), true);
+    document.body.appendChild(menu);
+    this._menu = menu;
+    setTimeout(() => {
+      window.addEventListener("pointerdown", this._closeMenuOnce = () =>
+        this._closePageMenu(), { once: true });
+    }, 0);
+  }
+
+  _closePageMenu() {
+    if (this._menu) { this._menu.remove(); this._menu = null; }
   }
 
   _observe(row, holder, index) {
@@ -172,7 +232,7 @@ export class Sidebar {
     el.addEventListener("dragover", (e) => {
       if (!this.doc) return;
       e.preventDefault();
-      e.dataTransfer.dropEffect = "copy";
+      e.dataTransfer.dropEffect = this._dragPage === null ? "copy" : "move";
       this._markGap(this._gapAt(e.clientY));
     });
     el.addEventListener("dragleave", () => this._markGap(null));
@@ -181,6 +241,16 @@ export class Sidebar {
       e.stopPropagation();
       const gap = this._gapAt(e.clientY);
       this._markGap(null);
+      // a dragged PAGE moves; a dragged FILE imports — both at the same gap
+      if (this._dragPage !== null && this._dragPage !== undefined) {
+        const from = this._dragPage;
+        this._dragPage = null;
+        // the gap is expressed in the document WITH the page still in it, and
+        // moveRangeOrder wants it with the block taken out
+        const to = gap > from ? gap - 1 : gap;
+        if (to !== from) this.onMovePage(from, to);
+        return;
+      }
       const files = [...(e.dataTransfer.files || [])];
       if (files.length) this.onDropFiles(files, gap);
     });

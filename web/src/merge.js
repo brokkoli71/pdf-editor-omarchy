@@ -148,3 +148,52 @@ function range(a, b) {
   for (let i = a; i < b; i++) out.push(i);
   return out;
 }
+
+// ── page management ──────────────────────────────────────────────────────────
+
+/** The page order after moving `count` pages from `src` to gap `dst`.
+ *
+ * `dst` is the gap index in the document with the block ALREADY taken out,
+ * which is the only reading that makes "drop it here" mean the same thing
+ * whether you dragged forwards or backwards. */
+export function moveRangeOrder(n, src, count, dst) {
+  const all = range(0, n);
+  const block = all.splice(src, count);
+  const at = Math.max(0, Math.min(all.length, dst));
+  all.splice(at, 0, ...block);
+  return all;
+}
+
+/** Rebuild `bytes` with its pages in `order` (old indices, in their new
+ * positions). Returns `{bytes, oldToNew}`.
+ *
+ * The outline is re-pointed AND re-sorted: copying pages renumbers what the
+ * entries point at but leaves them in their old sequence, so without the sort a
+ * moved chapter is listed first while sitting at page 30. */
+export async function applyPageOrder(bytes, order, outline = []) {
+  const donor = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  const out = await PDFDocument.create();
+  const copied = await out.copyPages(donor, order);
+  for (const p of copied) out.addPage(p);
+
+  const oldToNew = new Map();
+  order.forEach((old, next) => oldToNew.set(old, next));
+
+  const moved = outline
+    .filter((e) => oldToNew.has(e.page))
+    .map((e) => ({ ...e, page: oldToNew.get(e.page) }))
+    .sort((a, b) => a.page - b.page);
+  if (moved.length) writeOutline(out, moved);
+  return { bytes: await out.save(), oldToNew, outline: moved };
+}
+
+/** Drop pages by index. Returns `{bytes, oldToNew}`; `oldToNew` omits the pages
+ * that went, so a caller re-keying per-page state can tell "moved" from "gone". */
+export async function deletePages(bytes, indices, outline = []) {
+  const donor = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  const total = donor.getPageCount();
+  const drop = new Set(indices);
+  const keep = range(0, total).filter((i) => !drop.has(i));
+  if (!keep.length) throw new Error("a document cannot lose its last page");
+  return applyPageOrder(bytes, keep, outline);
+}

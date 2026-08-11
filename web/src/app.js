@@ -9,6 +9,7 @@ import {
 } from "./bindings.js";
 import { Surface, IMPLEMENTED_TOOLS } from "./surface.js";
 import { Doc, mergeDocuments, insertDocuments } from "./doc.js";
+import { applyPageOrder, deletePages, moveRangeOrder } from "./merge.js";
 import { Sidebar } from "./sidebar.js";
 import { NotesView } from "./notes.js";
 import { NotesModel } from "./notes-model.js";
@@ -147,6 +148,8 @@ const notes = new NotesView(document.getElementById("notes"), {
 const sidebar = new Sidebar(document.getElementById("sidebar"), {
   onGoToPage: (page) => surface.setPage(page),   // absolute nav, never a flip
   onDropFiles: (files, gap) => importAt(files, gap),
+  onMovePage: (from, to) => movePage(from, to),
+  onDeletePage: (index) => removePage(index),
 });
 
 const toolStrips = new Map();   // tool → [strip elements]
@@ -399,7 +402,7 @@ async function doSave({ reask = false } = {}) {
  * Everywhere else opens or merges into a new one. */
 async function importAt(files, gap) {
   if (!surface.doc) return openFiles(files);
-  const sources = await readFiles(files);
+  const sources = files[0]?.bytes ? files : await readFiles(files);
   if (!sources.length) return toast("No PDFs in that drop");
   try {
     const host = surface.doc;
@@ -412,6 +415,86 @@ async function importAt(files, gap) {
   } catch (err) {
     toast(`Could not insert: ${err.message}`);
   }
+}
+
+// ── page management ──────────────────────────────────────────────────────────
+
+/** Rebuild the document with its pages in `order`, carrying every per-page fact
+ * across. ONE rebuild and ONE re-key for the whole change — doing it page by
+ * page would re-render the document once per page, which a 40-page chapter
+ * feels. */
+async function rebuildPages(order, { deleted = null } = {}) {
+  const doc = surface.doc;
+  if (!doc) return;
+  const wasPage = surface.pageIndex;
+  try {
+    const { bytes, oldToNew, outline } = await applyPageOrder(doc.bytes, order,
+                                                              doc.outline);
+    const next = await Doc.open(bytes, doc.name);
+    next.outline = outline.length ? outline : next.outline;
+
+    const ink = new Map();
+    for (const [page, strokes] of doc.ink) {
+      if (oldToNew.has(page)) ink.set(oldToNew.get(page), strokes);
+    }
+    next.ink = ink;
+
+    // Notes are re-keyed by the rule that fits what happened: a DELETE has to
+    // hand a run's body to the next page in the run, which a permutation map
+    // cannot express, while a REORDER keeps a run only if it moved as a block.
+    if (deleted) {
+      for (const idx of [...deleted].sort((a, b) => b - a)) doc.notes.shiftForDelete(idx);
+    } else {
+      doc.notes.reorder(oldToNew);
+    }
+    next.notes = doc.notes;
+    next.handles = doc.handles;
+
+    await setDoc(next, document.getElementById("doc-title").textContent);
+    const land = deleted ? Math.min(wasPage, next.pageCount - 1)
+                         : (oldToNew.get(wasPage) ?? 0);
+    await surface.setPage(land);
+    markDirty(true);
+    return next;
+  } catch (err) {
+    toast(`Could not change pages: ${err.message}`);
+    return null;
+  }
+}
+
+async function movePage(from, to) {
+  if (!surface.doc || from === to) return;
+  const order = moveRangeOrder(surface.doc.pageCount, from, 1, to);
+  await rebuildPages(order);
+  toast(`Page ${from + 1} → ${to + 1}`);
+}
+
+async function removePage(index) {
+  const doc = surface.doc;
+  if (!doc) return;
+  if (doc.pageCount <= 1) return toast("A document cannot lose its last page");
+  const keep = [];
+  for (let i = 0; i < doc.pageCount; i++) if (i !== index) keep.push(i);
+  await rebuildPages(keep, { deleted: [index] });
+  toast(`Deleted page ${index + 1}`);
+}
+
+/** Insert pages from a file, at the current page. The same pipeline as a drop
+ * on the sidebar, so the menu and the gesture cannot drift. */
+async function insertPagesFromPicker() {
+  if (!surface.doc) return;
+  const at = surface.pageIndex;
+  if (canSaveInPlace) {
+    const picked = await openWithPicker(true);
+    if (picked && picked.length) return importAt(picked, at);
+    if (picked !== null) return;
+  }
+  const input = document.getElementById("insert-input");
+  input.onchange = () => {
+    if (input.files.length) importAt([...input.files], at);
+    input.value = "";
+  };
+  input.click();
 }
 
 function wireDocument() {
@@ -438,6 +521,7 @@ function wireDocument() {
   });
 
   document.getElementById("save-btn").addEventListener("click", () => doSave());
+  document.getElementById("insert-btn").addEventListener("click", insertPagesFromPicker);
   window.addEventListener("beforeunload", (e) => {
     // nothing is written until you say so, so leaving with unsaved work has to
     // be a deliberate act
