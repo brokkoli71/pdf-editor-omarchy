@@ -683,7 +683,12 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     "click, click again, then F2". A rename's **focus-leave is delivered after
     the fact**, so `finish` is guarded by that edit's own token AND checks the
     entry still has its box as parent — a list rebuilt in between otherwise
-    leaves it removing a child from a box that no longer owns it.
+    leaves it removing a child from a box that no longer owns it. **And the
+    leave DEFERS to an idle**: ending the edit destroys the very widget GTK is
+    moving focus out of, and doing that inline makes GTK go on walking a
+    widget with no parent — `gtk_widget_get_parent` assertions without end
+    (millions, not a handful). Enter and Escape are not inside a focus change
+    and stay immediate.
   - **Bookmarks are outline entries too, and can BE the outline** (row 153).
     The Outline/Pages switch appears when the document has a TOC *or*
     bookmarks — a lecture deck rarely has a TOC and is exactly what you
@@ -943,6 +948,14 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   are exactly TWO stated exceptions today, both for the same reason — a
   text-first page is one endless sheet with no page structure: linked page
   notes (row 129) and bookmarks (row 134).
+- **Never destroy a widget from inside the signal that is acting on it.** A
+  `focus-leave` handler that removes the entry it belongs to (and rebuilds the
+  list holding it) leaves GTK walking a widget it has just unparented — a
+  `gtk_widget_get_parent` assertion **per iteration, for ever**: 3.5M lines and
+  a killed process in one measurement, not the handful you see scroll past.
+  Defer the teardown to a `GLib.idle_add`; the signal itself must only note
+  what to do. The same shape hides in "closed" handlers (see the popover note
+  below) and in any `clicked` that repopulates the list its button sits in.
 - **Event reachability — a correct handler can still never run.** When a
   gesture "does nothing", test the PATH, not the handler (all of these tested
   fine in isolation while being unreachable in the app):

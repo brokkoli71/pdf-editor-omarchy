@@ -45,6 +45,11 @@ sidemark.RECENT_PATH = os.path.join(
 
 # ── helper: create a minimal single-page PDF in memory ───────────────────────
 
+def _controllers(widget):
+    model = widget.observe_controllers()
+    return [model.get_item(i) for i in range(model.get_n_items())]
+
+
 def _row_text(row):
     """All the text a list row shows, whatever it is wrapped in."""
     def walk(w):
@@ -8791,6 +8796,39 @@ class TestBookmarksInOutline(unittest.TestCase):
         self.assertTrue(seen, "the strip was never asked to show a page")
         self.assertEqual(seen[-1], (2, True),
                          "switching views must scroll to the current page")
+
+    def test_clicking_away_commits_from_an_idle_not_inside_the_focus_change(self):
+        """Ending the edit removes the entry from its row and rebuilds the
+        list — destroying the very widget GTK is moving focus out of. Done
+        inline, GTK goes on walking a widget that no longer has a parent and
+        floods the terminal with `gtk_widget_get_parent` assertions; it does
+        not stop, so it is millions of them. So the leave DEFERS: the edit is
+        still standing when the handler returns, and settles on the next idle.
+        """
+        def body(win):
+            win.notes_model.add_bookmark(1, "Old")
+            win._populate_toc()
+            row = next(r for r in _rows_of(win._toc_list)
+                       if getattr(r, "_bookmark_idx", None) == 1)
+            win._begin_rename(row)
+            entry = next(w for w in _rows_of(row._row_box)
+                         if isinstance(w, Gtk.Entry))
+            entry.set_text("Typed then clicked away")
+            focus = next(c for c in _controllers(entry)
+                         if isinstance(c, Gtk.EventControllerFocus))
+
+            focus.emit("leave")
+            self.assertTrue(getattr(row, "_renaming", False),
+                            "the edit was torn down inside the focus change")
+            self.assertEqual(win.notes_model.bookmark_name(1), "Old")
+
+            ctx = GLib.MainContext.default()
+            for _ in range(50):
+                ctx.iteration(False)
+            self.assertEqual(win.notes_model.bookmark_name(1),
+                             "Typed then clicked away")
+
+        self._run(body)
 
     def test_where_you_are_is_marked_at_two_strengths(self):
         """The entry you are ON and the entry you are INSIDE are different

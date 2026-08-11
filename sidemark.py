@@ -16359,11 +16359,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     lambda _c, kv, _kc, _st: (kv == Gdk.KEY_Escape
                                               and (finish(False) or True)))
         entry.add_controller(esc)
-        # clicking away commits, which is what every rename-in-place does.
-        # Escape has already ended the edit by the time focus leaves, and the
-        # `_renaming` guard is what makes the second call a no-op.
+        # Clicking away commits, which is what every rename-in-place does — but
+        # from an IDLE, never inside the focus change itself. Ending the edit
+        # removes the entry from its row and rebuilds the list, i.e. it destroys
+        # the very widget GTK is in the middle of moving focus out of; GTK then
+        # keeps walking a widget that no longer has a parent and floods the
+        # terminal with `gtk_widget_get_parent` assertions — millions of them,
+        # because it does not stop. Enter and Escape are not inside a focus
+        # change and stay immediate; the edit's token makes whichever call
+        # arrives second a no-op.
         focus = Gtk.EventControllerFocus()
-        focus.connect("leave", lambda _c: finish(True))
+        focus.connect("leave", lambda _c: GLib.idle_add(finish, True) and None)
         entry.add_controller(focus)
         entry.grab_focus()
 
