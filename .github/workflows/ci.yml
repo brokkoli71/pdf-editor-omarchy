@@ -77,18 +77,22 @@ jobs:
         # one test name per line, the LAST line names the test it died on.
         # --timeout: a GPU-less runner does not just crash, it also HANGS —
         # a run sat at 85% for 17 minutes and would have burned the job's
-        # whole budget. A per-test limit turns that into a named failure
-        # with a stack dump of where it stalled; `thread` dumps the stack
-        # rather than unwinding, which is what makes a GTK stall readable.
-        # 120 s is ~300x the slowest test here (~410 ms), so it can only
-        # fire on a genuine stall.
+        # whole budget. 120 s is ~300x the slowest test here (~410 ms), so it
+        # can only fire on a genuine stall.
+        #
+        # `signal`, NOT `thread`. The stall is inside app.run(), i.e. below
+        # Python in GTK's C code, and the thread method cannot interrupt that —
+        # it dumps stacks and kills the process, so the run STILL ends with no
+        # summary and the other failure's traceback is lost with it. SIGALRM
+        # lands while the GLib loop has the GIL released at its poll, raises in
+        # the main thread, and lets the suite carry on and report.
         # a BLOCK scalar, not a backslash continuation: YAML folds a plain
         # scalar's lines with a space and leaves the backslash in, so the shell
         # saw an argument literally called " --timeout=120" and pytest exited 4
         # before collecting a single test
         run: |
           python3 -m pytest test_pdfeditor.py -v -rf --tb=short \
-            --timeout=120 --timeout-method=thread
+            --timeout=120 --timeout-method=signal
 
       # The compositor has died mid-run before ("Error flushing display: Broken
       # pipe"), which kills the process before any summary is printed — the run
