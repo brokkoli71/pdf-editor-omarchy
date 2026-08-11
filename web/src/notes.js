@@ -172,8 +172,17 @@ export class NotesView {
     });
   }
 
+  /** Point the panel at a different document's notes.
+   *
+   * The buffer belongs to the model it was filled from, so it is committed to
+   * the OLD one before the swap. Assigning the model first and then calling
+   * showPage writes whatever is on screen into the new document at the page
+   * number the old one happened to be on — opening document B while on page 3
+   * of A silently gave B page 3 of A's notes. */
   setModel(model) {
+    if (this.model && this.model !== model) this.commit();
     this.model = model;
+    this.page = 0;
     this.showPage(0);
   }
 

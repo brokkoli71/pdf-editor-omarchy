@@ -258,6 +258,11 @@ function strokeFromAnnot(dict, pageH) {
     width: width > 0 ? width : 2.0,
     color: color || [0, 0, 0],
     opacity: opacity > 0 && opacity <= 1 ? opacity : 1.0,
-    flat: profile === null,
+    // `flat` records which TOOL drew a stroke, and a PDF carries no such thing:
+    // a missing profile means "constant width", which is equally true of a
+    // highlighter and of a snapped rectangle. Deriving it from the profile made
+    // every reloaded shape claim to be a highlighter. Nothing renders from it —
+    // width, colour and opacity all round-trip — so it is left unclaimed.
+    flat: false,
   };
 }

@@ -158,6 +158,13 @@ export class Surface {
   async setPage(index, { fit = false } = {}) {
     if (!this.doc) return;
     index = Math.max(0, Math.min(this.doc.pageCount - 1, index));
+    if (index !== this.pageIndex) {
+      // A selection belongs to the page it was made on. Carried across, its
+      // frame draws over ink that is no longer there and its verbs act on
+      // strokes nobody can see — a delete that removes something invisible.
+      this.clearSelection();
+      this._clearSnap();
+    }
     this.pageIndex = index;
     [this.pageW, this.pageH] = await this.doc.pageSize(index);
     if (fit) this.fit();
