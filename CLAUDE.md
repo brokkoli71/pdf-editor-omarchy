@@ -1146,20 +1146,19 @@ when something lands, fold its invariants upward and delete it from here rather
 than writing a line about having finished it. The chronology lives in
 `ideas.csv` and git.
 
-**START HERE (2026-08-10). Still a VALIDATION session, not a feature one —
+**START HERE (2026-08-11). Still a VALIDATION session, not a feature one —
 `notes/validation-session.md` is the checklist.** The ink/latency thread
 (rows 139/143/147) is CLOSED; do not reopen it without a new measurement.
-Begin at:
+**The INPUT thread is closed too**: row 135's stylus block and §1b's three
+fixes were all accepted in the hand on 2026-08-11 — the pen tip, both barrels,
+a finger panning, the palm not drawing while you write, toolbar binding by
+device, and the row 150 pinch. That was the largest untested surface in the
+app and the whole of the "a stylus's ends ARE mouse buttons" design; it holds,
+and it is now behavior described above rather than work in flight. Begin at:
 
-1. **Row 135, the stylus block** — the original plan, still entirely
-   unverified, and the largest untested feature in the app. Re-read its
-   warning about the stylus/HDMI mapping first.
-2. **§1b, three bug fixes shipped 2026-08-10** (rows 146, 148/150, 149) —
-   two of them are touch gestures, so none of it is verified. The one to
-   report back on is **two-finger zoom on a text page**: it is expected to
-   still fail, and *how* it fails answers row 150's open design question.
-3. Then the merge drops (row 123), the shape/grid dwell (row 121), the divider
-   gesture (row 130), and rows 140–142.
+1. The **merge drops** (row 123).
+2. Then the shape/grid dwell (row 121), the divider gesture (row 130), and
+   rows 140–142.
 
 *Closed 2026-08-10, with the measurements in `ideas.csv` rows 139/143/147:
 live smoothing ON, dot size and shape, pointer hiding, the smear trim (no felt
@@ -1170,23 +1169,25 @@ measured to be UPSTREAM of the compositor and is not ours to recover.*
 **In flight — code-verified, needing a pass in the real app. The whole list is
 one validation session; `notes/validation-session.md` is its checklist.**
 
-- **Row 135 (stylus, touch and palm).** The whole feature is gestures, so
-  none of it is verified: the pen tip drawing, the eraser barrel erasing, the
-  other barrel lassoing, a finger panning, and a palm not drawing while you
-  write. Hardware is a Goodix GXTP7380 convertible panel — the measurements
-  behind every decision are in `ideas.csv` row 135, and
-  `extras/input_probe.py` re-runs them (`--followup` for the awkward cases).
-  Two known rough edges to judge in the hand, both left deliberately: a *tap*
-  with the eraser barrel opens the sheet's context menu (a right press is
-  deferred there, and forking the router on device is worse), and row 126's
-  circle-to-lasso relies on a pen *lift* that a mid-stroke barrel flip
-  manufactures. Row 136 (a hardware-report script + GitHub issue template for
-  other people's devices) is the planned follow-up.
-  **Open, deferred to its own session:** on this laptop palm detection stops
-  working while the CHARGER IS PLUGGED IN — most likely charger noise on the
-  capacitive digitiser rather than anything in Sidemark. Re-measure on AC vs
-  battery with `extras/input_probe.py` before touching code; the question is
-  whether libinput's ~110 ms `TOUCH_END` still arrives when plugged in.
+- **Row 135 (stylus, touch and palm) — ACCEPTED IN THE HAND 2026-08-11**, so
+  it is no longer in flight; what it does is described in the input sections
+  above. Hardware is a Goodix GXTP7380 convertible panel and the measurements
+  behind every decision are in `ideas.csv` row 135, which
+  `extras/input_probe.py` re-runs (`--followup` for the awkward cases). Three
+  things outlive the validation:
+  - **Open, its own session:** on this laptop palm detection stops working
+    while the CHARGER IS PLUGGED IN — most likely charger noise on the
+    capacitive digitiser rather than anything in Sidemark (the accepted palm
+    result above was judged on battery). Re-measure on AC vs battery with
+    `extras/input_probe.py` before touching code; the question is whether
+    libinput's ~110 ms `TOUCH_END` still arrives when plugged in.
+  - Two rough edges were judged and **deliberately left**: an eraser-barrel
+    *tap* opens the sheet's context menu (a right press is deferred there, and
+    forking the router on device is worse), and row 126's circle-to-lasso
+    relies on a pen *lift* that a mid-stroke barrel flip manufactures. Fix
+    either only if it becomes painful in real use — not pre-emptively.
+  - Row 136 (a hardware-report script + GitHub issue template for other
+    people's devices) is the planned follow-up.
 
 - **Row 123 (merge import).** What needs real hardware: the drops themselves
   (several PDFs on the window → "Merge…"; several on the page thumbnails →
@@ -1231,6 +1232,16 @@ one validation session; `notes/validation-session.md` is its checklist.**
   The user's proposal: that UI belongs to the finger only when the finger's
   tool IS the caret. Needs the panel and a decision about what a lone finger
   on a sheet should do at all (a PDF page pans).
+- **Row 151 — a survivor finger should keep panning.** LOW priority, and the
+  one piece of row 150's pinch that was never built: lift one finger of a
+  two-finger gesture on a sheet and the gesture ENDS, because the survivor
+  reaches the router as a brand-new press (`GtkGestureDrag` is single-point)
+  and is re-resolved through the binding table. The latch already re-bases on
+  the finger that is left, so what is missing is a decision, not arithmetic —
+  and it belongs as a third exception AT the router, beside Shift+lasso and
+  the grabbable selection, never as a fork of the table. PDF pages are
+  unaffected (a finger there pans already). Only worth doing if it starts to
+  feel wrong in the hand.
 - **Row 119 (crop)** — the last piece of the image feature. Its design is
   settled in row 118 and must not be re-litigated: a field on the model applied
   at render, never a destructive re-encode, landing ONCE for both modes.
