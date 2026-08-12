@@ -143,6 +143,9 @@ const surface = new Surface(document.getElementById("page"), pen, bindings, {
   onLiveDraw: () => presenter.request(),
   // an anchor edits the NOTES, so the panel has to be told to re-read them
   onNotesChanged: () => { notes.showPage(surface.pageIndex); markDirty(true); },
+  // a press proved a tracked modifier was not really held; the window's copy is
+  // what the stripes are generated from, so it has to follow
+  onHeldModsCorrected: (mods) => { Object.assign(heldMods, mods); refreshToolBindings(); },
   onNotesRestored: () => {
     notes.showPage(surface.pageIndex);
     syncPageChrome();

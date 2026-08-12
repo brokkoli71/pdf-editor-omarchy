@@ -109,6 +109,9 @@ export class Surface {
     // called on every repaint, so a mirror can follow the live stroke
     this.onLiveDraw = opts.onLiveDraw || (() => {});
     this.onNotesChanged = opts.onNotesChanged || (() => {});
+    // a press found the tracked modifiers stale: the window owns them and the
+    // stripes read from them, so both have to hear about the correction
+    this.onHeldModsCorrected = opts.onHeldModsCorrected || (() => {});
 
     // The document, and which page is in front. Sidemark shows ONE page at a
     // time and flips between them; it is not a continuous scroll.
@@ -330,8 +333,28 @@ export class Surface {
   /** Merge the event's own modifier state with the window-tracked held keys —
    * the same rule the Python routers use, because a press can arrive without
    * the modifier mask and a Ctrl+press that reads as unmodified falls into the
-   * wrong branch. */
+   * wrong branch.
+   *
+   * A POINTER EVENT IS THE TRUTH ABOUT THIS MOMENT, so a real press also
+   * CORRECTS the tracked state instead of only adding to it. Tracked keys are
+   * inferred from keydown/keyup, and a keyup that never arrives leaves a
+   * modifier held for ever — after which `toolFor` resolves a chord nobody is
+   * pressing, that chord is usually bound to nothing, and the pen is silently
+   * DEAD until you press and release the key again. There is no visible cause:
+   * the bar still shows a tool and the page just stops taking ink. Observed
+   * with an injected Ctrl+Shift+Z whose modifier keyups were never delivered;
+   * the same hole is any keyup the window does not see, and `blur` only covers
+   * the ones where focus moves. Correcting here means the next press always
+   * fixes it. */
   _chordState(e) {
+    if (e && e.type === "pointerdown") {
+      const held = this._heldMods;
+      if ((held.ctrl && !e.ctrlKey) || (held.shift && !e.shiftKey)
+          || (held.alt && !e.altKey)) {
+        this._heldMods = { ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey };
+        this.onHeldModsCorrected(this._heldMods);
+      }
+    }
     return {
       ctrl: e.ctrlKey || this._heldMods.ctrl,
       shift: e.shiftKey || this._heldMods.shift,
