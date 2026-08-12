@@ -4,14 +4,11 @@
 # nothing else. Over HTTPS the File System Access API works, which is what gives
 # save-in-place; that is the one thing a `file://` copy or a plain http server
 # cannot offer.
-#
-# Runs only for the branch the prototype lives on, so it cannot publish from
-# master by accident.
 name: pages
 
 on:
   push:
-    branches: [web-prototype]
+    branches: [master]
   workflow_dispatch:
 
 permissions:

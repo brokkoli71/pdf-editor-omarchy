@@ -9,6 +9,10 @@ Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes pan
 
 > If Sidemark is useful to you, please ⭐ [star it on GitHub](https://github.com/brokkoli71/sidemark) and 🗳️ [vote for it on the AUR](https://aur.archlinux.org/packages/sidemark) — it's the main way other people discover the project.
 
+## Try it in your browser
+
+**[▶ Online demo](https://brokkoli71.github.io/sidemark/)** — no install, and your files stay on your machine. It runs a subset of the features below (there's a [six-step tour](https://brokkoli71.github.io/sidemark/demo.html) of the parts worth knowing). Use a Chromium-based browser: Firefox draws just as well but can't save in place, only download. More in [`web/README.md`](web/README.md).
+
 ## Why Sidemark
 
 Sidemark was built for taking lecture notes. It works with two plain files and nothing else: your document stays a `.pdf` and your notes are a `.md` sidecar you can open in any editor. Annotations are written straight back into the PDF as native ink, so what you draw and write stays in formats you already use everywhere.

@@ -1290,6 +1290,17 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 - Logging: `logger` writes a per-session file under `~/.cache/sidemark/logs/`,
   auto-deleted on clean exit, kept on errors.
 
+## The browser port (`web/`)
+
+A faithful port of the page, pen and notes runs in a browser out of `web/`,
+published to <https://brokkoli71.github.io/sidemark/> on every push to master.
+**`web/CLAUDE.md` is its reference** — read that before touching anything under
+`web/`. The one rule that belongs here: the ported pipeline is checked against
+`sidemark.py` by exported VECTORS (`extras/export_*_vectors.py`), so a change to
+the ink pipeline, the maths grammar, the sidecar format, the lasso geometry or
+the shape recogniser on this side may break `web/test/` — regenerate with
+`npm run vectors` in `web/` and re-run `npm test`.
+
 ## The deck branch (parked — not a concern)
 
 An experimental Sidemark **Deck** presentation editor lives on the `deck`
