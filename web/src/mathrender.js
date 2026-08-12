@@ -220,12 +220,21 @@ export function scriptScale(chain) {
 }
 
 /** The spans of a line that render as something other than themselves, as
- * `{from, to, kind, ...}` in SOURCE coordinates — what the editor turns into
- * replace-decorations.
+ * `{from, to, caretTo, kind, ...}` in SOURCE coordinates — what the editor
+ * turns into replace-decorations.
  *
  * Scripts are found first and their spans claimed, because a script's body is
  * ordinary text that must not also be symbol-substituted in place: `x^\alpha`
- * is one script whose rendered body is α. */
+ * is one script whose rendered body is α.
+ *
+ * TWO ends, and they are not the same end. `to` is what gets REPLACED and
+ * includes the space the expression ate; `caretTo` is what the editor tests
+ * the caret against and does NOT. That space is not part of what you are
+ * writing any more — you were forced to type it (`\alphax` is another command,
+ * `x^2b` superscripts "2b"), so typing it means you are DONE. Test the caret
+ * against `to` and the terminator you just typed holds the expression open
+ * underneath it, and a second space is needed to let go of something already
+ * finished. Accents eat no space, so both ends agree there. */
 export function renderSpans(line) {
   const spans = [];
   const claimed = [];
@@ -241,7 +250,8 @@ export function renderSpans(line) {
   for (const s of iterScripts(line, true)) {
     if (overlaps(s.from, s.to)) continue;
     spans.push({
-      from: s.from, to: s.to, kind: "script", chain: s.chain,
+      from: s.from, to: s.to, caretTo: scriptBodyEnd(s.match),
+      kind: "script", chain: s.chain,
       // the body renders too — `x^\alpha` lifts an α, not the word "\alpha"
       text: symbolize(s.body ?? "", false),
     });
@@ -254,7 +264,9 @@ export function renderSpans(line) {
     if (overlaps(from, to)) continue;
     const glyph = MD_SYMBOLS["\\" + m[1]];
     if (glyph === undefined) continue;     // unknown command — leave it alone
-    spans.push({ from, to, kind: "symbol", text: glyph });
+    // the backslash and the letters, never the space m[2] may have eaten
+    spans.push({ from, to, caretTo: from + 1 + m[1].length, kind: "symbol",
+                 text: glyph });
     claimed.push([from, to]);
   }
 

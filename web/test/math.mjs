@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import {
   MD_SYMBOLS, MD_ACCENTS, MAX_SCRIPT_DEPTH, SCRIPT_SCALE,
   symbolize, splitMarkup, iterScripts, scriptBodyEnd, scriptContent,
-  RENDERABLE_RE,
+  renderSpans, RENDERABLE_RE,
 } from "../src/mathrender.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -46,7 +46,37 @@ for (const c of V.cases) {
     iterScripts(c.raw, false).map((s) => ({ from: s.from, to: s.to, chain: s.chain })),
     c.scripts_fragment);
   check(`${label} renderable`, RENDERABLE_RE.test(c.raw), c.renderable);
+
+  // A rendered span has TWO ends: `to` is replaced, `caretTo` is what holds
+  // the source open under the caret. What separates them can only ever be the
+  // one space the expression ate — anything else means the caret keeps hold of
+  // text it is not touching, which is the bug where `x^2 ` needed a SECOND
+  // space before it would render.
+  const spans = renderSpans(c.raw);
+  const bodyEnd = new Map(c.scripts.map((s) => [s.from, s.body_end]));
+  for (const s of spans) {
+    const gap = c.raw.slice(s.caretTo ?? s.to, s.to);
+    check(`${label} @${s.from} caret end eats only a space`,
+          gap === "" || gap === " ", true);
+    // for scripts the oracle publishes the answer, so take it from there
+    if (s.kind === "script" && bodyEnd.has(s.from)) {
+      check(`${label} @${s.from} caret end`, s.caretTo, bodyEnd.get(s.from));
+    }
+  }
 }
+
+// The reported symptom, stated as behaviour: one space after an expression
+// finishes it. `pos` is where the caret sits; a span is revealed as source only
+// while the caret is within [from, caretTo].
+const reveals = (line, pos) =>
+  renderSpans(line).some((s) => pos >= s.from && pos <= (s.caretTo ?? s.to));
+check("x^2 with the caret still on it", reveals("x^2", 3), true);
+check("x^2 after ONE space", reveals("x^2 ", 4), false);
+check("\\alpha after ONE space", reveals("\\alpha ", 7), false);
+check("\\alpha with the caret still on it", reveals("\\alpha", 6), true);
+// an accent eats nothing, so its two ends agree and the rule above is a no-op
+check("\\hat{x} after ONE space", reveals("\\hat{x} ", 8), false);
+check("\\hat{x} with the caret still on it", reveals("\\hat{x}", 7), true);
 
 if (failures) {
   console.error(`\n✗ ${failures} of ${checks} maths checks failed.`);

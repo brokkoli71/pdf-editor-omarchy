@@ -125,9 +125,13 @@ function buildDecorations(view) {
 
       for (const span of renderSpans(line.text)) {
         const a = line.from + span.from, b = line.from + span.to;
-        // the caret reveals only the expression it is INSIDE, edges included:
-        // standing at either end means you are still writing it
-        if (sel.empty && sel.head >= a && sel.head <= b) continue;
+        // The caret reveals only the expression it is INSIDE, edges included:
+        // standing at either end means you are still writing it. Tested against
+        // `caretTo`, which stops before the space the expression ate — typing
+        // that space is how you say you are finished, so it must not be the
+        // thing that keeps the source open under the caret.
+        const caretB = line.from + (span.caretTo ?? span.to);
+        if (sel.empty && sel.head >= a && sel.head <= caretB) continue;
         if (hidden(a, b)) continue;    // already replaced as part of a comment
         const widget = span.kind === "script"
           ? new ScriptWidget(span.text, span.chain)
