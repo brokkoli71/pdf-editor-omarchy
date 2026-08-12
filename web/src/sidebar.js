@@ -265,13 +265,26 @@ export class Sidebar {
     add(label("Delete"), () => this.onDeletePages(pages), true);
     document.body.appendChild(menu);
     this._menu = menu;
+    // Close on a press OUTSIDE the menu — and only outside.
+    //
+    // A press anywhere used to close it, including on its own buttons: the
+    // pointerdown removed the menu, so the button was gone before `click` could
+    // reach it and every entry did nothing. A synthetic `.click()` hides this
+    // completely, because it never dispatches a pointerdown.
+    this._closeMenuOn = (e) => {
+      if (this._menu && this._menu.contains(e.target)) return;
+      this._closePageMenu();
+    };
     setTimeout(() => {
-      window.addEventListener("pointerdown", this._closeMenuOnce = () =>
-        this._closePageMenu(), { once: true });
+      window.addEventListener("pointerdown", this._closeMenuOn, true);
     }, 0);
   }
 
   _closePageMenu() {
+    if (this._closeMenuOn) {
+      window.removeEventListener("pointerdown", this._closeMenuOn, true);
+      this._closeMenuOn = null;
+    }
     if (this._menu) { this._menu.remove(); this._menu = null; }
   }
 
