@@ -24,6 +24,10 @@ export const MD_SYMBOLS = {
   "\\Gamma": "Γ", "\\Delta": "Δ", "\\Theta": "Θ", "\\Lambda": "Λ",
   "\\Xi": "Ξ", "\\Pi": "Π", "\\Sigma": "Σ", "\\Phi": "Φ",
   "\\Psi": "Ψ", "\\Omega": "Ω",
+  // ceiling: the RADICAL SIGN alone — no overbar, so `\sqrt x + 1` cannot say
+  // where the root ends. A bar would have to be drawn; a glyph that shows you
+  // a square root beats no glyph at all.
+  "\\sqrt": "√",
   "\\infty": "∞", "\\approx": "≈", "\\neq": "≠",
   "\\leq": "≤", "\\geq": "≥", "\\le": "≤", "\\ge": "≥",
   "\\pm": "±", "\\times": "×",

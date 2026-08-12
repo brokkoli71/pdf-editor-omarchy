@@ -67,6 +67,8 @@ CASES = [
     # emphasis: the maths grammar wins, `_` is a subscript
     "*italic* and **bold**",
     "snake_case_name",
+    r"\sqrt 2",            # the radical sign alone: no overbar to render
+    r"\sqrt{x+1}",
     # comments
     "<!-- page:3 -->",
 ]

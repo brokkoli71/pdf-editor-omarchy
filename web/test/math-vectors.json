@@ -893,6 +893,34 @@
    "renderable": true
   },
   {
+   "raw": "\\sqrt 2",
+   "symbolize": "√ 2",
+   "symbolize_fragment": "√ 2",
+   "split": [
+    [
+     "\\sqrt 2",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\sqrt{x+1}",
+   "symbolize": "√{x+1}",
+   "symbolize_fragment": "√{x+1}",
+   "split": [
+    [
+     "\\sqrt{x+1}",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
    "raw": "<!-- page:3 -->",
    "symbolize": "<!-- page:3 -->",
    "symbolize_fragment": "<!-- page:3 -->",
@@ -944,6 +972,7 @@
   "\\Phi": "Φ",
   "\\Psi": "Ψ",
   "\\Omega": "Ω",
+  "\\sqrt": "√",
   "\\infty": "∞",
   "\\approx": "≈",
   "\\neq": "≠",

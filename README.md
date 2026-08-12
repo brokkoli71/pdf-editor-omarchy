@@ -47,7 +47,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Date / time snippets** — type `/date`, `/time`, or `/now` then Space to expand
 - **Choose where notes live** — each PDF gets a `<filename>-notes.md` sidecar, created only once you actually write something; pick **Notes file…** from the ☰ menu to point several PDFs at one shared Markdown file (remembered per PDF)
 - **Slide between the two modes** — drag the notes divider all the way left and your notes become one full sheet you can write on; the page is still there behind it, so drag the same edge back out and it slides in again. Nothing is converted or written, so an accidental drag costs nothing, and each document reopens in the view you left it in
-- **Text-first mode** — open a bare `.md` (or **New text page**, `Ctrl+Alt+N`) and the window becomes one endless A4 sheet of live Markdown you can **draw on** with the same pen, highlighter, eraser and lasso — shape snap, smoothing, move/resize/duplicate included (ink rides along with the text you anchor it to). Drag the paper's side edge to set the sheet width — handy on a half-screen window — and it's remembered per document. The file stays **pure Markdown** — ink lives in a `<name>-ink.json` sidecar — and **Export as PDF** renders text and ink to A4 pages. Launching Sidemark without a file opens a persistent scratchpad page
+- **Text-first mode** — open a bare `.md` (or **New text page**, `Ctrl+Alt+N`) and the window becomes one endless A4 sheet of live Markdown you can **draw on** with the same pen, highlighter, eraser and lasso — shape snap, smoothing, move/resize/duplicate included (ink rides along with the text you anchor it to). Drag the paper's side edge to set the sheet width — handy on a half-screen window — and it's remembered per document. The file stays **pure Markdown** — ink lives in a `<name>-ink.json` sidecar — and **Export as PDF** renders text and ink to A4 pages. There's also a persistent scratchpad page, always waiting at the bottom of **Recent files**
 
 ### Navigation
 
@@ -206,7 +206,7 @@ Renders automatically on lines where the cursor isn't; move the cursor to a line
 | `x^2` or `x^{n+1}` | superscript (until next space, or braced) |
 | `x_ij` or `x_{i,j}` | subscript (until next space, or braced) |
 | `\alpha` `\beta` … `\omega` | Greek letters (α β … ω) |
-| `\sum` `\prod` `\int` | Σ Π ∫ |
+| `\sum` `\prod` `\int` `\sqrt` | Σ Π ∫ √ (the radical sign only — no overbar) |
 | `\infty` `\approx` `\neq` `\leq` `\geq` | ∞ ≈ ≠ ≤ ≥ |
 | `\in` `\notin` `\subset` `\cup` `\cap` `\emptyset` | ∈ ∉ ⊂ ∪ ∩ ∅ |
 | `\forall` `\exists` `\partial` `\nabla` `\to` | ∀ ∃ ∂ ∇ → |
@@ -273,7 +273,7 @@ While there are unsaved changes, Sidemark snapshots the document and notes (text
 
 ## Recent files
 
-Opened and saved files are tracked in `~/.local/share/sidemark/recent.json` (newest first, 15 entries) and accessible three ways:
+Opened and saved files are tracked in `~/.local/share/sidemark/recent.json` (last used first, 15 entries) and accessible three ways. Launching Sidemark without a file reopens the top of that list — the document you were last reading — and the scratchpad always keeps its place at the bottom of it:
 
 - **In-app** — the clock-arrow button next to *Open* lists them.
 - **XDG recent files** — opens are registered in `recently-used.xbel`, so GTK/GNOME file dialogs and KDE (including krunner's recent-documents results) pick them up automatically.

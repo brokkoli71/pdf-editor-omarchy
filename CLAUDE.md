@@ -38,6 +38,19 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     settle once. `_line_originals[ln]` is `(source, rendered, index map, open
     span)`; the open span is why a line the caret has just left gets
     re-rendered instead of being trusted as already done.
+    **A HEADING MARKER is the one exception (row 161)**, and it opens from
+    ANYWHERE on its line: it is a property of the whole line, it is the one
+    construct whose source you cannot read off what it renders, and revealing
+    it only pushes the line sideways — nothing on it re-renders.
+    *ceiling: `\sqrt` is the radical sign alone — no overbar, so it cannot say
+    where the root ends; a bar would have to be drawn, which is the wall `\vec`
+    hit.*
+    **`->` `<-` are NOT ours and must not be** (row 161): they are a **font
+    ligature**, and substituting them was tried and reverted. The report that
+    they had "stopped working" was a font-cache problem that a reboot fixed,
+    and no substitution can match a ligature's look — it spans both cells, so
+    a one-glyph `→` comes out visibly shorter. If they break again, the
+    question is about the font, not about `_MD_SYMBOLS`.
   - **Triple-click selects the whole LOGICAL line** (`line_bounds`) — one
     Return's worth of typing, however many rows it wraps onto. GtkTextView's
     own "line" is the DISPLAY line, a fragment of what looks like one. It is
@@ -538,6 +551,25 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   - The view is remembered per document in `recent.json` beside the reading
     position (`_recent_full_notes`), for the same reason: it is a view state
     about a document, and a sidecar must not appear because you looked at one.
+  - **The CARET crosses with you, both ways (row 162)** — the sheet opens at
+    the page you were reading, and closing it turns to the page the caret is
+    in. A page index and a character offset are two coordinate systems for the
+    same notes, and `note_offset_for_page` / `note_page_at_offset` are the one
+    marker table both read: two readings is how the caret comes back on a
+    different page than it left. **Two of the answers cannot come from the
+    offset**, which is why the session remembers the page the sheet was opened
+    at *and* the offset it was opened at (`_full_notes_from` /
+    `_full_notes_caret`): a run's shared body (row 129) says the RUN and not
+    which of its pages you were reading, and a caret that never MOVED has
+    learnt nothing since — which is also the only honest answer for a page with
+    no notes, whose caret was parked in somebody else's section. Otherwise the
+    caret's own marker wins. **On the way out, `_restore_note()` must run
+    BEFORE the jump**: `go_to_page` commits the notes panel, and a panel still
+    holding what it had before the sheet opened writes that back over the sheet
+    edit. The jump is active-session only, or a background tab's page change
+    paints the front tab's chrome. Scrolling the sheet there is
+    `TextPageView.scroll_to_offset`, not `scroll_to_mark` — the view is a
+    non-scrollable child and holds no scroll of its own.
   - **Replacing the sheet's text destroys every ink anchor.** A text page
     anchors each stroke and image to a `GtkTextMark`, and `set_text` deletes
     every mark in the buffer — so the drawings land in a heap at offset 0. The
@@ -800,6 +832,24 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   change, so `_restoring_page` stops it erasing the position it is about to
   restore, and the write must NOT re-order the list or "recent" comes to mean
   "whatever tab I scrolled in last".
+- **An empty launch reopens the LAST DOCUMENT, and the scratchpad is the
+  recents list's last resort (row 161).** `_open_last_document` walks
+  `recent.json` and stops at the scratchpad entry — nothing below it is newer.
+  Which makes the list the ONLY way into the scratchpad, so
+  `_seed_scratchpad_recent` (called from `open_new_window`) creates the file
+  and seeds it at the **TAIL**, never the front — at the front it would be "the
+  last document" and every launch would reopen it, which is the behaviour this
+  replaces — and `_add_recent` **pins** it against `RECENT_MAX`, dropping the
+  oldest ordinary file instead. `_scratchpad_path()` is the one name for it.
+  **"Recent" means last USED, not last opened**: every close refreshes the
+  entry (`_touch_recent`, from `_remember_closed` for a tab and from
+  `_destroy_all` for a window — oldest first, ACTIVE tab last), or opening A
+  then B and working in A hands you back B.
+  **And the walk SKIPS what is already on screen** (`_documents_open_elsewhere`,
+  every window of the app): a second bare launch is a request for ANOTHER
+  document, and the newest recent is by then the one in front of you. If the
+  scratchpad itself is open, the fallback is a fresh blank sheet rather than a
+  second view of one file — two windows saving one `.md` loses writing.
 - **The thumbnail strip scrolls for a REASON, never as a side effect.** Opening
   it, or turning the page, brings the current page into view; a rebuild
   (`_populate_toc` runs on every bookmark, link, rename) puts the strip back

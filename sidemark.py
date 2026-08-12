@@ -29,6 +29,45 @@ RECENT_PATH = os.path.join(
 RECENT_MAX = 15
 
 
+def _scratchpad_path():
+    """The persistent scratchpad. Resolved at call time — `~` follows $HOME, so
+    a test can move the whole data dir out of the user's way."""
+    return os.path.join(os.path.expanduser("~"), ".local", "share",
+                        "sidemark", "scratchpad.md")
+
+
+def _seed_scratchpad_recent():
+    """Make sure the scratchpad exists and is IN the recents list.
+
+    It is the one document with no other way in — an empty launch reopens what
+    you were last reading now (`_open_last_document`), not the scratchpad — so
+    the recents list is the door, and the door has to be there before you first
+    look for it. Seeded at the TAIL, never the front: a list it had just jumped
+    to the top of would make every launch reopen the scratchpad, which is the
+    behaviour this replaces. `_add_recent` then pins it against the cap."""
+    path = _scratchpad_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8"):
+                pass
+        items = _load_recent()
+        if any(it.get("path") == path for it in items):
+            return
+        items.append({"path": path, "ts": 0})
+        _write_recent(items)
+    except OSError:
+        logger.error("scratchpad seeding failed:\n" + traceback.format_exc())
+
+
+def _write_recent(items):
+    os.makedirs(os.path.dirname(RECENT_PATH), exist_ok=True)
+    tmp = RECENT_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f)
+    os.replace(tmp, RECENT_PATH)
+
+
 def _load_recent():
     """Recent files, newest first; entries whose file vanished are dropped."""
     try:
@@ -52,12 +91,17 @@ def _add_recent(path, page=None):
     if page:
         entry["page"] = int(page)
     items.insert(0, entry)
-    del items[RECENT_MAX:]
-    os.makedirs(os.path.dirname(RECENT_PATH), exist_ok=True)
-    tmp = RECENT_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(items, f)
-    os.replace(tmp, RECENT_PATH)
+    # The scratchpad is PINNED: it is the only document you cannot reach any
+    # other way (see _seed_scratchpad_recent), so it must never be the entry
+    # the cap pushes out — the oldest ordinary file goes instead.
+    scratch = _scratchpad_path()
+    while len(items) > RECENT_MAX:
+        drop = next((i for i in range(len(items) - 1, -1, -1)
+                     if items[i].get("path") != scratch), None)
+        if drop is None:
+            break
+        del items[drop]
+    _write_recent(items)
 
 
 # Where an INSTALLED copy of the script lives. Anything else — a working-tree
@@ -138,11 +182,7 @@ def _remember_recent_full_notes(path, on):
             break
     else:
         return
-    os.makedirs(os.path.dirname(RECENT_PATH), exist_ok=True)
-    tmp = RECENT_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(items, f)
-    os.replace(tmp, RECENT_PATH)
+    _write_recent(items)
 
 
 def _remember_recent_page(path, page):
@@ -159,11 +199,7 @@ def _remember_recent_page(path, page):
             break
     else:
         return
-    os.makedirs(os.path.dirname(RECENT_PATH), exist_ok=True)
-    tmp = RECENT_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(items, f)
-    os.replace(tmp, RECENT_PATH)
+    _write_recent(items)
 
 
 def _settings_path():
@@ -7817,6 +7853,65 @@ def parse_note_sections(raw):
     return NoteSections(sections, linked, True, bookmarks, hidden)
 
 
+# ── where a page sits in the sidecar's TEXT (row 162) ─────────────────────────
+# The full-notes view (row 130) shows the whole sidecar as one sheet, so moving
+# between the page and the sheet is moving between two coordinate systems for
+# the same notes: a page index one way, a character offset the other. These are
+# the translation, kept as plain functions on the text because both directions
+# have to agree about what "page N's notes start here" means — two readings of
+# one marker table is how the caret comes back on a different page than it left.
+
+def note_marker_spans(text):
+    """[(first page, last page, marker start, marker end)] for every page marker
+    in a sidecar's text, in the order they appear. A range marker
+    (`<!-- page:13-40 continued -->`) covers every page in it."""
+    out = []
+    for m in re.finditer(_PAGE_MARKER_RE, text):
+        first = int(m.group(1))
+        last = int(m.group(2)) if m.group(2) else first
+        out.append((first, max(first, last), m.start(), m.end()))
+    return out
+
+
+def note_page_at_offset(text, off):
+    """Which page's notes the caret at `off` is in — the page of the last marker
+    at or before it. None above the first marker (the `![[embed]]` line, or a
+    file with no markers at all), which is a real answer: the caret is in the
+    file, not in any page."""
+    page = None
+    for first, _last, start, _end in note_marker_spans(text):
+        if start > off:
+            break
+        page = first
+    return page
+
+
+def note_offset_for_page(text, idx):
+    """Where page idx's notes begin in a sidecar's text.
+
+    The first character of its body; the end of its marker when the page is
+    marked but empty (the caret then sits on the marker, which reveals it and
+    says which page you are on); and where the section WOULD be inserted when
+    the page has none at all — the start of the first later section, else the
+    end of the file. That last case cannot round-trip through
+    `note_page_at_offset`, which is why the caller also remembers the page it
+    came from rather than trusting the offset alone."""
+    spans = note_marker_spans(text)
+    for i, (first, last, _start, end) in enumerate(spans):
+        if first <= idx <= last:
+            limit = spans[i + 1][2] if i + 1 < len(spans) else len(text)
+            body = end
+            while body < limit and text[body] in " \t\r\n":
+                body += 1
+            # a section with no body of its own: stay on the marker line rather
+            # than drifting onto the next page's marker
+            return body if body < limit else end
+    for first, _last, start, _end in spans:
+        if first > idx:
+            return start
+    return len(text)
+
+
 def read_note_sections(path):
     """NoteSections for a notes sidecar on disk; empty when there isn't one or
     it can't be read."""
@@ -8534,6 +8629,14 @@ _MD_SYMBOLS = {
     r'\Gamma': 'Γ', r'\Delta': 'Δ', r'\Theta': 'Θ', r'\Lambda': 'Λ',
     r'\Xi': 'Ξ', r'\Pi': 'Π', r'\Sigma': 'Σ', r'\Phi': 'Φ',
     r'\Psi': 'Ψ', r'\Omega': 'Ω',
+    # ceiling: `\sqrt` is the RADICAL SIGN alone — there is no overbar, so
+    # `\sqrt x + 1` reads as "√x + 1" and cannot say where the root ends. A
+    # bar would have to be drawn (a combining U+0305 per character sits at the
+    # wrong height on most fonts, exactly as \vec does), and a glyph that shows
+    # you a square root is worth more than no glyph at all. Braces are visible
+    # for the same reason: `\sqrt{x+1}` renders "√{x+1}", which at least
+    # delimits it.
+    r'\sqrt': '√',
     r'\infty': '∞', r'\approx': '≈', r'\neq': '≠',
     r'\leq': '≤', r'\geq': '≥', r'\le': '≤', r'\ge': '≥',
     r'\pm': '±', r'\times': '×',
@@ -11108,7 +11211,15 @@ class MarkdownNotesView(GtkSource.View):
         if m:
             lvl = len(m.group(1))
             apply(["h1", "h2", "h3"][lvl - 1], 0, len(text))
-            hide(0, m.end())     # the "## " itself, opened only from inside it
+            # The "## " is opened from ANYWHERE on the line, not only from
+            # inside the marker itself — the exception to row 141's "only what
+            # the caret touches". A heading marker is a property of the whole
+            # line (it is why the line is big), it is the one construct whose
+            # source you cannot see by looking at what it renders, and a caret
+            # at the end of a heading is a caret editing that heading. Nothing
+            # is displaced by it either: the line's other symbols are only
+            # pushed sideways, never re-rendered.
+            hide(0, m.end(), within=(0, len(text)))
             return
 
         # [[wiki links]] → styled + clickable; brackets hidden off cursor line.
@@ -12125,6 +12236,35 @@ class TextPageView(Gtk.Overlay):
         ox, oy = self.view.window_to_buffer_coords(
             Gtk.TextWindowType.WIDGET, 0, 0)
         return ox + vx, oy + vy
+
+    def scroll_to_offset(self, off, top_frac=0.25, tries=8):
+        """Bring a buffer position into view on the sheet.
+
+        `scroll_to_mark` does nothing here: the view is a NON-scrollable child
+        (see __init__), so it holds no scroll of its own — the viewport does,
+        and the position has to be translated into it by hand. Retried while
+        the sheet has no allocation yet, the thumbnail strip's trap: entering
+        the full-notes view sets the text, shows the sheet and moves the
+        divider in one frame, so at the moment we are asked the view still
+        reports no height and every line is at y=0."""
+        buf = self.view.get_buffer()
+        it = buf.get_iter_at_offset(max(0, min(int(off), buf.get_char_count())))
+        res = self.view.translate_coordinates(self.scroll, 0.0, 0.0)
+        if (res is None or self.view.get_height() <= 1) and tries > 0:
+            GLib.timeout_add(
+                40,
+                lambda: self.scroll_to_offset(off, top_frac, tries - 1) and False)
+            return
+        if res is None:
+            return
+        va = self.scroll.get_vadjustment()
+        span = va.get_upper() - va.get_page_size()
+        if span <= 0:
+            return          # the whole sheet is on screen already
+        _ox, oy = self.view.buffer_to_window_coords(
+            Gtk.TextWindowType.WIDGET, 0, int(self.view.get_iter_location(it).y))
+        target = va.get_value() + res[1] + oy - va.get_page_size() * top_frac
+        va.set_value(max(0.0, min(target, span)))
 
     def _buffer_to_overlay(self, bx, by):
         """Buffer → overlay coords, keeping the fraction.
@@ -14328,6 +14468,7 @@ class DocumentSession:
         "_drag_export_dir",
         "_has_toc", "_toc_thumbs", "_drop_indicator_row", "_text_mode",
         "_pane_settling", "_pane_watch_id", "_pane_settle_id",
+        "_full_notes_from", "_full_notes_caret",
     )
     WIDGETS = (
         "canvas", "_notes_view", "_panel_notes_view", "_notes_box",
@@ -14371,6 +14512,10 @@ class DocumentSession:
         self._current_thumb_row = None
         self._thumb_centred_page = None
         self._drag_export_dir = None
+        # the page the full-notes sheet was opened from, and the caret offset
+        # it was opened AT (row 162) — the way back out asks both
+        self._full_notes_from = None
+        self._full_notes_caret = None
         self._has_toc = False
         self._toc_thumbs = False
         self._drop_indicator_row = None
@@ -15952,9 +16097,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         pos = s._paned.get_position()
         if 100 < pos < w - 150:
             s._saved_pane_pos = pos
+        # the page you are leaving, so the sheet opens at ITS notes and the way
+        # back out knows which page of a shared run you were reading (row 162)
+        s._full_notes_from = s.canvas.current_page_idx
+        s._full_notes_caret = None
         self._enter_text_mode(s)
         if s is self._active_session:
             self._restore_note()          # fills the sheet from the model
+            self._place_full_notes_caret(s, s._full_notes_from)
         if remember and not s._is_untitled:
             _remember_recent_full_notes(s._path, True)
         toast = Adw.Toast.new("Notes as one page — drag the left edge back out "
@@ -15971,14 +16121,60 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if not self._full_notes_view(s):
             return False
         self._commit_note_for(s)          # sheet → model, parsed back per page
+        target = self._full_notes_target_page(s)
         self._leave_text_mode(s)
+        s._full_notes_from = s._full_notes_caret = None
         if s is self._active_session:
             self._set_notes_shown(True)
+            # the panel has to hold THIS page's notes before the page turns:
+            # `go_to_page` commits the panel on the way out, and a panel still
+            # showing what it held before the sheet opened would write that
+            # stale text back over what was just edited on the sheet
             self._restore_note()
+            if target is not None:
+                self.canvas.go_to_page(target)
             self._populate_toc()
         if not s._is_untitled:
             _remember_recent_full_notes(s._path, False)
         return True
+
+    def _place_full_notes_caret(self, s, idx):
+        """Open the sheet at page idx's notes — caret in them, scrolled to them.
+
+        The sheet is the whole sidecar, so "the page you were on" is a position
+        in one long text (row 162). A linked run stores its body once, on the
+        run's first page, so the lookup asks for the run — the page you were
+        reading has no text of its own to go to."""
+        buf = s._notes_view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        off = note_offset_for_page(text, s.notes_model.run_start(idx))
+        off = max(0, min(off, buf.get_char_count()))
+        buf.place_cursor(buf.get_iter_at_offset(off))
+        s._full_notes_caret = off
+        if s._text_page is not None:
+            s._text_page.scroll_to_offset(off)
+
+    def _full_notes_target_page(self, s):
+        """Which page to come back to when the sheet closes — the page the
+        caret is in, None when there is nothing to say.
+
+        Two of the three answers come from the page the sheet was OPENED at,
+        because a character offset cannot carry them. A run of linked pages
+        shares one body (row 129), so the caret in it says the run and not
+        which page of it you were reading; and a caret that never moved from
+        where the sheet put it has learnt nothing since — including the case
+        where the page had no notes at all and the caret went to where they
+        would go, which is somebody else's section."""
+        buf = s._notes_view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        off = buf.get_iter_at_mark(buf.get_insert()).get_offset()
+        page = note_page_at_offset(text, off)
+        home = s._full_notes_from
+        if home is None:
+            return page
+        if page is None or off == s._full_notes_caret:
+            return home
+        return home if home in s.notes_model.run_pages(page) else page
 
     def _pull_page_in(self, s=None):
         """The left-edge pull. On a PDF's notes sheet it brings the pages back;
@@ -16813,10 +17009,22 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         else:
             self._tab_view.close_page(page)   # fires close-page below
 
+    def _touch_recent(self, s):
+        """Closing a document is the last thing you did with it — refresh its
+        recents entry so "recent" means last USED, not last opened. That is
+        what an empty launch reopens (`_open_last_document`), and without this
+        it would hand you back whichever file you happened to open first."""
+        if s is None:
+            return
+        path = getattr(s, "_path", None) or getattr(s, "_notes_path", None)
+        if path and not getattr(s, "_is_untitled", False):
+            self._remember_recent(path)
+
     def _remember_closed(self, s):
         """Push a just-closed document onto the reopen stack so Ctrl+Shift+T can
         bring it back. Only files with a real path are reopenable (their notes
         are remembered per-PDF); untitled scratch tabs are skipped."""
+        self._touch_recent(s)
         path = getattr(s, "_path", None)
         if path and not getattr(s, "_is_untitled", False):
             self._closed_tabs.append(path)
@@ -17271,6 +17479,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         dlg.present(self)
 
     def _destroy_all(self):
+        # Closing the window closes every document in it. Refresh them oldest
+        # first with the ACTIVE tab last, so the document you were actually
+        # looking at is the one the next empty launch reopens.
+        active = self._active_session
+        for s in self._sessions:
+            if s is not active:
+                self._touch_recent(s)
+        self._touch_recent(active)
         for s in self._sessions:
             if s._presenter is not None:
                 s._presenter.close()
@@ -20841,11 +21057,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _remember_recent(self, path):
         path = os.path.abspath(path)
-        # the scratchpad and unsaved blanks are noise in a recents list
-        data_dir = os.path.join(os.path.expanduser("~"), ".local", "share", "sidemark")
-        if path in (os.path.join(data_dir, "scratchpad.md"),
-                    os.path.join(data_dir, "scratchpad.pdf")):
-            return
+        # Unsaved temp blanks are noise in a recents list. The SCRATCHPAD is
+        # not: it is a document you keep coming back to, and the recents list
+        # is now the only way in (see _seed_scratchpad_recent), so it belongs
+        # there like anything else you have been working in.
         if os.path.basename(path).startswith("sidemark_blank_"):
             return
         try:
@@ -21202,14 +21417,62 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._set_file_title("Untitled note")
         self._clear_dirty()
 
+    def _open_last_document(self):
+        """What an empty launch opens: the document you last had open.
+
+        "Recent" here means last USED, not last opened — every close refreshes
+        the entry (`_touch_recent`), so coming back lands you where you left
+        off rather than on whatever you happened to open first that day. The
+        scratchpad sits at the tail of the list until you actually use it, so
+        it is what a first run (or a list of files that have all been deleted)
+        falls back to."""
+        scratch = _scratchpad_path()
+        open_now = self._documents_open_elsewhere()
+        for it in _load_recent():
+            path = it.get("path", "")
+            if path == scratch:
+                break          # nothing in the list is newer than the scratchpad
+            if path in open_now:
+                continue       # already on screen — see _documents_open_elsewhere
+            self.open_file(path)
+            return False
+        if scratch in open_now:
+            # …and the scratchpad is a FILE like any other: two windows editing
+            # it means one of them loses its writing at the next save. A fresh
+            # blank sheet is the nearest thing to what was asked for.
+            self._on_new_text_page()
+        else:
+            self._open_scratchpad()
+        return False
+
+    def _documents_open_elsewhere(self):
+        """Every document already on screen, in any window of this app.
+
+        A second bare launch is a request for ANOTHER document to work on — the
+        one you were last reading is by then the one in front of you, and
+        handing back a second view of it is the one outcome that helps nobody.
+        So the walk down the recents list skips whatever is already open. This
+        is also why it reads every window rather than this one: a new window is
+        empty, so its own tabs can never be the answer."""
+        out = set()
+        app = self.get_application()
+        for win in (app.get_windows() if app is not None else ()):
+            if not isinstance(win, PDFEditorWindow):
+                continue
+            for s in win._sessions:
+                for p in (getattr(s, "_path", None),
+                          getattr(s, "_notes_path", None)):
+                    if p:
+                        out.add(os.path.abspath(p))
+        return out
+
     def _open_scratchpad(self):
         """Open (or create) the persistent scratchpad — a text-first page at
         ~/.local/share/sidemark/scratchpad.md (ink in scratchpad-ink.json).
         Earlier versions used a scratchpad.pdf there; it stays on disk and can
         still be opened like any other PDF."""
-        data_dir = os.path.join(os.path.expanduser("~"), ".local", "share", "sidemark")
-        os.makedirs(data_dir, exist_ok=True)
-        path = os.path.join(data_dir, "scratchpad.md")
+        path = _scratchpad_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         if not os.path.exists(path):
             with open(path, "w", encoding="utf-8"):
                 pass
@@ -22941,7 +23204,10 @@ class PDFEditorApp(Adw.Application):
 
     def open_new_window(self, path=None, page=0, blank=None):
         logger.info("Opening new window: %s",
-                    path or (f"(blank {blank})" if blank else "(scratchpad)"))
+                    path or (f"(blank {blank})" if blank else "(last document)"))
+        # the scratchpad has to be in the recents list before anyone goes
+        # looking for it there — it is the only way in now (row 160)
+        _seed_scratchpad_recent()
         win = PDFEditorWindow(self)
         win.present()
         if path and os.path.isfile(path):
@@ -22949,15 +23215,15 @@ class PDFEditorApp(Adw.Application):
             if page > 0:
                 win._go_to_page(page)
         elif blank:
-            # `--new` REPLACES the scratchpad rather than joining it: the
-            # scratchpad is what an empty launch means, and a launch that
-            # asked for a blank page did not ask for two documents.
+            # `--new` REPLACES what an empty launch would have opened rather
+            # than joining it: a launch that asked for a blank page did not ask
+            # for two documents.
             GLib.idle_add(lambda: (win._on_new_text_page() if blank == "text"
                                    else win._on_new_pdf(None)) and False)
         else:
             if path:
                 logger.warning("File not found: %s", path)
-            GLib.idle_add(win._open_scratchpad)
+            GLib.idle_add(win._open_last_document)
         return win
 
 

@@ -2989,6 +2989,9 @@ class TestModeGestures(unittest.TestCase):
             win._notes_view.get_buffer().set_text(
                 "<!-- page:0 -->\n\nedited first\n\n"
                 "<!-- page:1 -->\n\nsecond page note\n")
+            # the page you come back to follows the caret (row 162), so say
+            # where it is rather than leaving it wherever set_text dropped it
+            self._put_caret(win, "edited first")
             self.assertTrue(win._leave_full_notes_view())
             self.assertFalse(win._text_mode)
             self.assertEqual(win.notes_model.own_text(0), "edited first")
@@ -3109,6 +3112,144 @@ class TestModeGestures(unittest.TestCase):
             self.assertFalse(win._text_mode)
 
         self._run_in_window(2, body)
+
+    # ── the caret follows you across the divider (row 162) ───────────────────
+
+    MD_RUN = ("<!-- page:0 -->\n\nzero note\n\n"
+              "<!-- page:1 -->\n\nshared body\n\n"
+              "<!-- page:2-3 continued -->\n")
+
+    def _sheet_offset_of(self, win, needle):
+        buf = win._notes_view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        return text.index(needle)
+
+    def _put_caret(self, win, needle):
+        buf = win._notes_view.get_buffer()
+        buf.place_cursor(
+            buf.get_iter_at_offset(self._sheet_offset_of(win, needle)))
+
+    def test_the_sheet_opens_at_the_page_you_left(self):
+        def body(win):
+            win.canvas.go_to_page(1)
+            win._enter_full_notes_view()
+            self.assertEqual(win._active_session._full_notes_caret,
+                             self._sheet_offset_of(win, "shared body"))
+
+        self._run_in_window(4, body, md=self.MD_RUN)
+
+    def test_the_page_comes_back_from_where_the_caret_is(self):
+        def body(win):
+            win._enter_full_notes_view()          # from page 0
+            self._put_caret(win, "shared body")
+            win._leave_full_notes_view()
+            self.assertEqual(win.canvas.current_page_idx, 1)
+
+        self._run_in_window(4, body, md=self.MD_RUN)
+
+    def test_a_shared_body_returns_to_the_page_you_came_from(self):
+        """A run of linked pages stores its body once (row 129), so the caret
+        in it says the run and not which of its pages you were reading."""
+        def body(win):
+            win.canvas.go_to_page(3)
+            win._enter_full_notes_view()
+            # inside the run's body, but moved — still page 3, not the run start
+            buf = win._notes_view.get_buffer()
+            buf.place_cursor(buf.get_iter_at_offset(
+                self._sheet_offset_of(win, "shared body") + 4))
+            win._leave_full_notes_view()
+            self.assertEqual(win.canvas.current_page_idx, 3)
+
+        self._run_in_window(4, body, md=self.MD_RUN)
+
+    def test_a_caret_in_another_run_wins_over_the_page_you_came_from(self):
+        def body(win):
+            win.canvas.go_to_page(3)
+            win._enter_full_notes_view()
+            self._put_caret(win, "zero note")
+            win._leave_full_notes_view()
+            self.assertEqual(win.canvas.current_page_idx, 0)
+
+        self._run_in_window(4, body, md=self.MD_RUN)
+
+    def test_a_caret_in_no_page_at_all_returns_to_the_page_you_came_from(self):
+        """Above the first marker there is no page to read off the offset — and
+        a page with no notes sends the caret to where its section WOULD go,
+        which is somebody else's. Both fall back to where you came from."""
+        def body(win):
+            win.canvas.go_to_page(1)
+            win._enter_full_notes_view()
+            buf = win._notes_view.get_buffer()
+            buf.place_cursor(buf.get_start_iter())
+            win._leave_full_notes_view()
+            self.assertEqual(win.canvas.current_page_idx, 1)
+
+        self._run_in_window(4, body, md=self.MD_RUN)
+
+    def test_a_page_with_no_notes_comes_back_to_itself(self):
+        def body(win):
+            win.canvas.go_to_page(2)      # nothing of its own in this sidecar
+            win._enter_full_notes_view()
+            win._leave_full_notes_view()
+            self.assertEqual(win.canvas.current_page_idx, 2)
+
+        self._run_in_window(4, body,
+                            md="<!-- page:0 -->\n\nzero note\n")
+
+    def test_following_the_caret_does_not_lose_a_sheet_edit(self):
+        """The page turns on the way out, and turning a page COMMITS the notes
+        panel — which must be holding the page you are leaving by then, not
+        what it held before the sheet opened."""
+        def body(win):
+            win._enter_full_notes_view()          # from page 0
+            win._notes_view.get_buffer().set_text(
+                "<!-- page:0 -->\n\nedited zero\n\n"
+                "<!-- page:1 -->\n\nedited one\n")
+            self._put_caret(win, "edited one")
+            win._leave_full_notes_view()
+            self.assertEqual(win.canvas.current_page_idx, 1)
+            self.assertEqual(win.notes_model.own_text(0), "edited zero")
+            self.assertEqual(win.notes_model.own_text(1), "edited one")
+
+        self._run_in_window(4, body, md=self.MD_RUN)
+
+
+class TestNoteTextPositions(unittest.TestCase):
+    """Row 162 — a page index one way, a character offset in the sidecar's text
+    the other. Two readings of one marker table is how the caret comes back on
+    a different page than it left."""
+
+    MD = ("![[deck.pdf]]\n\n<!-- page:0 -->\n\nfirst\n\n"
+          "<!-- page:3 bookmark -->\n\nthird\n\n"
+          "<!-- page:5-8 continued -->\n")
+
+    def test_a_page_offset_lands_in_that_page_s_body(self):
+        off = sidemark.note_offset_for_page(self.MD, 3)
+        self.assertTrue(self.MD[off:].startswith("third"))
+        self.assertEqual(sidemark.note_page_at_offset(self.MD, off), 3)
+
+    def test_a_range_marker_answers_for_every_page_in_it(self):
+        for p in (5, 6, 8):
+            off = sidemark.note_offset_for_page(self.MD, p)
+            self.assertEqual(sidemark.note_page_at_offset(self.MD, off), 5)
+
+    def test_an_empty_section_keeps_the_caret_on_its_own_marker(self):
+        """Skipping the blank lines after a bodyless marker walks straight into
+        the NEXT page's section, which is the one place the caret must not go."""
+        md = "<!-- page:1 continued -->\n\n<!-- page:2 -->\n\nsecond\n"
+        off = sidemark.note_offset_for_page(md, 1)
+        self.assertEqual(sidemark.note_page_at_offset(md, off), 1)
+
+    def test_a_page_with_no_section_gets_the_place_one_would_go(self):
+        off = sidemark.note_offset_for_page(self.MD, 1)
+        self.assertEqual(off, self.MD.index("<!-- page:3"))
+        # …past the last section, that is the end of the file
+        self.assertEqual(sidemark.note_offset_for_page(self.MD, 12),
+                         len(self.MD))
+
+    def test_above_the_first_marker_is_no_page_at_all(self):
+        self.assertIsNone(sidemark.note_page_at_offset(self.MD, 0))
+        self.assertIsNone(sidemark.note_page_at_offset("plain notes", 4))
 
 
 class TestSheetInkSurvivesModeSwitches(unittest.TestCase):
@@ -5072,6 +5213,30 @@ class TestLatexFormatting(unittest.TestCase):
         v, buf = self._render_line0('![[deck.pdf]]')
         it = buf.get_iter_at_line(0)[1]; it.forward_chars(3)          # inside [[
         self.assertFalse(it.has_tag(v._t["link"]))
+
+    # ── heading markers ──────────────────────────────────────────────────────
+    def test_heading_marker_hidden_off_the_cursor_line(self):
+        v, buf = self._render_line0('## Eigenvalues')
+        for col in range(3):                       # the "## " itself
+            self.assertTrue(
+                buf.get_iter_at_line_offset(0, col)[1].has_tag(v._t["hide"]))
+        self.assertTrue(
+            buf.get_iter_at_line_offset(0, 4)[1].has_tag(v._t["h2"]))
+
+    def test_heading_marker_opens_from_anywhere_on_its_line(self):
+        """A heading marker is a property of the WHOLE line, and the one
+        construct whose source you cannot read off what it renders — so the
+        caret being on the line is enough, wherever on it it sits."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('## Eigenvalues\nother')
+        it = buf.get_iter_at_line(0)[1]
+        it.forward_to_line_end()                   # caret at the END of it
+        buf.place_cursor(it)
+        v._rehighlight()
+        for col in range(3):
+            self.assertFalse(
+                buf.get_iter_at_line_offset(0, col)[1].has_tag(v._t["hide"]))
 
 
 class TestNoteLinkParse(unittest.TestCase):
@@ -12281,6 +12446,39 @@ class TestRecentFiles(unittest.TestCase):
             sidemark._add_recent(self._touch(f"f{i}.pdf"))
         self.assertEqual(len(sidemark._load_recent()), sidemark.RECENT_MAX)
 
+    def _home(self):
+        """A throwaway $HOME, so the scratchpad lands beside the temp recents
+        instead of in the user's real data dir."""
+        p = mock.patch.dict(os.environ, {"HOME": self._tmp.name})
+        p.start()
+        self.addCleanup(p.stop)
+        return sidemark._scratchpad_path()
+
+    def test_scratchpad_is_seeded_at_the_tail(self):
+        """It is seeded so it can be FOUND — the recents list is the only way
+        into the scratchpad now. At the tail, never the front: at the front it
+        would be "the last document" and every launch would reopen it."""
+        scratch = self._home()
+        a = self._touch("a.pdf")
+        sidemark._add_recent(a)
+        sidemark._seed_scratchpad_recent()
+        self.assertTrue(os.path.exists(scratch))
+        self.assertEqual([it["path"] for it in sidemark._load_recent()],
+                         [a, scratch])
+        # seeding twice must not duplicate it or move it
+        sidemark._seed_scratchpad_recent()
+        self.assertEqual([it["path"] for it in sidemark._load_recent()],
+                         [a, scratch])
+
+    def test_scratchpad_survives_the_cap(self):
+        scratch = self._home()
+        sidemark._seed_scratchpad_recent()
+        for i in range(sidemark.RECENT_MAX + 5):
+            sidemark._add_recent(self._touch(f"f{i}.pdf"))
+        paths = [it["path"] for it in sidemark._load_recent()]
+        self.assertIn(scratch, paths)
+        self.assertLessEqual(len(paths), sidemark.RECENT_MAX)
+
     def test_missing_files_dropped_and_corrupt_json_tolerated(self):
         a = self._touch("a.pdf")
         sidemark._add_recent(a)
@@ -12412,7 +12610,9 @@ class TestRecentFiles(unittest.TestCase):
         if errors:
             raise errors[0]
 
-    def test_scratchpad_and_temp_blanks_not_recorded(self):
+    def test_temp_blanks_not_recorded(self):
+        """An untitled blank has no file to come back to — the scratchpad, by
+        contrast, is recorded like any other document (row 161)."""
         errors = []
         app = Adw.Application(application_id="test.sidemark.recentskip")
 
@@ -14453,8 +14653,9 @@ class TestTextFirstMode(unittest.TestCase):
             self._run_in_window(body)
 
     def test_scratchpad_opens_as_a_text_page(self):
-        """An empty launch opens the persistent scratchpad as a text-first
-        page (scratchpad.md), and the scratchpad stays out of recents."""
+        """The scratchpad is a text-first page (scratchpad.md), and opening it
+        records it in recents like any other document you have worked in — it
+        is the one document with no other way in."""
         with tempfile.TemporaryDirectory() as d:
             def body(win):
                 old_home = os.environ.get("HOME", "")
@@ -14472,9 +14673,88 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertIsNone(s._path)
                 self.assertEqual(s._notes_path, md)
                 self.assertFalse(win._dirty)
-                # _open_markdown remembers recents — the scratchpad is exempt
-                self.assertNotIn(md, [it.get("path")
-                                      for it in sidemark._load_recent()])
+                self.assertIn(md, [it.get("path")
+                                   for it in sidemark._load_recent()])
+
+            self._run_in_window(body)
+
+    def test_empty_launch_reopens_the_last_document(self):
+        """An empty launch comes back to what you were last reading; the
+        scratchpad is what it falls back to when there is nothing else."""
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(sidemark, "RECENT_PATH",
+                                  os.path.join(d, "recent.json")):
+            def body(win):
+                old_home = os.environ.get("HOME", "")
+                os.environ["HOME"] = d
+                try:
+                    md = os.path.join(d, "lecture.md")
+                    with open(md, "w") as f:
+                        f.write("notes\n")
+                    # nothing but the seeded scratchpad → the scratchpad
+                    sidemark._seed_scratchpad_recent()
+                    win._open_last_document()
+                    self._settle(200)
+                    self.assertEqual(win._active_session._notes_path,
+                                     sidemark._scratchpad_path())
+                    # …and once a real document has been closed, that one
+                    sidemark._add_recent(md)
+                    win._open_last_document()
+                    self._settle(200)
+                    self.assertEqual(win._active_session._notes_path, md)
+                finally:
+                    os.environ["HOME"] = old_home
+
+            self._run_in_window(body)
+
+    def test_a_second_launch_skips_what_is_already_on_screen(self):
+        """Opening a second Sidemark with no file is a request for ANOTHER
+        document: the newest recent is by then the one already in front of you,
+        so the walk skips it and takes the next."""
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(sidemark, "RECENT_PATH",
+                                  os.path.join(d, "recent.json")):
+            def body(win):
+                a, b = (os.path.join(d, n) for n in ("a.md", "b.md"))
+                for p in (a, b):
+                    with open(p, "w") as f:
+                        f.write("x\n")
+                sidemark._add_recent(a)
+                sidemark._add_recent(b)          # b is the newest
+                win._do_open_file(b)             # …and it is what this window holds
+                self._settle(100)
+                self.assertEqual(
+                    win._documents_open_elsewhere(), {b})
+                # a fresh window in the same app must land on `a`, not on `b`
+                second = PDFEditorWindow(win.get_application())
+                second.present()
+                try:
+                    second._open_last_document()
+                    self._settle(200)
+                    self.assertEqual(second._active_session._notes_path, a)
+                finally:
+                    second.destroy()
+
+            self._run_in_window(body)
+
+    def test_closing_a_tab_refreshes_its_place_in_recents(self):
+        """"Recent" has to mean last USED: open A then B, work in A, close it,
+        and A is what the next launch reopens."""
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(sidemark, "RECENT_PATH",
+                                  os.path.join(d, "recent.json")):
+            def body(win):
+                a, b = (os.path.join(d, n) for n in ("a.md", "b.md"))
+                for p in (a, b):
+                    with open(p, "w") as f:
+                        f.write("x\n")
+                sidemark._add_recent(a)
+                sidemark._add_recent(b)          # b is newest by open order
+                self.assertEqual(sidemark._load_recent()[0]["path"], b)
+                win._do_open_file(a)
+                self._settle(100)
+                win._remember_closed(win._active_session)
+                self.assertEqual(sidemark._load_recent()[0]["path"], a)
 
             self._run_in_window(body)
 
