@@ -76,8 +76,9 @@ def main():
         worker = fh.read()
     with open(os.path.join(HERE, "index.html"), encoding="utf-8") as fh:
         html = fh.read()
-    with open(os.path.join(HERE, "icon.svg"), encoding="utf-8") as fh:
-        icon = fh.read()
+    def data_uri(name, mime):
+        with open(os.path.join(HERE, name), "rb") as fh:
+            return f"data:{mime};base64," + base64.b64encode(fh.read()).decode("ascii")
 
     # The worker rides as a JSON string rather than inside a <script> block: its
     # source contains sequences that would close the tag, and JSON escaping is
@@ -102,11 +103,13 @@ def main():
         "</script>\n"
     )
 
-    # the favicon rides as a data URI; a single file has nothing to fetch
-    icon_uri = "data:image/svg+xml;base64," + base64.b64encode(
-        icon.encode("utf-8")).decode("ascii")
+    # the icons ride as data URIs; a single file has nothing to fetch them from
     html = inline(html, r'<link rel="icon"[^>]*>',
-                  f'<link rel="icon" href="{icon_uri}" type="image/svg+xml">')
+                  '<link rel="icon" type="image/png" sizes="32x32" href="'
+                  + data_uri("icon-32.png", "image/png") + '">')
+    html = inline(html, r'<link rel="apple-touch-icon"[^>]*>',
+                  '<link rel="apple-touch-icon" sizes="180x180" href="'
+                  + data_uri("icon-180.png", "image/png") + '">')
     html = inline(html, r'<link rel="stylesheet"[^>]*>',
                   "<style>\n" + css + "\n</style>")
     html = inline(html, r'<script type="module" src="src/app\.js"></script>',
