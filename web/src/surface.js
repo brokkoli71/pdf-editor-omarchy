@@ -199,13 +199,32 @@ export class Surface {
     this.requestDraw();
   }
 
-  /** Only RELATIVE navigation is a "flip" — a thumbnail click or an outline row
-   * goes straight to its page. */
+  /** Only RELATIVE navigation is a "flip" — and only relative navigation SKIPS
+   * a hidden page. A thumbnail click, a bookmark or an outline row still opens
+   * one: that is what keeps it reachable and editable, and the dimmed row in
+   * the strip is the only way to select it again and bring it back. */
   flipPage(delta) {
     if (!this.doc) return;
-    const next = this.pageIndex + delta;
-    if (next < 0 || next >= this.doc.pageCount) return;
+    const next = this.nextPageFor(this.pageIndex, delta);
+    if (next === null) return;
     this.setPage(next, { fit: false });
+  }
+
+  /** The page `delta` steps away, skipping hidden ones. Resolved in ONE place —
+   * resolving it in both the buttons and the scroll-past-edge is how paging
+   * from 1 over a hidden 2-4 lands on 7 instead of 5. */
+  nextPageFor(from, delta) {
+    if (!this.doc) return null;
+    const step = delta > 0 ? 1 : -1;
+    let page = from;
+    for (let n = 0; n < Math.abs(delta); n++) {
+      let next = page + step;
+      while (next >= 0 && next < this.doc.pageCount
+             && this.doc.notes.isHidden(next)) next += step;
+      if (next < 0 || next >= this.doc.pageCount) return page === from ? null : page;
+      page = next;
+    }
+    return page === from ? null : page;
   }
 
   /** Device pixels per document unit to rasterise at: exactly what will be
@@ -898,6 +917,23 @@ export class Surface {
     this.requestDraw();
   }
 
+  /** Change the colour of every selected stroke — picking a colour with ink
+   * lassoed recolours it, rather than only arming the next stroke.
+   *
+   * IMAGES would be skipped here: there is no pen colour on a photograph. */
+  recolourSelected(color) {
+    if (!this.hasSelection()) return false;
+    const before = this.selected.map((s) => ({ stroke: s, color: s.color }));
+    if (before.every((r) => r.color.every((c, i) => c === color[i]))) return false;
+    for (const rec of before) rec.stroke.color = color.slice();
+    this._pushUndo({ type: "recolour", page: this.pageIndex, records: before,
+                     after: color.slice() });
+    this.invalidateLayer();
+    this.onChange();
+    this.requestDraw();
+    return true;
+  }
+
   duplicateSelected() {
     if (!this.hasSelection()) return;
     const offset = DUPLICATE_OFFSET / this.zoom;
@@ -1097,6 +1133,8 @@ export class Surface {
       const i = strokes.lastIndexOf(op.stroke);
       if (i >= 0) strokes.splice(i, 1);
       for (const rec of op.siblings) rec.stroke.pts = rec.before.map((p) => p.slice());
+    } else if (op.type === "recolour") {
+      for (const rec of op.records) rec.stroke.color = rec.color;
     }
     // a stale loop after an undone move is impossible only because undo clears
     // the selection — do not remove this
@@ -1135,6 +1173,8 @@ export class Surface {
     } else if (op.type === "grid") {
       strokes.push(op.stroke);
       for (const rec of op.siblings) rec.stroke.pts = rec.after.map((p) => p.slice());
+    } else if (op.type === "recolour") {
+      for (const rec of op.records) rec.stroke.color = op.after.slice();
     }
     this.clearSelection();
     this.undoStack.push(op);

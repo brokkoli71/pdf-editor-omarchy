@@ -12,6 +12,8 @@ export class Sidebar {
     this.onMovePage = opts.onMovePage || (() => {});
     this.onDeletePage = opts.onDeletePage || (() => {});
     this.onDropBookmark = opts.onDropBookmark || (() => {});
+    this.onToggleHidden = opts.onToggleHidden || (() => {});
+    this.onAddPage = opts.onAddPage || (() => {});
     this.showBookmarks = opts.showBookmarks !== false;
     this.doc = null;
     this.page = 0;
@@ -127,7 +129,8 @@ export class Sidebar {
   _buildPages() {
     for (let i = 0; i < this.doc.pageCount; i++) {
       const row = document.createElement("button");
-      row.className = "row thumb" + (i === this.page ? " current" : "");
+      row.className = "row thumb" + (i === this.page ? " current" : "")
+        + (this.doc.notes.isHidden(i) ? " hidden-page" : "");
       row.dataset.page = String(i);
 
       const holder = document.createElement("span");
@@ -191,6 +194,14 @@ export class Sidebar {
     if (this.doc && index < this.doc.pageCount - 1) {
       add("Move down", () => this.onMovePage(index, index + 1));
     }
+    // The verb offered is the one that CHANGES something, so a page you are
+    // looking at never shows both.
+    add(this.doc && this.doc.notes.isHidden(index) ? "Unhide page" : "Hide page",
+        () => this.onToggleHidden(index));
+    add("Add blank page after", () => this.onAddPage(index, "plain"));
+    add("  …with lines", () => this.onAddPage(index, "lines"));
+    add("  …with squares", () => this.onAddPage(index, "squares"));
+    add("  …with dots", () => this.onAddPage(index, "dots"));
     add("Delete page", () => this.onDeletePage(index), true);
     document.body.appendChild(menu);
     this._menu = menu;

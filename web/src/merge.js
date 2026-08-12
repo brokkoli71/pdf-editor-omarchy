@@ -5,7 +5,7 @@
 // arithmetic and the outline writing are the parts worth testing, and they are
 // exactly the parts a browser adds nothing to.
 
-import { PDFDocument, PDFName, PDFDict, PDFArray, PDFNumber, PDFString }
+import { PDFDocument, PDFName, PDFDict, PDFArray, PDFNumber, PDFString, rgb }
   from "../vendor/pdf-lib.esm.js";
 
 /** Merge several documents into ONE, with a CHAPTER PER FILE.
@@ -196,4 +196,76 @@ export async function deletePages(bytes, indices, outline = []) {
   const keep = range(0, total).filter((i) => !drop.has(i));
   if (!keep.length) throw new Error("a document cannot lose its last page");
   return applyPageOrder(bytes, keep, outline);
+}
+
+// ── blank pages ──────────────────────────────────────────────────────────────
+//
+// The ruling is drawn into the page CONTENT when the page is made, not painted
+// under it at render time: a background you write on is one you hand in, so it
+// has to export, print and survive being opened anywhere else.
+//
+// The cost of that choice is that it is fixed at creation. Changing it later
+// would mean marking which pages are ours, and it is not worth that to re-rule
+// a page you can simply make again.
+
+export const PAGE_BACKGROUNDS = ["plain", "lines", "squares", "dots"];
+export const PAGE_BG_SPACING = 20.0;   // PDF units between rulings (~7 mm on A4)
+export const PAGE_BG_RGB = [0.72, 0.76, 0.82];
+export const PAGE_BG_MARGIN = 28.0;    // unruled border, so ruling never touches
+                                       // the edge
+
+/** Rule a page. THE one painter for this, so a page made from the menu and one
+ * made by "add blank page" can never come out ruled differently. */
+export function drawPageBackground(page, kind, spacing = PAGE_BG_SPACING) {
+  if (!PAGE_BACKGROUNDS.includes(kind) || kind === "plain" || spacing <= 0) return;
+  const { width, height } = page.getSize();
+  const x0 = PAGE_BG_MARGIN, y0 = PAGE_BG_MARGIN;
+  const x1 = width - PAGE_BG_MARGIN, y1 = height - PAGE_BG_MARGIN;
+  if (x1 <= x0 || y1 <= y0) return;
+  const color = rgb(PAGE_BG_RGB[0], PAGE_BG_RGB[1], PAGE_BG_RGB[2]);
+
+  if (kind === "dots") {
+    for (let y = y0; y <= y1 + 1e-9; y += spacing) {
+      for (let x = x0; x <= x1 + 1e-9; x += spacing) {
+        page.drawCircle({ x, y, size: 0.6, color, borderWidth: 0 });
+      }
+    }
+    return;
+  }
+  for (let y = y0; y <= y1 + 1e-9; y += spacing) {
+    page.drawLine({ start: { x: x0, y }, end: { x: x1, y },
+                    thickness: 0.4, color });
+  }
+  if (kind === "squares") {
+    for (let x = x0; x <= x1 + 1e-9; x += spacing) {
+      page.drawLine({ start: { x, y: y0 }, end: { x, y: y1 },
+                      thickness: 0.4, color });
+    }
+  }
+}
+
+/** A blank page's bytes — THE blank page, so a document does not go plain at
+ * page 2. */
+export async function blankPdfBytes(width = 595, height = 842, kind = "plain") {
+  const doc = await PDFDocument.create();
+  drawPageBackground(doc.addPage([width, height]), kind);
+  return doc.save();
+}
+
+/** Insert a blank page after `afterIndex`, at the size of the page it follows.
+ * Returns `{bytes, oldToNew}` — the caller re-keys per-page state with it. */
+export async function addBlankPage(bytes, afterIndex, kind = "plain", outline = []) {
+  const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  const pages = doc.getPages();
+  const at = Math.max(0, Math.min(afterIndex, pages.length - 1));
+  const { width, height } = pages[at].getSize();
+  drawPageBackground(doc.insertPage(at + 1, [width, height]), kind);
+
+  const oldToNew = new Map();
+  for (let i = 0; i < pages.length; i++) oldToNew.set(i, i > at ? i + 1 : i);
+  const moved = outline
+    .map((e) => ({ ...e, page: oldToNew.get(e.page) ?? e.page }))
+    .sort((a, b) => a.page - b.page);
+  if (moved.length) writeOutline(doc, moved);
+  return { bytes: await doc.save(), oldToNew, outline: moved, inserted: at + 1 };
 }

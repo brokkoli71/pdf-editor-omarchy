@@ -9,7 +9,8 @@ import {
 } from "./bindings.js";
 import { Surface, IMPLEMENTED_TOOLS } from "./surface.js";
 import { Doc, mergeDocuments, insertDocuments } from "./doc.js";
-import { applyPageOrder, deletePages, moveRangeOrder } from "./merge.js";
+import { applyPageOrder, deletePages, moveRangeOrder, addBlankPage,
+         blankPdfBytes } from "./merge.js";
 import { Sidebar } from "./sidebar.js";
 import { NotesView } from "./notes.js";
 import { NotesModel } from "./notes-model.js";
@@ -157,12 +158,15 @@ const sidebar = new Sidebar(document.getElementById("sidebar"), {
   onMovePage: (from, to) => movePage(from, to),
   onDeletePage: (index) => removePage(index),
   onDropBookmark: (page) => dropBookmark(page),
+  onToggleHidden: (page) => toggleHidden(page),
+  onAddPage: (page, kind) => addPageAfter(page, kind),
   showBookmarks: store.get("outline_bookmarks") !== false,
   onShowBookmarks: (on) => store.set("outline_bookmarks", on),
 });
 
 const search = new Search(
   { get pageCount() { return surface.doc ? surface.doc.pageCount : 0; },
+    get notes() { return surface.doc ? surface.doc.notes : null; },
     getPage: (i) => surface.doc.page(i) },
   {
     onUpdate: () => refreshSearch(),
@@ -560,6 +564,55 @@ async function removePage(index) {
 
 /** Insert pages from a file, at the current page. The same pipeline as a drop
  * on the sidebar, so the menu and the gesture cannot drift. */
+/** Set a page aside: still in the document and still editable, but skipped when
+ * paging. Like a bookmark it is a property OF one page, so it needs no
+ * adjacency rule — it just follows its page through every re-key. */
+function toggleHidden(index) {
+  const doc = surface.doc;
+  if (!doc) return;
+  const notes = doc.notes;
+  const hidden = notes.isHidden(index);
+  if (hidden) notes._hidden.delete(index);
+  else notes._hidden.add(index);
+  markDirty(true);
+  rememberSession();
+  sidebar.setDoc(doc);
+  sidebar.setPage(surface.pageIndex);
+  toast(hidden ? `Page ${index + 1} shown` : `Page ${index + 1} hidden`);
+}
+
+async function addPageAfter(index, kind = "plain") {
+  const doc = surface.doc;
+  if (!doc) return;
+  try {
+    const r = await addBlankPage(doc.bytes, index, kind, doc.outline);
+    const next = await Doc.open(r.bytes, doc.name);
+    next.outline = r.outline.length ? r.outline : next.outline;
+    const ink = new Map();
+    for (const [page, strokes] of doc.ink) ink.set(r.oldToNew.get(page) ?? page, strokes);
+    next.ink = ink;
+    doc.notes.shiftForInsert(r.inserted, 1);
+    next.notes = doc.notes;
+    next.handles = doc.handles;
+    await setDoc(next, document.getElementById("doc-title").textContent);
+    await surface.setPage(r.inserted);
+    markDirty(true);
+    toast(kind === "plain" ? "Blank page added" : `Blank page added (${kind})`);
+  } catch (err) {
+    toast(`Could not add a page: ${err.message}`);
+  }
+}
+
+async function newDocument(kind = "plain") {
+  try {
+    const doc = await Doc.open(await blankPdfBytes(595, 842, kind), "Untitled");
+    await setDoc(doc, "Untitled");
+    toast("New document");
+  } catch (err) {
+    toast(`Could not create a document: ${err.message}`);
+  }
+}
+
 async function insertPagesFromPicker() {
   if (!surface.doc) return;
   const at = surface.pageIndex;
@@ -960,6 +1013,17 @@ function buildBindingsList() {
 
 /** The pen's colour lives in the bar as well as the popover, so the thing you
  * change most often is one click away and visible without opening anything. */
+/** Setting a colour with ink LASSOED recolours it — one gesture, not "change
+ * the pen, then wonder why the selection did not follow". */
+function applyPenColor(rgb) {
+  setPenSetting("pen_color", rgb);
+  document.getElementById("color-btn").value = toHex(rgb);
+  refreshPenSwatch();
+  if (surface.recolourSelected(rgb)) toast("Recoloured");
+  surface.invalidateLayer();
+  surface.requestDraw();
+}
+
 function refreshPenSwatch() {
   const el = document.getElementById("pen-swatch");
   if (el) el.style.background = cssRgb(pen.pen_color);
@@ -972,13 +1036,7 @@ function buildSwatches() {
     const b = document.createElement("button");
     b.title = name;
     b.style.background = cssRgb(rgb);
-    b.addEventListener("click", () => {
-      setPenSetting("pen_color", rgb);
-      document.getElementById("color-btn").value = toHex(rgb);
-      refreshPenSwatch();
-      surface.invalidateLayer();
-      surface.requestDraw();
-    });
+    b.addEventListener("click", () => applyPenColor(rgb));
     host.appendChild(b);
   }
 }
@@ -1009,12 +1067,7 @@ function wirePopover() {
 
   const color = document.getElementById("color-btn");
   color.value = toHex(pen.pen_color);
-  color.addEventListener("input", () => {
-    setPenSetting("pen_color", fromHex(color.value));
-    refreshPenSwatch();
-    surface.invalidateLayer();
-    surface.requestDraw();
-  });
+  color.addEventListener("input", () => applyPenColor(fromHex(color.value)));
 
   bindCheck("hover-lead", pen.hover_lead, (on) => setPenSetting("hover_lead", on));
   bindCheck("live-smooth", pen.live_smooth, (on) => setPenSetting("live_smooth", on));
@@ -1075,6 +1128,28 @@ function wireKeys() {
     if ((e.ctrlKey || e.metaKey) && key === "z") {
       e.preventDefault();
       if (e.shiftKey) surface.redo(); else surface.undo();
+    } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && key === "n") {
+      e.preventDefault();
+      addPageAfter(surface.pageIndex);
+    } else if ((e.ctrlKey || e.metaKey) && key === "n") {
+      e.preventDefault();
+      newDocument();
+    } else if ((e.ctrlKey || e.metaKey) && key === "o") {
+      e.preventDefault();
+      document.getElementById("open-btn").click();
+    } else if ((e.ctrlKey || e.metaKey) && key === "0") {
+      e.preventDefault();
+      surface.fit();
+      surface.requestDraw();
+    } else if ((e.ctrlKey || e.metaKey) && (key === "\\" || e.code === "Backslash")) {
+      e.preventDefault();
+      const paned = document.getElementById("paned");
+      const full = paned.classList.contains("full-notes");
+      // Ctrl+\ toggles the notes: away entirely, or back to where the divider
+      // last was — the same two states the divider drag moves between.
+      const frac = store.get("pane_fraction") || 0.62;
+      wireDivider.setSplit(full ? frac : (surface.doc ? 0.999 : frac),
+                           { remember: false });
     } else if ((e.ctrlKey || e.metaKey) && key === "b") {
       e.preventDefault();
       toggleBookmark();

@@ -98,6 +98,14 @@ export class Search {
     return rec;
   }
 
+  /** What a page's NOTES say. Read through `ownText`, never `get` — a linked
+   * run resolves to the same body on every page of it, so searching the
+   * resolved text reports one note as a hit on five slides. */
+  _notesFor(page) {
+    const notes = this.provider.notes;
+    return notes ? (notes.ownText(page) || "") : "";
+  }
+
   _hitsIn(text, page) {
     const out = [];
     const needle = this.query.toLowerCase();
@@ -163,10 +171,16 @@ export class Search {
     try { rec = await this._textFor(page); } catch { return []; }
     if (token !== this._token) return [];
     const hits = this._hitsIn(rec.text, page);
+    // a note is a hit on its page too, and carries no rects — the highlight
+    // belongs on the page's own text
+    for (const h of this._hitsIn(this._notesFor(page), page)) {
+      hits.push({ ...h, inNotes: true });
+    }
     if (!hits.length) return [];
     // rebuilt in PAGE order, never in the order the scan found them
     this.matches = this.matches.concat(hits).sort((a, b) =>
-      a.page - b.page || a.from - b.from);
+      a.page - b.page || (a.inNotes ? 1 : 0) - (b.inNotes ? 1 : 0)
+      || a.from - b.from);
     return hits;
   }
 
@@ -239,6 +253,7 @@ export class Search {
     const out = [];
     for (const m of this.matches) {
       if (m.page !== page) continue;
+      if (m.inNotes) continue;
       for (const r of matchRects(rec.spans, m.from, m.to)) {
         out.push({ rect: r, current: m === this.current });
       }

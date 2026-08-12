@@ -285,6 +285,11 @@ button:disabled:hover { background: transparent; }
 .thumb-img canvas { width: 100%; height: auto; display: block; }
 .thumb-no { font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; }
 .thumb.current .thumb-img { outline: 2px solid var(--accent-bg); outline-offset: 1px; }
+/* set aside: still in the document and still editable, but skipped when paging
+   and left out of an export. Dimmed rather than removed, because the row is the
+   only way to select it again and bring it back. */
+.thumb.hidden-page .thumb-img { opacity: .35; }
+.thumb.hidden-page .thumb-no { text-decoration: line-through; color: var(--dim); }
 .thumb.current .thumb-no { color: var(--window-fg); font-weight: 700; }
 
 .outline-row { padding-right: 8px; }
