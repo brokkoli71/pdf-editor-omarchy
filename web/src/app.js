@@ -1222,10 +1222,26 @@ function wireDocument() {
   // so a drop there imports at the gap instead of replacing the document.
   const hint = document.getElementById("drop-hint");
   let depth = 0;
+
+  /** How many FILES this drag carries. Not `items.length`, which counts data
+   * TYPES: a page dragged out of the strip carries three of them (the plain
+   * text, the desktop's `DownloadURL`, the other-window handoff key), so the
+   * window offered to "merge 3 files" for a drag that was carrying one page and
+   * no files at all. `types` naming "Files" is the signal that survives a drag
+   * whose data cannot be read yet. */
+  const fileCount = (dt) => {
+    if (!dt || ![...(dt.types || [])].includes("Files")) return 0;
+    return [...(dt.items || [])].filter((i) => i.kind === "file").length;
+  };
+
+  const clear = () => { depth = 0; hint.hidden = true; };
+
   window.addEventListener("dragenter", (e) => {
     e.preventDefault();
+    const n = fileCount(e.dataTransfer);
+    // an internal page drag is not an offer to open anything
+    if (!n) return;
     depth++;
-    const n = e.dataTransfer?.items?.length || 0;
     document.getElementById("drop-title").textContent =
       n > 1 ? `Drop to merge ${n} files` : "Drop to open";
     hint.hidden = false;
@@ -1233,14 +1249,22 @@ function wireDocument() {
   window.addEventListener("dragover", (e) => { e.preventDefault(); });
   window.addEventListener("dragleave", (e) => {
     e.preventDefault();
-    if (--depth <= 0) { depth = 0; hint.hidden = true; }
+    if (--depth <= 0) clear();
   });
   window.addEventListener("drop", (e) => {
     e.preventDefault();
-    depth = 0;
-    hint.hidden = true;
+    clear();
     if (e.dataTransfer.files.length) openFiles(e.dataTransfer.files);
   });
+  // A DRAG THAT ENDS ELSEWHERE STILL ENDS. Dropping a page onto the desktop
+  // finishes the gesture outside this window: no `drop` here, and the last
+  // `dragleave` can go missing across a frame or a child element, so the
+  // enter/leave count never returns to zero and the hint stays on screen for
+  // ever. `dragend` fires on the source for every outcome, including cancel.
+  window.addEventListener("dragend", clear, true);
+  // and a drag that left the window entirely — the pointer is gone, so nothing
+  // else will arrive to balance the count
+  document.addEventListener("mouseleave", () => { if (depth) clear(); });
 }
 
 // ── the toolbar as a binding surface ─────────────────────────────────────────

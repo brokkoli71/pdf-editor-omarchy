@@ -50,6 +50,22 @@ export const STRAIGHT_HOLD_MS = 500;   // hold still this long mid-stroke to sna
 // was therefore never snapped.
 export const CIRCLE_LASSO_HOLD_MS = 500;
 
+/** HOW STILL "STILL" HAS TO BE — for both holds, because it is one fact about a
+ * hand, not two facts about two gestures.
+ *
+ * A hand holding a pen against glass for half a second does not stop moving; it
+ * drifts. Reported: both dwells were "too precisely not moving" to be usable.
+ * Here the circle-to-lasso hold had NO tolerance at all — any motion event
+ * cancelled it — and the shape dwell re-armed its timer on every event, so a
+ * shaking hand reset the clock forever and it never fired.
+ *
+ * The two measure from different places, and that difference is the whole
+ * design. Circle-to-lasso measures from where the press LANDED, so a slow drag
+ * across the page can never become a selection. The shape dwell measures from
+ * wherever the pen was last moving, because you draw a shape and then stop, and
+ * the hold has to start from where you stopped. */
+export const HOLD_SLOP_PX = 16.0;
+
 export const IMPLEMENTED_TOOLS = new Set(["pen", "highlighter", "eraser", "pan",
                                           "zoom", "lasso", "text", "anchor"]);
 
@@ -556,6 +572,8 @@ export class Surface {
     }
     if (tool === "eraser") this._eraseAt(dx, dy);
     if (tool === "pen" || tool === "highlighter") {
+      // both clocks start here, and the dwell's anchor with them
+      this._snapAnchor = [e.offsetX, e.offsetY];
       this._armSnapTimer();
       this._armCircleLasso(dx, dy);
     }
@@ -673,8 +691,22 @@ export class Surface {
       }
     }
     a.lastView = [e.offsetX, e.offsetY];
-    if (a.tool === "pen" || a.tool === "highlighter") this._armSnapTimer();
-    this._cancelCircleLasso();   // the pen moved: this was an ordinary stroke
+
+    // A HOLD IS NOT A FREEZE. Both dwells stay alive while the pen is merely
+    // drifting; see HOLD_SLOP_PX for why they measure from different origins.
+    if (Math.hypot(e.offsetX - a.startView[0], e.offsetY - a.startView[1])
+        > HOLD_SLOP_PX) {
+      this._cancelCircleLasso();     // this press went somewhere: a real stroke
+    }
+    if (a.tool === "pen" || a.tool === "highlighter") {
+      const anchor = this._snapAnchor || a.startView;
+      if (Math.hypot(e.offsetX - anchor[0], e.offsetY - anchor[1]) > HOLD_SLOP_PX) {
+        // the pen is still travelling — start the clock again from here, rather
+        // than on every event, which is what a shaking hand could never outrun
+        this._snapAnchor = [e.offsetX, e.offsetY];
+        this._armSnapTimer();
+      }
+    }
     this.requestDraw();
   }
 

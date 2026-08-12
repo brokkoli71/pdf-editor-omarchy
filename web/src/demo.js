@@ -12,6 +12,8 @@
 // it, the step is wrong.
 
 import { shapeVertices, VERTEX_WELD_EPS } from "./lasso.js";
+import { PAGES_MIME } from "./sidebar.js";
+import { putHandoff } from "./db.js";
 
 const frame = document.getElementById("demo-frame");
 const el = {
@@ -59,22 +61,26 @@ function watchToasts() {
   return true;
 }
 
-/** A page leaving the window: the drag that hands a PDF to the desktop.
+/** A page leaving the window.
  *
- * There is no way to see where a drag LANDS — the drop happens in a file
- * manager this page will never hear from. What can be checked is the half that
- * was broken until recently and is the whole of Sidemark's side: that the drag
- * left carrying a file at all. */
+ * Where it LANDS is unknowable from here — another window, a file manager, or
+ * nowhere. Chromium also strips `DownloadURL` from what web content can see
+ * during a drag (it becomes `chromium/x-drag-id`), so even the types are only
+ * fully visible at `dragstart` on the source. What is checkable is Sidemark's
+ * whole side of it: the drag left carrying pages. */
 let pageDragOut = 0;
 function watchPageDrags() {
   const doc = frame.contentDocument;
   if (!doc) return false;
+  // BUBBLE, not capture. The strip fills the payload in its own handler on the
+  // row; a capture listener on the document runs BEFORE that one, and sees a
+  // dataTransfer carrying nothing at all — the step could never tick.
   doc.addEventListener("dragstart", (e) => {
     const types = [...(e.dataTransfer?.types || [])].map((t) => t.toLowerCase());
     if (types.includes("downloadurl") || types.includes("application/x-sidemark-pages")) {
       pageDragOut = Date.now();
     }
-  }, true);
+  });
   return true;
 }
 
@@ -185,9 +191,9 @@ const steps = [
     list: [
       "Drag a thumbnail to a different position.",
       "Drag the handout below into the strip.",
-      "Drag a thumbnail out onto your desktop.",
+      "Drag a thumbnail out of the strip and let go.",
     ],
-    hint: "The strip is the leftmost button in the bar.",
+    hint: "The strip is the leftmost button in the bar. A page dragged out leaves as a PDF with its ink in it — into another Sidemark window, or onto your desktop where the browser allows it.",
     handout: true,
     arm(ctx) {
       ctx.pages0 = app()?.doc?.pageCount ?? 0;
@@ -296,30 +302,38 @@ function finish() {
   el.end.hidden = false;
 }
 
-/** The page you drag INTO the document. A real file, offered by a real drag —
- * the same path a PDF dragged out of a file manager takes, which is the point:
- * the app is not being told about it, it is being dropped on. */
+/** The page you drag INTO the document.
+ *
+ * It rides the SAME handoff a page dragged out of another Sidemark window
+ * rides: a key into the shared database, with the bytes parked under it. That
+ * is not a shortcut — a page can only reach the app this way or as a real file
+ * from your own disk, and A PAGE CANNOT PUT A FILE ON A DRAG. Measured: adding
+ * one with `DataTransfer.items.add(file)` inside `dragstart` starts a perfectly
+ * ordinary drag that arrives at the drop with `files.length === 0`, so the card
+ * looked draggable, dropped cleanly, and did nothing whatsoever.
+ *
+ * What it teaches is true either way: pages arriving from somewhere else land
+ * at the gap you drop them in. */
 function handoutCard() {
   const card = document.createElement("div");
   card.className = "demo-handout";
   card.draggable = true;
   card.innerHTML = '<span class="demo-file">PDF</span><span>handout.pdf<small>drag me into the page strip</small></span>';
-  card.addEventListener("dragstart", async (e) => {
-    // `setData` must run synchronously inside dragstart, so the bytes are
-    // fetched when the step opens, not here
-    if (!handoutFile) return;
+  card.addEventListener("dragstart", (e) => {
+    if (!handoutKey) return;          // still fetching: a drag with no payload
     e.dataTransfer.effectAllowed = "copy";
-    e.dataTransfer.items.add(handoutFile);
+    e.dataTransfer.setData(PAGES_MIME, handoutKey);
   });
   return card;
 }
 
-let handoutFile = null;
+let handoutKey = null;
 async function loadHandout() {
   try {
-    const bytes = await fetch("demo/handout.pdf").then((r) => r.arrayBuffer());
-    handoutFile = new File([bytes], "handout.pdf", { type: "application/pdf" });
-  } catch { /* the step still passes on a page dragged in from anywhere else */ }
+    const buf = await fetch("demo/handout.pdf").then((r) => r.arrayBuffer());
+    handoutKey = `demo-handout-${Date.now()}`;
+    await putHandoff(handoutKey, { name: "handout.pdf", bytes: new Uint8Array(buf) });
+  } catch { handoutKey = null; }   // the step still passes on any PDF dropped in
 }
 
 // ── starting up ──────────────────────────────────────────────────────────────

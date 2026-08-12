@@ -237,8 +237,11 @@ export class Sidebar {
       clearTimeout(this._armTimer);
       this.onDragArm(index);
       e.dataTransfer.effectAllowed = "copyMove";
-      // some browsers refuse to start a drag with no payload
-      e.dataTransfer.setData("text/plain", String(index));
+      // A drag needs SOME payload to start, and it must not be `text/plain`:
+      // the notes editor accepts dropped text, so a page dragged over the notes
+      // panel was inserting its own index there as characters. Our own type is
+      // meaningless to everything else on the page, which is the point.
+      e.dataTransfer.setData(PAGES_MIME, "");
       // …and if a file is ready for these pages, offer it to the DESKTOP as
       // well, so the same drag reorders inside the strip and exports outside it
       const payload = this.onDragPayload(index);
@@ -454,8 +457,10 @@ export class Sidebar {
       // Pages dragged out of ANOTHER Sidemark window. Checked before the files,
       // because a drag can carry both and this is the lossless half — it brings
       // the ink with it, where a file would arrive flattened.
+      // an EMPTY key is the "this drag has started" marker, not a handoff
       const key = e.dataTransfer.getData(PAGES_MIME);
       if (key) return this.onDropPages(key, gap);
+      if (e.dataTransfer.types.includes(PAGES_MIME)) return;   // ours, unready
       const files = [...(e.dataTransfer.files || [])];
       if (files.length) this.onDropFiles(files, gap);
     });
