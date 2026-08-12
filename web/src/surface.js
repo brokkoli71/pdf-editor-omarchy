@@ -13,6 +13,7 @@ import { recognizeShape, snapGridDivider, respaceDividers, polylineIsClosed,
          SNAP_LABELS } from "./shapes.js";
 import { pageWords, nearestWord, wordsBetween, wordsInRect,
          selectionText, selectionRects } from "./textlayer.js";
+import { copySelection, takeCopy, hasCopy, copyExtent } from "./clipboard.js";
 import {
   pointInPolygon, lassoHandlePoints, lassoHandleAnchor, lassoScaleFactors,
   lassoHandleCursor, lassoChipCentre, lassoChipHit, lassoDeleteCentre,
@@ -500,6 +501,7 @@ export class Surface {
       return;
     }
 
+    this._pointerAt = [e.offsetX, e.offsetY];
     if (!this.active) {
       // a stylus in proximity: this is the hover trail the lead-in reads
       if (e.pointerType === "pen" && e.buttons === 0) {
@@ -1042,6 +1044,39 @@ export class Surface {
     this.onChange();
     this.requestDraw();
     return true;
+  }
+
+  /** Copy the lasso selection. Wins over text copy when there is one — the
+   * ink you have selected is what you meant. */
+  async copySelected() {
+    if (!this.hasSelection()) return null;
+    return copySelection(this.selected);
+  }
+
+  /** Paste the held ink at a document point, and select it — so a fresh paste
+   * drags immediately, with the pen or the caret still in hand. */
+  pasteAt(px, py) {
+    if (!hasCopy()) return false;
+    const size = copyExtent() || [0, 0];
+    // dropped so its CENTRE is under the pointer, which is where you are
+    // looking when you press Ctrl+V
+    const copies = takeCopy(px - size[0] / 2, py - size[1] / 2);
+    if (!copies.length) return false;
+    for (const c of copies) this.strokes.push(c);
+    this._pushUndo({ type: "add", page: this.pageIndex, strokes: copies });
+    this._setSelected(copies, null);
+    this.invalidateLayer();
+    this.onChange();
+    this.requestDraw();
+    return true;
+  }
+
+  /** Where a paste lands: the POINTER when it is over the page, else the middle
+   * of the view. Never the caret — with a pen or the lasso in hand there is no
+   * useful caret. */
+  pastePoint() {
+    const p = this._pointerAt || [this.cssW / 2, this.cssH / 2];
+    return this.toDoc(p[0], p[1]);
   }
 
   duplicateSelected() {

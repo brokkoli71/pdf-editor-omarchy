@@ -1356,11 +1356,26 @@ function wireKeys() {
     } else if ((e.ctrlKey || e.metaKey) && key === "b") {
       e.preventDefault();
       toggleBookmark();
+    } else if ((e.ctrlKey || e.metaKey) && key === "v") {
+      if (!typingInNotes() && surface.pasteAt) {
+        const [px, py] = surface.pastePoint();
+        if (surface.pasteAt(px, py)) { e.preventDefault(); toast("Pasted"); }
+      }
     } else if ((e.ctrlKey || e.metaKey) && key === "c") {
       // App-level keys belong on the WINDOW so they fire whatever has focus,
       // and the window asks the surface rather than the surface owning the key.
       // The editor keeps Ctrl+C while the caret is in it.
-      if (surface.hasTextSelection() && !typingInNotes()) {
+      //
+      // A LASSO selection wins over a text one: the ink you have selected is
+      // what you meant by copy.
+      if (surface.hasSelection() && !typingInNotes()) {
+        e.preventDefault();
+        surface.copySelected().then((r) => {
+          if (!r) return;
+          toast(r.picture ? `Copied ${r.count} stroke${r.count > 1 ? "s" : ""}`
+                          : `Copied ${r.count} — the picture could not reach the system clipboard`);
+        });
+      } else if (surface.hasTextSelection() && !typingInNotes()) {
         e.preventDefault();
         navigator.clipboard.writeText(surface.selectedText)
           .then(() => toast("Copied"))
