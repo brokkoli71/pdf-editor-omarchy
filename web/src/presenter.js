@@ -30,7 +30,7 @@ const POPUP_HTML = `<!doctype html>
 </style></head>
 <body>
   <canvas id="m"></canvas>
-  <div class="hint" id="h">Space / arrows to page · F for fullscreen · Esc to close</div>
+  <div class="hint" id="h">Click or space to advance · right-click or ← to go back · F fullscreen · Esc closes</div>
 </body></html>`;
 
 export class Presenter {
@@ -43,6 +43,8 @@ export class Presenter {
     this.onNeedFrame = opts.onNeedFrame || (() => {});
     this.onClose = opts.onClose || (() => {});
     this._pending = false;
+    this._navAt = 0;      // when the last press paged, so a browser delivering
+                          // both pointerdown and mousedown does not page twice
   }
 
   get open() { return !!(this.win && !this.win.closed); }
@@ -73,12 +75,36 @@ export class Presenter {
         e.preventDefault(); nav(-1);
       }
     });
-    // click to advance, right-click to go back — what a clicker sends
-    win.addEventListener("mousedown", (e) => {
+    // Click to advance, right-click (or the mouse's Back button) to go back —
+    // what a clicker sends.
+    //
+    // On the DOCUMENT in the capture phase, not on the window in the bubble
+    // phase: a right press can be consumed by the context-menu machinery before
+    // it reaches the window, which is exactly the shape of "right-click does
+    // nothing". Capturing at the document sees it first, whatever happens after.
+    //
+    // `pointerdown` rather than `mousedown` so a pen or a touchscreen driving
+    // the projected window works too — the same reason the canvas uses it.
+    const back = (e) => e.button === 2 || e.button === 3;
+    const onPress = (e) => {
       e.preventDefault();
-      nav(e.button === 2 || e.button === 3 ? -1 : 1);
-    });
-    win.addEventListener("contextmenu", (e) => e.preventDefault());
+      this._navAt = Date.now();
+      nav(back(e) ? -1 : 1);
+    };
+    // ONE target. Capture runs window → document → element, so the document
+    // already sees every press inside the page; adding the window as well ran
+    // the handler twice and paged two slides per click.
+    const doc = win.document;
+    doc.addEventListener("pointerdown", onPress, true);
+    // …with a plain mouse fallback, in case pointer events are unavailable to
+    // this window. `_navAt` makes the pair idempotent, so a browser delivering
+    // both does not page twice.
+    doc.addEventListener("mousedown", (e) => {
+      if (Date.now() - this._navAt < 250) return;
+      onPress(e);
+    }, true);
+    doc.addEventListener("contextmenu", (e) => e.preventDefault(), true);
+    doc.addEventListener("auxclick", (e) => e.preventDefault(), true);
     win.addEventListener("resize", () => this.request());
     win.addEventListener("pagehide", () => this.stop());
     // the hint fades once, so it explains itself and then gets out of the way
