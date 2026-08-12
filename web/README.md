@@ -60,7 +60,9 @@ constants.
 - **The extended dwell** — hold still mid-stroke and the freehand line becomes a
   clean rectangle, ellipse, polygon or line, with a label naming what you will
   get. A line inside a rectangle becomes a GRID DIVIDER and re-spaces its
-  siblings to equal cells.
+  siblings to equal cells. The pen then keeps hold of the new shape's last
+  control point, and what is already on the page pulls it in — so a shape joins
+  a drawing without lifting.
 - **Circle to lasso** — draw a loop, lift, then press and hold on it and it
   becomes the selection. The pen stays in your hand.
 - **Saving** — `Ctrl+S` writes the PDF with the ink in it as real annotations,
@@ -69,7 +71,9 @@ constants.
   desktop, with ink stored per page. A sidebar switches Pages/Outline, and the
   outline carries the "you are here" rule. Drop several files at once and they
   merge into ONE document with a chapter per file; drop onto the sidebar and
-  they insert at that gap.
+  they insert at that gap. Drag a thumbnail OUT and those pages leave as a PDF
+  — onto the desktop (Chromium), or into another Sidemark window's pages, where
+  they arrive with their ink.
 
 ## Which browser
 
@@ -118,7 +122,7 @@ Scope limits, not oversights:
   recovers ~10% of the lag error at best, negative past 40 ms.
   `getPredictedEvents()` is the same guess with a vendor's name on it — don't
   reach for it.
-- **No text-first mode**, no bookmarks, no wiki links, no presenter or share.
+- **No text-first mode**, no wiki links, no share-to-phone.
 
 ## Conformance
 

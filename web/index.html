@@ -18,12 +18,6 @@
     <button class="flat icon-btn" id="open-btn" title="Open a PDF (or drop one anywhere)" aria-label="Open">
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 12.5v-9A.5.5 0 0 1 2.5 3h3.2l1.4 1.6h6.4a.5.5 0 0 1 .5.5v7.4a.5.5 0 0 1-.5.5h-11a.5.5 0 0 1-.5-.5z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
     </button>
-    <button class="flat icon-btn" id="recent-btn" title="Recent documents" aria-label="Recent documents" aria-haspopup="dialog">
-      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.8" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 4.6V8l2.4 1.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    </button>
-    <button class="flat icon-btn" id="insert-btn" title="Insert pages from a PDF at this page" aria-label="Insert pages">
-      <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="2.5" width="7" height="11" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M12.5 6v6M9.5 9h6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-    </button>
     <button class="flat icon-btn" id="save-btn" title="Save (Ctrl+S)" aria-label="Save">
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2.5h7.2L13.5 5.8V13a.5.5 0 0 1-.5.5H3a.5.5 0 0 1-.5-.5V3a.5.5 0 0 1 .5-.5z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M5.5 2.5v3.2h5V2.5M5 13.5V9.8h6v3.7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
     </button>
@@ -38,14 +32,6 @@
   </div>
 
   <div class="hb-end">
-    <div class="pager" id="zoomer">
-      <button class="flat icon-btn" id="zoom-out" title="Zoom out" aria-label="Zoom out">
-        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8h9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
-      </button>
-      <button class="flat icon-btn" id="zoom-in" title="Zoom in" aria-label="Zoom in">
-        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
-      </button>
-    </div>
     <div class="pager" id="pager">
       <button class="flat icon-btn" id="prev-page" title="Previous page" aria-label="Previous page">
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -70,9 +56,6 @@
     <button class="flat icon-btn" id="present-btn" title="Presenter mode — mirror this page to a second screen" aria-label="Presenter mode">
       <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.8" y="2.6" width="12.4" height="8.4" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M6 13.6h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
     </button>
-    <button class="flat icon-btn" id="bookmark-btn" title="Bookmark this page (Ctrl+B)" aria-label="Bookmark page" aria-pressed="false">
-      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.2l1.8 3.7 4 .6-2.9 2.8.7 4L8 11.4l-3.6 1.9.7-4L2.2 6.5l4-.6z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
-    </button>
     <button class="flat icon-btn" id="undo-btn" title="Undo (Ctrl+Z)" aria-label="Undo">
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 7h6.5a3.5 3.5 0 1 1 0 7H7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M5.5 4.2 2.8 7l2.7 2.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
@@ -82,8 +65,44 @@
     <button class="flat icon-btn" id="pen-btn" title="Pen settings" aria-label="Pen settings" aria-haspopup="dialog">
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11.6 2.6a1.4 1.4 0 0 1 2 2L6.2 12 3 13l1-3.2z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
     </button>
+    <button class="flat icon-btn" id="more-btn" title="More" aria-label="More" aria-haspopup="menu">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+    </button>
   </div>
 </header>
+
+<!-- The verbs that are reached rather than reflexed.
+     What stays in the bar is what a hand in the middle of writing reaches for:
+     the page, the notes, undo, the pen. Everything here has a keyboard
+     shortcut, a gesture or a place in the sidebar as well — this is the second
+     way to it, not the only one. Each row IS the button it always was, id and
+     wiring unchanged, so nothing is duplicated to drift. -->
+<div class="popover menu-popover" id="more-popover" role="menu" aria-label="More" hidden>
+  <div class="popover-body">
+    <button class="flat menu-item" id="recent-btn" aria-haspopup="dialog">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.8" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 4.6V8l2.4 1.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Recent documents
+    </button>
+    <button class="flat menu-item" id="insert-btn">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="2.5" width="7" height="11" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M12.5 6v6M9.5 9h6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      Insert pages from a PDF…
+    </button>
+    <button class="flat menu-item" id="bookmark-btn" aria-pressed="false">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.2l1.8 3.7 4 .6-2.9 2.8.7 4L8 11.4l-3.6 1.9.7-4L2.2 6.5l4-.6z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+      Bookmark this page
+      <span class="menu-key">Ctrl+B</span>
+    </button>
+    <div class="menu-sep"></div>
+    <button class="flat menu-item" id="zoom-in">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      Zoom in
+    </button>
+    <button class="flat menu-item" id="zoom-out">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8h9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      Zoom out
+    </button>
+  </div>
+</div>
 
 <!-- Above BOTH modes on purpose: a search bar living inside the page column is
      unreachable the moment the notes take the window, and the handler runs

@@ -68,6 +68,16 @@
 
 * { box-sizing: border-box; }
 
+/* `hidden` MEANS hidden, everywhere and once.
+   The UA sheet's `[hidden] { display: none }` is an author-rule loss waiting to
+   happen: any class rule that sets `display` outranks it, so `.pager` painted
+   the presenter's timer in the header for a document nobody was presenting —
+   while the JS that set `hidden` was correct the whole time. The half-dozen
+   `.thing[hidden]` rules further down were each that bug, found and patched one
+   at a time; this is the rule they were all approximating. Keep new components
+   OUT of that list — they are covered here. */
+[hidden] { display: none !important; }
+
 html, body {
   height: 100%;
   margin: 0;
@@ -234,7 +244,6 @@ button:disabled:hover { background: transparent; }
 }
 
 @media (max-width: 620px) {
-  #zoomer { display: none; }
   #sidebar { width: 150px; }
 }
 
@@ -539,6 +548,20 @@ button:disabled:hover { background: transparent; }
 .grow { flex: 1; }
 .row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
 .popover label.dim { margin-top: 6px; }
+
+/* The overflow menu. A row is the BUTTON — same element, same id, same handler
+   as when it stood in the bar — grown a label, because a verb you had to go
+   looking for is one you no longer recognise by its icon alone. */
+.menu-popover { width: 268px; }
+.menu-item {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%; padding: 7px 8px;
+  font-size: 14px; text-align: left; border-radius: 6px;
+}
+.menu-item svg { width: 16px; height: 16px; flex: none; }
+.menu-item:hover { background: var(--btn-hover); }
+.menu-item .menu-key { margin-left: auto; font-size: 12px; color: var(--dim); }
+.menu-sep { height: 1px; background: var(--separator); margin: 4px 2px; }
 
 .scale-row { display: flex; align-items: center; gap: 8px; }
 .scale-row output {

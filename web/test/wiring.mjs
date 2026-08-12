@@ -112,6 +112,25 @@ for (const file of readdirSync(src).filter((f) => f.endsWith(".js"))) {
   }
 }
 
+// ── every BUTTON in the page must be reached by some module ─────────────────
+// The other direction of the same failure: an element that exists, is painted,
+// and that nothing ever listens to. A button moved between containers keeps its
+// id and its handler — one rebuilt as a copy in its new home does not, and a
+// menu of dead entries is exactly what this suite was written for.
+{
+  const html = readFileSync(join(src, "..", "index.html"), "utf8");
+  const code = readdirSync(src).filter((f) => f.endsWith(".js"))
+    .map((f) => read(f)).join("\n");
+  for (const m of html.matchAll(/<button\b[^>]*\sid="([^"]+)"/g)) {
+    const id = m[1];
+    // reached by id or by selector — `getElementById("x")` or `querySelector("#x")`
+    const forms = [`"${id}"`, `'${id}'`, `"#${id}"`, `'#${id}'`];
+    if (!forms.some((f) => code.includes(f))) {
+      fail(`index.html: <button id="${id}"> is never referenced by any module`);
+    }
+  }
+}
+
 if (failures) {
   console.error(`\n✗ ${failures} wiring problem(s).`);
   process.exit(1);

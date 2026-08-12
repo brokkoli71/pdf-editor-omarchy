@@ -4,6 +4,16 @@
 // lecture deck there is nothing to switch to, and an empty half of a switch is
 // worse than no switch.
 
+/** The drag type one Sidemark window offers another: a key into the shared
+ * `handoff` store, never the bytes. A `dataTransfer` string crosses windows;
+ * an object URL does not. */
+export const PAGES_MIME = "application/x-sidemark-pages";
+
+/** How long a press must last before the pages under it are extracted ready for
+ * a drag. Long enough that turning the page never pays for it, short enough
+ * that the hand has not yet moved far enough to start one. */
+const DRAG_ARM_MS = 130;
+
 export class Sidebar {
   constructor(root, opts) {
     this.root = root;
@@ -14,6 +24,8 @@ export class Sidebar {
     this.onExportPages = opts.onExportPages || (() => {});
     this.onSelectionChanged = opts.onSelectionChanged || (() => {});
     this.onDragPayload = opts.onDragPayload || (() => null);
+    this.onDragArm = opts.onDragArm || (() => {});
+    this.onDropPages = opts.onDropPages || (() => {});
     this.onDropBookmark = opts.onDropBookmark || (() => {});
     this.onToggleHidden = opts.onToggleHidden || (() => {});
     this.onAddPage = opts.onAddPage || (() => {});
@@ -203,8 +215,27 @@ export class Sidebar {
    * "between these two rows", whatever you are dragging. */
   _makeReorderable(row, index) {
     row.draggable = true;
+    // A drag's payload must be set SYNCHRONOUSLY inside `dragstart`, and
+    // extracting pages is async — so the press ARMS it. `pointerdown` is the
+    // only moment there is: it precedes the drag by at least the distance the
+    // hand has to move. Without this the export was ready only for a page you
+    // had ctrl-clicked first, so an ordinary drag of an unselected thumbnail
+    // carried no file at all and dropping it did nothing, anywhere.
+    //
+    // Held off by DRAG_ARM_MS, because extracting pages means parsing the whole
+    // document: a plain click to turn the page must not pay for it. A press
+    // that is still down after this long is going somewhere.
+    row.addEventListener("pointerdown", () => {
+      clearTimeout(this._armTimer);
+      this._armTimer = setTimeout(() => this.onDragArm(index), DRAG_ARM_MS);
+    });
+    row.addEventListener("pointerup", () => clearTimeout(this._armTimer));
     row.addEventListener("dragstart", (e) => {
       this._dragPage = index;
+      // …and again here, for the case the press was too quick for the arm: this
+      // drag goes without a file, the next one has it ready
+      clearTimeout(this._armTimer);
+      this.onDragArm(index);
       e.dataTransfer.effectAllowed = "copyMove";
       // some browsers refuse to start a drag with no payload
       e.dataTransfer.setData("text/plain", String(index));
@@ -212,7 +243,14 @@ export class Sidebar {
       // well, so the same drag reorders inside the strip and exports outside it
       const payload = this.onDragPayload(index);
       if (payload) {
-        try { e.dataTransfer.setData("DownloadURL", payload); } catch { /* not Chromium */ }
+        if (payload.download) {
+          try { e.dataTransfer.setData("DownloadURL", payload.download); }
+          catch { /* not Chromium: the menu's export is the whole feature */ }
+        }
+        // The same drag also travels to ANOTHER Sidemark window, which cannot
+        // read a `DownloadURL` (that type is for the desktop) nor an object URL
+        // from this one. It gets a key into the shared database instead.
+        if (payload.handoff) e.dataTransfer.setData(PAGES_MIME, payload.handoff);
       }
       row.classList.add("dragging");
     });
@@ -393,6 +431,11 @@ export class Sidebar {
         if (to !== from) this.onMovePage(from, to);
         return;
       }
+      // Pages dragged out of ANOTHER Sidemark window. Checked before the files,
+      // because a drag can carry both and this is the lossless half — it brings
+      // the ink with it, where a file would arrive flattened.
+      const key = e.dataTransfer.getData(PAGES_MIME);
+      if (key) return this.onDropPages(key, gap);
       const files = [...(e.dataTransfer.files || [])];
       if (files.length) this.onDropFiles(files, gap);
     });

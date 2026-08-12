@@ -21,6 +21,7 @@ import { listRecent, rememberRecent, forgetRecent, clearRecent,
          recentState, openRecent } from "./recent.js";
 import { Search } from "./search.js";
 import { Presenter, Timer } from "./presenter.js";
+import { putHandoff, takeHandoff } from "./db.js";
 
 // ── settings (the settings.json analogue) ────────────────────────────────────
 
@@ -182,7 +183,9 @@ const sidebar = new Sidebar(document.getElementById("sidebar"), {
   onDeletePages: (pages) => removePages(pages),
   onExportPages: (pages) => doExportPages(pages),
   onSelectionChanged: (pages) => preparePageDrag(pages),
+  onDragArm: (index) => preparePageDrag(sidebar.pagesActedOn(index)),
   onDragPayload: (index) => pageDragPayload(index),
+  onDropPages: (key, gap) => importHandoff(key, gap),
   onDropBookmark: (page) => dropBookmark(page),
   onToggleHidden: (page, unhide) => toggleHidden(page, unhide),
   onAddPage: (page, kind) => addPageAfter(page, kind),
@@ -214,6 +217,7 @@ wireDivider();
 wireSearch();
 wireBookmarks();
 wireRecent();
+wireMoreMenu();
 wirePresenter();
 wireNotesPanel();
 refreshToolBindings();
@@ -650,32 +654,65 @@ async function doExportPages(pages) {
   }
 }
 
-/** Prepare the file a page DRAG will hand to the desktop.
+/** Prepare what a page DRAG will hand over — a file for the desktop, and a key
+ * for another Sidemark window.
  *
- * `dataTransfer.setData` has to run synchronously inside `dragstart`, and
- * extracting pages is async — so the bytes are built when the SELECTION changes
- * and held ready. `DownloadURL` is a Chromium-only drag type; everywhere else
- * the menu's export is the whole feature. */
+ * `dataTransfer.setData` has to run synchronously inside `dragstart` and
+ * extracting pages is async, so the bytes are built AHEAD: when the selection
+ * changes, and again on the press that starts a drag (`onDragArm`). The press
+ * is the one that matters — dragging a thumbnail you never selected is the
+ * ordinary case, and it used to carry nothing at all.
+ *
+ * `DownloadURL` is Chromium-only, and only ever reaches the desktop; the
+ * `handoff` key is what crosses to a second window, in every browser. */
 let pageDrag = null;
+let pageDragSeq = 0;
 async function preparePageDrag(pages) {
-  if (pageDrag) { URL.revokeObjectURL(pageDrag.url); pageDrag = null; }
+  const want = pages.join(",");
+  if (pageDrag && pageDrag.pages === want) return;   // already in hand
+  const seq = ++pageDragSeq;
   const doc = surface.doc;
   if (!doc || !pages.length) return;
   try {
     const bytes = await extractPages(doc, pages);
+    // A slower extraction that has since been superseded must not overwrite the
+    // one the hand is actually dragging.
+    if (seq !== pageDragSeq) return;
+    if (pageDrag) URL.revokeObjectURL(pageDrag.url);
+    const key = `pages-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     pageDrag = {
-      pages: pages.join(","),
+      pages: want,
+      key,
       name: exportName(doc.name, pages),
       url: URL.createObjectURL(new Blob([bytes], { type: "application/pdf" })),
     };
-  } catch { pageDrag = null; }
+    await putHandoff(key, { name: pageDrag.name, bytes });
+  } catch { /* a drag that cannot be prepared still reorders inside the strip */ }
 }
 
-/** The `DownloadURL` payload for a drag starting on `index`, or null. */
+/** The payloads for a drag starting on `index`, or null when the bytes for
+ * exactly these pages are not ready yet. */
 function pageDragPayload(index) {
   const pages = sidebar.pagesActedOn(index);
   if (!pageDrag || pageDrag.pages !== pages.join(",")) return null;
-  return `application/pdf:${pageDrag.name}:${pageDrag.url}`;
+  return {
+    download: `application/pdf:${pageDrag.name}:${pageDrag.url}`,
+    handoff: pageDrag.key,
+  };
+}
+
+/** Pages dragged in from another Sidemark window: the bytes are waiting in the
+ * shared database under the key the drag carried. Imported through the ordinary
+ * merge pipeline, so a page from another window lands exactly like a dropped
+ * file — at the gap, with its notes re-keyed. */
+async function importHandoff(key, gap) {
+  try {
+    const rec = await takeHandoff(key);
+    if (!rec) return toast("Those pages are no longer available");
+    await importAt([{ name: rec.name, bytes: rec.bytes }], gap);
+  } catch (err) {
+    toast(`Could not insert: ${err.message}`);
+  }
 }
 
 /** Insert pages from a file, at the current page. The same pipeline as a drop
@@ -908,6 +945,27 @@ function wireRecent() {
     await clearRecent();
     buildRecentList();
   });
+}
+
+/** The overflow menu: the verbs that are reached rather than reflexed.
+ *
+ * It holds the very buttons that used to stand in the bar, so there is nothing
+ * to keep in step — a menu that rebuilt them as copies would be a second set of
+ * handlers, which is how one of them comes to be dead. It closes on any of
+ * them, because two popovers share the header's top-right corner and the second
+ * would open behind the first. */
+function wireMoreMenu() {
+  const pop = document.getElementById("more-popover");
+  const btn = document.getElementById("more-btn");
+  btn.addEventListener("click", () => { pop.hidden = !pop.hidden; });
+  for (const item of pop.querySelectorAll(".menu-item")) {
+    item.addEventListener("click", () => { pop.hidden = true; });
+  }
+  document.addEventListener("pointerdown", (e) => {
+    if (!pop.hidden && !pop.contains(e.target) && !btn.contains(e.target)) {
+      pop.hidden = true;
+    }
+  }, true);
 }
 
 // ── bookmarks and linked notes ───────────────────────────────────────────────

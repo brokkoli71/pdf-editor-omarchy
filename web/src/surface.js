@@ -580,6 +580,15 @@ export class Surface {
     // frame-rate stream sees ~30 — 78% of every stroke discarded, which is the
     // whole of what the pipeline used to call "undersampling". Walk the
     // recovered samples in BEFORE the event's own point.
+    // A stroke the dwell has already settled must not take more samples: they
+    // would be appended to the clean shape, undoing the recognition a moment
+    // after it fired. The pen drives the held control point from here on.
+    if (this._straightMode && (a.tool === "pen" || a.tool === "highlighter")) {
+      this._dragLiveVertex(a, dx, dy);
+      a.lastView = [e.offsetX, e.offsetY];
+      return;
+    }
+
     const coalesced = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
     const samples = coalesced.length ? coalesced : [e];
     for (const s of samples) {
@@ -641,6 +650,53 @@ export class Surface {
     this._snapAt = [Math.max(...xs), Math.min(...ys)];
     a.pts = pts;
     a.press = [];              // a settled shape has no pressure profile
+    this._armLiveVertex(a);
+    this.requestDraw();
+  }
+
+  /** After the dwell the pen KEEPS HOLD of the shape's last control point, and
+   * every corner polyline already on the page becomes a live magnet for it — so
+   * a fresh shape joins what is already drawn without ever lifting.
+   *
+   * Only the corner kinds get this: a line, a path, a polygon. There is no
+   * single point to keep hold of on an ellipse, and a rectangle's corner would
+   * have to skew it. For a closed ring the point is index 0, since that is the
+   * one `moveShapeVertex` carries to both ends.
+   *
+   * The target sets are frozen HERE, at dwell time: rebuilding them on every
+   * motion event over a page of handwriting is tens of thousands of segments.
+   * The live shape offers its OWN points and edges too — the held point and the
+   * two edges meeting it are excluded by `snapPoint`, or it would pin itself. */
+  _armLiveVertex(a) {
+    a.liveHeld = null;
+    if (!["line", "path", "polygon"].includes(this._snapKind)) return;
+    if (!a.pts || a.pts.length < 2) return;
+    const closed = polylineIsClosed(a.pts);
+    a.liveHeld = closed ? 0 : a.pts.length - 1;
+    a.liveSelf = { stroke: a, verts: a.pts };
+    a.liveTargets = this._pageShapes();
+    a.liveCurves = this._snapCurves();
+  }
+
+  /** A settled shape does not accept new samples — the pen is now moving its
+   * held control point instead. This is also the classic straight snap: a
+   * recognised LINE whose far end follows the nib is exactly a rubber band. */
+  _dragLiveVertex(a, dx, dy) {
+    if (a.liveHeld === null || a.liveHeld === undefined) return;
+    const hit = vertexSnapRadius(this.cssW, this.cssH) / this.zoom;
+    const curves = curveSnapShapes(a.liveCurves || [], dx, dy, hit);
+    const held = [{ stroke: a, index: a.liveHeld }];
+    const shapes = (a.liveTargets || []).concat([a.liveSelf]);
+    const snapped = snapPoint(shapes, dx, dy, hit, held, curves);
+    const [x, y] = snapped || [dx, dy];
+    this._snapAtPoint = snapped;
+    a.pts = moveShapeVertex(a.pts, a.liveHeld, x, y);
+    // the frozen entry describes an array that has just been replaced
+    a.liveSelf.verts = a.pts;
+    // the label names the shape you are about to be left with, so it rides the
+    // shape's corner rather than staying where the dwell happened to fire
+    const xs = a.pts.map((p) => p[0]), ys = a.pts.map((p) => p[1]);
+    this._snapAt = [Math.max(...xs), Math.min(...ys)];
     this.requestDraw();
   }
 
@@ -703,6 +759,9 @@ export class Surface {
     this._snapKind = null;
     this._snapLabel = null;
     this._snapAt = null;
+    // the halo belongs to the point that was in hand; a stale one paints a
+    // snap on a page where nothing is being dragged
+    this._snapAtPoint = null;
   }
 
   _onUp(e, cancelled = false) {
@@ -1539,6 +1598,7 @@ export class Surface {
 
     this.onLiveDraw();
     this._drawLive(ctx);
+    this._drawLiveVertices(ctx);
     this._drawSnapLabel(ctx);
     this._drawLassoPath(ctx);
     this._drawSelection(ctx);
@@ -1741,6 +1801,37 @@ export class Surface {
     drawLassoChip(ctx, chx, chy, this.selectionBoxed, accent);
     const [dlx, dly] = lassoDeleteCentre(box[0], box[1], LASSO_PAD);
     drawLassoDelete(ctx, dlx, dly);
+  }
+
+  /** The control points of the shape still under the pen, and the magnets
+   * within reach of it.
+   *
+   * Only the targets IN REACH are painted. Every corner on the page lighting up
+   * at once says "these are all in play", when what is true is that one of them
+   * is about to catch the point in your hand. */
+  _drawLiveVertices(ctx) {
+    const a = this.active;
+    if (!a || !this._straightMode || a.liveHeld === null
+        || a.liveHeld === undefined) return;
+    const accent = "rgba(53, 132, 228, 0.95)";
+    const [hx, hy] = a.pts[a.liveHeld];
+    const hit = vertexSnapRadius(this.cssW, this.cssH) / this.zoom;
+    const near = [];
+    for (const { verts } of (a.liveTargets || [])) {
+      for (const v of verts) {
+        if (Math.hypot(v[0] - hx, v[1] - hy) <= hit) near.push(this.toView(v[0], v[1]));
+      }
+    }
+    if (near.length) {
+      ctx.save();
+      ctx.globalAlpha = 0.45;    // a magnet is a candidate, not a handle
+      drawShapeVertices(ctx, near, accent);
+      ctx.restore();
+    }
+    const own = shapeVertices(a.pts).map((v) => this.toView(v[0], v[1]));
+    const snapped = this._snapAtPoint
+      ? this.toView(this._snapAtPoint[0], this._snapAtPoint[1]) : null;
+    if (own.length) drawShapeVertices(ctx, own, accent, snapped);
   }
 
   /** The glyph naming what the dwell recognised, at the shape's top-right —
