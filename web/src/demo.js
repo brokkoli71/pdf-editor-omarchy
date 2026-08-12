@@ -11,7 +11,6 @@
 // into the app to make something happen — if a step can pass without you doing
 // it, the step is wrong.
 
-import { shapeVertices, VERTEX_WELD_EPS } from "./lasso.js";
 import { PAGES_MIME } from "./sidebar.js";
 import { putHandoff } from "./db.js";
 
@@ -68,21 +67,27 @@ function watchToasts() {
 // what the tour teaches. The drag still works into another Sidemark window, and
 // the hint says so.
 
-/** Two strokes sharing a corner — the weld, re-derived exactly as the app
- * re-derives it, rather than asking the app whether it thinks it welded. */
-function weldedPair(strokes) {
-  const shapes = strokes.map((s) => shapeVertices(s.pts)).filter((v) => v.length);
-  for (let i = 0; i < shapes.length; i++) {
-    for (let j = i + 1; j < shapes.length; j++) {
-      for (const a of shapes[i]) {
-        for (const b of shapes[j]) {
-          if (Math.abs(a[0] - b[0]) <= VERTEX_WELD_EPS
-              && Math.abs(a[1] - b[1]) <= VERTEX_WELD_EPS) return true;
-        }
-      }
-    }
+/** How many strokes on the page are CLOSED RINGS — the last point sitting
+ * exactly on the first.
+ *
+ * That is the honest signature of a recognised rect, ellipse or polygon, and
+ * nothing else here makes one: `recognizeShape` closes those three by
+ * construction (`corners.concat([corners[0]])`), while freehand ink is only
+ * ever "closed" to within a fraction of its own diagonal, which is thousands
+ * of times this tolerance. So it reads the RESULT of the dwell off the page
+ * and can be measured at any time — where the dwell itself is a MOMENT, caught
+ * only if a 250 ms poll happens to land inside it.
+ */
+const RING_EPS = 1e-6;
+function closedRings(strokes) {
+  let n = 0;
+  for (const s of strokes) {
+    const p = s.pts;
+    if (!p || p.length < 4) continue;
+    const a = p[0], b = p[p.length - 1];
+    if (Math.abs(a[0] - b[0]) <= RING_EPS && Math.abs(a[1] - b[1]) <= RING_EPS) n++;
   }
-  return false;
+  return n;
 }
 
 // ── the steps ────────────────────────────────────────────────────────────────
@@ -126,20 +131,17 @@ const steps = [
 
   {
     id: "dwell",
-    title: "Hold still, then join",
-    body: "Draw a rough box and STOP MOVING without lifting. It becomes a clean rectangle. Then, still without lifting, drag the point you are holding onto a corner of it — the two snap together.",
-    hint: "Half a second of stillness is enough. A label appears naming what you are about to get.",
-    arm(ctx) { ctx.snapped = false; },
-    check(ctx) {
-      const a = app();
-      if (!a) return false;
-      // the dwell is a MOMENT, so it is caught as it happens rather than found
-      // afterwards; the weld is a fact about the page and can be measured at
-      // any time
-      if (a.surface._snapKind) ctx.snapped = true;
-      return ctx.snapped && weldedPair(a.strokes);
-    },
-    done: "Nothing was stored to join them: two points at the same place ARE one point, worked out afresh every time you grab one.",
+    title: "Hold still",
+    body: "Draw a rough box and STOP MOVING without lifting. It becomes a clean rectangle.",
+    hint: "Half a second of stillness is enough. A label appears naming what you are about to get. Keep holding after it snaps and you can drag the corner you are left with onto another one — they join.",
+    // Gated on a SHAPE appearing, not on the join that follows it. The join was
+    // the gate once and the step stuck: it asks for a second gesture chained
+    // onto the end of the first, so anyone who lifted the pen — which the label
+    // makes look finished — was stranded on a step with no way forward. The
+    // dwell is what the step is for, and a closed ring is proof it fired.
+    arm(ctx) { ctx.rings0 = closedRings(app()?.strokes || []); },
+    check(ctx) { return closedRings(app()?.strokes || []) > ctx.rings0; },
+    done: "It is an ordinary stroke, not a shape object — the lasso, the eraser and undo all reach it exactly as they reach your handwriting.",
   },
 
   {
