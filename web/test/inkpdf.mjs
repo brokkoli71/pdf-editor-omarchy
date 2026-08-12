@@ -10,8 +10,9 @@
 import { PDFDocument, PDFName, PDFString } from "../vendor/pdf-lib.esm.js";
 import { writeInk, readInk, INK_PROFILE_TAG } from "../src/inkpdf.js";
 
-let failures = 0;
+let failures = 0, checks = 0;
 function check(name, got, want) {
+  checks++;
   const ok = JSON.stringify(got) === JSON.stringify(want);
   if (!ok) { failures++; console.error(`  ✗ ${name}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`); }
 }
@@ -155,8 +156,86 @@ const flat = {
   check("foreign ink left on the page", inkAnnots(doc).length, 1);
 }
 
+// ── images: the round trip ──────────────────────────────────────────────────
+// A pasted image is a /Stamp annotation marked as ours, with the ORIGINAL bytes
+// beside it in a private stream. What must hold: the bytes come back exactly
+// (an image re-encoded on every save gets worse every time), the frame comes
+// back including a rotation the /Rect cannot express, a save REGENERATES rather
+// than accumulating, and a stamp somebody else put there is never touched.
+{
+  const { writeImages, readImages, IMAGE_TAG } = await import("../src/inkpdf.js");
+  const { PDFDocument: PD, PDFName: PN, PDFString: PS } = await import("../vendor/pdf-lib.esm.js");
+
+  // the smallest valid PNG: 1x1, opaque
+  const PNG = Uint8Array.from(atob(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+  ), (c) => c.charCodeAt(0));
+  const decode = async (bytes, mime) => ({ bytes, mime, bitmap: null });
+  const quad = (x, y, w, h) => [[x, y], [x + w, y], [x + w, y + h], [x, y + h], [x, y]];
+
+  const make = async () => {
+    const d = await PD.create();
+    d.addPage([400, 600]);
+    return d;
+  };
+
+  // a plain, axis-aligned image
+  {
+    const d = await make();
+    const obj = { image: { bytes: PNG, mime: "image/png" }, pts: quad(50, 60, 120, 90) };
+    check("one image written", await writeImages(d, new Map([[0, [obj]]])), 1);
+    const back = await readImages(await PD.load(await d.save()), decode);
+    const got = back.get(0)?.[0];
+    check("it comes back", !!got, true);
+    check("with the same bytes", got && [...got.image.bytes].join(",") === [...PNG].join(","), true);
+    check("and the same frame", JSON.stringify(got?.pts), JSON.stringify(quad(50, 60, 120, 90)));
+  }
+
+  // a ROTATED frame: the /Rect is axis-aligned, so the corners are what carry it
+  {
+    const d = await make();
+    const pts = [[100, 100], [180, 140], [160, 180], [80, 140], [100, 100]];
+    await writeImages(d, new Map([[0, [{ image: { bytes: PNG, mime: "image/png" }, pts }]]]));
+    const back = await readImages(await PD.load(await d.save()), decode);
+    check("a rotated frame survives", JSON.stringify(back.get(0)?.[0]?.pts), JSON.stringify(pts));
+  }
+
+  // saving twice must REGENERATE, not accumulate
+  {
+    const d = await make();
+    const objs = [{ image: { bytes: PNG, mime: "image/png" }, pts: quad(10, 10, 50, 50) }];
+    await writeImages(d, new Map([[0, objs]]));
+    await writeImages(d, new Map([[0, objs]]));
+    const back = await readImages(await PD.load(await d.save()), decode);
+    check("still one image after two saves", back.get(0)?.length, 1);
+  }
+
+  // somebody ELSE's stamp is left exactly where it is
+  {
+    const d = await make();
+    const page = d.getPages()[0];
+    const ctx = d.context;
+    const theirs = ctx.obj({ Type: "Annot", Subtype: "Stamp", Rect: [0, 0, 10, 10] });
+    theirs.set(PN.of("Contents"), PS.of("someone else's stamp"));
+    page.node.addAnnot(ctx.register(theirs));
+    await writeImages(d, new Map([[0, [{ image: { bytes: PNG, mime: "image/png" }, pts: quad(5, 5, 20, 20) }]]]));
+    const reloaded = await PD.load(await d.save());
+    const annots = reloaded.getPages()[0].node.Annots();
+    let mine = 0, foreign = 0;
+    for (let i = 0; i < annots.size(); i++) {
+      const dict = reloaded.getPages()[0].node.context.lookup(annots.get(i));
+      const t = String(dict.get(PN.of("Contents"))?.asString?.() ?? "");
+      if (t.includes(IMAGE_TAG)) mine++; else foreign++;
+    }
+    check("ours is written", mine, 1);
+    check("and theirs is untouched", foreign, 1);
+  }
+}
+
+
 if (failures) {
   console.error(`\n✗ ${failures} ink-PDF check(s) failed.`);
   process.exit(1);
 }
-console.log("✓ ink-PDF checks passed (annots, appearance, profile, regeneration, foreign ink).");
+console.log(`✓ ${checks} ink-PDF checks passed (annots, appearance, profile, images, regeneration, foreign ink).`);
+

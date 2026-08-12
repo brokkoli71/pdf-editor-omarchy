@@ -15,6 +15,7 @@
 // cost far more than it saves.
 
 import { withStore } from "./db.js";
+import { makeImage } from "./images.js";
 
 const STORE_NAME = "session";
 const KEY = "last";
@@ -23,7 +24,32 @@ const KEY = "last";
 /** Ink is a Map of page → strokes; strokes are plain objects, so the only work
  * is turning the Map into something structured-cloneable and back. */
 function inkToJson(ink) {
-  return [...ink.entries()].filter(([, s]) => s && s.length);
+  // An image's BITMAP is a decoded copy of its own bytes, so it is dropped here
+  // and made again on the way back: storing it would put a second, larger
+  // representation of every picture in the session record for no gain.
+  const strip = (o) => (o && o.image
+    ? { ...o, image: { bytes: o.image.bytes, mime: o.image.mime } }
+    : o);
+  return [...ink.entries()]
+    .filter(([, s]) => s && s.length)
+    .map(([page, objs]) => [page, objs.map(strip)]);
+}
+
+/** Decode the images a restored session brought back. Async, and deliberately
+ * tolerant: a picture that will not decode is dropped and the rest of the
+ * session still opens. */
+async function rehydrate(ink) {
+  for (const [page, objs] of ink) {
+    const out = [];
+    for (const o of objs) {
+      if (!o.image) { out.push(o); continue; }
+      if (o.image.bitmap) { out.push(o); continue; }
+      try { out.push({ ...o, image: await makeImage(o.image.bytes, o.image.mime) }); }
+      catch { /* dropped */ }
+    }
+    ink.set(page, out);
+  }
+  return ink;
 }
 
 function inkFromJson(raw) {
@@ -62,7 +88,7 @@ export async function loadSession() {
   try {
     const rec = await withStore(STORE_NAME, "readonly", (store) => store.get(KEY));
     if (!rec || !rec.bytes) return null;
-    return { ...rec, ink: inkFromJson(rec.ink) };
+    return { ...rec, ink: await rehydrate(inkFromJson(rec.ink)) };
   } catch {
     return null;
   }

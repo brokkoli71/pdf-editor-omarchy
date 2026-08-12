@@ -53,6 +53,11 @@ constants.
   handles; a dragged point snaps onto another and the two then move as one.
 - **Copy** — Ctrl+C on a lasso selection puts a 3x PNG on the system clipboard
   and the objects in the tab, so pasting back returns editable ink.
+- **Paste an image** — Ctrl+V drops it at the pointer as an OBJECT, not a
+  flattened stamp: move, resize, rotate and delete it for ever, with ink drawn
+  on top and the eraser leaving it alone. It is saved as a stamp annotation
+  marked as ours, with the original bytes beside it, so a round trip returns
+  exactly what you pasted and other readers still see the picture.
 - **Anchors and callouts** — an anchor IS a paragraph of the page's notes,
   marked with where it points.
 - **Presenter mode** — a bare mirror for a second screen with live ink, its own
@@ -126,9 +131,9 @@ Safari is not supported and is not being tested.
 
 Scope limits, not oversights:
 
-- **No pasted images** (parked), no image crop, no tabs, no wiki links, no
-  text-first mode, no export of notes, no OCR, no PowerPoint import, no
-  share-to-phone (a browser tab cannot listen on a socket).
+- **No image crop** (the last piece of the image feature), no tabs, no wiki
+  links, no text-first mode, no export of notes, no OCR, no PowerPoint import,
+  no share-to-phone (a browser tab cannot listen on a socket).
 - **No prediction.** Settled: it was graded against 133 Hz captured ink and
   recovers ~10% of the lag error at best, negative past 40 ms.
   `getPredictedEvents()` is the same guess with a vendor's name on it — don't

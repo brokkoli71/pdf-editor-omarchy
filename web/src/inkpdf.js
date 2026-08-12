@@ -21,6 +21,11 @@ import { PDFName, PDFNumber, PDFString, PDFArray } from "../vendor/pdf-lib.esm.j
 import { strokeOutline } from "./draw.js";
 
 export const INK_PROFILE_TAG = "sidemark:press=";
+/** Ours among the /Stamp annotations, by the same rule the ink uses: a marker
+ * in /Contents, which is a free text field that survives a round trip
+ * untouched. It is what lets a save STRIP AND REGENERATE our images while
+ * leaving a stamp some other application put there exactly where it is. */
+export const IMAGE_TAG = "sidemark:image=";
 
 const f = (v) => (Math.round(v * 1000) / 1000).toString();
 
@@ -265,4 +270,170 @@ function strokeFromAnnot(dict, pageH) {
     // width, colour and opacity all round-trip — so it is left unclaimed.
     flat: false,
   };
+}
+
+// ── images ──────────────────────────────────────────────────────────────────
+//
+// A pasted image is a /Stamp annotation whose appearance stream draws an image
+// XObject. That is the same decision ink made, for the same reason: an
+// annotation is a separate, removable object with an owner we can mark, so a
+// save can strip ours and write them again without ever touching the page's own
+// content stream — which is where the desktop's hardest bugs live. Every reader
+// renders stamp annotations, so the file looks right elsewhere; only Sidemark
+// takes them apart again.
+
+/** Frame a quad as PDF's own (x, y, w, h, angle-free) rectangle plus the matrix
+ * that puts the picture back at the angle you left it. */
+function imagePlacement(pts, pageH) {
+  const [p0, p1, , p3] = pts;
+  const w = Math.hypot(p1[0] - p0[0], p1[1] - p0[1]);
+  const h = Math.hypot(p3[0] - p0[0], p3[1] - p0[1]);
+  const cx = (p0[0] + pts[2][0]) / 2;
+  const cy = (p0[1] + pts[2][1]) / 2;
+  // document y is DOWN, PDF y is UP, so the angle turns the other way
+  const angle = -Math.atan2(p1[1] - p0[1], p1[0] - p0[0]);
+  const [px, py] = toPdf([cx, cy], pageH);
+  return { w, h, cx: px, cy: py, angle };
+}
+
+async function addImageAnnot(doc, page, obj, pageH) {
+  if (!obj.image || !obj.image.bytes || !obj.image.bytes.length) return false;
+  const { w, h, cx, cy, angle } = imagePlacement(obj.pts, pageH);
+  if (!(w > 0 && h > 0)) return false;
+
+  const bytes = obj.image.bytes;
+  const jpeg = /jpe?g/i.test(obj.image.mime || "");
+  let embedded;
+  try {
+    embedded = jpeg ? await doc.embedJpg(bytes) : await doc.embedPng(bytes);
+  } catch {
+    return false;              // an image we cannot embed must not lose the save
+  }
+
+  const ctx = doc.context;
+  // The annotation's /Rect is axis-aligned, so a ROTATED image needs a box big
+  // enough to hold it — the appearance stream then turns the picture inside it.
+  const c = Math.abs(Math.cos(angle)), s2 = Math.abs(Math.sin(angle));
+  const bw = w * c + h * s2, bh = w * s2 + h * c;
+  const rect = [cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2].map(f).join(" ");
+
+  const resources = ctx.obj({ XObject: ctx.obj({ Img: embedded.ref }) });
+  const apDict = ctx.obj({
+    Type: "XObject", Subtype: "Form",
+    BBox: ctx.obj([0, 0, bw, bh].map((v) => PDFNumber.of(Math.round(v * 1000) / 1000))),
+    Resources: resources,
+  });
+  // place it centred in the box, turned, and scaled to its own size
+  const cos = Math.cos(angle), sin = Math.sin(angle);
+  const ops = [
+    "q",
+    `1 0 0 1 ${f(bw / 2)} ${f(bh / 2)} cm`,
+    `${f(cos)} ${f(sin)} ${f(-sin)} ${f(cos)} 0 0 cm`,
+    `${f(w)} 0 0 ${f(h)} ${f(-w / 2)} ${f(-h / 2)} cm`,
+    "/Img Do",
+    "Q",
+  ];
+  const apRef = ctx.register(ctx.stream(ops.join("\n"), apDict));
+
+  const annot = ctx.obj({
+    Type: "Annot",
+    Subtype: "Stamp",
+    Rect: rect.split(" ").map((v) => PDFNumber.of(Number(v))),
+    F: 4,                                   // print
+    AP: { N: apRef },
+  });
+  // ours, and the frame as we mean it — the /Rect cannot express a rotation, so
+  // the corners ride along and are what gets read back
+  annot.set(PDFName.of("Contents"), PDFString.of(
+    IMAGE_TAG + JSON.stringify({ mime: obj.image.mime, pts: obj.pts })));
+  // THE ORIGINAL BYTES, kept verbatim in a private stream beside the appearance.
+  //
+  // Reading the picture back out of the appearance is not the same thing: a PNG
+  // is embedded as raw samples under Flate, so recovering a file from it means
+  // re-encoding, and an image re-encoded on every save gets worse every time.
+  // A private key is ignored by every other reader, and this way what comes
+  // back is byte-for-byte what you pasted.
+  //
+  // ceiling: a PNG is therefore stored twice, once as the appearance and once
+  // as itself. If that ever matters, a JPEG's appearance stream already IS its
+  // file (DCTDecode) and could be referenced instead of copied.
+  annot.set(PDFName.of("Sidemark_Src"), ctx.register(ctx.stream(bytes)));
+  page.node.addAnnot(ctx.register(annot));
+  return true;
+}
+
+/** Strip the stamps WE wrote, for the reason ink is stripped: a save must
+ * REGENERATE rather than accumulate. */
+function stripOurImages(doc) {
+  for (const page of doc.getPages()) {
+    const annots = page.node.Annots();
+    if (!annots) continue;
+    for (let i = annots.size() - 1; i >= 0; i--) {
+      const dict = page.node.context.lookup(annots.get(i));
+      if (!dict || !dict.get) continue;
+      const subtype = dict.get(PDFName.of("Subtype"));
+      if (!subtype || subtype.asString?.() !== "/Stamp") continue;
+      const contents = dict.get(PDFName.of("Contents"));
+      const text = contents?.asString?.() ?? contents?.decodeText?.() ?? "";
+      if (String(text).includes(IMAGE_TAG)) annots.remove(i);
+    }
+  }
+}
+
+/** Write every page's images. `images` is the page → objects map. */
+export async function writeImages(doc, images) {
+  stripOurImages(doc);
+  const pages = doc.getPages();
+  let written = 0;
+  for (const [index, objs] of images) {
+    const page = pages[index];
+    if (!page || !objs || !objs.length) continue;
+    const pageH = page.getSize().height;
+    for (const obj of objs) {
+      if (await addImageAnnot(doc, page, obj, pageH)) written++;
+    }
+  }
+  return written;
+}
+
+/** Read our images back, page → objects, with the bytes exactly as pasted.
+ *
+ * `decode` turns bytes into something drawable and is passed in, because that
+ * needs a browser and this module is also read by the tests in node. */
+export async function readImages(doc, decode) {
+  const out = new Map();
+  const pages = doc.getPages();
+  for (let index = 0; index < pages.length; index++) {
+    const page = pages[index];
+    const annots = page.node.Annots();
+    if (!annots) continue;
+    const objs = [];
+    // BACKWARDS, because each adopted image is removed on the way past: leaving
+    // it in means pdf.js paints the stamp as well, and the picture you drag is
+    // then sitting on its own ghost. Same trap the ink meets.
+    for (let i = annots.size() - 1; i >= 0; i--) {
+      const dict = page.node.context.lookup(annots.get(i));
+      if (!dict || !dict.get) continue;
+      const subtype = dict.get(PDFName.of("Subtype"));
+      if (!subtype || subtype.asString?.() !== "/Stamp") continue;
+      const contents = dict.get(PDFName.of("Contents"));
+      const text = String(contents?.asString?.() ?? contents?.decodeText?.() ?? "");
+      const at = text.indexOf(IMAGE_TAG);
+      if (at < 0) continue;
+      let meta;
+      try { meta = JSON.parse(text.slice(at + IMAGE_TAG.length).replace(/\)$/, "")); }
+      catch { continue; }
+      if (!meta || !Array.isArray(meta.pts)) continue;
+      const srcRef = dict.get(PDFName.of("Sidemark_Src"));
+      const stream = srcRef && page.node.context.lookup(srcRef);
+      const bytes = stream && (stream.contents || stream.getContents?.());
+      if (!bytes || !bytes.length) continue;
+      try {
+        objs.unshift({ image: await decode(bytes, meta.mime), pts: meta.pts });
+        annots.remove(i);
+      } catch { /* an unreadable image is dropped, never a failed load */ }
+    }
+    if (objs.length) out.set(index, objs);
+  }
+  return out;
 }

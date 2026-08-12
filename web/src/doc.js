@@ -7,7 +7,8 @@
 import * as pdfjs from "../vendor/pdf.min.mjs";
 import { PDFDocument } from "../vendor/pdf-lib.esm.js";
 import { NotesModel } from "./notes-model.js";
-import { readInk } from "./inkpdf.js";
+import { readInk, readImages } from "./inkpdf.js";
+import { makeImage } from "./images.js";
 
 // The single-file build has no URLs to fetch from, so it hands us a Worker it
 // built from an inlined blob. Served normally, the worker is just a file next
@@ -52,6 +53,13 @@ export class Doc {
     try {
       const lib = await PDFDocument.load(bytes, { ignoreEncryption: true });
       ink = readInk(lib);
+      // Images are adopted the same way and into the SAME per-page list, so
+      // everything downstream — selecting, moving, undoing, saving — sees one
+      // kind of thing. They go in FIRST because ink is painted over them.
+      const images = await readImages(lib, makeImage);
+      for (const [page, objs] of images) {
+        ink.set(page, objs.concat(ink.get(page) || []));
+      }
       if (ink.size) bytes = await lib.save();
     } catch {
       // an unreadable document is pdf.js's problem to report, not ours; a file

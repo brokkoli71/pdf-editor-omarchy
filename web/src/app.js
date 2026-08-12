@@ -234,6 +234,7 @@ wireSearch();
 wireBookmarks();
 wireRecent();
 wireMoreMenu();
+wirePaste();
 wirePresenter();
 wireNotesPanel();
 refreshToolBindings();
@@ -1547,11 +1548,6 @@ function wireKeys() {
     } else if ((e.ctrlKey || e.metaKey) && key === "b") {
       e.preventDefault();
       toggleBookmark();
-    } else if ((e.ctrlKey || e.metaKey) && key === "v") {
-      if (!typingInNotes() && surface.pasteAt) {
-        const [px, py] = surface.pastePoint();
-        if (surface.pasteAt(px, py)) { e.preventDefault(); toast("Pasted"); }
-      }
     } else if ((e.ctrlKey || e.metaKey) && key === "c") {
       // App-level keys belong on the WINDOW so they fire whatever has focus,
       // and the window asks the surface rather than the surface owning the key.
@@ -1612,6 +1608,40 @@ function wireKeys() {
 /** Is the caret in the notes editor? CodeMirror puts focus on a contenteditable
  * inside the panel, so asking the panel whether it CONTAINS the focused node is
  * the reliable test — `.has-focus` on the wrapper is not always set yet. */
+/** Ctrl+V, all of it, in one place.
+ *
+ * It has to be the `paste` EVENT rather than a key: the system clipboard cannot
+ * be read from a keydown, and an image lives only there. That makes this the
+ * one path, which is what stops the two kinds of paste disagreeing about which
+ * of them just happened.
+ *
+ * The order is the rule: the notes editor keeps its own paste; then our OWN
+ * objects, because pasting ink back as editable ink is the point of copying it
+ * and the system clipboard also holds a flat picture of that same ink; then an
+ * image from anywhere else.
+ */
+function wirePaste() {
+  window.addEventListener("paste", async (e) => {
+    if (typingInNotes()) return;
+    const [px, py] = surface.pastePoint();
+    if (surface.pasteAt(px, py)) { e.preventDefault(); return toast("Pasted"); }
+    // `getAsFile` must be called before any await: the clipboard items are only
+    // alive for the duration of the event
+    const item = [...(e.clipboardData?.items || [])]
+      .find((i) => i.kind === "file" && i.type.startsWith("image/"));
+    const file = item && item.getAsFile();
+    if (!file) return;
+    e.preventDefault();
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const ok = await surface.pasteImageAt(bytes, file.type, px, py);
+      toast(ok ? "Image pasted" : "That image could not be read");
+    } catch (err) {
+      toast(`Could not paste: ${err.message}`);
+    }
+  });
+}
+
 function typingInNotes() {
   const panel = document.getElementById("notes");
   return !!(panel && document.activeElement && panel.contains(document.activeElement));

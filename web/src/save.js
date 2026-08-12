@@ -19,16 +19,33 @@
 // glanced at.
 
 import { PDFDocument } from "../vendor/pdf-lib.esm.js";
-import { writeInk } from "./inkpdf.js";
+import { writeInk, writeImages } from "./inkpdf.js";
+import { isImage } from "./images.js";
 
 export const canSaveInPlace = typeof window !== "undefined"
   && "showSaveFilePicker" in window;
 
-/** The annotated PDF's bytes: the document as opened, with every page's ink
- * written in as annotations. */
+
+/** The page → objects map, split into the two things a PDF stores differently.
+ * One list everywhere else; the split lives here and nowhere else. */
+function splitObjects(ink) {
+  const strokes = new Map(), images = new Map();
+  for (const [page, objs] of ink) {
+    const s = objs.filter((o) => !isImage(o));
+    const i = objs.filter(isImage);
+    if (s.length) strokes.set(page, s);
+    if (i.length) images.set(page, i);
+  }
+  return { strokes, images };
+}
+
+/** The annotated PDF's bytes: the document as opened, with every page's ink and
+ * images written in as annotations. */
 export async function buildPdf(doc) {
   const pdf = await PDFDocument.load(doc.bytes, { ignoreEncryption: true });
-  writeInk(pdf, doc.ink);
+  const { strokes, images } = splitObjects(doc.ink);
+  writeInk(pdf, strokes);
+  await writeImages(pdf, images);
   return pdf.save();
 }
 
@@ -176,7 +193,9 @@ export async function extractPages(doc, indices) {
     const strokes = doc.ink.get(old);
     if (strokes && strokes.length) ink.set(next, strokes);
   });
-  writeInk(out, ink);
+  const { strokes, images } = splitObjects(ink);
+  writeInk(out, strokes);
+  await writeImages(out, images);
   return out.save();
 }
 

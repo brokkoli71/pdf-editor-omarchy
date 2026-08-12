@@ -16,6 +16,8 @@ import { pageWords, nearestWord, wordsBetween, wordsInRect,
 import { copySelection, takeCopy, hasCopy, copyExtent } from "./clipboard.js";
 import { parseAnchors, addAnchor, moveAnchor, moveCallout, calloutBox,
          drawAnchor, ANCHOR_R } from "./anchors.js";
+import { isImage, imageHit, imageQuad, imageFrame, drawImageObject,
+         makeImage, pasteScale } from "./images.js";
 import {
   pointInPolygon, lassoHandlePoints, lassoHandleAnchor, lassoScaleFactors,
   lassoHandleCursor, lassoChipCentre, lassoChipHit, lassoDeleteCentre,
@@ -1113,6 +1115,7 @@ export class Surface {
   _vertexShapes() {
     const out = [];
     for (const stroke of this.selected) {
+      if (isImage(stroke)) continue;   // four handles on a photo would skew it
       const verts = shapeVertices(stroke.pts);
       if (verts.length) out.push({ stroke, verts });
     }
@@ -1141,6 +1144,7 @@ export class Surface {
   _pageShapes() {
     const out = [];
     for (const stroke of this.strokes) {
+      if (isImage(stroke)) continue;
       const verts = shapeVertices(stroke.pts);
       if (verts.length) out.push({ stroke, verts });
     }
@@ -1156,6 +1160,7 @@ export class Surface {
   _snapCurves() {
     const out = [];
     for (const stroke of this.strokes) {
+      if (isImage(stroke)) continue;
       if (shapeVertices(stroke.pts).length) continue;   // that is a corner shape
       if (stroke.pts.length >= 2) out.push({ stroke, verts: stroke.pts });
     }
@@ -1278,10 +1283,17 @@ export class Surface {
     this._setSelected(additive ? mergeSelection(this.selected, caught) : caught, loop);
   }
 
+  /** What a click selects: INK BEFORE IMAGES, because ink is painted on top of
+   * them and so is what you were pointing at. */
   _strokeAt(pt) {
     for (let i = this.strokes.length - 1; i >= 0; i--) {
       const s = this.strokes[i];
+      if (isImage(s)) continue;
       if (strokeHit(s.pts, pt[0], pt[1], Math.max(s.width, 6) / 2 + 3)) return s;
+    }
+    for (let i = this.strokes.length - 1; i >= 0; i--) {
+      const s = this.strokes[i];
+      if (isImage(s) && imageHit(s, pt[0], pt[1])) return s;
     }
     return null;
   }
@@ -1321,7 +1333,10 @@ export class Surface {
    * IMAGES would be skipped here: there is no pen colour on a photograph. */
   recolourSelected(color) {
     if (!this.hasSelection()) return false;
-    const before = this.selected.map((s) => ({ stroke: s, color: s.color }));
+    // there is no pen colour on a photograph
+    const before = this.selected.filter((s) => !isImage(s))
+                                .map((s) => ({ stroke: s, color: s.color }));
+    if (!before.length) return false;
     if (before.every((r) => r.color.every((c, i) => c === color[i]))) return false;
     for (const rec of before) rec.stroke.color = color.slice();
     this._pushUndo({ type: "recolour", page: this.pageIndex, records: before,
@@ -1351,6 +1366,29 @@ export class Surface {
     for (const c of copies) this.strokes.push(c);
     this._pushUndo({ type: "add", page: this.pageIndex, strokes: copies });
     this._setSelected(copies, null);
+    this.invalidateLayer();
+    this.onChange();
+    this.requestDraw();
+    return true;
+  }
+
+  /** Paste an image from the system clipboard, at a document point.
+   *
+   * It lands as an OBJECT — bytes and a frame — and comes back SELECTED, so it
+   * can be dragged into place immediately with whatever is still in your hand.
+   * Its size is `pasteScale`'s four caps, of which the visible-window one is
+   * what stops a screenshot arriving several screens wide when you are zoomed
+   * in. */
+  async pasteImageAt(bytes, mime, px, py) {
+    const image = await makeImage(bytes, mime);
+    const [w, h] = pasteScale(image.natural, [this.pageW, this.pageH],
+                              [this.cssW, this.cssH], this.zoom);
+    if (!(w > 0 && h > 0)) return false;
+    const obj = { image, pts: imageQuad(px - w / 2, py - h / 2, w, h) };
+    this.strokes.push(obj);
+    // the SAME "add" op ink uses: one list, one undo, nothing to keep in step
+    this._pushUndo({ type: "add", page: this.pageIndex, strokes: [obj] });
+    this._setSelected([obj], null);
     this.invalidateLayer();
     this.onChange();
     this.requestDraw();
@@ -1487,6 +1525,9 @@ export class Surface {
     const a = this.active;
     for (let i = this.strokes.length - 1; i >= 0; i--) {
       const s = this.strokes[i];
+      // THE ERASER IGNORES IMAGES. Rubbing out a note written ON a picture must
+      // not take the picture with it; the lasso and Del are how an image goes.
+      if (isImage(s)) continue;
       if (strokeHit(s.pts, x, y, eraseRadius(s.width))) {
         this.strokes.splice(i, 1);
         a.erased.push({ stroke: s, index: i });
@@ -1651,7 +1692,12 @@ export class Surface {
     const lc = this._layer.getContext("2d");
     lc.setTransform(dpr, 0, 0, dpr, 0, 0);
     lc.clearRect(0, 0, this.cssW, this.cssH);
-    for (const s of this.strokes) this._paintStroke(lc, s);
+    // INK DRAWS ON TOP OF IMAGES, in two passes over one list. They share a
+    // list so that selecting, transforming and undoing cannot tell them apart;
+    // they need two passes because a picture pasted after a note must not bury
+    // the note.
+    for (const s of this.strokes) if (isImage(s)) this._paintImage(lc, s);
+    for (const s of this.strokes) if (!isImage(s)) this._paintStroke(lc, s);
     this._layerKey = key;
   }
 
@@ -1660,8 +1706,22 @@ export class Surface {
     const dpr = window.devicePixelRatio || 1;
     const lc = this._layer.getContext("2d");
     lc.setTransform(dpr, 0, 0, dpr, 0, 0);
-    this._paintStroke(lc, stroke);
+    // ceiling: an image appended this way lands ON TOP of existing ink for one
+    // frame, until the next full repaint puts it back underneath. Invalidating
+    // instead would re-paint every stroke on the page for one paste.
+    if (isImage(stroke)) this._paintImage(lc, stroke);
+    else this._paintStroke(lc, stroke);
     this._layerKey = `${this.cssW}x${this.cssH}@${dpr}:${this.zoom}:${this.offX}:${this.offY}:${this.strokes.length}`;
+  }
+
+  /** The same view transform the ink gets, so an image and the notes drawn on
+   * it move together and stay in register at every zoom. */
+  _paintImage(ctx, obj) {
+    ctx.save();
+    ctx.translate(this.offX, this.offY);
+    ctx.scale(this.zoom, this.zoom);
+    drawImageObject(ctx, obj);
+    ctx.restore();
   }
 
   _paintStroke(ctx, s) {

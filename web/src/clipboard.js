@@ -12,6 +12,7 @@
 // cross-tab paste and keeps the thing that matters.
 
 import { drawInkStroke, rgbCss } from "./draw.js";
+import { isImage, drawImageObject } from "./images.js";
 
 export const SIDEMARK_MIME = "application/x-sidemark-objects+json";
 export const COPY_RENDER_SCALE = 3.0;   // supersample the picture other apps get
@@ -25,7 +26,8 @@ let held = null;
 export function selectionBounds(strokes, pad = COPY_PAD) {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (const s of strokes) {
-    const half = (s.width || 0) / 2 * Math.max(1, ...(s.profile || [1]));
+    // an image has a frame rather than a width; its corners ARE its extent
+    const half = isImage(s) ? 0 : (s.width || 0) / 2 * Math.max(1, ...(s.profile || [1]));
     for (const [x, y] of s.pts) {
       if (x - half < x0) x0 = x - half;
       if (x + half > x1) x1 = x + half;
@@ -55,7 +57,11 @@ export async function renderSelectionPng(strokes, scale = COPY_RENDER_SCALE) {
   ctx.save();
   ctx.scale(scale, scale);
   ctx.translate(-x0, -y0);
+  // images under, ink over — the same order the page paints them in, or a copy
+  // would look different from what you selected
+  for (const s of strokes) if (isImage(s)) drawImageObject(ctx, s);
   for (const s of strokes) {
+    if (isImage(s)) continue;
     ctx.fillStyle = rgbCss(s.color, s.opacity);
     ctx.strokeStyle = ctx.fillStyle;
     drawInkStroke(ctx, s.pts, s.width, s.profile);
@@ -72,7 +78,10 @@ export async function copySelection(strokes) {
   // deep enough that a later edit of the original cannot reach the copy
   held = {
     origin: [box[0], box[1]],
-    strokes: strokes.map((s) => ({
+    // ceiling: only the INK is held for an in-app paste. An image would need
+    // its bytes copied with it, which is the next piece of this feature; the
+    // picture on the system clipboard already contains it either way.
+    strokes: strokes.filter((s) => !isImage(s)).map((s) => ({
       pts: s.pts.map((p) => [p[0], p[1]]),
       profile: s.profile ? s.profile.slice() : null,
       width: s.width,
