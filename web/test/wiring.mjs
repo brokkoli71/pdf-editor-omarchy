@@ -49,6 +49,7 @@ const BUILTIN = new Set([
   "constructor",
   "MouseEvent", "DragEvent", "Worker", "IntersectionObserver", "RegExp",
   "Uint8Array", "Error", "Boolean", "globalThis", "isNaN", "isFinite", "escape",
+  "matchMedia", "MutationObserver", "URLSearchParams", "DragEvent", "ClipboardItem",
 ]);
 
 /** Comments and string literals are not code. Without stripping them, every
@@ -99,15 +100,27 @@ for (const file of readdirSync(src).filter((f) => f.endsWith(".js"))) {
 // A missing id throws on the line that touches it, which aborts module
 // evaluation — so a mistyped or never-added element does not just break its own
 // button, it stops everything after it from initialising at all.
+// Each module is checked against the page that LOADS it, not against index.html
+// for everything: the tour has its own page, and pooling the two ids together
+// would let a demo id satisfy an app lookup that has nothing to serve it.
+const PAGE_OF = { "demo.js": "demo.html" };
 {
-  const html = readFileSync(join(src, "..", "index.html"), "utf8");
-  const present = new Set([...html.matchAll(/\sid="([^"]+)"/g)].map((m) => m[1]));
+  const idsIn = (file) => new Set(
+    [...readFileSync(join(src, "..", file), "utf8").matchAll(/\sid="([^"]+)"/g)]
+      .map((m) => m[1]));
+  const pages = new Map();
   for (const file of readdirSync(src).filter((f) => f.endsWith(".js"))) {
     // presenter.js reaches into a document it WRITES itself, not this page
     if (file === "presenter.js") continue;
+    const page = PAGE_OF[file] || "index.html";
+    if (!pages.has(page)) pages.set(page, idsIn(page));
+    const present = pages.get(page);
     const code = readFileSync(join(src, file), "utf8");
-    for (const m of code.matchAll(/getElementById\(\s*["'`]([^"'`]+)["'`]\s*\)/g)) {
-      if (!present.has(m[1])) fail(`${file}: getElementById("${m[1]}") — no such id in index.html`);
+    // `document.` specifically: a lookup on some OTHER document — the tour
+    // reaching into the app in its frame — belongs to a page this check cannot
+    // know, and guessing at it would fail correct code.
+    for (const m of code.matchAll(/\bdocument\.getElementById\(\s*["'`]([^"'`]+)["'`]\s*\)/g)) {
+      if (!present.has(m[1])) fail(`${file}: getElementById("${m[1]}") — no such id in ${page}`);
     }
   }
 }

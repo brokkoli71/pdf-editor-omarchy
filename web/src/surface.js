@@ -141,6 +141,10 @@ export class Surface {
     this.offX = 0.0;
     this.offY = 0.0;
     this._fitPending = true;
+    // "is this view still the one `fit` produced?" — what decides whether a
+    // container resize re-fits the page or preserves the zoom you chose
+    this._fitted = true;
+    this._hostSize = null;
 
     // the press in flight
     this.active = null;
@@ -171,6 +175,7 @@ export class Surface {
     this.searchRects = null;
 
     this._install();
+    this._installResizeWatch();
   }
 
   // ── the document ───────────────────────────────────────────────────────────
@@ -294,6 +299,48 @@ export class Surface {
     this._snapView();
     this.invalidateLayer();
     this._schedulePageRender();
+    // this view IS the fit now — until a hand changes it
+    this._fitted = true;
+  }
+
+  /** THE VIEW FOLLOWS ITS CONTAINER, whatever changed it.
+   *
+   * A window resize is not the only way this canvas changes size, and it was
+   * the only one being watched: hiding the sidebar, dragging the divider, or
+   * the frame the tour runs in settling all resize it with no window event at
+   * all. The page then kept the scale and position it had for a box that no
+   * longer existed — a page fitted to a narrow column stayed that size when
+   * the column got the whole window, and one rendered while the canvas was
+   * still zero-sized never rendered again.
+   *
+   * A resize must NOT throw away a zoom the hand chose, so there are two
+   * cases: a view still at its fit re-fits, and a zoomed one keeps its scale
+   * with whatever was in the middle of the view staying in the middle. */
+  _installResizeWatch() {
+    const host = this.el.parentElement || this.el;
+    if (typeof ResizeObserver !== "function") return;
+    this._resizeWatch = new ResizeObserver(() => this._onHostResize(host));
+    this._resizeWatch.observe(host);
+  }
+
+  _onHostResize(host) {
+    const w = host.clientWidth, h = host.clientHeight;
+    if (!w || !h) return;                       // laid out to nothing yet
+    const prev = this._hostSize;
+    if (prev && prev[0] === w && prev[1] === h) return;
+    this._hostSize = [w, h];
+    if (!prev || this._fitted) {
+      // `fit` measures the CANVAS, which is resized from the host during the
+      // draw and so still carries the old size at this moment
+      this._fitPending = true;
+    } else {
+      this.offX += (w - prev[0]) / 2;
+      this.offY += (h - prev[1]) / 2;
+      this._snapView();
+      this._schedulePageRender();
+    }
+    this.invalidateLayer();
+    this.requestDraw();
   }
 
   /** Re-rendering the page is expensive, so it is debounced behind the zoom
@@ -309,6 +356,7 @@ export class Surface {
 
   zoomAt(factor, cx, cy) {
     const [dx, dy] = this.toDoc(cx, cy);
+    this._fitted = false;        // a scale the hand chose; a resize keeps it
     this.zoom = Math.max(0.05, Math.min(16, this.zoom * factor));
     this.offX = cx - dx * this.zoom;
     this.offY = cy - dy * this.zoom;
@@ -319,6 +367,7 @@ export class Surface {
   }
 
   panBy(dx, dy) {
+    this._fitted = false;
     this.offX += dx;
     this.offY += dy;
     this._snapView();

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sidemark — a short tour</title>
+<link rel="icon" type="image/png" sizes="32x32" href="icon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="icon-180.png">
+<link rel="stylesheet" href="src/style.css">
+<link rel="stylesheet" href="src/demo.css">
+</head>
+<body class="demo-body">
+
+<!-- The tour is a REAL Sidemark in an iframe, not a video of one. Every step
+     waits until the app itself says you did the thing — being told about the
+     dwell is exactly what fails, which is why this page exists at all. The
+     sandbox flag keeps it from touching your session, recents or button
+     table. -->
+<div class="demo-shell">
+  <aside class="demo-panel" id="demo-panel">
+    <header class="demo-head">
+      <a class="demo-back" href="index.html" title="Open Sidemark itself">← Sidemark</a>
+      <div class="demo-dots" id="demo-dots" aria-hidden="true"></div>
+    </header>
+
+    <div class="demo-step" id="demo-step">
+      <h1 id="demo-title">Loading…</h1>
+      <p id="demo-body"></p>
+      <p class="demo-hint" id="demo-hint" hidden></p>
+      <div class="demo-extra" id="demo-extra" hidden></div>
+    </div>
+
+    <div class="demo-done" id="demo-done" hidden>
+      <span class="demo-tick" aria-hidden="true">✓</span>
+      <span id="demo-done-text">Done</span>
+    </div>
+
+    <footer class="demo-foot">
+      <button class="flat" id="demo-prev">Back</button>
+      <button class="flat" id="demo-skip">Skip this step</button>
+    </footer>
+  </aside>
+
+  <div class="demo-stage">
+    <iframe id="demo-frame" src="index.html?sandbox=1" title="Sidemark"></iframe>
+  </div>
+</div>
+
+<div class="demo-end" id="demo-end" hidden>
+  <div class="demo-end-card">
+    <h1>That is the whole of it.</h1>
+    <p>
+      Everything else follows from those: the tools live on the buttons you put
+      them on, shapes and selections come out of holding still, and the notes
+      are a plain <code>.md</code> file you can read anywhere.
+    </p>
+    <div class="demo-end-row">
+      <a class="demo-cta" href="index.html">Open Sidemark</a>
+      <button class="flat" id="demo-again">Take the tour again</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="src/demo.js"></script>
+</body>
+</html>

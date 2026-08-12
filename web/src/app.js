@@ -25,6 +25,18 @@ import { putHandoff, takeHandoff } from "./db.js";
 
 // ── settings (the settings.json analogue) ────────────────────────────────────
 
+/** SANDBOX MODE — the app running as somebody's exhibit rather than as their
+ * app. `/demo` embeds a real Sidemark and drives it, and a tutorial must not
+ * cost you anything: settings are READ so the sandbox looks like your app, and
+ * nothing is written back. The session and the recents list are left alone
+ * entirely. Deliberately one query parameter rather than a build flag — it has
+ * to BE the app, or the demo teaches something else.
+ *
+ * The button table is the load-bearing one: a step that asks you to put the
+ * lasso on the middle button would otherwise rebind your real Sidemark, since
+ * `Bindings.save()` persists on every rebind. */
+export const SANDBOX = new URLSearchParams(location.search).has("sandbox");
+
 const STORE_KEY = "sidemark.web.settings";
 const store = {
   _data: null,
@@ -37,6 +49,7 @@ const store = {
   get(key) { return this._load()[key]; },
   set(key, value) {
     this._load()[key] = value;
+    if (SANDBOX) return;              // remembered for this visit, and no longer
     try { localStorage.setItem(STORE_KEY, JSON.stringify(this._data)); } catch { /* private mode */ }
   },
 };
@@ -242,7 +255,11 @@ window.__sidemark = {
   get pen() { return pen; },
 };
 
-window.addEventListener("resize", () => { surface.fit(); surface.requestDraw(); });
+// The view follows its container through a ResizeObserver inside the Surface,
+// which fires AFTER layout and knows whether you had chosen a zoom. Re-fitting
+// from here as well would run before the canvas had its new size — fitting the
+// page to the box it just left — and would throw away that zoom every time the
+// window moved.
 surface.requestDraw();
 
 // Reopen where you left off; a blank A4 sheet when there is nothing to reopen.
@@ -317,6 +334,7 @@ function watchForStalledStart() {
 }
 
 async function restoreSession() {
+  if (SANDBOX) return false;
   const rec = await loadSession();
   if (!rec) return false;
   const doc = await Doc.open(rec.bytes, rec.name);
@@ -336,6 +354,7 @@ async function restoreSession() {
  * that a reload loses nothing, rarely enough that it costs nothing. */
 let sessionTimer = null;
 function rememberSession() {
+  if (SANDBOX) return;
   clearTimeout(sessionTimer);
   sessionTimer = setTimeout(() => saveSession(surface.doc, surface.pageIndex), 800);
 }
@@ -359,7 +378,7 @@ async function setDoc(doc, title) {
   markDirty(false);
   rememberSession();
   // an untitled blank is not a document anyone wants to come back to
-  if (doc.name && doc.name !== "Untitled") {
+  if (!SANDBOX && doc.name && doc.name !== "Untitled") {
     rememberRecent({ name: doc.name, bytes: doc.bytes,
                      handle: doc.handles?.pdf || null, page: 0 });
   }
@@ -393,7 +412,6 @@ function wireDivider() {
     notes.setFull(full);
     if (remember && !full) store.set("pane_fraction", frac);
     store.set("full_notes", full);
-    surface.fit();
     surface.requestDraw();
   };
   wireDivider.setSplit = setSplit;
@@ -1173,7 +1191,6 @@ function wireDocument() {
     const bar = document.getElementById("sidebar");
     bar.hidden = !bar.hidden;
     if (!bar.hidden) sidebar.rebuild();
-    surface.fit();
     surface.requestDraw();
   });
 
@@ -1181,8 +1198,9 @@ function wireDocument() {
   document.getElementById("insert-btn").addEventListener("click", insertPagesFromPicker);
   window.addEventListener("beforeunload", (e) => {
     // nothing is written until you say so, so leaving with unsaved work has to
-    // be a deliberate act
-    if (dirty) { e.preventDefault(); e.returnValue = ""; }
+    // be a deliberate act — but a SANDBOX has nothing of yours in it, and a
+    // tour that will not let you leave is a tour nobody finishes
+    if (dirty && !SANDBOX) { e.preventDefault(); e.returnValue = ""; }
   });
 
   const atCentre = (f) => {

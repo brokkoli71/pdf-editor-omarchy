@@ -8,6 +8,12 @@ cd web && python3 -m http.server 8000
 # → http://localhost:8000
 ```
 
+`demo.html` is a six-step tour of the parts you would never find on your own —
+the dwell, welding, tools on buttons — driving a real Sidemark beside it and
+waiting until you have actually done each one. It runs the app with `?sandbox=1`,
+which reads your settings but writes nothing back, so a tour costs you neither
+your session nor your button table.
+
 ## What this is for
 
 To answer one question before any more of the port is written: **does the pen
