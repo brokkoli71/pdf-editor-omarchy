@@ -14,7 +14,8 @@ import { applyPageOrder, deletePages, moveRangeOrder, addBlankPage,
 import { Sidebar } from "./sidebar.js";
 import { NotesView } from "./notes.js";
 import { NotesModel } from "./notes-model.js";
-import { saveDocument, openWithPicker, canSaveInPlace } from "./save.js";
+import { saveDocument, openWithPicker, canSaveInPlace, exportPages,
+         extractPages, exportName, saveNotesAs } from "./save.js";
 import { saveSession, loadSession, clearSession } from "./session.js";
 import { listRecent, rememberRecent, forgetRecent, clearRecent,
          recentState, openRecent } from "./recent.js";
@@ -176,9 +177,12 @@ const sidebar = new Sidebar(document.getElementById("sidebar"), {
   onGoToPage: (page) => surface.setPage(page),   // absolute nav, never a flip
   onDropFiles: (files, gap) => importAt(files, gap),
   onMovePage: (from, to) => movePage(from, to),
-  onDeletePage: (index) => removePage(index),
+  onDeletePages: (pages) => removePages(pages),
+  onExportPages: (pages) => doExportPages(pages),
+  onSelectionChanged: (pages) => preparePageDrag(pages),
+  onDragPayload: (index) => pageDragPayload(index),
   onDropBookmark: (page) => dropBookmark(page),
-  onToggleHidden: (page) => toggleHidden(page),
+  onToggleHidden: (page, unhide) => toggleHidden(page, unhide),
   onAddPage: (page, kind) => addPageAfter(page, kind),
   showBookmarks: store.get("outline_bookmarks") !== false,
   onShowBookmarks: (on) => store.set("outline_bookmarks", on),
@@ -503,8 +507,22 @@ async function doSave({ reask = false } = {}) {
     if (!result) return;                       // cancelled
     markDirty(false);
     const what = result.notes ? `${result.pdf} + ${result.notes}` : result.pdf;
-    toast(result.inPlace ? `Saved ${what}`
-                         : `Downloaded ${what} — this browser cannot write back to the original`);
+    if (result.notesPending) {
+      // the picker spends the gesture, so choosing where the NOTES go has to be
+      // its own click rather than a second dialog in the same one
+      toast(`Saved ${what}`, {
+        action: "Save notes…",
+        onAction: async () => {
+          try {
+            const name = await saveNotesAs(surface.doc);
+            if (name) toast(`Saved ${name}`);
+          } catch (err) { toast(`Could not save notes: ${err.message}`); }
+        },
+      });
+    } else {
+      toast(result.inPlace ? `Saved ${what}`
+                           : `Downloaded ${what} — this browser cannot write back to the original`);
+    }
   } catch (err) {
     toast(`Could not save: ${err.message}`);
   } finally {
@@ -583,14 +601,57 @@ async function movePage(from, to) {
   toast(`Page ${from + 1} → ${to + 1}`);
 }
 
-async function removePage(index) {
+async function removePages(pages) {
   const doc = surface.doc;
   if (!doc) return;
-  if (doc.pageCount <= 1) return toast("A document cannot lose its last page");
+  const drop = new Set(pages);
+  if (drop.size >= doc.pageCount) {
+    return toast("A document cannot lose its last page");
+  }
   const keep = [];
-  for (let i = 0; i < doc.pageCount; i++) if (i !== index) keep.push(i);
-  await rebuildPages(keep, { deleted: [index] });
-  toast(`Deleted page ${index + 1}`);
+  for (let i = 0; i < doc.pageCount; i++) if (!drop.has(i)) keep.push(i);
+  sidebar.clearSelection();
+  await rebuildPages(keep, { deleted: [...drop] });
+  toast(drop.size > 1 ? `Deleted ${drop.size} pages` : `Deleted page ${pages[0] + 1}`);
+}
+
+async function doExportPages(pages) {
+  const doc = surface.doc;
+  if (!doc || !pages.length) return;
+  try {
+    const name = await exportPages(doc, pages);
+    if (name) toast(`Exported ${name}`);
+  } catch (err) {
+    toast(`Could not export: ${err.message}`);
+  }
+}
+
+/** Prepare the file a page DRAG will hand to the desktop.
+ *
+ * `dataTransfer.setData` has to run synchronously inside `dragstart`, and
+ * extracting pages is async — so the bytes are built when the SELECTION changes
+ * and held ready. `DownloadURL` is a Chromium-only drag type; everywhere else
+ * the menu's export is the whole feature. */
+let pageDrag = null;
+async function preparePageDrag(pages) {
+  if (pageDrag) { URL.revokeObjectURL(pageDrag.url); pageDrag = null; }
+  const doc = surface.doc;
+  if (!doc || !pages.length) return;
+  try {
+    const bytes = await extractPages(doc, pages);
+    pageDrag = {
+      pages: pages.join(","),
+      name: exportName(doc.name, pages),
+      url: URL.createObjectURL(new Blob([bytes], { type: "application/pdf" })),
+    };
+  } catch { pageDrag = null; }
+}
+
+/** The `DownloadURL` payload for a drag starting on `index`, or null. */
+function pageDragPayload(index) {
+  const pages = sidebar.pagesActedOn(index);
+  if (!pageDrag || pageDrag.pages !== pages.join(",")) return null;
+  return `application/pdf:${pageDrag.name}:${pageDrag.url}`;
 }
 
 /** Insert pages from a file, at the current page. The same pipeline as a drop
@@ -598,11 +659,11 @@ async function removePage(index) {
 /** Set a page aside: still in the document and still editable, but skipped when
  * paging. Like a bookmark it is a property OF one page, so it needs no
  * adjacency rule — it just follows its page through every re-key. */
-function toggleHidden(index) {
+function toggleHidden(index, unhide = null) {
   const doc = surface.doc;
   if (!doc) return;
   const notes = doc.notes;
-  const hidden = notes.isHidden(index);
+  const hidden = unhide === null ? notes.isHidden(index) : unhide;
   if (hidden) notes._hidden.delete(index);
   else notes._hidden.add(index);
   markDirty(true);

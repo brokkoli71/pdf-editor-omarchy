@@ -636,8 +636,13 @@ hr { border: none; border-top: 1px solid var(--separator); margin: 10px 0 2px; w
   padding: 8px 16px;
   font-size: 13px;
   z-index: 30;
-  pointer-events: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
+/* the toast itself ignores the pointer; only an action button in it does not */
+.toast { pointer-events: none; }
+.toast button { pointer-events: auto; background: var(--btn-bg); }
 .toast[hidden] { display: none; }
 
 /* Shown only when startup stalls — see watchForStalledStart. A blank sheet with

@@ -52,6 +52,14 @@ async function writeHandle(handle, bytes) {
   await w.close();
 }
 
+// A FILE PICKER MUST BE THE FIRST THING THE GESTURE DOES.
+//
+// `showSaveFilePicker` requires transient user activation, and awaiting
+// anything before it spends that activation — the call then fails with "Must be
+// handling a user gesture", which reads to the user as the menu entry doing
+// nothing. So every path here asks for the file FIRST and builds the bytes
+// afterwards, even though building first would read more naturally.
+
 /** Ask for somewhere to put a file, or null if the user cancelled. */
 async function pickSave(suggestedName, description, accept) {
   try {
@@ -72,9 +80,19 @@ async function pickSave(suggestedName, description, accept) {
 export async function saveDocument(doc, { reask = false } = {}) {
   const base = baseName(doc.name);
   doc.handles = doc.handles || {};
+  const result = { pdf: null, notes: null, inPlace: false, notesPending: false };
+
+  // ASK FIRST — see the note above pickSave. Nothing may be awaited before it.
+  if (canSaveInPlace && (reask || !doc.handles.pdf)) {
+    const handle = await pickSave(`${base}.pdf`, "PDF document",
+                                  { "application/pdf": [".pdf"] });
+    if (!handle) return null;                     // cancelled: nothing written
+    doc.handles.pdf = handle;
+    doc.handles.notes = null;                     // a new home needs a new sidecar
+  }
+
   const pdfBytes = await buildPdf(doc);
   const notesText = doc.notes.hasContent() ? doc.notes.toText() : null;
-  const result = { pdf: null, notes: null, inPlace: false };
 
   if (!canSaveInPlace) {
     download(pdfBytes, `${base}.pdf`, "application/pdf");
@@ -86,31 +104,34 @@ export async function saveDocument(doc, { reask = false } = {}) {
     return result;
   }
 
-  if (reask || !doc.handles.pdf) {
-    const handle = await pickSave(`${base}.pdf`, "PDF document",
-                                  { "application/pdf": [".pdf"] });
-    if (!handle) return null;                     // cancelled: nothing written
-    doc.handles.pdf = handle;
-    doc.handles.notes = null;                     // a new home needs a new sidecar
-  }
   await writeHandle(doc.handles.pdf, pdfBytes);
   result.pdf = doc.handles.pdf.name;
   result.inPlace = true;
 
   if (notesText !== null) {
-    if (!doc.handles.notes) {
-      // The sidecar cannot be derived from the PDF's handle — the API hands out
-      // a file, never its directory — so the first save asks where the notes
-      // go. Once. After that both write silently.
-      doc.handles.notes = await pickSave(`${base}.md`, "Markdown notes",
-                                         { "text/markdown": [".md"] });
-    }
     if (doc.handles.notes) {
       await writeHandle(doc.handles.notes, notesText);
       result.notes = doc.handles.notes.name;
+    } else {
+      // The sidecar cannot be derived from the PDF's handle — the API hands out
+      // a file, never its directory — and this gesture's activation has already
+      // gone on the PDF, so a second picker here would fail. The caller offers
+      // it as its own action instead.
+      result.notesPending = true;
     }
   }
   return result;
+}
+
+/** Choose where the notes go. Must be called straight from a user gesture. */
+export async function saveNotesAs(doc) {
+  const handle = await pickSave(`${baseName(doc.name)}.md`, "Markdown notes",
+                                { "text/markdown": [".md"] });
+  if (!handle) return null;
+  doc.handles = doc.handles || {};
+  doc.handles.notes = handle;
+  await writeHandle(handle, doc.notes.toText());
+  return handle.name;
 }
 
 /** Open a PDF through the picker, keeping the handle so a later save can write
@@ -179,14 +200,14 @@ export function exportName(docName, indices) {
 /** Save an extracted set of pages, in place where that is possible and as a
  * download where it is not. */
 export async function exportPages(doc, indices) {
-  const bytes = await extractPages(doc, indices);
-  const name = exportName(doc.name, indices);
+  const name = exportName(doc.name, indices);   // sync: nothing awaited yet
   if (!canSaveInPlace) {
-    download(bytes, name, "application/pdf");
+    download(await extractPages(doc, indices), name, "application/pdf");
     return name;
   }
+  // the picker FIRST, then the work — see the note above pickSave
   const handle = await pickSave(name, "PDF document", { "application/pdf": [".pdf"] });
   if (!handle) return null;
-  await writeHandle(handle, bytes);
+  await writeHandle(handle, await extractPages(doc, indices));
   return handle.name;
 }
