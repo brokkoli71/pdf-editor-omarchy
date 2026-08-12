@@ -42,6 +42,17 @@ constants.
   started — and the revocation armed by the capture device, never the touch
   count, so a resting palm cannot eat a pen stroke.
 - Pen, highlighter, eraser, pan, zoom-to-region; undo/redo; the pen popover.
+- **The caret** — drag to select text on a PDF, Ctrl+C to copy it.
+- **Control points and welding** — every selected corner polyline grows vertex
+  handles; a dragged point snaps onto another and the two then move as one.
+- **Copy** — Ctrl+C on a lasso selection puts a 3x PNG on the system clipboard
+  and the objects in the tab, so pasting back returns editable ink.
+- **Anchors and callouts** — an anchor IS a paragraph of the page's notes,
+  marked with where it points.
+- **Presenter mode** — a bare mirror for a second screen with live ink, its own
+  fit, and paging that drives the editor. Timer on your screen, not the slide.
+- **Recent documents**, **hidden pages**, **blank pages** with the four rulings,
+  **bookmarks**, **linked page notes**, **search** across the PDF and the notes.
 - **The lasso** — select by loop, move, resize on 8 handles, rotate (Shift snaps
   to 15°), `Ctrl+D`, `Del`. A selection wears the LOOP it was drawn with and
   that is the grab region; the chip switches to the box, the red cross deletes.
@@ -100,15 +111,13 @@ Safari is not supported and is not being tested.
 
 Scope limits, not oversights:
 
-- **Text cursor and anchor** stay in the table and in the bar — removing them
-  would change the binding model — but a press that resolves to one does nothing
-  here. They are marked in the tooltip.
+- **No pasted images** (parked), no image crop, no tabs, no wiki links, no
+  text-first mode, no export of notes, no OCR, no PowerPoint import, no
+  share-to-phone (a browser tab cannot listen on a socket).
 - **No prediction.** Settled: it was graded against 133 Hz captured ink and
   recovers ~10% of the lag error at best, negative past 40 ms.
   `getPredictedEvents()` is the same guess with a vendor's name on it — don't
   reach for it.
-- **No pasted images**, no control points or welding on a selected shape, no
-  text cursor, no anchors/callouts.
 - **No text-first mode**, no bookmarks, no wiki links, no presenter or share.
 
 ## Conformance
@@ -135,6 +144,7 @@ exporters under `extras/`, three runners under `test/`:
 | `lasso.mjs` | 184 | handle points, anchors, scale factors, chip, polygon |
 | `shapes.mjs` | 100 | 13 strokes through the recogniser |
 | `inkpdf.mjs` | — | annots, appearance, profile, regeneration, foreign ink |
+| `wiring.mjs` | — | callbacks supplied, bare calls resolve, DOM ids exist |
 
 The ink vectors are **real captured strokes** from `notes/*.jsonl` — the same
 hand and digitiser the constants were tuned against. The oracle earned its place
@@ -155,6 +165,22 @@ invisible for continuous outputs, but it flips DISCRETE decisions (it changed
 which point RDP called a corner on a near-tie) and the port gets blamed for the
 exporter's arithmetic.
 
+## The wiring guard
+
+`test/wiring.mjs` exists because of a specific failure: four page-menu entries
+shipped DEAD. They were callbacks a module reads that `app.js` never supplied,
+and functions referenced that were never defined — none of which is a syntax
+error, so `node --check` passed and the entries simply did nothing when clicked.
+The cause was string-anchored edits whose anchors had drifted, and
+`String.replace` returns the original silently when it finds nothing.
+
+It checks three things, each of which has caught a real bug: every callback a
+module READS is supplied where it is constructed, every bare call resolves, and
+every `getElementById` names something that exists in the page. That last one
+matters more than it sounds — a missing id throws on the line that touches it,
+which aborts module evaluation, so one mistyped element stops everything after
+it from initialising.
+
 ## Verifying gestures
 
 The conformance suites cover geometry, not wiring — and wiring is where the real
@@ -168,3 +194,10 @@ again:
   move the target out from under the test.
 - A synthetic event has no `getCoalescedEvents()`, which is why the reader
   falls back to `[e]` rather than assuming the method exists.
+- **`element.click()` is not a click.** It dispatches only a click, where a hand
+  sends pointerdown first — and pointerdown is what closes a menu. A whole
+  context menu was dead to real clicks while a synthetic test reported every
+  entry working. Send the full sequence.
+- **A synthetic click carries no user activation** (`navigator.userActivation
+  .isActive` is false), so no script can open a file picker. Anything gated on a
+  gesture needs `Input.dispatchMouseEvent` over CDP, or a hand.
