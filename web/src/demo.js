@@ -193,7 +193,7 @@ const steps = [
       "Drag the handout below into the strip.",
       "Drag a thumbnail out of the strip and let go.",
     ],
-    hint: "The strip is the leftmost button in the bar. A page dragged out leaves as a PDF with its ink in it — into another Sidemark window, or onto your desktop where the browser allows it.",
+    hint: "The strip is the leftmost button in the bar. A page dragged out leaves as a PDF with its ink in it — drop it into another Sidemark window to see it arrive. (A file manager will not take it: that hand-off belongs to the browser, and on Linux it does not make it out.) For a file, use Export in the page's right-click menu.",
     handout: true,
     arm(ctx) {
       ctx.pages0 = app()?.doc?.pageCount ?? 0;

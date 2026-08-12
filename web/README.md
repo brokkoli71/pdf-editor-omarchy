@@ -78,8 +78,11 @@ constants.
   outline carries the "you are here" rule. Drop several files at once and they
   merge into ONE document with a chapter per file; drop onto the sidebar and
   they insert at that gap. Drag a thumbnail OUT and those pages leave as a PDF
-  — onto the desktop (Chromium), or into another Sidemark window's pages, where
-  they arrive with their ink.
+  with their ink — into another Sidemark window's page strip, which works.
+  Dropping one on a FILE MANAGER does not, at least on Linux: the browser hands
+  that drag to the desktop through `DownloadURL`, which it strips from anything
+  the page can see, so it is neither ours to fix nor ours to test. Use the
+  page menu's Export for a file.
 
 ## Which browser
 

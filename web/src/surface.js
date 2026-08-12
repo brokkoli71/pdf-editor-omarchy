@@ -66,6 +66,14 @@ export const CIRCLE_LASSO_HOLD_MS = 500;
  * the hold has to start from where you stopped. */
 export const HOLD_SLOP_PX = 16.0;
 
+/** Tools that only change what you are LOOKING at. They are the exemption from
+ * "a press outside a selection dismisses it": moving the view is something you
+ * do while arranging a selection, and losing it because you panned would be a
+ * bug of its own. Everything else marks the page, and the press that dismisses
+ * must not also mark it. */
+export const VIEW_TOOLS = new Set(["pan", "zoom"]);
+export const pressDismissesSelection = (tool) => !VIEW_TOOLS.has(tool);
+
 export const IMPLEMENTED_TOOLS = new Set(["pen", "highlighter", "eraser", "pan",
                                           "zoom", "lasso", "text", "anchor"]);
 
@@ -532,6 +540,26 @@ export class Surface {
 
     const tool = this.toolForEvent(e);
     if (!tool || !IMPLEMENTED_TOOLS.has(tool)) return;
+
+    // A PRESS OUTSIDE A SELECTION DISMISSES IT, AND DOES NOTHING ELSE.
+    //
+    // The press above this line is one that HIT the selection — a grab, the
+    // chip, the delete cross. Anything else means you are done with it, and the
+    // first thing you do afterwards should not also land on the page: a stroke
+    // drawn while a selection was still up is one you have to undo, and the
+    // marks are on top of work you had just been arranging.
+    //
+    // The view tools are exempt on purpose. Panning or zooming does not touch
+    // the page and is a thing you do WHILE arranging a selection — losing it
+    // because you moved the view would be its own bug.
+    if (this.hasSelection() && pressDismissesSelection(tool)) {
+      this.clearSelection();
+      // and the REST of the gesture goes with it. Leaving `active` unset is
+      // what does that here: a pen press always jitters, and the drawing
+      // branch would otherwise take the motion and leave a stray mark beside
+      // the selection you were only dismissing.
+      return;
+    }
 
     const startPts = [];
     const startPress = [];
