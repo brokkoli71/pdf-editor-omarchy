@@ -19,6 +19,8 @@ import {
   lassoDeleteHit, drawLassoChip, drawLassoDelete, mergeSelection, selectionBbox,
   scalePoint, rotatePoint, rotateKnobCentre, rotateKnobHit, drawRotateKnob,
   LASSO_PAD, HANDLE_HIT, ROTATE_SNAP_DEG, DUPLICATE_OFFSET,
+  shapeVertices, moveShapeVertex, weldedVertices, vertexSnapRadius, snapPoint,
+  curveSnapShapes, drawShapeVertices, VERTEX_HIT_PX,
 } from "./lasso.js";
 
 export const PAGE_W = 595.0, PAGE_H = 842.0;   // A4 in document units, the size
@@ -124,6 +126,8 @@ export class Surface {
     this.selected = [];
     this.selectionLoop = null;
     this.selectionBoxed = false;
+    // where a dragged control point is currently snapped, for the halo
+    this._snapAtPoint = null;
 
     // view: document units → CSS px is `zoom`, origin at (offX, offY)
     this.zoom = 1.0;
@@ -526,6 +530,11 @@ export class Surface {
       a.lastView = [e.offsetX, e.offsetY];
       return;
     }
+    if (a.tool === "vertex") {
+      this._dragVertex(a, dx, dy);
+      a.lastView = [e.offsetX, e.offsetY];
+      return;
+    }
     if (a.tool === "move" || a.tool === "resize" || a.tool === "rotate") {
       this._transformSelection(a, dx, dy);
       a.lastView = [e.offsetX, e.offsetY];
@@ -705,6 +714,9 @@ export class Surface {
     } else if (a.tool === "lasso") {
       const { shift } = this._chordState(e);
       this._finishLasso(a.pts, shift);
+    } else if (a.tool === "vertex") {
+      this._snapAtPoint = null;
+      this._commitVertex(a);
     } else if (a.tool === "move" || a.tool === "resize" || a.tool === "rotate") {
       this._commitTransform(a);
     }
@@ -807,6 +819,89 @@ export class Surface {
     return null;
   }
 
+  // ── control points ─────────────────────────────────────────────────────────
+
+  /** Every selected stroke that HAS control points, with them. */
+  _vertexShapes() {
+    const out = [];
+    for (const stroke of this.selected) {
+      const verts = shapeVertices(stroke.pts);
+      if (verts.length) out.push({ stroke, verts });
+    }
+    return out;
+  }
+
+  /** The control point under a document point, as the WELD at that spot — two
+   * points sharing a coordinate are one point and drag together. */
+  _vertexAt(px, py) {
+    const hit = VERTEX_HIT_PX / this.zoom;
+    let best = null, bestD = hit;
+    for (const { stroke, verts } of this._vertexShapes()) {
+      verts.forEach((v, i) => {
+        const d = Math.hypot(v[0] - px, v[1] - py);
+        if (d <= bestD) { bestD = d; best = { stroke, index: i, at: v }; }
+      });
+    }
+    if (!best) return null;
+    // every point at that coordinate, across every shape on the page
+    return weldedVertices(this._pageShapes(), best.at[0], best.at[1]);
+  }
+
+  /** Every corner polyline on the page — the magnets a dragged point snaps to.
+   * Frozen per gesture; rebuilding them on each motion event over a page of
+   * shapes is work nobody asked for. */
+  _pageShapes() {
+    const out = [];
+    for (const stroke of this.strokes) {
+      const verts = shapeVertices(stroke.pts);
+      if (verts.length) out.push({ stroke, verts });
+    }
+    return out;
+  }
+
+  _snapTargets(held) {
+    return this._pageShapes();
+  }
+
+  /** Freehand strokes as snap targets — their ENDS as points, their polyline as
+   * edges. Bbox-filtered at drag time. */
+  _snapCurves() {
+    const out = [];
+    for (const stroke of this.strokes) {
+      if (shapeVertices(stroke.pts).length) continue;   // that is a corner shape
+      if (stroke.pts.length >= 2) out.push({ stroke, verts: stroke.pts });
+    }
+    return out;
+  }
+
+  _dragVertex(a, dx, dy) {
+    const hit = vertexSnapRadius(this.cssW, this.cssH) / this.zoom;
+    const curves = curveSnapShapes(a.curves, dx, dy, hit);
+    const snapped = snapPoint(a.targets, dx, dy, hit, a.held, curves);
+    const [x, y] = snapped || [dx, dy];
+    this._snapAtPoint = snapped;
+    for (const { stroke, index } of a.held) {
+      stroke.pts = moveShapeVertex(stroke.pts, index, x, y);
+    }
+    this.invalidateLayer();
+    this.requestDraw();
+  }
+
+  _commitVertex(a) {
+    const moved = a.before.some((rec) =>
+      rec.pts.some((p, i) => p[0] !== rec.stroke.pts[i][0]
+                          || p[1] !== rec.stroke.pts[i][1]));
+    if (!moved) return;
+    this._pushUndo({
+      type: "reshape", page: this.pageIndex,
+      records: a.before.map((rec) => ({ stroke: rec.stroke, pts: rec.pts,
+                                        width: rec.stroke.width })),
+      after: a.before.map((rec) => ({ pts: rec.stroke.pts.map((p) => p.slice()),
+                                      width: rec.stroke.width })),
+    });
+    this.onChange();
+  }
+
   /** A deep copy of the selected strokes' geometry, for the undo op. */
   _snapshotSelected() {
     return this.selected.map((s) => ({
@@ -845,6 +940,19 @@ export class Surface {
       pts: [], press: [], erased: [],
     };
     if (this.selectionBoxed) {
+      // A control point sits inside the box, on top of a resize handle, and
+      // WINS there — the corner of a shape is what you were aiming at.
+      const grabbed = this._vertexAt(dx, dy);
+      if (grabbed) {
+        this.active = {
+          ...base, tool: "vertex",
+          held: grabbed,
+          before: grabbed.map(({ stroke }) => ({ stroke, pts: stroke.pts.map((p) => p.slice()) })),
+          targets: this._snapTargets(grabbed),
+          curves: this._snapCurves(),
+        };
+        return true;
+      }
       const bbox = this._selectionBbox();
       const [kx, ky] = rotateKnobCentre(box[0], box[1], box[2]);
       if (rotateKnobHit(kx, ky, e.offsetX, e.offsetY)) {
@@ -1485,6 +1593,16 @@ export class Surface {
         ctx.stroke();
       }
       drawRotateKnob(ctx, x0, y0, x1, accent);
+      // …and the control points on top, since one sits over a resize handle
+      const verts = [];
+      for (const { verts: vs } of this._vertexShapes()) {
+        for (const v of vs) verts.push(this.toView(v[0], v[1]));
+      }
+      if (verts.length) {
+        const snapped = this._snapAtPoint
+          ? this.toView(this._snapAtPoint[0], this._snapAtPoint[1]) : null;
+        drawShapeVertices(ctx, verts, accent, snapped);
+      }
     }
     ctx.restore();
 
