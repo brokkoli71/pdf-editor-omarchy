@@ -111,12 +111,19 @@ export async function insertDocuments(host, sources, atPage) {
   for (const [page, strokes] of before.ink) ink.set(page, strokes);
   let offset = Math.min(atPage, total);
 
+  const skipped = [];
   for (const src of sources) {
     let d;
-    try { d = await PDFDocument.load(src.bytes, { ignoreEncryption: true }); }
-    catch { continue; }
+    try {
+      d = await PDFDocument.load(src.bytes, { ignoreEncryption: true });
+    } catch (err) {
+      // a source that cannot be read must not lose the rest — but it must not
+      // vanish silently either, which is how "nothing happened" happens
+      skipped.push(`${src.name}: ${err.message}`);
+      continue;
+    }
     const idx = d.getPageIndices();
-    if (!idx.length) continue;
+    if (!idx.length) { skipped.push(`${src.name}: no pages`); continue; }
     const copied = await merged.copyPages(d, idx);
     for (const p of copied) merged.addPage(p);
     chapters.push({ title: stripExt(src.name), page: offset, level: 0 });
@@ -129,12 +136,12 @@ export async function insertDocuments(host, sources, atPage) {
   const shift = offset - Math.min(atPage, total);
   for (const [page, strokes] of after.ink) ink.set(page + shift, strokes);
 
-  const existing = host.outline.map((e) => ({
+  const existing = (host.outline || []).map((e) => ({
     ...e, page: e.page >= atPage ? e.page + shift : e.page,
   }));
   const all = [...existing, ...chapters].sort((a, b) => a.page - b.page);
   if (all.length) writeOutline(merged, all);
-  return { bytes: await merged.save(), ink };
+  return { bytes: await merged.save(), ink, chapters, skipped };
 }
 
 function sliceInk(map, from, to) {

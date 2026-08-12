@@ -438,6 +438,9 @@ button:disabled:hover { background: transparent; }
 /* Collapsed, the handle is the only way back to the page, so it wears a wide
    visible grip instead of a few pixels hard against the window edge. */
 #paned.full-notes > #stage { flex-basis: 0 !important; overflow: hidden; }
+/* the other end: the notes folded away entirely */
+#paned.notes-hidden > #divider { width: 10px; }
+#paned.notes-hidden > #notes-col { overflow: hidden; }
 #paned.full-notes > #divider {
   width: 14px;
   background: var(--window-bg);

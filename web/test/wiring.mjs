@@ -95,6 +95,23 @@ for (const file of readdirSync(src).filter((f) => f.endsWith(".js"))) {
   }
 }
 
+// ── every element the code reaches for must EXIST in the page ───────────────
+// A missing id throws on the line that touches it, which aborts module
+// evaluation — so a mistyped or never-added element does not just break its own
+// button, it stops everything after it from initialising at all.
+{
+  const html = readFileSync(join(src, "..", "index.html"), "utf8");
+  const present = new Set([...html.matchAll(/\sid="([^"]+)"/g)].map((m) => m[1]));
+  for (const file of readdirSync(src).filter((f) => f.endsWith(".js"))) {
+    // presenter.js reaches into a document it WRITES itself, not this page
+    if (file === "presenter.js") continue;
+    const code = readFileSync(join(src, file), "utf8");
+    for (const m of code.matchAll(/getElementById\(\s*["'`]([^"'`]+)["'`]\s*\)/g)) {
+      if (!present.has(m[1])) fail(`${file}: getElementById("${m[1]}") — no such id in index.html`);
+    }
+  }
+}
+
 if (failures) {
   console.error(`\n✗ ${failures} wiring problem(s).`);
   process.exit(1);

@@ -215,6 +215,7 @@ wireSearch();
 wireBookmarks();
 wireRecent();
 wirePresenter();
+wireNotesPanel();
 refreshToolBindings();
 refreshUndo();
 
@@ -424,8 +425,11 @@ async function readFiles(files) {
   const pdfs = [];
   // A `.md` dropped alongside its PDF is that PDF's SIDECAR — the same pairing
   // the desktop makes, where a document is a `.pdf` plus the `.md` beside it.
-  // Matching is by base name, which is the rule the file layout already
-  // encodes.
+  // Base name FIRST, because that is the rule the file layout encodes; but the
+  // desktop also remembers a notes file chosen by hand, and those are often
+  // named for the course rather than the file (`0_merged.pdf` beside
+  // `26-sose-inhalte_nlp.md`). So one PDF and one `.md` dropped together are
+  // paired whatever they are called — there is nothing else they could mean.
   const sidecars = new Map();
   for (const f of list) {
     if (/\.md$/i.test(f.name)) {
@@ -439,6 +443,9 @@ async function readFiles(files) {
       name: f.name,
       notesText: sidecars.get(f.name.replace(/\.[^.]+$/, "")) ?? null,
     });
+  }
+  if (pdfs.length === 1 && sidecars.size === 1 && !pdfs[0].notesText) {
+    pdfs[0].notesText = [...sidecars.values()][0];
   }
   // a `.md` on its own is a notes file for the document already open
   if (!pdfs.length && sidecars.size && surface.doc) {
@@ -536,16 +543,31 @@ async function doSave({ reask = false } = {}) {
  * Everywhere else opens or merges into a new one. */
 async function importAt(files, gap) {
   if (!surface.doc) return openFiles(files);
-  const sources = files[0]?.bytes ? files : await readFiles(files);
+  // Are these already-read sources, or Files to read?
+  //
+  // NOT a truthiness test on `.bytes`: `Blob.prototype.bytes()` is a METHOD in
+  // current browsers, so every File has a truthy `.bytes` and every dropped
+  // file was handed to pdf-lib as a FUNCTION. It failed with "must be of type
+  // Uint8Array but was actually of type NaN" inside a `catch { continue }`,
+  // which is why the drop looked like it did nothing at all.
+  const ready = ArrayBuffer.isView(files[0]?.bytes);
+  const sources = ready ? files : await readFiles(files);
   if (!sources.length) return toast("No PDFs in that drop");
   try {
     const host = surface.doc;
-    const { bytes, ink } = await insertDocuments(host, sources, gap);
+    const was = host.pageCount;
+    const { bytes, ink, skipped } = await insertDocuments(host, sources, gap);
+    if (skipped && skipped.length) console.warn("import skipped:", skipped);
     const doc = await Doc.open(bytes, host.name);
     doc.ink = ink;
     await setDoc(doc, document.getElementById("doc-title").textContent);
     await surface.setPage(gap);
-    toast(`Inserted ${sources.length} document${sources.length > 1 ? "s" : ""} at page ${gap + 1}`);
+    // the COUNT, not just "inserted": an import that silently added nothing is
+    // the failure this reports, and it is otherwise invisible
+    const added = doc.pageCount - was;
+    toast(added > 0
+      ? `Inserted ${added} page${added > 1 ? "s" : ""} at page ${gap + 1}`
+      : "Nothing was inserted — those pages could not be read");
   } catch (err) {
     toast(`Could not insert: ${err.message}`);
   }
@@ -798,6 +820,60 @@ function syncPresenting() {
   document.getElementById("presenting").hidden = !on;
   document.getElementById("present-btn").classList.toggle("suggested", on);
   if (!on) timer.pause();
+  // Closing the projected window by hand does not always reach us — `pagehide`
+  // is not guaranteed — and the timer sitting in the header afterwards claims a
+  // presentation that ended. So while it is open, its being open is CHECKED.
+  clearInterval(syncPresenting._watch);
+  if (on) {
+    syncPresenting._watch = setInterval(() => {
+      if (!presenter.open) { clearInterval(syncPresenting._watch); syncPresenting(); }
+    }, 1000);
+  }
+}
+
+/** Show or hide the notes column. The same two states the divider drag moves
+ * between, so the button and the drag cannot disagree about where it sits. */
+function toggleNotes(force = null) {
+  const stage = document.getElementById("stage");
+  const cur = parseFloat(stage.style.flexBasis) / 100;
+  const hidden = Number.isFinite(cur) && cur > 0.97;
+  const show = force === null ? hidden : force;
+  wireDivider.setSplit(show ? (store.get("pane_fraction") || 0.62) : 0.999,
+                       { remember: false });
+  const btn = document.getElementById("notes-btn");
+  btn.setAttribute("aria-pressed", String(show));
+  btn.classList.toggle("suggested", false);
+  document.getElementById("paned").classList.toggle("notes-hidden", !show);
+}
+
+/** Open a notes file for the document already open — for a sidecar named for
+ * the course rather than the file, which is what the desktop's "choose notes
+ * file" is for. */
+function openNotesFile() {
+  const input = document.getElementById("notes-input");
+  input.onchange = async () => {
+    const f = input.files[0];
+    input.value = "";
+    if (!f || !surface.doc) return;
+    surface.doc.notes.setFromText(await f.text());
+    notes.setModel(surface.doc.notes);
+    notes.showPage(surface.pageIndex);
+    sidebar.setDoc(surface.doc);
+    syncPageChrome();
+    markDirty(true);
+    rememberSession();
+    toast(`Notes loaded from ${f.name}`);
+  };
+  input.click();
+}
+
+function wireNotesPanel() {
+  document.getElementById("notes-btn").addEventListener("click", () => toggleNotes());
+  // a long press, or a right-click, opens a notes file instead of toggling
+  document.getElementById("notes-btn").addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    openNotesFile();
+  });
 }
 
 function wirePresenter() {
@@ -1348,13 +1424,7 @@ function wireKeys() {
       surface.requestDraw();
     } else if ((e.ctrlKey || e.metaKey) && (key === "\\" || e.code === "Backslash")) {
       e.preventDefault();
-      const paned = document.getElementById("paned");
-      const full = paned.classList.contains("full-notes");
-      // Ctrl+\ toggles the notes: away entirely, or back to where the divider
-      // last was — the same two states the divider drag moves between.
-      const frac = store.get("pane_fraction") || 0.62;
-      wireDivider.setSplit(full ? frac : (surface.doc ? 0.999 : frac),
-                           { remember: false });
+      toggleNotes();
     } else if ((e.ctrlKey || e.metaKey) && key === "b") {
       e.preventDefault();
       toggleBookmark();
