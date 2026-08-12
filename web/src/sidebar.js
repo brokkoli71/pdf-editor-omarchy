@@ -303,6 +303,26 @@ export class Sidebar {
     add(label("Delete"), () => this.onDeletePages(pages), true);
     document.body.appendChild(menu);
     this._menu = menu;
+    // KEEP IT ON SCREEN. The strip is a column you scroll to the bottom of, so
+    // most right-clicks land in the lower half of the window — and a menu is
+    // nine entries tall. Placed naively at the pointer it ran 241 px past the
+    // bottom on the last thumbnail, putting EVERY entry out of reach: the
+    // handlers all worked, and nobody could click one.
+    //
+    // Measured after insertion, because the height is whatever the entries
+    // came to. It flips ABOVE the pointer when there is more room there — never
+    // just clamped to the bottom edge, which would drop the menu under the
+    // hand that opened it.
+    const m = menu.getBoundingClientRect();
+    const margin = 6;
+    if (m.bottom > window.innerHeight - margin) {
+      const above = e.clientY - m.height;
+      menu.style.top = `${above >= margin ? above
+        : Math.max(margin, window.innerHeight - m.height - margin)}px`;
+    }
+    if (m.right > window.innerWidth - margin) {
+      menu.style.left = `${Math.max(margin, window.innerWidth - m.width - margin)}px`;
+    }
     // Close on a press OUTSIDE the menu — and only outside.
     //
     // A press anywhere used to close it, including on its own buttons: the

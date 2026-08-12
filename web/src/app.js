@@ -223,6 +223,22 @@ wireNotesPanel();
 refreshToolBindings();
 refreshUndo();
 
+// A read-only window onto the live model, for driving the app from a browser
+// session rather than reading its source. Everything painful in this port has
+// been WIRING — a handler that is correct and never reached — and the only way
+// to tell those apart is to press the thing for real and then ask the model what
+// happened. Squinting at a screenshot answers "is there a line?", never "do
+// these two points share a coordinate". Nothing here is written to; it is the
+// same objects the app is using, so reading it cannot change behaviour.
+window.__sidemark = {
+  get surface() { return surface; },
+  get doc() { return surface.doc; },
+  get strokes() { return surface.strokes; },
+  get selected() { return surface.selected; },
+  get bindings() { return bindings; },
+  get pen() { return pen; },
+};
+
 window.addEventListener("resize", () => { surface.fit(); surface.requestDraw(); });
 surface.requestDraw();
 
