@@ -79,10 +79,12 @@ constants.
   merge into ONE document with a chapter per file; drop onto the sidebar and
   they insert at that gap. Drag a thumbnail OUT and those pages leave as a PDF
   with their ink — into another Sidemark window's page strip, which works.
-  Dropping one on a FILE MANAGER does not, at least on Linux: the browser hands
-  that drag to the desktop through `DownloadURL`, which it strips from anything
-  the page can see, so it is neither ours to fix nor ours to test. Use the
-  page menu's Export for a file.
+  A FILE MANAGER will not take it on Linux, and the reason is worth knowing:
+  the browser can drag out a file that already EXISTS (a download leaves as a
+  `file://` URI), but a page offering bytes it has not written yet needs
+  `DownloadURL`, the file-promise type Chromium implements on Windows and macOS
+  only. Extracted pages live in memory, so there is no file to point at. Export
+  writes one.
 
 ## Which browser
 
