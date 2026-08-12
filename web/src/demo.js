@@ -61,28 +61,12 @@ function watchToasts() {
   return true;
 }
 
-/** A page leaving the window.
- *
- * Where it LANDS is unknowable from here — another window, a file manager, or
- * nowhere. Chromium also strips `DownloadURL` from what web content can see
- * during a drag (it becomes `chromium/x-drag-id`), so even the types are only
- * fully visible at `dragstart` on the source. What is checkable is Sidemark's
- * whole side of it: the drag left carrying pages. */
-let pageDragOut = 0;
-function watchPageDrags() {
-  const doc = frame.contentDocument;
-  if (!doc) return false;
-  // BUBBLE, not capture. The strip fills the payload in its own handler on the
-  // row; a capture listener on the document runs BEFORE that one, and sees a
-  // dataTransfer carrying nothing at all — the step could never tick.
-  doc.addEventListener("dragstart", (e) => {
-    const types = [...(e.dataTransfer?.types || [])].map((t) => t.toLowerCase());
-    if (types.includes("downloadurl") || types.includes("application/x-sidemark-pages")) {
-      pageDragOut = Date.now();
-    }
-  });
-  return true;
-}
+// A page dragged OUT was the third task here, and is not any more: where a drag
+// lands is unknowable from this page, and on Linux it cannot reach a file
+// manager at all — a browser only drags out files that already exist, and these
+// pages are made as you drag them. Export is the way to a file, so Export is
+// what the tour teaches. The drag still works into another Sidemark window, and
+// the hint says so.
 
 /** Two strokes sharing a corner — the weld, re-derived exactly as the app
  * re-derives it, rather than asking the app whether it thinks it welded. */
@@ -191,9 +175,9 @@ const steps = [
     list: [
       "Drag a thumbnail to a different position.",
       "Drag the handout below into the strip.",
-      "Drag a thumbnail out of the strip and let go.",
+      "Right-click a page and Export it.",
     ],
-    hint: "The strip is the leftmost button in the bar. A page dragged out leaves as a PDF with its ink in it — drop it into another Sidemark window to see it arrive. (A file manager will not take it on Linux: a browser can only drag out a file that already exists on disk, and these pages are made as you drag them. Export writes one.)",
+    hint: "The strip is the leftmost button in the bar. Select several pages first (Ctrl+click) and every one of these acts on all of them. A page can also be dragged straight into another Sidemark window.",
     handout: true,
     arm(ctx) {
       ctx.pages0 = app()?.doc?.pageCount ?? 0;
@@ -201,18 +185,19 @@ const steps = [
       ctx.added = false;
       ctx.out = false;
       lastToast = { text: "", at: 0 };
-      pageDragOut = 0;
     },
     check(ctx) {
       const a = app();
       if (!a || !a.doc) return false;
+      // the reorder and the export leave nothing in the model to find
+      // afterwards, so they are read from the app's own account of what it did
       if (/^Page \d+ → \d+$/.test(lastToast.text)) ctx.moved = true;
+      if (/^Exported /.test(lastToast.text)) ctx.out = true;
       if (a.doc.pageCount > ctx.pages0) ctx.added = true;
-      if (pageDragOut) ctx.out = true;
       progress(ctx);
       return ctx.moved && ctx.added && ctx.out;
     },
-    done: "A dragged page leaves as an ordinary PDF, with its ink in it — into your files, or into another Sidemark window.",
+    done: "Those pages leave as an ordinary PDF with the ink in them — openable anywhere, and still editable here.",
   },
 ];
 
@@ -362,7 +347,6 @@ async function start() {
     return;
   }
   watchToasts();
-  watchPageDrags();
   await loadHandout();
   await seed();
   await new Promise((r) => setTimeout(r, 600));
