@@ -14,6 +14,8 @@ import { recognizeShape, snapGridDivider, respaceDividers, polylineIsClosed,
 import { pageWords, nearestWord, wordsBetween, wordsInRect,
          selectionText, selectionRects } from "./textlayer.js";
 import { copySelection, takeCopy, hasCopy, copyExtent } from "./clipboard.js";
+import { parseAnchors, addAnchor, moveAnchor, moveCallout, calloutBox,
+         drawAnchor, ANCHOR_R } from "./anchors.js";
 import {
   pointInPolygon, lassoHandlePoints, lassoHandleAnchor, lassoScaleFactors,
   lassoHandleCursor, lassoChipCentre, lassoChipHit, lassoDeleteCentre,
@@ -49,7 +51,7 @@ export const STRAIGHT_HOLD_MS = 500;   // hold still this long mid-stroke to sna
 export const CIRCLE_LASSO_HOLD_MS = 500;
 
 export const IMPLEMENTED_TOOLS = new Set(["pen", "highlighter", "eraser", "pan",
-                                          "zoom", "lasso", "text"]);
+                                          "zoom", "lasso", "text", "anchor"]);
 
 /** How many fingers are on the glass — and whether THIS hand ever had two.
  *
@@ -106,6 +108,7 @@ export class Surface {
     this.onNotesRestored = opts.onNotesRestored || (() => {});
     // called on every repaint, so a mirror can follow the live stroke
     this.onLiveDraw = opts.onLiveDraw || (() => {});
+    this.onNotesChanged = opts.onNotesChanged || (() => {});
 
     // The document, and which page is in front. Sidemark shows ONE page at a
     // time and flips between them; it is not a continuous scroll.
@@ -417,6 +420,23 @@ export class Surface {
       // table.
     }
 
+    // An anchor or a callout is grabbable with ANY tool, like a selection — it
+    // is a thing ON the page, and having to change tools to nudge one is the
+    // sort of friction the binding table exists to avoid.
+    const grabbed = this._anchorAt(e.offsetX, e.offsetY);
+    if (grabbed) {
+      this.active = {
+        pointerId: e.pointerId, tool: "anchor-move", device: e.pointerType,
+        grabbed, start: [dx, dy],
+        offset: grabbed.part === "dot"
+          ? [dx - grabbed.anchor.x, dy - grabbed.anchor.y]
+          : [dx - grabbed.anchor.callout[0], dy - grabbed.anchor.callout[1]],
+        lastView: [e.offsetX, e.offsetY], startView: [e.offsetX, e.offsetY],
+        pts: [], press: [], erased: [],
+      };
+      return;
+    }
+
     // ── the selection's own targets, before any tool is resolved ────────────
     // A live selection is grabbable with ANY tool (row 125), and its chip and
     // delete cross are tap targets that have to beat the tool underneath them.
@@ -529,6 +549,17 @@ export class Surface {
     if (a.tool === "text") {
       a.cur = [dx, dy];
       this._updateTextSelection(a);
+      a.lastView = [e.offsetX, e.offsetY];
+      return;
+    }
+    if (a.tool === "anchor-move") {
+      const { anchor, part } = a.grabbed;
+      const x = dx - a.offset[0], y = dy - a.offset[1];
+      const text = this.doc.notes.get(this.pageIndex);
+      this._writeNotes(part === "dot" ? moveAnchor(text, anchor.line, x, y)
+                                      : moveCallout(text, anchor, x, y));
+      // the parse is by LINE, and the line has not moved, so the record stays
+      // valid for the rest of the drag
       a.lastView = [e.offsetX, e.offsetY];
       return;
     }
@@ -716,6 +747,13 @@ export class Surface {
     } else if (a.tool === "lasso") {
       const { shift } = this._chordState(e);
       this._finishLasso(a.pts, shift);
+    } else if (a.tool === "anchor") {
+      // a drag places the callout where you let go; a click leaves a bare dot
+      const moved = Math.hypot(e.offsetX - a.startView[0], e.offsetY - a.startView[1]);
+      const [ex, ey] = this.toDoc(e.offsetX, e.offsetY);
+      this._placeAnchor(a.pts[0][0], a.pts[0][1], moved > 12 ? [ex, ey] : null);
+    } else if (a.tool === "anchor-move") {
+      // nothing to commit: each motion already wrote the notes
     } else if (a.tool === "vertex") {
       this._snapAtPoint = null;
       this._commitVertex(a);
@@ -737,6 +775,63 @@ export class Surface {
     if (this.active && this.active.device === "touch") {
       this.active = null;
       this._updateCursor();
+    }
+  }
+
+  // ── anchors and callouts ───────────────────────────────────────────────────
+
+  /** The anchors on this page, parsed from its notes. Re-read rather than
+   * cached: the notes are the truth, and they can change from the panel at any
+   * time. */
+  get anchors() {
+    if (!this.doc) return [];
+    return parseAnchors(this.doc.notes.get(this.pageIndex));
+  }
+
+  _writeNotes(text) {
+    this.doc.notes.set(this.pageIndex, text);
+    this.onNotesChanged();
+    this.onChange();
+    this.requestDraw();
+  }
+
+  /** The anchor or callout under a screen point, if any. */
+  _anchorAt(sx, sy) {
+    const ctx = this.ctx;
+    for (const a of this.anchors) {
+      const [ax, ay] = this.toView(a.x, a.y);
+      if (Math.hypot(sx - ax, sy - ay) <= ANCHOR_R + 4) return { anchor: a, part: "dot" };
+      if (a.callout && a.text) {
+        const [cx, cy] = this.toView(a.callout[0], a.callout[1]);
+        const box = calloutBox(ctx, a.text, cx, cy);
+        if (box && sx >= box.x && sx <= box.x + box.w
+                && sy >= box.y && sy <= box.y + box.h) {
+          return { anchor: a, part: "callout" };
+        }
+      }
+    }
+    return null;
+  }
+
+  /** Place an anchor. A DRAG places its callout where you let go, which is why
+   * the tool is a drag and not a click. */
+  _placeAnchor(dx, dy, callout = null) {
+    if (!this.doc) return;
+    this._writeNotes(addAnchor(this.doc.notes.get(this.pageIndex), dx, dy, callout));
+  }
+
+  _drawAnchors(ctx) {
+    if (!this.doc) return;
+    const accent = "rgb(53, 132, 228)";
+    const dim = "rgba(34, 33, 29, 0.85)";
+    for (const a of this.anchors) {
+      const screen = this.toView(a.x, a.y);
+      let box = null;
+      if (a.callout && a.text) {
+        const [cx, cy] = this.toView(a.callout[0], a.callout[1]);
+        box = calloutBox(ctx, a.text, cx, cy);
+      }
+      drawAnchor(ctx, screen, box, accent, dim);
     }
   }
 
@@ -1438,6 +1533,7 @@ export class Surface {
 
     this._drawSearchHits(ctx);
     this._drawTextSelection(ctx);
+    this._drawAnchors(ctx);
     this._ensureLayer();
     ctx.drawImage(this._layer, 0, 0, this.cssW, this.cssH);
 

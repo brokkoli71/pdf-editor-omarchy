@@ -140,6 +140,8 @@ const heldMods = { ctrl: false, shift: false, alt: false };
 const surface = new Surface(document.getElementById("page"), pen, bindings, {
   onChange: () => { refreshUndo(); markDirty(true); rememberSession(); },
   onLiveDraw: () => presenter.request(),
+  // an anchor edits the NOTES, so the panel has to be told to re-read them
+  onNotesChanged: () => { notes.showPage(surface.pageIndex); markDirty(true); },
   onNotesRestored: () => {
     notes.showPage(surface.pageIndex);
     syncPageChrome();

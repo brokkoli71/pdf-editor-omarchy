@@ -64,6 +64,27 @@ class ScriptWidget extends WidgetType {
   ignoreEvent() { return false; }
 }
 
+// A whole-line comment hides its NEWLINE too, or a hidden marker still costs a
+// blank line where it used to be.
+const COMMENT_RE = /<!--[\s\S]*?-->/g;
+
+/** HTML comments are hidden, as in any Markdown viewer — and Sidemark's own
+ * per-page bookkeeping lives in them (page markers, anchors, callouts), so on a
+ * sheet showing a whole sidecar they would be most of what is on screen.
+ *
+ * Never REMOVED from the file, only from the view, and revealed on the cursor's
+ * line like every other marker. */
+function commentRanges(text, lineFrom) {
+  const out = [];
+  COMMENT_RE.lastIndex = 0;
+  for (const m of text.matchAll(COMMENT_RE)) {
+    const from = m.index, to = m.index + m[0].length;
+    const whole = text.slice(0, from).trim() === "" && text.slice(to).trim() === "";
+    out.push({ from: lineFrom + from, to: lineFrom + to, whole });
+  }
+  return out;
+}
+
 function buildDecorations(view) {
   const builder = new RangeSetBuilder();
   const { state } = view;
@@ -81,16 +102,40 @@ function buildDecorations(view) {
       // a selection touching this line at all reveals the whole line
       if (selFrom >= 0 && selFrom <= line.to && selTo >= line.from) continue;
 
+      const onThisLine = sel.empty && sel.head >= line.from && sel.head <= line.to;
+      const comments = onThisLine ? [] : commentRanges(line.text, line.from);
+      const hidden = (a, b) => comments.some((c) => a < c.to && c.from < b);
+      // A RangeSetBuilder demands ranges in ascending order, and a line's
+      // comments and its maths are interleaved in the source — so the line's
+      // decorations are COLLECTED and sorted rather than added as they are
+      // found. Adding them in two passes throws.
+      const onLine = [];
+      // A line that is ONLY a comment has to lose its NEWLINE too, or a hidden
+      // marker still costs a blank line. A plugin may not replace a line break
+      // — CodeMirror refuses that outright — so the LINE is hidden instead,
+      // which removes its height and its break together.
+      if (comments.some((c) => c.whole)) {
+        builder.add(line.from, line.from,
+                    Decoration.line({ attributes: { class: "sm-hidden-line" } }));
+        continue;
+      }
+      for (const c of comments) {
+        onLine.push({ from: c.from, to: c.to, deco: Decoration.replace({}) });
+      }
+
       for (const span of renderSpans(line.text)) {
         const a = line.from + span.from, b = line.from + span.to;
         // the caret reveals only the expression it is INSIDE, edges included:
         // standing at either end means you are still writing it
         if (sel.empty && sel.head >= a && sel.head <= b) continue;
+        if (hidden(a, b)) continue;    // already replaced as part of a comment
         const widget = span.kind === "script"
           ? new ScriptWidget(span.text, span.chain)
           : new GlyphWidget(span.text, "sm-glyph");
-        builder.add(a, b, Decoration.replace({ widget }));
+        onLine.push({ from: a, to: b, deco: Decoration.replace({ widget }) });
       }
+      onLine.sort((p, q) => p.from - q.from || p.to - q.to);
+      for (const d of onLine) builder.add(d.from, d.to, d.deco);
     }
   }
   return builder.finish();
@@ -142,6 +187,7 @@ const theme = EditorView.theme({
   },
   ".cm-placeholder": { color: "var(--dim)" },
   ".sm-script": { lineHeight: "0" },   // a lifted script must not open the line
+  ".sm-hidden-line": { display: "none" },
 });
 
 export class NotesView {
