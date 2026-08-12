@@ -134,3 +134,59 @@ export async function openWithPicker(multiple = true) {
   }
   return out;
 }
+
+// ── exporting a subset of pages ──────────────────────────────────────────────
+
+/** A PDF of just `indices`, in the order given, with their ink written in.
+ *
+ * The ink is re-keyed to the new page numbers rather than dropped: exporting a
+ * few slides to hand to somebody and having your annotations not come with them
+ * is the one thing that would make the feature pointless. */
+export async function extractPages(doc, indices) {
+  const donor = await PDFDocument.load(doc.bytes, { ignoreEncryption: true });
+  const out = await PDFDocument.create();
+  const wanted = indices.filter((i) => i >= 0 && i < donor.getPageCount());
+  if (!wanted.length) throw new Error("no pages selected");
+  const copied = await out.copyPages(donor, wanted);
+  for (const p of copied) out.addPage(p);
+
+  const ink = new Map();
+  wanted.forEach((old, next) => {
+    const strokes = doc.ink.get(old);
+    if (strokes && strokes.length) ink.set(next, strokes);
+  });
+  writeInk(out, ink);
+  return out.save();
+}
+
+/** A name for the exported file that says what is in it. */
+export function exportName(docName, indices) {
+  const base = String(docName || "pages").replace(/\.[^.]+$/, "");
+  if (indices.length === 1) return `${base} p${indices[0] + 1}.pdf`;
+  const runs = [];
+  let start = indices[0], prev = indices[0];
+  for (const i of indices.slice(1)) {
+    if (i === prev + 1) { prev = i; continue; }
+    runs.push(start === prev ? `${start + 1}` : `${start + 1}-${prev + 1}`);
+    start = prev = i;
+  }
+  runs.push(start === prev ? `${start + 1}` : `${start + 1}-${prev + 1}`);
+  // a name that lists every page of a 40-page selection is not a name
+  const span = runs.length > 3 ? `${indices.length} pages` : `p${runs.join(",")}`;
+  return `${base} ${span}.pdf`;
+}
+
+/** Save an extracted set of pages, in place where that is possible and as a
+ * download where it is not. */
+export async function exportPages(doc, indices) {
+  const bytes = await extractPages(doc, indices);
+  const name = exportName(doc.name, indices);
+  if (!canSaveInPlace) {
+    download(bytes, name, "application/pdf");
+    return name;
+  }
+  const handle = await pickSave(name, "PDF document", { "application/pdf": [".pdf"] });
+  if (!handle) return null;
+  await writeHandle(handle, bytes);
+  return handle.name;
+}

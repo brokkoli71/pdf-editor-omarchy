@@ -23,6 +23,7 @@
   --separator: rgb(34 33 29 / 13%);
   --surround: #e8ddd2;   /* PDFCanvas.surround_color, (0.910, 0.867, 0.824) */
   --radius: 8px;
+  --header-h: 47px;      /* what floats under the header measures from this */
 }
 
 :root:not([data-theme="light"]) {
@@ -93,7 +94,7 @@ body {
   grid-template-columns: 1fr auto 1fr;
   align-items: center;
   gap: 6px;
-  min-height: 47px;
+  min-height: var(--header-h);
   padding: 0 6px;
   background: var(--headerbar-bg);
   border-bottom: 1px solid var(--headerbar-border);
@@ -101,6 +102,9 @@ body {
 }
 
 .hb-start, .hb-end { display: flex; align-items: center; gap: 2px; min-width: 0; }
+/* the side cells must be allowed to SHRINK, or they push into the centre one
+   and the whole bar overlaps itself rather than adapting */
+.headerbar > * { min-width: 0; }
 .hb-start { justify-self: start; padding-left: 2px; }
 .hb-center { justify-self: center; display: flex; align-items: center; gap: 8px; }
 
@@ -198,11 +202,47 @@ button:disabled:hover { background: transparent; }
   font-variant-numeric: tabular-nums;
 }
 
+/* ── narrow windows ───────────────────────────────────────────────────────
+   The three groups stop fitting on one line at about 1000px, and a grid whose
+   middle column is fixed does not degrade — it overlaps. So the tools take a
+   row of their own, which loses nothing: every button stays reachable and only
+   the bar gets taller. Below that the title goes (the tab already names the
+   document) and then the zoom buttons (scroll and pinch still zoom). */
+
+@media (max-width: 1000px) {
+  :root { --header-h: 84px; }
+  .headerbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: auto auto;
+    row-gap: 2px;
+    padding: 3px 6px;
+  }
+  .hb-start { grid-area: 1 / 1; }
+  .hb-end { grid-area: 1 / 2; }
+  .hb-center {
+    grid-area: 2 / 1 / 2 / -1;
+    justify-self: center;
+    max-width: 100%;
+    overflow-x: auto;          /* narrower still: the tools scroll, never clip */
+    scrollbar-width: none;
+  }
+  .hb-center::-webkit-scrollbar { display: none; }
+}
+
+@media (max-width: 760px) {
+  .hb-start .title { display: none; }
+}
+
+@media (max-width: 620px) {
+  #zoomer { display: none; }
+  #sidebar { width: 150px; }
+}
+
 /* ── search ──────────────────────────────────────────────────────────────── */
 
 .searchbar {
   position: absolute;
-  top: 55px; right: 14px;
+  top: calc(var(--header-h) + 8px); right: 14px;
   z-index: 25;
   display: flex;
   align-items: center;
@@ -288,6 +328,8 @@ button:disabled:hover { background: transparent; }
 /* set aside: still in the document and still editable, but skipped when paging
    and left out of an export. Dimmed rather than removed, because the row is the
    only way to select it again and bring it back. */
+.thumb.picked { background: color-mix(in srgb, var(--accent-bg) 18%, transparent); }
+.thumb.picked .thumb-img { outline: 2px solid var(--accent-bg); outline-offset: 1px; }
 .thumb.hidden-page .thumb-img { opacity: .35; }
 .thumb.hidden-page .thumb-no { text-decoration: line-through; color: var(--dim); }
 .thumb.current .thumb-no { color: var(--window-fg); font-weight: 700; }
@@ -476,11 +518,11 @@ button:disabled:hover { background: transparent; }
 
 .popover {
   position: absolute;
-  top: 52px;
+  top: calc(var(--header-h) + 5px);
   right: 8px;
   z-index: 20;
   width: 288px;
-  max-height: calc(100vh - 64px);
+  max-height: calc(100vh - var(--header-h) - 20px);
   overflow-y: auto;
   background: var(--popover-bg);
   border-radius: 12px;
@@ -546,7 +588,7 @@ hr { border: none; border-top: 1px solid var(--separator); margin: 10px 0 2px; w
 }
 .binding button:hover { background: var(--btn-hover); color: inherit; }
 
-.name-popover { top: 55px; right: 14px; width: 260px; }
+.name-popover { top: calc(var(--header-h) + 8px); right: 14px; width: 260px; }
 .name-popover input[type="text"] {
   font: inherit; color: inherit; background: var(--btn-bg);
   border: none; border-radius: 6px; padding: 6px 9px; min-height: 32px;

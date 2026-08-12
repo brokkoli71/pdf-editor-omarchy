@@ -10,7 +10,10 @@ export class Sidebar {
     this.onGoToPage = opts.onGoToPage;
     this.onDropFiles = opts.onDropFiles;
     this.onMovePage = opts.onMovePage || (() => {});
-    this.onDeletePage = opts.onDeletePage || (() => {});
+    this.onDeletePages = opts.onDeletePages || (() => {});
+    this.onExportPages = opts.onExportPages || (() => {});
+    this.onSelectionChanged = opts.onSelectionChanged || (() => {});
+    this.onDragPayload = opts.onDragPayload || (() => null);
     this.onDropBookmark = opts.onDropBookmark || (() => {});
     this.onToggleHidden = opts.onToggleHidden || (() => {});
     this.onAddPage = opts.onAddPage || (() => {});
@@ -20,7 +23,11 @@ export class Sidebar {
     this.view = "pages";
     this._thumbCentred = null;
     this._dragPage = null;
-    this._menu = null;   // "is this a new page or the same one?"
+    this._menu = null;
+    // A multi-selection of PAGES, separate from which page is in front. Plain
+    // click navigates and clears it; Ctrl+click picks; Shift+click extends.
+    this.selected = new Set();
+    this._anchor = null;   // "is this a new page or the same one?"
 
     this.switchEl = root.querySelector("#side-switch");
     this.listEl = root.querySelector("#side-list");
@@ -142,7 +149,8 @@ export class Sidebar {
       label.textContent = String(i + 1);
       row.appendChild(label);
 
-      row.addEventListener("click", () => this.onGoToPage(i));
+      if (this.selected.has(i)) row.classList.add("picked");
+      row.addEventListener("click", (e) => this._clickPage(e, i));
       this._makeReorderable(row, i);
       this.listEl.appendChild(row);
 
@@ -152,6 +160,44 @@ export class Sidebar {
     }
   }
 
+  _clickPage(e, index) {
+    if (e.shiftKey && this._anchor !== null) {
+      const [lo, hi] = this._anchor <= index ? [this._anchor, index]
+                                             : [index, this._anchor];
+      for (let i = lo; i <= hi; i++) this.selected.add(i);
+    } else if (e.ctrlKey || e.metaKey) {
+      if (this.selected.has(index)) this.selected.delete(index);
+      else this.selected.add(index);
+      this._anchor = index;
+    } else {
+      // a plain click is navigation, and navigation ends a selection — leaving
+      // one behind means the next verb acts on pages you stopped thinking about
+      this.selected.clear();
+      this._anchor = index;
+      this.onGoToPage(index);
+      this.rebuild();
+      this.onSelectionChanged([...this.selected]);
+      return;
+    }
+    this.rebuild();
+    this.onSelectionChanged([...this.selected]);
+  }
+
+  /** Which pages a per-page verb applies to: the multi-selection when the
+   * clicked row is IN it, else that row alone. ONE rule, shared by the menu and
+   * the drag-export, so the two cannot disagree about what you meant. */
+  pagesActedOn(clicked) {
+    if (this.selected.has(clicked)) return [...this.selected].sort((a, b) => a - b);
+    return [clicked];
+  }
+
+  clearSelection() {
+    if (!this.selected.size) return;
+    this.selected.clear();
+    this.rebuild();
+    this.onSelectionChanged([]);
+  }
+
   /** Drag a thumbnail to move its page. The drop lands at the GAP you are
    * hovering, which is the same rule a file drop uses — one meaning for
    * "between these two rows", whatever you are dragging. */
@@ -159,9 +205,15 @@ export class Sidebar {
     row.draggable = true;
     row.addEventListener("dragstart", (e) => {
       this._dragPage = index;
-      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.effectAllowed = "copyMove";
       // some browsers refuse to start a drag with no payload
       e.dataTransfer.setData("text/plain", String(index));
+      // …and if a file is ready for these pages, offer it to the DESKTOP as
+      // well, so the same drag reorders inside the strip and exports outside it
+      const payload = this.onDragPayload(index);
+      if (payload) {
+        try { e.dataTransfer.setData("DownloadURL", payload); } catch { /* not Chromium */ }
+      }
       row.classList.add("dragging");
     });
     row.addEventListener("dragend", () => {
@@ -189,6 +241,11 @@ export class Sidebar {
       b.addEventListener("click", () => { this._closePageMenu(); fn(); });
       menu.appendChild(b);
     };
+    const pages = this.pagesActedOn(index);
+    const many = pages.length > 1;
+    const label = (verb) => (many ? `${verb} ${pages.length} pages` : verb);
+    add(many ? `Export ${pages.length} pages…` : "Export this page…",
+        () => this.onExportPages(pages));
     add("Go to page", () => this.onGoToPage(index));
     if (index > 0) add("Move up", () => this.onMovePage(index, index - 1));
     if (this.doc && index < this.doc.pageCount - 1) {
@@ -196,13 +253,16 @@ export class Sidebar {
     }
     // The verb offered is the one that CHANGES something, so a page you are
     // looking at never shows both.
-    add(this.doc && this.doc.notes.isHidden(index) ? "Unhide page" : "Hide page",
-        () => this.onToggleHidden(index));
+    // the verb offered is the one that CHANGES something, so a mixed selection
+    // needs no thought
+    const allHidden = pages.every((p) => this.doc && this.doc.notes.isHidden(p));
+    add(label(allHidden ? "Unhide" : "Hide"),
+        () => pages.forEach((p) => this.onToggleHidden(p, allHidden)));
     add("Add blank page after", () => this.onAddPage(index, "plain"));
     add("  …with lines", () => this.onAddPage(index, "lines"));
     add("  …with squares", () => this.onAddPage(index, "squares"));
     add("  …with dots", () => this.onAddPage(index, "dots"));
-    add("Delete page", () => this.onDeletePage(index), true);
+    add(label("Delete"), () => this.onDeletePages(pages), true);
     document.body.appendChild(menu);
     this._menu = menu;
     setTimeout(() => {
