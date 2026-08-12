@@ -16,6 +16,8 @@ import { NotesView } from "./notes.js";
 import { NotesModel } from "./notes-model.js";
 import { saveDocument, openWithPicker, canSaveInPlace } from "./save.js";
 import { saveSession, loadSession } from "./session.js";
+import { listRecent, rememberRecent, forgetRecent, clearRecent,
+         recentState, openRecent } from "./recent.js";
 import { Search } from "./search.js";
 
 // ── settings (the settings.json analogue) ────────────────────────────────────
@@ -187,6 +189,7 @@ wireDocument();
 wireDivider();
 wireSearch();
 wireBookmarks();
+wireRecent();
 refreshToolBindings();
 refreshUndo();
 
@@ -302,6 +305,11 @@ async function setDoc(doc, title) {
   // is by definition not an unsaved edit
   markDirty(false);
   rememberSession();
+  // an untitled blank is not a document anyone wants to come back to
+  if (doc.name && doc.name !== "Untitled") {
+    rememberRecent({ name: doc.name, bytes: doc.bytes,
+                     handle: doc.handles?.pdf || null, page: 0 });
+  }
 }
 
 /** The divider between the page and the notes. GtkPaned's position, by hand. */
@@ -627,6 +635,94 @@ async function insertPagesFromPicker() {
     input.value = "";
   };
   input.click();
+}
+
+// ── recent documents ─────────────────────────────────────────────────────────
+
+function whenText(at) {
+  const mins = Math.round((Date.now() - at) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours} h ago`;
+  const days = Math.round(hours / 24);
+  return days === 1 ? "yesterday" : `${days} days ago`;
+}
+
+async function buildRecentList() {
+  const host = document.getElementById("recent-list");
+  const entries = await listRecent();
+  host.replaceChildren();
+  if (!entries.length) {
+    const p = document.createElement("p");
+    p.className = "recent-empty";
+    p.textContent = "Nothing yet — documents you open appear here.";
+    host.appendChild(p);
+    return;
+  }
+  for (const entry of entries) {
+    const state = await recentState(entry);
+    const row = document.createElement("div");
+    row.className = "recent-row" + (state === "gone" ? " gone" : "");
+
+    const open = document.createElement("button");
+    open.className = "open";
+    open.innerHTML = `<span class="name"></span><span class="when"></span>`;
+    open.querySelector(".name").textContent = entry.name;
+    open.querySelector(".when").textContent =
+      state === "gone" ? "no longer available"
+      : state === "needs-permission" ? `${whenText(entry.at)} · will ask permission`
+      : whenText(entry.at);
+    open.disabled = state === "gone";
+    open.addEventListener("click", () => reopenRecent(entry));
+    row.appendChild(open);
+
+    const drop = document.createElement("button");
+    drop.className = "drop";
+    drop.textContent = "×";
+    drop.title = "Forget this document";
+    drop.addEventListener("click", async () => {
+      await forgetRecent(entry.id);
+      buildRecentList();
+    });
+    row.appendChild(drop);
+    host.appendChild(row);
+  }
+}
+
+async function reopenRecent(entry) {
+  document.getElementById("recent-popover").hidden = true;
+  try {
+    // called straight from the click, because asking for permission on a handle
+    // needs a user gesture and an await before it would lose one
+    const opened = await openRecent(entry);
+    if (!opened) return toast("That document could not be opened");
+    const doc = await Doc.open(opened.bytes, opened.name);
+    if (opened.handle) doc.handles = { pdf: opened.handle };
+    await setDoc(doc, opened.name);
+    if (entry.page) await surface.setPage(entry.page);
+    toast(`Opened ${opened.name}`);
+  } catch (err) {
+    toast(`Could not open: ${err.message}`);
+  }
+}
+
+function wireRecent() {
+  const pop = document.getElementById("recent-popover");
+  const btn = document.getElementById("recent-btn");
+  btn.addEventListener("click", async () => {
+    pop.hidden = !pop.hidden;
+    if (!pop.hidden) await buildRecentList();
+  });
+  document.addEventListener("pointerdown", (e) => {
+    if (!pop.hidden && !pop.contains(e.target) && !btn.contains(e.target)) {
+      pop.hidden = true;
+    }
+  }, true);
+  document.getElementById("recent-clear").addEventListener("click", async () => {
+    await clearRecent();
+    buildRecentList();
+  });
 }
 
 // ── bookmarks and linked notes ───────────────────────────────────────────────

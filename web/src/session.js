@@ -14,36 +14,11 @@
 // and the ink rides as JSON. Rebuilding the annotated PDF on every stroke would
 // cost far more than it saves.
 
-const DB_NAME = "sidemark";
-const STORE = "session";
+import { withStore } from "./db.js";
+
+const STORE_NAME = "session";
 const KEY = "last";
 
-function open() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
-    req.onupgradeneeded = () => {
-      if (!req.result.objectStoreNames.contains(STORE)) {
-        req.result.createObjectStore(STORE);
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function withStore(mode, fn) {
-  const db = await open();
-  try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, mode);
-      const req = fn(tx.objectStore(STORE));
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  } finally {
-    db.close();
-  }
-}
 
 /** Ink is a Map of page → strokes; strokes are plain objects, so the only work
  * is turning the Map into something structured-cloneable and back. */
@@ -68,7 +43,7 @@ function inkFromJson(raw) {
 export async function saveSession(doc, page) {
   if (!doc) return;
   try {
-    await withStore("readwrite", (store) => store.put({
+    await withStore(STORE_NAME, "readwrite", (store) => store.put({
       name: doc.name,
       bytes: doc.bytes,
       ink: inkToJson(doc.ink),
@@ -85,7 +60,7 @@ export async function saveSession(doc, page) {
 
 export async function loadSession() {
   try {
-    const rec = await withStore("readonly", (store) => store.get(KEY));
+    const rec = await withStore(STORE_NAME, "readonly", (store) => store.get(KEY));
     if (!rec || !rec.bytes) return null;
     return { ...rec, ink: inkFromJson(rec.ink) };
   } catch {
@@ -95,6 +70,6 @@ export async function loadSession() {
 
 export async function clearSession() {
   try {
-    await withStore("readwrite", (store) => store.delete(KEY));
+    await withStore(STORE_NAME, "readwrite", (store) => store.delete(KEY));
   } catch { /* nothing to clear is not a failure */ }
 }

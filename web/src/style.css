@@ -588,6 +588,29 @@ hr { border: none; border-top: 1px solid var(--separator); margin: 10px 0 2px; w
 }
 .binding button:hover { background: var(--btn-hover); color: inherit; }
 
+.recent-popover { width: 300px; }
+.recent-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 4px; border-radius: 6px;
+}
+.recent-row:hover { background: var(--btn-hover); }
+.recent-row .open {
+  flex: 1; min-width: 0; text-align: left; background: transparent;
+  padding: 2px 4px; min-height: 24px;
+}
+.recent-row .name {
+  display: block; font-size: 13px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.recent-row .when { display: block; font-size: 11px; color: var(--dim); }
+.recent-row.gone .name { color: var(--dim); text-decoration: line-through; }
+.recent-row .drop {
+  background: transparent; color: var(--dim); padding: 2px 6px;
+  min-height: 22px; font-size: 14px; border-radius: 5px;
+}
+.recent-row .drop:hover { background: var(--btn-hover); color: inherit; }
+.recent-empty { font-size: 13px; color: var(--dim); padding: 6px 4px; }
+
 .name-popover { top: calc(var(--header-h) + 8px); right: 14px; width: 260px; }
 .name-popover input[type="text"] {
   font: inherit; color: inherit; background: var(--btn-bg);
