@@ -101,6 +101,8 @@ export class Surface {
     this.onChange = opts.onChange || (() => {});
     this.onPageChange = opts.onPageChange || (() => {});
     this.onNotesRestored = opts.onNotesRestored || (() => {});
+    // called on every repaint, so a mirror can follow the live stroke
+    this.onLiveDraw = opts.onLiveDraw || (() => {});
 
     // The document, and which page is in front. Sidemark shows ONE page at a
     // time and flips between them; it is not a continuous scroll.
@@ -1296,6 +1298,7 @@ export class Surface {
     this._ensureLayer();
     ctx.drawImage(this._layer, 0, 0, this.cssW, this.cssH);
 
+    this.onLiveDraw();
     this._drawLive(ctx);
     this._drawSnapLabel(ctx);
     this._drawLassoPath(ctx);
@@ -1366,6 +1369,64 @@ export class Surface {
     ctx.strokeStyle = rgbCss(color, flat ? this.pen.hl_opacity : 1.0);
     drawInkStroke(ctx, pts, width, profile);
     ctx.restore();
+  }
+
+  /** A frame for the presenter mirror: the current page with its ink, fitted to
+   * `w`x`h` device pixels on black.
+   *
+   * It keeps its OWN fit rather than copying the editor's view — that is the
+   * whole point of a mirror: you can zoom in to work on a corner of a slide
+   * while the audience still sees it whole. The live stroke is included, so ink
+   * appears there as it is laid down rather than when the pen lifts. */
+  async mirrorFrame(w, h) {
+    if (!this.doc || w < 2 || h < 2) return null;
+    const c = new OffscreenCanvas(w, h);
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = "#000";               // black surround, for a projector
+    ctx.fillRect(0, 0, w, h);
+
+    const scale = Math.min(w / this.pageW, h / this.pageH);
+    const ox = (w - this.pageW * scale) / 2;
+    const oy = (h - this.pageH * scale) / 2;
+
+    ctx.save();
+    ctx.translate(ox, oy);
+    ctx.scale(scale, scale);
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, this.pageW, this.pageH);
+    ctx.restore();
+
+    // the page is re-rendered at the mirror's own scale rather than reusing the
+    // editor's bitmap, which is fitted to a different window
+    try {
+      const page = new OffscreenCanvas(Math.max(1, Math.round(this.pageW * scale)),
+                                       Math.max(1, Math.round(this.pageH * scale)));
+      await this.doc.render(this.pageIndex, scale, page);
+      ctx.drawImage(page, ox, oy);
+    } catch { /* a page that will not render still shows its ink */ }
+
+    ctx.save();
+    ctx.translate(ox, oy);
+    ctx.scale(scale, scale);
+    for (const st of this.strokes) {
+      ctx.fillStyle = rgbCss(st.color, st.opacity);
+      ctx.strokeStyle = rgbCss(st.color, st.opacity);
+      drawInkStroke(ctx, st.pts, st.width, st.profile);
+    }
+    const a = this.active;
+    if (a && (a.tool === "pen" || a.tool === "highlighter")) {
+      const flat = a.tool === "highlighter";
+      const press = this._hasPressureFor(a) ? a.press : [];
+      const live = this._straightMode ? { pts: a.pts, profile: null }
+        : liveInkStroke(a.pts, press, this.pen.smoothing, { flat });
+      const color = flat ? this.pen.hl_color : this.pen.pen_color;
+      ctx.fillStyle = rgbCss(color, flat ? this.pen.hl_opacity : 1.0);
+      ctx.strokeStyle = ctx.fillStyle;
+      drawInkStroke(ctx, live.pts, flat ? this.pen.hl_width : this.pen.pen_width,
+                    live.profile);
+    }
+    ctx.restore();
+    return c.transferToImageBitmap();
   }
 
   /** The loop being drawn, in flight. */

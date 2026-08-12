@@ -15,10 +15,11 @@ import { Sidebar } from "./sidebar.js";
 import { NotesView } from "./notes.js";
 import { NotesModel } from "./notes-model.js";
 import { saveDocument, openWithPicker, canSaveInPlace } from "./save.js";
-import { saveSession, loadSession } from "./session.js";
+import { saveSession, loadSession, clearSession } from "./session.js";
 import { listRecent, rememberRecent, forgetRecent, clearRecent,
          recentState, openRecent } from "./recent.js";
 import { Search } from "./search.js";
+import { Presenter, Timer } from "./presenter.js";
 
 // ── settings (the settings.json analogue) ────────────────────────────────────
 
@@ -137,6 +138,7 @@ const heldMods = { ctrl: false, shift: false, alt: false };
 
 const surface = new Surface(document.getElementById("page"), pen, bindings, {
   onChange: () => { refreshUndo(); markDirty(true); rememberSession(); },
+  onLiveDraw: () => presenter.request(),
   onNotesRestored: () => {
     notes.showPage(surface.pageIndex);
     syncPageChrome();
@@ -146,12 +148,28 @@ const surface = new Surface(document.getElementById("page"), pen, bindings, {
     sidebar.setPage(page);
     notes.showPage(page);
     syncPageChrome();
+    presenter.request();
     rememberSession();
   },
 });
 
 const notes = new NotesView(document.getElementById("notes"), {
   onDirty: () => { markDirty(true); rememberSession(); },
+});
+
+const presenter = new Presenter({
+  // paging from the projected window drives the EDITOR, so the two cannot drift
+  onNav: (delta) => surface.flipPage(delta),
+  onNeedFrame: async () => {
+    const size = presenter.frameSize();
+    if (!size) return;
+    presenter.show(await surface.mirrorFrame(size[0], size[1]));
+  },
+  onClose: () => syncPresenting(),
+});
+
+const timer = new Timer(() => {
+  document.getElementById("timer").textContent = Timer.format(timer.seconds);
 });
 
 const sidebar = new Sidebar(document.getElementById("sidebar"), {
@@ -190,6 +208,7 @@ wireDivider();
 wireSearch();
 wireBookmarks();
 wireRecent();
+wirePresenter();
 refreshToolBindings();
 refreshUndo();
 
@@ -202,8 +221,12 @@ surface.requestDraw();
 watchForStalledStart();
 noteSavingSupport();
 restoreSession()
-  .catch((err) => {
+  .catch(async (err) => {
+    // A session that cannot be restored would fail again on every load, so it
+    // is thrown away rather than kept. A stale document is not worth an app
+    // that greets you with an error for ever.
     console.error("could not restore the last session", err);
+    await clearSession();
     return null;
   })
   .then((restored) => (restored ? null : Doc.blank().then((d) => setDoc(d, "Untitled"))))
@@ -705,6 +728,29 @@ async function reopenRecent(entry) {
   } catch (err) {
     toast(`Could not open: ${err.message}`);
   }
+}
+
+function syncPresenting() {
+  const on = presenter.open;
+  document.getElementById("presenting").hidden = !on;
+  document.getElementById("present-btn").classList.toggle("suggested", on);
+  if (!on) timer.pause();
+}
+
+function wirePresenter() {
+  document.getElementById("present-btn").addEventListener("click", () => {
+    if (presenter.open) { presenter.stop(); return; }
+    if (!presenter.start()) {
+      return toast("The browser blocked the presenter window — allow popups for this page");
+    }
+    timer.reset();
+    timer.start();
+    syncPresenting();
+  });
+  document.getElementById("timer-toggle").addEventListener("click", () => timer.toggle());
+  document.getElementById("timer-reset").addEventListener("click", () => timer.reset());
+  // a presenter window outlives a reload otherwise, mirroring a dead editor
+  window.addEventListener("pagehide", () => presenter.stop());
 }
 
 function wireRecent() {
