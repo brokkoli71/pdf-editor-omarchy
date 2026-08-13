@@ -1274,6 +1274,19 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   fits better than its bbox, so on residual alone the polygon takes the grid
   snap away (`quad_is_axis_aligned`). Every kind needs an entry in the shared
   `SNAP_LABELS`; a missing one is a KeyError mid-gesture.
+  - **A HOLD IS NOT A FREEZE (row 160).** A hand holding a pen against glass
+    drifts, so both dwells share ONE forgiving tolerance (`HOLD_SLOP_PX`) —
+    there is one hold time to learn, so there is one slop. **They measure from
+    different origins and that is the design**: circle-to-lasso from where the
+    press LANDED, so a slow drag across the page can never become a selection;
+    the shape dwell from wherever the pen was last MOVING, because you draw a
+    shape and then stop. Never re-base the lasso anchor to be kind to a slow
+    drag — that is the case the press origin exists to reject. The dwell's
+    anchor is the load-bearing half: `_arm_straight_timer(at)` is called only
+    once the pen has travelled past the slop from `_straight_anchor`, because
+    re-arming per motion event lets a shaking hand restart the clock for ever
+    and the dwell can never fire, whatever the tolerance. Both surfaces re-arm
+    from their own motion handler, so a fix to one of them is invisible.
 - **Geometry you STORE must not go through the int-truncating coord helpers.**
   `window_to_buffer_coords`/`buffer_to_window_coords` only take ints, so a
   per-point conversion rounds every point on the way in *and* out. Invisible

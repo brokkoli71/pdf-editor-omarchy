@@ -1962,7 +1962,19 @@ def draw_lasso_delete(ctx, cx, cy):
 # is available to convert was by construction never snapped.
 
 CIRCLE_LASSO_HOLD_MS = 500     # the shape snap's dwell, so one hold time to learn
-CIRCLE_LASSO_SLOP_PX = 6.0     # move further than this and it was a real stroke
+
+# A HOLD IS NOT A FREEZE (row 160). A hand holding a pen against glass does not
+# stop moving, it DRIFTS, so a tolerance measured in single pixels is one nobody
+# has — at 6.0 both dwells demanded a stillness no hand could give them. ONE
+# tolerance governs both holds, because there is one hold time to learn.
+#
+# The two measure from DIFFERENT ORIGINS and that is the design, not an
+# oversight: circle-to-lasso from where the press LANDED, so a slow drag across
+# the page can never turn into a selection; the shape dwell from wherever the
+# pen was last MOVING, because you draw a shape and then stop, and the hold has
+# to begin where you stopped. Never re-base the lasso anchor to be kind to a
+# slow drag — the slow drag is the one case the press origin exists to reject.
+HOLD_SLOP_PX = 16.0
 
 
 def circle_lasso_target(strokes, hits, inside=None):
@@ -3032,6 +3044,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # the in-progress stroke to a line from its start to the cursor
         self._straight_mode = False
         self._straight_timer = None
+        self._straight_anchor = None   # where the pen was last moving (row 160)
 
         # undo: ("draw", page, stroke[, group]) | ("erase", page, idx, stroke, group);
         # erase ops of one drag gesture share a group and undo together, as do the
@@ -5567,8 +5580,9 @@ class PDFCanvas(Gtk.DrawingArea):
             # fits whatever region you draw, no forced canvas aspect ratio
             self._zoom_end = (sx + offset_x, sy + offset_y)
         else:
-            # past the slop this press is a real stroke, not a hold (row 126)
-            if math.hypot(offset_x, offset_y) > CIRCLE_LASSO_SLOP_PX:
+            # past the slop this press is a real stroke, not a hold (row 126) —
+            # measured from where the press LANDED, never a rolling anchor
+            if math.hypot(offset_x, offset_y) > HOLD_SLOP_PX:
                 self._cancel_circle_lasso()
             pt = self._screen_to_pdf(sx + offset_x, sy + offset_y)
             if self._straight_mode:
@@ -5612,8 +5626,14 @@ class PDFCanvas(Gtk.DrawingArea):
                 if self._press_now is not None:
                     self.current_press.append(self._press_now)
                 self._note_sample(sx + offset_x, sy + offset_y)
-                # re-arm on every motion → the snap fires once the cursor rests
-                self._arm_straight_timer()
+                # The clock starts again from wherever the pen was last MOVING,
+                # never on every motion event: a hand that shakes in place
+                # restarts a per-event clock for ever and the dwell can never
+                # fire (row 160). Until the anchor exists, the press point is it.
+                cx, cy = sx + offset_x, sy + offset_y
+                ax, ay = self._straight_anchor or (sx, sy)
+                if math.hypot(cx - ax, cy - ay) > HOLD_SLOP_PX:
+                    self._arm_straight_timer((cx, cy))
             if self.on_live_draw:
                 self.on_live_draw()   # mirror the in-progress ink live
         self.queue_draw()
@@ -5835,14 +5855,22 @@ class PDFCanvas(Gtk.DrawingArea):
         self._apply_cursor()          # the pen lifted — give the pointer back
         self.queue_draw()
 
-    def _arm_straight_timer(self):
+    def _arm_straight_timer(self, at=None):
+        """Start the dwell clock, anchored where the pen is now (`at`, in
+        SCREEN coords — the space HOLD_SLOP_PX is measured in).
+
+        The anchor is what makes the dwell reachable: the clock restarts only
+        once the pen has genuinely travelled away from it, so a drift inside
+        the slop lets the clock run out instead of resetting it (row 160)."""
         self._cancel_straight_timer()
+        self._straight_anchor = at
         if self.shape_snap == "off":
             return
         self._straight_timer = GLib.timeout_add(
             self.STRAIGHT_HOLD_MS, self._snap_to_shape)
 
     def _cancel_straight_timer(self):
+        self._straight_anchor = None
         if self._straight_timer is not None:
             GLib.source_remove(self._straight_timer)
             self._straight_timer = None
@@ -11675,6 +11703,7 @@ class TextPageView(Gtk.Overlay):
         # divider (recognize_shape), obeying the shared shape_snap setting
         self._straight_mode = False
         self._straight_timer = None
+        self._straight_anchor = None   # where the pen was last moving (row 160)
         self._snap_kind = None
         self._snap_label = None
         self._snap_at = (0.0, 0.0)   # overlay-space anchor for the glyph
@@ -13078,8 +13107,9 @@ class TextPageView(Gtk.Overlay):
             if abs(dx) + abs(dy) > 1:
                 self._lasso_moved = True
         elif self.current_stroke:
-            # past the slop this press is a real stroke, not a hold (row 126)
-            if math.hypot(dx, dy) > CIRCLE_LASSO_SLOP_PX:
+            # past the slop this press is a real stroke, not a hold (row 126) —
+            # from the press origin, like the canvas
+            if math.hypot(dx, dy) > HOLD_SLOP_PX:
                 self._cancel_circle_lasso()
             if self._straight_mode:
                 if self._snap_kind in ("line", "path", "polygon"):
@@ -13107,8 +13137,11 @@ class TextPageView(Gtk.Overlay):
                 if self._press_now is not None:
                     self.current_press.append(self._press_now)
                 self._note_sample(x, y)
-                # re-arm on every motion → the snap fires once the cursor rests
-                self._arm_straight_timer()
+                # the rolling anchor, PDF-canvas parity (row 160) — the press
+                # point stands in until the pen has moved once
+                ax, ay = self._straight_anchor or (x - dx, y - dy)
+                if math.hypot(x - ax, y - ay) > HOLD_SLOP_PX:
+                    self._arm_straight_timer((x, y))
         else:
             self._erase_at(x, y)
         if self._selected_images and (self._lasso_moving or self._lasso_scaling
@@ -13218,14 +13251,18 @@ class TextPageView(Gtk.Overlay):
 
     STRAIGHT_HOLD_MS = PDFCanvas.STRAIGHT_HOLD_MS
 
-    def _arm_straight_timer(self):
+    def _arm_straight_timer(self, at=None):
+        """PDF-canvas parity, in OVERLAY coords — see PDFCanvas for why the
+        anchor rolls (row 160)."""
         self._cancel_straight_timer()
+        self._straight_anchor = at
         if self.get_shape_snap() == "off":
             return
         self._straight_timer = GLib.timeout_add(
             self.STRAIGHT_HOLD_MS, self._snap_to_shape)
 
     def _cancel_straight_timer(self):
+        self._straight_anchor = None
         if self._straight_timer is not None:
             GLib.source_remove(self._straight_timer)
             self._straight_timer = None

@@ -1121,11 +1121,57 @@ class TestStraightLineSnap(unittest.TestCase):
     def test_free_motion_appends_and_arms_timer(self):
         c = self._canvas()
         c.current_stroke = [(0, 0)]
-        c._on_drag_update(self._drag(0, 0), 5, 5)
+        far = sidemark.HOLD_SLOP_PX + 5
+        c._on_drag_update(self._drag(0, 0), far, 0)
         self.assertEqual(len(c.current_stroke), 2)
         self.assertIsNotNone(c._straight_timer)
         c._cancel_straight_timer()
         self.assertIsNone(c._straight_timer)
+
+    def _count_arms(self, c):
+        """Count re-arms, not source ids: GLib hands back an int that it is
+        free to REUSE once the old source is removed, so comparing ids cannot
+        tell 'the clock ran on' from 'it was restarted and got its id back'."""
+        arms = []
+        real = c._arm_straight_timer
+
+        def spy(at=None):
+            arms.append(at)
+            return real(at)
+
+        c._arm_straight_timer = spy
+        return arms
+
+    def test_a_drifting_hand_does_not_restart_the_dwell(self):
+        """Row 160: the whole defect. A hand holding a pen against glass does
+        not stop moving, so a dwell re-armed on every motion event can never
+        fire — the drift keeps resetting the clock, and the gesture is
+        unreachable however long you hold it."""
+        c = self._canvas()
+        c.current_stroke = [(0, 0)]
+        arms = self._count_arms(c)
+        far = sidemark.HOLD_SLOP_PX + 5
+        c._on_drag_update(self._drag(0, 0), far, 0)      # a real move: armed
+        self.assertEqual(len(arms), 1)
+        self.assertIsNotNone(c._straight_timer)
+        for jitter in (1.5, -2.0, 2.5, -1.0, 3.0):       # tremor about that spot
+            c._on_drag_update(self._drag(0, 0), far + jitter, jitter)
+        self.assertEqual(len(arms), 1)                   # the clock ran on
+        c._cancel_straight_timer()
+
+    def test_travelling_on_restarts_the_dwell_from_where_it_got_to(self):
+        """The other half: a pen still drawing must NOT snap mid-stroke, so a
+        stroke travelling across the page keeps re-arming — and the clock
+        begins where the pen STOPPED, not where the press landed."""
+        c = self._canvas()
+        c.current_stroke = [(0, 0)]
+        arms = self._count_arms(c)
+        step = sidemark.HOLD_SLOP_PX + 1
+        c._on_drag_update(self._drag(0, 0), step, 0)
+        c._on_drag_update(self._drag(0, 0), step * 2, 0)   # away from the anchor
+        self.assertEqual(len(arms), 2)
+        self.assertEqual(tuple(c._straight_anchor), (step * 2, 0))
+        c._cancel_straight_timer()
 
     def test_drag_end_resets_straight_state(self):
         c = self._canvas()
@@ -7357,8 +7403,25 @@ class TestLassoSelect(unittest.TestCase):
         canvas._on_drag_begin(_FakeDrag(30, 30), 30, 30)
         self.assertIsNotNone(canvas._circle_timer)
         canvas._on_drag_update(
-            _FakeDrag(30, 30), sidemark.CIRCLE_LASSO_SLOP_PX + 5, 0)
+            _FakeDrag(30, 30), sidemark.HOLD_SLOP_PX + 5, 0)
         self.assertIsNone(canvas._circle_timer)   # it is a stroke, not a hold
+        canvas._cancel_circle_lasso()
+
+    def test_a_drifting_hand_still_holds(self):
+        """Row 160's other side: the hold has to survive a hand that shakes,
+        or the gesture is unreachable. Measured from the PRESS ORIGIN, so this
+        cannot be widened by walking the anchor along (that is what would let a
+        slow drag across the page become a selection)."""
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        self._circle(canvas)
+        canvas.tool = "pen"
+        canvas._on_drag_begin(_FakeDrag(30, 30), 30, 30)
+        # drift on the scale a real hand gives you, not single pixels: this is
+        # the range the old 6 px tolerance rejected and nobody could hold
+        for jitter in (6.0, -7.0, 8.0, -5.0):
+            canvas._on_drag_update(_FakeDrag(30, 30), jitter, -jitter)
+            self.assertIsNotNone(canvas._circle_timer)
         canvas._cancel_circle_lasso()
 
     def test_moving_after_the_conversion_neither_draws_nor_erases(self):
@@ -15597,6 +15660,34 @@ class TestTextPageLasso(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_a_drifting_hand_does_not_restart_the_sheet_dwell(self):
+        """Row 160 on the sheet — the PDF canvas' rule, on the other
+        substrate. A dwell re-armed per motion event can never fire, because a
+        hand holding a pen against glass drifts and each drift resets the
+        clock. Counts re-arms rather than GLib source ids, which are ints GLib
+        may hand back again after the old source is removed."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                win._set_tool_mode("pen")
+                arms = []
+                real = tp._arm_straight_timer
+                tp._arm_straight_timer = lambda at=None: (
+                    arms.append(at), real(at))[1]
+                g = self._gesture(300.0, 100.0)
+                tp._on_press_begin(g, 300.0, 100.0)
+                far = sidemark.HOLD_SLOP_PX + 5
+                tp._on_press_update(g, far, 0.0)          # a real move: armed
+                self.assertEqual(len(arms), 1)
+                for jitter in (1.5, -2.0, 2.5, -1.0, 3.0):
+                    tp._on_press_update(g, far + jitter, jitter)
+                self.assertEqual(len(arms), 1)            # the clock ran on
+                self.assertIsNotNone(tp._straight_timer)
+                tp._cancel_straight_timer()
+
+            self._run_in_window(body)
+
     def test_freehand_ink_is_smoothed_on_commit(self):
         with tempfile.TemporaryDirectory() as d:
             def body(win):
@@ -16536,33 +16627,11 @@ class TestLinkCompletions(unittest.TestCase):
         self._run_in_window(body)
 
 
-    def test_hovering_a_link_previews_the_page_it_leads_to(self):
-        """A link is a promise about a page you cannot see, and following one
-        costs you your place (row 165). The preview answers it in place."""
-        def body(win):
-            with tempfile.TemporaryDirectory() as d:
-                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=5)
-                b = os.path.join(d, "l2.pdf"); make_pdf(b, n_pages=4)
-                win._do_open_file(a)
-                win.notes_model.add_bookmark(3, "Eigenvalues")
-                tex, caption = win._link_preview(
-                    sidemark._parse_note_link("#Eigenvalues"))
-                self.assertIsNotNone(tex)
-                self.assertGreater(tex.get_width(), 0)
-                self.assertIn("p.4", caption)          # the page it names
-                self.assertIn("a.pdf", caption)
-                # …and a document that is not open renders from disk, once
-                tex2, caption2 = win._link_preview(
-                    sidemark._parse_note_link("l2.pdf#page=3"))
-                self.assertIsNotNone(tex2)
-                self.assertIn("l2.pdf", caption2)
-                self.assertEqual(len(win._preview_cache), 1)
-                win._link_preview(sidemark._parse_note_link("l2.pdf#page=3"))
-                self.assertEqual(len(win._preview_cache), 1)   # cached
-                # a target that is not there has nothing to show
-                self.assertIsNone(win._link_preview(
-                    sidemark._parse_note_link("#Nothing")))
-        self._run_in_window(body, present=False)
+    # The link PREVIEW's test went with the feature (row 166, deferred): it
+    # drove `_link_preview`, which the revert removed. Do not restore it from
+    # git without the code — read the row first; what it asserted (the render,
+    # the caption naming the page, the file+mtime+page cache, an unresolvable
+    # target showing nothing) is the shape to rebuild, not the thing to keep.
 
 
 # ── pasted images on a text page ──────────────────────────────────────────────
