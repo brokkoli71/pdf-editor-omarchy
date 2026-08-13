@@ -31,6 +31,12 @@ LOG="/tmp/sidemark-weston.log"
 
 if [ "${1:-}" = "--stop" ]; then
   pkill -f "weston.*$SOCK" 2>/dev/null && echo "stopped headless weston" || echo "not running"
+  # …and take the SOCKET with it. A dead compositor leaves its socket file
+  # behind, and the reuse check below is "does the socket exist" — so every
+  # later run connects to nothing and every window test fails with GTK's
+  # "couldn't be initialized", which reads like a broken test, not a missing
+  # compositor.
+  rm -f "$RT/$SOCK" "$RT/$SOCK.lock"
   exit 0
 fi
 
@@ -65,6 +71,12 @@ fi
 mkdir -p "$RT"
 chmod 700 "$RT"
 
+# Reuse the running compositor, but only if it IS running: a crash (or a kill)
+# leaves the socket file in place, and connecting to a stale one fails in a way
+# that names neither weston nor this script.
+if ! pgrep -f "weston.*$SOCK" >/dev/null 2>&1; then
+  rm -f "$RT/$SOCK" "$RT/$SOCK.lock"
+fi
 if [ ! -S "$RT/$SOCK" ]; then
   XDG_RUNTIME_DIR="$RT" weston --backend=headless --socket="$SOCK" --idle-time=0 \
     >"$LOG" 2>&1 &

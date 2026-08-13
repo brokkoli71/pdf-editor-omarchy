@@ -5411,13 +5411,25 @@ class TestNoteLinkParse(unittest.TestCase):
         return _parse_note_link(s)
 
     def test_same_document_page(self):
-        self.assertEqual(self._p('#page=12'), {"path": None, "page": 12,
-                                               "label": "#page=12"})
+        self.assertEqual(self._p('#page=12'),
+                         {"path": None, "page": 12, "anchor": None,
+                          "label": "#page=12"})
         self.assertEqual(self._p('#5')["page"], 5)
 
     def test_file_only(self):
         self.assertEqual(self._p('deck.pdf'),
-                         {"path": "deck.pdf", "page": None, "label": "deck.pdf"})
+                         {"path": "deck.pdf", "page": None, "anchor": None,
+                          "label": "deck.pdf"})
+
+    def test_a_fragment_that_is_not_a_number_is_a_NAME(self):
+        """The form the feature is now for: a bookmark or a heading, which
+        follows its page when the document is re-paged (row 165)."""
+        got = self._p('#Eigenvalues')
+        self.assertEqual((got["path"], got["page"], got["anchor"]),
+                         (None, None, "Eigenvalues"))
+        got = self._p('l2.pdf#Chapter 2|see there')
+        self.assertEqual((got["path"], got["anchor"], got["label"]),
+                         ("l2.pdf", "Chapter 2", "see there"))
 
     def test_file_and_page(self):
         got = self._p('sub/l2.pdf#page=3')
@@ -5425,6 +5437,7 @@ class TestNoteLinkParse(unittest.TestCase):
 
     def test_bad_fragment_has_no_page(self):
         self.assertIsNone(self._p('a.pdf#nope')["page"])
+        self.assertEqual(self._p('a.pdf#nope')["anchor"], "nope")
 
     def test_alias_sets_label_only(self):
         # [[target|label]] — the alias becomes the display label; the target
@@ -5446,6 +5459,60 @@ class TestNoteLinkParse(unittest.TestCase):
 
     def test_no_alias_label_is_the_target(self):
         self.assertEqual(self._p('deck.pdf')["label"], "deck.pdf")
+
+
+class TestAnchorCompletions(unittest.TestCase):
+    """What the `[[` popup offers (row 165): the NAMED places in a document —
+    its bookmarks and headings — and files, never a bare page number."""
+
+    ANCHORS = {
+        None: [{"name": "Eigenvalues", "page": 4, "kind": "bookmark"},
+               {"name": "Chapter Two", "page": 9, "kind": "heading"}],
+        "l2.pdf": [{"name": "The kernel trick", "page": 2, "kind": "bookmark"}],
+    }
+
+    def _c(self, query, files=(("/n/l2.pdf", "open"),), page=7):
+        return sidemark._link_candidates(
+            query, list(files), current_page=page, base_dir="/n",
+            anchors_cb=lambda p: self.ANCHORS.get(p, []))
+
+    def test_this_documents_names_come_first(self):
+        got = self._c("")
+        self.assertEqual([c["insert"] for c in got][:2],
+                         ["#Eigenvalues", "#Chapter Two"])
+        self.assertEqual(got[0]["kind"], "anchor")
+        self.assertIn("p.4", got[0]["detail"])
+        self.assertIn("l2.pdf", [c["insert"] for c in got])
+
+    def test_a_hash_asks_for_the_named_places_of_that_file(self):
+        got = self._c("l2.pdf#")
+        self.assertEqual([(c["insert"], c["kind"]) for c in got],
+                         [("l2.pdf#The kernel trick", "anchor")])
+        self.assertEqual([c["insert"] for c in self._c("l2.pdf#kernel")],
+                         ["l2.pdf#The kernel trick"])
+        self.assertEqual([c["insert"] for c in self._c("l2.pdf#nothing")], [])
+
+    def test_a_bare_hash_asks_this_document(self):
+        self.assertEqual([c["insert"] for c in self._c("#Chapter")],
+                         ["#Chapter Two"])
+
+    def test_a_number_after_the_hash_is_still_a_page(self):
+        """Page numbers are not SUGGESTED, but typing one has to work — half
+        the links already written are page links."""
+        got = self._c("l2.pdf#12")
+        self.assertEqual(got[-1]["insert"], "l2.pdf#page=12")
+        self.assertIn("moves", got[-1]["detail"])
+
+    def test_the_filter_matches_names_and_filenames(self):
+        self.assertEqual([c["insert"] for c in self._c("eigen")],
+                         ["#Eigenvalues"])
+        self.assertEqual([c["insert"] for c in self._c("l2")], ["l2.pdf"])
+
+    def test_a_document_with_no_names_offers_its_files(self):
+        got = sidemark._link_candidates("", [("/n/l2.pdf", "open")],
+                                        current_page=3, base_dir="/n",
+                                        anchors_cb=lambda p: [])
+        self.assertEqual([c["insert"] for c in got], ["#page=3", "l2.pdf"])
 
 
 class TestLinkAutocompleteHelpers(unittest.TestCase):
@@ -15962,18 +16029,172 @@ class TestFollowNoteLink(unittest.TestCase):
         self._run_in_window(body)
 
 
+class TestDeadLinkRendering(unittest.TestCase):
+    """A link with nothing at the other end is struck through (row 165) — the
+    one signal that tells you a target has moved before you click it."""
+
+    def _view(self, live=lambda link: True):
+        v = sidemark.MarkdownNotesView()
+        v.link_resolver = live
+        return v
+
+    def _tagged(self, v, buf, name):
+        it = buf.get_start_iter()
+        tag = v._t[name]
+        while not it.is_end():
+            if it.has_tag(tag):
+                return True
+            it.forward_char()
+        return False
+
+    def test_a_link_that_resolves_to_nothing_is_struck_through(self):
+        v = self._view(live=lambda link: link.get("anchor") == "here")
+        buf = v.get_buffer()
+        buf.set_text('see [[#here]] and [[#gone]]\nx')
+        buf.place_cursor(buf.get_end_iter())          # off the link line
+        v._rehighlight()
+        strike = v._t["deadlink"]
+        live_at = buf.get_iter_at_line_offset(0, 6)[1]     # inside [[#here]]
+        dead_at = buf.get_iter_at_line_offset(0, 21)[1]    # inside [[#gone]]
+        self.assertTrue(live_at.has_tag(v._t["link"]))
+        self.assertFalse(live_at.has_tag(strike))
+        self.assertTrue(dead_at.has_tag(strike))
+
+    def test_nothing_is_struck_through_while_you_are_typing_it(self):
+        """Half of every target is unresolvable while you write it, and a line
+        that strikes itself out under your hands reads as your mistake."""
+        v = self._view(live=lambda link: False)
+        buf = v.get_buffer()
+        buf.set_text('see [[#gone]]')
+        buf.place_cursor(buf.get_iter_at_line_offset(0, 8)[1])   # in the link
+        v._rehighlight()
+        self.assertFalse(self._tagged(v, buf, "deadlink"))
+
+    def test_a_plain_markdown_editor_strikes_nothing_through(self):
+        """No resolver means no opinion: this widget is also just a Markdown
+        editor, and a `.md` opened on its own has nothing to resolve against."""
+        v = self._view(live=None)
+        v.link_resolver = None
+        buf = v.get_buffer()
+        buf.set_text('see [[whatever.pdf]]\nx')
+        buf.place_cursor(buf.get_end_iter())
+        v._rehighlight()
+        self.assertFalse(self._tagged(v, buf, "deadlink"))
+
+    def test_the_answer_is_asked_once_and_then_forgotten_on_demand(self):
+        """`_rehighlight` asks about every link on every keystroke, so the
+        answer is memoised — and dropped when a bookmark or an outline entry
+        changes, which is what the link was waiting for."""
+        asked = []
+
+        def live(link):
+            asked.append(link.get("anchor"))
+            return False
+        v = self._view(live=live)
+        buf = v.get_buffer()
+        buf.set_text('[[#soon]]\nx')
+        buf.place_cursor(buf.get_end_iter())
+        for _ in range(3):
+            v._rehighlight()
+        self.assertEqual(asked, ["soon"])
+        v.forget_link_status()
+        v._rehighlight()
+        self.assertEqual(asked, ["soon", "soon"])
+
+
+class TestDocumentAnchors(unittest.TestCase):
+    """The named places a link can point at: a document's outline headings and
+    the bookmarks in its sidecar (row 165). Read without opening the document
+    in a window — a link to another file must resolve while you type."""
+
+    def _doc(self, d, name="l2.pdf", toc=None, sidecar=None):
+        path = os.path.join(d, name)
+        make_pdf(path, n_pages=6)
+        if toc:
+            doc = fitz.open(path)
+            doc.set_toc(toc)
+            doc.saveIncr() if doc.can_save_incrementally() else doc.save(
+                path, incremental=False)
+            doc.close()
+        if sidecar is not None:
+            with open(sidemark.notes_path_for(path), "w",
+                      encoding="utf-8") as f:
+                f.write(sidecar)
+        return path
+
+    def test_headings_and_bookmarks_are_both_anchors(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._doc(
+                d, toc=[[1, "Chapter One", 1], [1, "Chapter Two", 4]],
+                sidecar='<!-- page:3 bookmark="Eigenvalues" -->\nsome note\n')
+            # sidecar markers are 0-based page INDICES; a link's page is 1-based
+            got = {a["name"]: (a["page"], a["kind"])
+                   for a in sidemark.document_anchors(path)}
+            self.assertEqual(got.get("Chapter Two"), (4, "heading"))
+            self.assertEqual(got.get("Eigenvalues"), (4, "bookmark"))
+
+    def test_an_unnamed_bookmark_carries_its_derived_label(self):
+        """A bookmark's label is derived from the page's own notes when it was
+        never renamed (row 134) — the same rule the sidebar shows, or you
+        would be offered a link to a nameless thing."""
+        with tempfile.TemporaryDirectory() as d:
+            path = self._doc(
+                d, sidecar='<!-- page:2 bookmark -->\n# The kernel trick\nmore\n')
+            self.assertEqual(
+                [(a["name"], a["page"]) for a in sidemark.document_anchors(path)],
+                [("The kernel trick", 3)])
+
+    def test_a_document_with_nothing_named_has_no_anchors(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(sidemark.document_anchors(self._doc(d)), [])
+        self.assertEqual(sidemark.document_anchors("/nope/missing.pdf"), [])
+
+    def test_the_earliest_page_wins_a_repeated_name(self):
+        """"Summary" is a heading in every chapter. Resolving by dict order
+        means the same link lands somewhere else after an edit."""
+        anchors = [{"name": "Summary", "page": 9, "kind": "heading"},
+                   {"name": "summary ", "page": 4, "kind": "bookmark"}]
+        self.assertEqual(sidemark.anchor_page(anchors, "Summary"), 4)
+        self.assertEqual(sidemark.anchor_page(anchors, " SUMMARY"), 4)
+        self.assertIsNone(sidemark.anchor_page(anchors, "Nothing"))
+
+    def test_the_index_follows_the_sidecar(self):
+        """The cache is keyed on mtimes, not on a signal: bookmarks change in
+        another window, or in an editor, and a stale entry strikes a live link
+        through."""
+        with tempfile.TemporaryDirectory() as d:
+            path = self._doc(d, sidecar='<!-- page:1 bookmark="First" -->\nx\n')
+            self.assertEqual(sidemark.anchor_page(
+                sidemark.document_anchors(path), "First"), 2)
+            npath = sidemark.notes_path_for(path)
+            os.utime(path, (0, 0))          # make the mtimes distinguishable
+            with open(npath, "w", encoding="utf-8") as f:
+                f.write('<!-- page:4 bookmark="Second" -->\ny\n')
+            os.utime(npath, (10, 10))
+            anchors = sidemark.document_anchors(path)
+            self.assertIsNone(sidemark.anchor_page(anchors, "First"))
+            self.assertEqual(sidemark.anchor_page(anchors, "Second"), 5)
+
+
 class TestLinkCompletions(unittest.TestCase):
     """The window gathers [[ autocomplete candidates from the open tabs, recent
     files and the current page (the pure ranking/filtering is TestLink*)."""
 
-    def _run_in_window(self, body):
+    def _run_in_window(self, body, present=True):
+        """`present=False` leaves the window UNMAPPED, which is how a test
+        reaches the `[[` picker: showing a Gtk.Popover creates a Wayland
+        surface, and the headless compositor the suite runs under dies on it
+        — taking every later test in the run with it. The picker guards its
+        own show on `get_mapped()` for exactly this reason, and the candidate
+        list it works from is filled either way."""
         errors = []
         app = Adw.Application(application_id="test.sidemark.linkcomplete")
 
         def on_activate(a):
             try:
                 win = PDFEditorWindow(a)
-                win.present()
+                if present:
+                    win.present()
                 body(win)
             except Exception as e:
                 errors.append(e)
@@ -16007,6 +16228,107 @@ class TestLinkCompletions(unittest.TestCase):
                 win.open_file_in_tab(b)
                 labels = [c["label"] for c in win._link_completions("alg")]
                 self.assertEqual(labels, ["algebra.pdf"])
+        self._run_in_window(body)
+
+
+    def test_completions_offer_this_documents_bookmarks(self):
+        """A bookmark you have just made — not saved yet — is the target you
+        are about to link to, so the open document's anchors are read live."""
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=4)
+                win._do_open_file(a)
+                win.notes_model.set(2, "The kernel trick\nmore")
+                win.notes_model.add_bookmark(2)
+                inserts = [c["insert"] for c in win._link_completions("")]
+                self.assertIn("#The kernel trick", inserts)
+                self.assertEqual(
+                    [c["insert"] for c in win._link_completions("#kernel")],
+                    ["#The kernel trick"])
+        self._run_in_window(body)
+
+    def test_a_bookmark_name_resolves_to_its_page(self):
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=6)
+                win._do_open_file(a)
+                win.notes_model.add_bookmark(3, "Eigenvalues")
+                full, idx, ok = win._resolve_note_link(
+                    sidemark._parse_note_link("#Eigenvalues"))
+                self.assertEqual((full, idx, ok), (None, 3, True))
+                # …and follows the page it is on, not the number it had
+                win.notes_model.remove_bookmark(3)
+                win.notes_model.add_bookmark(5, "Eigenvalues")
+                win._forget_link_status()
+                self.assertEqual(win._resolve_note_link(
+                    sidemark._parse_note_link("#Eigenvalues"))[1], 5)
+        self._run_in_window(body)
+
+    def test_a_target_that_is_not_there_does_not_resolve(self):
+        """What the strike-through is drawn from — a missing file, a name
+        nothing carries, a page past the end."""
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=3)
+                win._do_open_file(a)
+                for target in ("gone.pdf", "#Nothing", "#page=99",
+                               "gone.pdf#Nothing"):
+                    ok = win._resolve_note_link(
+                        sidemark._parse_note_link(target))[2]
+                    self.assertFalse(ok, target)
+                for target in ("#page=2", "#1"):
+                    self.assertTrue(win._resolve_note_link(
+                        sidemark._parse_note_link(target))[2], target)
+        self._run_in_window(body)
+
+    def test_a_link_to_another_document_resolves_by_name(self):
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=2)
+                b = os.path.join(d, "l2.pdf"); make_pdf(b, n_pages=8)
+                with open(sidemark.notes_path_for(b), "w",
+                          encoding="utf-8") as f:
+                    f.write('<!-- page:5 bookmark="Proof" -->\nx\n')
+                win._do_open_file(a)
+                full, idx, ok = win._resolve_note_link(
+                    sidemark._parse_note_link("l2.pdf#Proof"))
+                self.assertTrue(ok)
+                self.assertTrue(os.path.samefile(full, b))
+                self.assertEqual(idx, 5)
+        self._run_in_window(body)
+
+
+    def test_the_menu_verb_starts_a_link_and_opens_the_picker(self):
+        """Discoverability (row 165): `[[` was the only way in and nothing said
+        so. The entry has to LEAVE the syntax on screen, with targets offered."""
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=3)
+                win._do_open_file(a)
+                win.notes_model.add_bookmark(1, "Eigenvalues")
+                win._begin_note_link()
+                buf = win._notes_view.get_buffer()
+                self.assertEqual(
+                    buf.get_text(*buf.get_bounds(), False), "[[]]")
+                it = buf.get_iter_at_mark(buf.get_insert())
+                self.assertEqual(it.get_line_offset(), 2)   # between them
+                self.assertIn("#Eigenvalues",
+                              [c["insert"] for c in win._notes_view._link_rows])
+        self._run_in_window(body, present=False)
+
+    def test_a_link_to_here_names_the_page_rather_than_numbering_it(self):
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=5)
+                win._do_open_file(a)
+                win._go_to_page(2)
+                # nothing names this page yet, so the number is all there is
+                self.assertEqual(win.link_target_to_here(), "a.pdf#page=3")
+                win.notes_model.add_bookmark(2, "Eigenvalues")
+                self.assertEqual(win.link_target_to_here(), "a.pdf#Eigenvalues")
+                # written INSIDE this document's own notes it needs no filename
+                self.assertEqual(win.link_target_to_here(for_dir=d),
+                                 "#Eigenvalues")
         self._run_in_window(body)
 
 

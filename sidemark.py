@@ -8749,25 +8749,122 @@ def _split_markup(text):
 
 
 def _parse_note_link(inner):
-    """A [[target]] body → {'path', 'page', 'label'}. Forms:
-    `#page=N` / `#N` (same document), `file.pdf`, `file.pdf#page=N` / `#N`.
-    An optional `|display text` sets the label shown in place of the target
-    (`[[file.pdf#page=3|the proof]]`). `path` is None for a same-document link;
-    `page` is 1-based or None; `label` is the display text (the alias if given,
-    else the target verbatim)."""
+    """A [[target]] body → {'path', 'page', 'anchor', 'label'}. Forms:
+    `#Bookmark or Chapter` (an ANCHOR — the form you are meant to write),
+    `#page=N` / `#N` (a page number), either of them after a file
+    (`file.pdf#Eigenvalues`), or a bare `file.pdf`. An optional
+    `|display text` sets the label shown in place of the target.
+
+    `path` is None for a same-document link; `page` is 1-based or None;
+    `anchor` is the name to look up when there is no page number; `label` is
+    the display text (the alias if given, else the target verbatim).
+
+    A NAME is the target that survives (row 165): pages move — insert one,
+    reorder a chapter, merge two decks and every `#page=N` in your notes is
+    quietly pointing somewhere else — while a bookmark or a heading follows
+    its page. The page forms stay readable for ever: notes already written
+    are full of them, and a link that stops resolving is worse than one whose
+    syntax we would not choose again."""
     inner = inner.strip()
     # Split on the FIRST '|' only — the target never contains one, so anything
     # after it is display text (which may itself contain '|').
     target, alias = (inner.split('|', 1) + [None])[:2]
     target = target.strip()
     path, frag = (target.split('#', 1) + [''])[:2] if '#' in target else (target, '')
-    page = None
+    page, anchor = None, None
+    frag = frag.strip()
     if frag:
-        mm = re.fullmatch(r'(?:page=)?(\d+)', frag.strip())
+        mm = re.fullmatch(r'(?:page=)?(\d+)', frag)
         if mm:
             page = int(mm.group(1))
+        else:
+            anchor = frag
     label = alias.strip() if alias is not None else target
-    return {"path": path.strip() or None, "page": page, "label": label}
+    return {"path": path.strip() or None, "page": page, "anchor": anchor,
+            "label": label}
+
+
+# ── where a link can point: the named places in a document (row 165) ──────────
+#
+# A document's anchors are its BOOKMARKS (row 134) and its outline HEADINGS —
+# the two things in Sidemark that already have a name and a page. Both are
+# read without opening a viewer: headings come from the PDF's own outline, and
+# bookmarks live in the `-notes.md` sidecar's page markers, so a document that
+# is not open costs one file read to index.
+#
+# The cache is keyed on the files' mtimes rather than a signal, because the
+# things that change anchors are not all ours: another Sidemark window, an
+# editor on the sidecar, a rename in a different tab. A stale entry would
+# strike a live link through.
+_ANCHOR_CACHE = {}
+ANCHOR_CACHE_MAX = 64
+
+
+def _document_anchors_uncached(pdf_path):
+    anchors = []
+    try:
+        with fitz.open(pdf_path) as doc:
+            for entry in normalize_toc(doc.get_toc(simple=True) or []):
+                if len(entry) >= 3:
+                    anchors.append({"name": str(entry[1]).strip(),
+                                    "page": max(1, int(entry[2])),
+                                    "kind": "heading"})
+    except Exception:
+        pass                    # not a PDF, gone, or encrypted: no headings
+    npath = notes_path_for(pdf_path)
+    try:
+        with open(npath, encoding="utf-8") as f:
+            parsed = parse_note_sections(f.read())
+    except OSError:
+        parsed = None
+    if parsed is not None:
+        for idx, name in sorted(dict(parsed.bookmarks).items()):
+            if not name:
+                # an unnamed bookmark's label is DERIVED from the page's own
+                # notes (row 134), and deriving it is the sidecar's own rule
+                text = parsed.sections.get(idx, "") if isinstance(
+                    parsed.sections, dict) else ""
+                name = next((ln.strip() for ln in text.splitlines()
+                             if ln.strip()), "")
+                name = re.sub(r'^#+\s*', '', name).strip()[:60]
+            if name:
+                anchors.append({"name": name, "page": idx + 1,
+                                "kind": "bookmark"})
+    return anchors
+
+
+def document_anchors(pdf_path):
+    """The named places a `[[link]]` can point at inside `pdf_path`, as
+    `{name, page (1-based), kind}` — headings first, then bookmarks."""
+    try:
+        key = (os.path.abspath(pdf_path),
+               os.path.getmtime(pdf_path),
+               os.path.getmtime(notes_path_for(pdf_path))
+               if os.path.exists(notes_path_for(pdf_path)) else 0)
+    except OSError:
+        return []
+    hit = _ANCHOR_CACHE.get(key)
+    if hit is None:
+        if len(_ANCHOR_CACHE) >= ANCHOR_CACHE_MAX:
+            _ANCHOR_CACHE.clear()
+        hit = _ANCHOR_CACHE[key] = _document_anchors_uncached(pdf_path)
+    return hit
+
+
+def anchor_page(anchors, name):
+    """The 1-based page an anchor name resolves to, or None.
+
+    Case- and space-insensitive, and the EARLIEST page wins when two places
+    share a name — a heading repeated in every chapter ("Summary") is exactly
+    the case, and picking one at random by dict order is how the same link
+    lands somewhere else after a save."""
+    want = " ".join(str(name).split()).casefold()
+    best = None
+    for a in anchors:
+        if " ".join(str(a["name"]).split()).casefold() == want:
+            if best is None or a["page"] < best:
+                best = a["page"]
+    return best
 
 
 def _link_query_at_cursor(line_text, cursor_col):
@@ -8799,23 +8896,63 @@ def _link_insert_path(target_path, base_dir):
         return target_path
 
 
-def _link_candidates(query, files, current_page=None, base_dir=None):
+def _link_candidates(query, files, current_page=None, base_dir=None,
+                     anchors_cb=None):
     """Ordered autocomplete candidates for a `[[` query.
 
     `files` is an ordered, de-duplicated list of `(path, kind)` (most relevant
-    first — open tabs before recents; kind in {'open','recent'}). A candidate is
-    `{insert, label, detail, kind}` where `insert` is the text to drop between
-    `[[` and `]]`. The query filters files by case-insensitive basename
-    substring; a "this page" entry is offered when it matches too."""
-    q = query.strip().lower()
-    out = []
-    if current_page is not None and q in "this page":
+    first — open tabs before recents; kind in {'open','recent'}). `anchors_cb`
+    is asked for the named places (bookmarks and headings) of a document: it
+    takes a link path, or None for the document you are writing in.
+
+    A candidate is `{insert, label, detail, kind}` where `insert` is the text
+    to drop between `[[` and `]]`. What you are offered is a FILE, or a NAME
+    inside one (row 165) — never a bare page number, because a page number is
+    the one target that stops meaning what you chose the moment somebody
+    inserts a slide. `#page=N` is still written and still followed; it is just
+    not what the app suggests.
+
+    A `#` in the query switches to the second stage: everything before it
+    names the document (empty = this one), everything after filters its
+    anchors."""
+    q = query.strip()
+    def matches(text, needle):
+        return not needle or needle.lower() in str(text).lower()
+
+    def anchors_of(path):
+        try:
+            return list(anchors_cb(path) or []) if anchors_cb else []
+        except Exception:
+            return []
+
+    if '#' in q:
+        where, frag = q.split('#', 1)
+        where, frag = where.strip(), frag.strip()
+        prefix = where or ''
+        out = [{"insert": f"{prefix}#{a['name']}",
+                "label": a["name"],
+                "detail": f"p.{a['page']} · {a['kind']}",
+                "kind": "anchor"}
+               for a in anchors_of(where or None) if matches(a["name"], frag)]
+        if frag.isdigit():
+            # you typed a number: you meant a page, and it is still a target
+            out.append({"insert": f"{prefix}#page={frag}",
+                        "label": f"Page {frag}",
+                        "detail": "page number — moves if pages are inserted",
+                        "kind": "page"})
+        return out
+
+    out = [{"insert": f"#{a['name']}", "label": a["name"],
+            "detail": f"p.{a['page']} · {a['kind']} · this document",
+            "kind": "anchor"}
+           for a in anchors_of(None) if matches(a["name"], q)]
+    if current_page is not None and q.lower() in "this page":
         out.append({"insert": f"#page={current_page}",
                     "label": f"This page (p.{current_page})",
                     "detail": "same document", "kind": "page"})
     for path, kind in files:
         base = os.path.basename(path)
-        if q and q not in base.lower():
+        if not matches(base, q):
             continue
         out.append({"insert": _link_insert_path(path, base_dir),
                     "label": base, "detail": os.path.dirname(path) or "",
@@ -10155,6 +10292,13 @@ class MarkdownNotesView(GtkSource.View):
             "subscript":   tag("subscript",   rise=-2000, scale=0.65),
             "link":        tag("link",        underline=1,   # Pango.Underline.SINGLE
                                foreground="#78aeff" if is_dark else "#1a5fb4"),
+            # A link with nothing at the other end is struck through and left
+            # grey (row 165). It is not an error and must not shout: a target
+            # is unresolvable for half the time you spend typing it, and a
+            # link to a file you have not written yet is a perfectly ordinary
+            # thing to have in notes.
+            "deadlink":    tag("deadlink",    underline=0, strikethrough=True,
+                               foreground="#8b8b8b"),
         }
 
         self._cursor_line = 0
@@ -10201,6 +10345,11 @@ class MarkdownNotesView(GtkSource.View):
         # set by the window: called with the [[query → list of _link_candidates()
         # dicts to offer in the autocomplete popup (None disables the popup)
         self.link_candidates_cb = None
+        # set by the window: called with a _parse_note_link() dict, returns
+        # True when the target exists. Unset means "no opinion", and nothing is
+        # ever struck through — this widget is also a plain Markdown editor.
+        self.link_resolver = None
+        self._link_live = {}       # target text → (is it live?, when we asked)
         self._link_popup = None      # lazily-built Gtk.Popover
         self._link_list = None       # the Gtk.ListBox inside it
         self._link_rows = []         # candidate dicts currently shown, in order
@@ -10247,6 +10396,39 @@ class MarkdownNotesView(GtkSource.View):
         return False
 
     # ── [[wiki links]] ────────────────────────────────────────────────────────
+
+    LINK_LIVE_TTL = 5.0        # seconds a "does this resolve?" answer is kept
+
+    def _link_is_live(self, inner):
+        """Does this [[target]] point at something? Memoised, because
+        `_rehighlight` asks about every link on every line on every keystroke,
+        and answering means touching the disk.
+
+        The memo EXPIRES rather than being invalidated: what a link resolves
+        against is bookmarks, headings and files, which another window, another
+        tab or another editor changes without telling us. A few seconds of a
+        stale answer is invisible; a permanent one strikes a live link
+        through."""
+        if self.link_resolver is None:
+            return True
+        target = inner.split('|', 1)[0].strip()
+        if not target:
+            return True                     # `[[|label]]`: nothing typed yet
+        now = time.monotonic()
+        hit = self._link_live.get(target)
+        if hit is not None and now - hit[1] < self.LINK_LIVE_TTL:
+            return hit[0]
+        try:
+            live = bool(self.link_resolver(_parse_note_link(inner)))
+        except Exception:
+            live = True                     # never strike on our own error
+        self._link_live[target] = (live, now)
+        return live
+
+    def forget_link_status(self):
+        """Drop the memo — something that links resolve against has changed
+        (a bookmark, an outline entry, the document in front)."""
+        self._link_live.clear()
 
     def _link_target_at(self, wx, wy):
         """The _parse_note_link() dict for the [[link]] under widget coords
@@ -10472,6 +10654,13 @@ class MarkdownNotesView(GtkSource.View):
         if self._link_popup is not None and self._link_popup.get_visible():
             self._link_popup.set_visible(False)
         self._link_rows = []
+
+    def open_link_picker(self):
+        """Show the `[[` picker for wherever the caret is standing. The menu
+        entry's other half (row 165): it inserts the brackets, this offers the
+        targets. Refreshing on the buffer's own signal would not do — nothing
+        was typed."""
+        self._update_link_popup()
 
     def _on_key(self, ctrl, keyval, keycode, state):
         # While the [[ autocomplete popup is open it owns the navigation keys
@@ -11275,6 +11464,13 @@ class MarkdownNotesView(GtkSource.View):
             if in_code(a, b):
                 continue                     # [[..]] inside `code` is literal
             apply("link", a + 2, b - 2)
+            # …and struck through when it resolves to nothing. Never while the
+            # caret is in it: a target is unwritten for most of the time you
+            # spend typing it, and a line that strikes itself out under your
+            # hands reads as an error you have made rather than one you are
+            # about to fix.
+            if not caret_in(a, b) and not self._link_is_live(m.group(1)):
+                apply("deadlink", a + 2, b - 2)
             bar = text.find('|', a + 2, b - 2)
             hide(a, bar + 1 if bar != -1 else a + 2, within=(a, b))
             hide(b - 2, b, within=(a, b))    # ]]
@@ -15019,6 +15215,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "Bookmarks", lambda: self._show_menu_page("bookmarks"),
             "Jump to a bookmark, or bookmark this page (Ctrl+B)")
         self._bookmark_menu_item.set_visible(False)
+        # Linking is the feature this project was designed around and it was
+        # unfindable: `[[` opens the picker, and nothing anywhere said so
+        # (row 165). One entry that DOES the thing teaches the syntax by
+        # leaving it on screen with the picker already open.
+        _menu_item("Link to a page…",
+                   lambda: (menu_pop.popdown(), self._begin_note_link()),
+                   "Insert a [[link]] in the notes — to a bookmark, a chapter, "
+                   "or another document (Ctrl+K)")
+        _menu_item("Copy link to this page",
+                   lambda: (menu_pop.popdown(), self._copy_link_to_here()),
+                   "Put a [[link]] to this page on the clipboard, to paste "
+                   "into another document's notes")
         _menu_item("Keyboard shortcuts", lambda: self._show_menu_page("shortcuts"),
                    "Show the full list of keyboard shortcuts")
 
@@ -15858,6 +16066,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._notes_view.font_zoom_cb = lambda d: s.win._change_notes_font(d)
         s._notes_view.on_follow_link = lambda link: s.win._follow_note_link(link)
         s._notes_view.link_candidates_cb = lambda q: s.win._link_completions(q)
+        s._notes_view.link_resolver = lambda link: s.win._resolve_note_link(link)[2]
         s._notes_view.get_buffer().connect("changed", lambda *a: s.win._on_notes_changed(*a))
         s._notes_view.get_buffer().connect("notify::cursor-position", lambda *a: s.win._on_notes_cursor_moved(*a))
         notes_scroll.set_child(s._notes_view)
@@ -16054,6 +16263,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         tp.view.font_zoom_cb = lambda d: tp.zoom_step_at(d, *tp._mouse_xy)
         tp.view.on_follow_link = lambda link: s.win._follow_note_link(link)
         tp.view.link_candidates_cb = lambda q: s.win._link_completions(q)
+        tp.view.link_resolver = lambda link: s.win._resolve_note_link(link)[2]
         tp.view.get_buffer().connect(
             "changed", lambda *a: s.win._on_notes_changed(*a))
         tp.on_ink_action = lambda: s.win._on_ink_action()
@@ -16460,6 +16670,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Ctrl+R",        "Reload (new instance, same tabs)"),
             ("Ctrl+\\",       "Toggle notes"),
             ("Notes panel",   None),
+            ("Ctrl+K",        "Link to a page — a bookmark, a chapter, or "
+                              "another document"),
             ("Ctrl++ / Ctrl+-", "Bigger / smaller notes font"),
             ("Ctrl+0",        "Reset notes font size"),
             ("Ctrl+Scroll",   "Bigger / smaller notes font"),
@@ -17798,38 +18010,168 @@ class PDFEditorWindow(Adw.ApplicationWindow):
              else f"Bookmark page {page}")
             + " (Ctrl+B) — hold for the list of bookmarks")
 
-    def _follow_note_link(self, link):
-        """Navigate a [[wiki link]] clicked in the notes (Ctrl+click). A same-
-        document link (`[[#page=N]]`) jumps the page; a link naming a file opens
-        it in a tab (at `#page=N` when given), reusing the current tab if that
-        file is already the open document."""
-        path, page = link.get("path"), link.get("page")
+    def link_target_to_here(self, for_dir=None):
+        """The `[[target]]` that points at what you are looking at now.
 
-        def jump(idx):
-            if idx is not None and self.canvas.document:
-                self._go_to_page(max(0, idx - 1))   # links are 1-based
-
+        A NAME if this page has one — its bookmark, or a heading that starts
+        here — because that is what survives a page being inserted above it;
+        the page number only when it has none. `for_dir` is the folder the
+        link will be WRITTEN in: from anywhere else the file has to be named,
+        while a link inside this document's own notes stays a bare `#name`
+        and keeps working when the file is renamed."""
+        path = self._path or self._notes_path
         if not path:
-            jump(page)
+            return None
+        here = None
+        if not self._text_mode and self.canvas.document:
+            idx = self.canvas.current_page_idx
+            if self.notes_model.is_bookmarked(idx):
+                here = self._bookmark_label(idx) or None
+            if here is None:
+                for a in self._own_anchors():
+                    if a["page"] == idx + 1 and a["kind"] == "heading":
+                        here = a["name"]
+                        break
+            if here is None:
+                here = f"page={idx + 1}"
+        same = False
+        if for_dir is not None:
+            try:
+                same = os.path.samefile(for_dir, os.path.dirname(path)) and \
+                    self._link_notes_base_dir() and os.path.samefile(
+                        for_dir, self._link_notes_base_dir())
+            except OSError:
+                same = False
+        file_part = "" if same and for_dir is not None else \
+            _link_insert_path(path, for_dir)
+        if here is None:
+            return file_part or os.path.basename(path)
+        return f"{file_part}#{here}"
+
+    def _copy_link_to_here(self):
+        """Put a link to this page on the clipboard, ready to paste into
+        another document's notes. The other half of "link to a page…": you
+        cannot pick a target in a document you are not looking at."""
+        target = self.link_target_to_here()
+        if not target:
+            self._toast("Nothing to link to yet — save the document first")
             return
-        base = os.path.dirname(
-            self._path or self._active_notes_path or self._notes_path or "")
-        full = path if os.path.isabs(path) else os.path.normpath(
-            os.path.join(base, path))
-        if not os.path.isfile(full):
-            self._toast(f"Link target not found: {path}")
+        Gdk.Display.get_default().get_clipboard().set(f"[[{target}]]")
+        self._toast(f"Copied [[{target}]]")
+
+    def _begin_note_link(self):
+        """Start a link where the caret is: insert `[[]]`, put the caret
+        between the brackets and open the picker. The menu entry exists to be
+        FOUND, so it has to leave the syntax on screen — next time you type
+        `[[` yourself."""
+        view = self._notes_view
+        if view is None:
             return
+        if not self._text_mode and not self._notes_toggle.get_active():
+            self._notes_toggle.set_active(True)   # you cannot type in a panel
+                                                  # that is not on screen
+        view.grab_focus()
+        buf = view.get_buffer()
+        buf.begin_user_action()
         try:
-            same = self._path and os.path.samefile(full, self._path)
-        except OSError:
-            # our own file was deleted/renamed on disk while open — the target
-            # exists (checked above), so treat it as a different document
-            same = False
-        if same:
-            jump(page)          # link into the document we're already showing
+            if buf.get_has_selection():
+                buf.delete_selection(True, True)
+            buf.insert_at_cursor("[[]]")
+        finally:
+            buf.end_user_action()
+        it = buf.get_iter_at_mark(buf.get_insert())
+        it.backward_chars(2)
+        buf.place_cursor(it)
+        view.open_link_picker()
+
+    def _forget_link_status(self):
+        """Every notes editor in the window re-asks what its links resolve to.
+        Cheap, and it must reach the BACKGROUND tabs too: a bookmark made here
+        is what a link written there was waiting for."""
+        for s in self._sessions:
+            for view in (getattr(s, "_panel_notes_view", None),
+                         s._text_page.view if getattr(s, "_text_page", None)
+                         else None):
+                if view is not None:
+                    view.forget_link_status()
+
+    def _own_anchors(self):
+        """This document's named places, live — its outline headings and its
+        bookmarks as they stand right now, including the ones you have made
+        and not saved. A link to a bookmark must resolve the moment you make
+        it, so the OPEN document is never read off the disk."""
+        anchors = []
+        try:
+            for entry in self.canvas.get_toc() if self.canvas.document else []:
+                if len(entry) >= 3:
+                    anchors.append({"name": str(entry[1]).strip(),
+                                    "page": max(1, int(entry[2])),
+                                    "kind": "heading"})
+        except Exception:
+            pass
+        for idx, _name in self.notes_model.bookmarks():
+            label = self._bookmark_label(idx)
+            if label:
+                anchors.append({"name": label, "page": idx + 1,
+                                "kind": "bookmark"})
+        return anchors
+
+    def _link_full_path(self, path):
+        """A link's file part → an absolute path, resolved against the folder
+        the active document lives in."""
+        if os.path.isabs(path):
+            return path
+        return os.path.normpath(os.path.join(self._link_notes_base_dir(), path))
+
+    def _resolve_note_link(self, link):
+        """Where a [[link]] points, as `(full path or None, page index or
+        None, ok)`. `ok` is False for a target that does not exist — a file
+        that is not there, or a name no bookmark or heading in it carries.
+
+        ONE resolver for every consumer: following it, striking it through
+        while you write, and the hover preview. Two of those would drift, and
+        a link that looks live and does nothing is the worst of the three."""
+        path, page, anchor = (link.get("path"), link.get("page"),
+                              link.get("anchor"))
+        full = None
+        if path:
+            full = self._link_full_path(path)
+            if not os.path.isfile(full):
+                return None, None, False
+            try:
+                if self._path and os.path.samefile(full, self._path):
+                    full = None             # the document already in front
+            except OSError:
+                pass
+        if anchor:
+            anchors = self._own_anchors() if full is None else \
+                document_anchors(full)
+            page = anchor_page(anchors, anchor)
+            if page is None:
+                return full, None, False
+        if full is None and page is None:
+            # a same-document link with nothing to aim at
+            return None, None, False
+        idx = None if page is None else max(0, page - 1)
+        if full is None and idx is not None and self.canvas.document \
+                and idx >= self.canvas.document.page_count:
+            return None, None, False        # past the end of this document
+        return full, idx, True
+
+    def _follow_note_link(self, link):
+        """Navigate a [[wiki link]] clicked in the notes (Ctrl+click). A
+        same-document link jumps the page; a link naming a file opens it in a
+        tab, reusing the current tab if that file is already the open
+        document. The target may be a page number or the NAME of a bookmark or
+        heading (row 165)."""
+        full, idx, ok = self._resolve_note_link(link)
+        if not ok:
+            self._toast(f"Link target not found: {link.get('label') or ''}")
             return
-        self.open_file_in_tab(full)
-        jump(page)
+        if full is not None:
+            self.open_file_in_tab(full)
+        if idx is not None and self.canvas.document:
+            self._go_to_page(idx)
 
     def _link_notes_base_dir(self):
         """The folder the active document's [[links]] resolve against — the
@@ -17838,9 +18180,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._path or self._active_notes_path or self._notes_path or "")
 
     def _link_completions(self, query):
-        """Autocomplete candidates for a `[[query` in the notes: the other open
-        tabs (most relevant), then recent files, plus a 'this page' entry. The
-        current document is left out of the file list — 'this page' covers it."""
+        """Autocomplete candidates for a `[[query` in the notes: this
+        document's own bookmarks and headings, a 'this page' entry, the other
+        open tabs and then recent files. The current document is left out of
+        the file list — its own anchors cover it. A `#` in the query asks for
+        the anchors of whichever document is named before it."""
         base = self._link_notes_base_dir()
         current = self._path and os.path.abspath(self._path)
         files, seen = [], set()
@@ -17853,7 +18197,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         page = None
         if not self._text_mode and self.canvas.document:
             page = self.canvas.current_page_idx + 1   # links are 1-based
-        return _link_candidates(query, files, current_page=page, base_dir=base)
+
+        def anchors_for(path):
+            # None (or a path that IS this document) means the open document,
+            # whose anchors are live — a bookmark you have just made and not
+            # saved is exactly the one you are about to link to.
+            if not path:
+                return self._own_anchors()
+            full = self._link_full_path(path)
+            try:
+                if self._path and os.path.samefile(full, self._path):
+                    return self._own_anchors()
+            except OSError:
+                pass
+            return document_anchors(full)
+
+        return _link_candidates(query, files, current_page=page, base_dir=base,
+                                anchors_cb=anchors_for)
 
     def _link_candidate_sources(self):
         """(kind, path) pairs feeding autocomplete: open tabs first (in tab
@@ -18171,6 +18531,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # window closes once its last tab is gone.
             self._close_active_tab()
             return True
+        if ctrl_held and keyval in (Gdk.KEY_k, Gdk.KEY_K):
+            # start a [[link]] wherever you are — window-level, because the
+            # notes panel may not even be open yet
+            self._begin_note_link()
+            return True
         # Copy/paste of ink and images, in EITHER mode. These live HERE, at the
         # window's capture controller, and not on the surface: a surface's own
         # controllers only see a key when focus is somewhere inside it, so
@@ -18482,6 +18847,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # a rebuild throws every row away, so remember where the strip was
         # standing: a bookmark added on page 200 must not send it back to the top
         keep_scroll = self._toc_scroll.get_vadjustment().get_value()
+        # This runs on every bookmark, rename and outline edit — which is
+        # exactly the list of things a [[link]] resolves against, so it is
+        # where a struck-through link learns it is live again (row 165).
+        self._forget_link_status()
         if self._thumb_idle_id is not None:
             GLib.source_remove(self._thumb_idle_id)
             self._thumb_idle_id = None
