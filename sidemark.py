@@ -11562,6 +11562,13 @@ class TextPageView(Gtk.Overlay):
         self._mouse_xy = (0.0, 0.0)
         self._pointer_in = False   # is the pointer over the sheet? (paste target)
         motion = Gtk.EventControllerMotion()
+        # CAPTURE, for the thumb controller's reason and then one more: a
+        # thumb pan is driven from MOTION (there is no gesture to report a
+        # delta), and once the TextView's own click gesture has CLAIMED the
+        # press, every motion of that sequence stops there and never bubbles
+        # up to this ancestor. The press would route, the tool would be in
+        # hand, and the sheet would simply never move.
+        motion.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         motion.connect("motion", self._on_sheet_motion)
         motion.connect("enter", self._on_sheet_enter)
         motion.connect("leave", self._on_sheet_leave)
@@ -12146,6 +12153,8 @@ class TextPageView(Gtk.Overlay):
             # Replayed through the one press router with a synthetic drag, the
             # same trick the PDF canvas uses (button 10 never reaches a
             # GestureDrag).
+            if self._thumb_gesture is not None:
+                return True     # already held: a second press says nothing
             shift = bool(event.get_modifier_state()
                          & Gdk.ModifierType.SHIFT_MASK)
             if not shift and self.get_held_mods is not None:
@@ -12155,12 +12164,20 @@ class TextPageView(Gtk.Overlay):
             self._on_press_begin(self._thumb_gesture, *self._mouse_xy)
             if self._press_tool is None and not self._panning:
                 self._thumb_gesture = None
+            # SWALLOW a press we took — the one thing the PDF canvas never has
+            # to do. There the canvas is the whole surface; here the press goes
+            # on to the GtkTextView, which starts its own selection drag and
+            # then AUTOSCROLLS to keep the caret visible, undoing the pan on
+            # every motion event. That reads as "the sheet moves a few pixels
+            # and then refuses to move", with the routing log looking perfect.
+            return self._thumb_gesture is not None
         elif t == Gdk.EventType.BUTTON_RELEASE and event.get_button() == BTN_THUMB:
             g, self._thumb_gesture = self._thumb_gesture, None
             if g is not None:
                 sx, sy = g.get_start_point()[1], g.get_start_point()[2]
                 self._on_press_end(g, self._mouse_xy[0] - sx,
                                    self._mouse_xy[1] - sy)
+                return True     # its press never got there; nor does this
         return False
 
     def _on_sheet_scroll(self, ctrl, dx, dy):

@@ -889,27 +889,52 @@ class TestPinchZoom(unittest.TestCase):
         tp.bindings.bind(sidemark.chord_id(sidemark.BTN_THUMB), "pen",
                          mode="text")
         tp._mouse_xy = (100.0, 100.0)
-        tp._on_thumb_event(None, types.SimpleNamespace(
+        press = types.SimpleNamespace(
             get_event_type=lambda: Gdk.EventType.BUTTON_PRESS,
             get_button=lambda: sidemark.BTN_THUMB,
-            get_modifier_state=lambda: Gdk.ModifierType(0)))
+            get_modifier_state=lambda: Gdk.ModifierType(0))
+        # and the press is SWALLOWED: left to travel on, the GtkTextView below
+        # starts a selection drag and autoscrolls the sheet back on every
+        # motion event, fighting whatever the thumb is doing
+        self.assertTrue(tp._on_thumb_event(None, press))
         self.assertEqual(tp._press_tool, "pen")
+        # a second press while it is held says nothing and must not re-route
+        tp._press_tool = "sentinel"
+        tp._on_thumb_event(None, press)
+        self.assertEqual(tp._press_tool, "sentinel")
 
-    def test_the_sheets_thumb_controller_is_capture_phase(self):
+    def test_an_unbound_thumb_on_the_sheet_is_left_alone(self):
+        """Swallowing is for a press we TOOK. With nothing bound, the event has
+        to travel on — the sheet is a text editor, and a button nobody claimed
+        belongs to whatever is below."""
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text("alpha\n")
+        tp.bindings.bind(sidemark.chord_id(sidemark.BTN_THUMB), None,
+                         mode="text")
+        tp._mouse_xy = (100.0, 100.0)
+        self.assertFalse(tp._on_thumb_event(None, types.SimpleNamespace(
+            get_event_type=lambda: Gdk.EventType.BUTTON_PRESS,
+            get_button=lambda: sidemark.BTN_THUMB,
+            get_modifier_state=lambda: Gdk.ModifierType(0))))
+        self.assertIsNone(tp._thumb_gesture)
+
+    def test_the_sheets_raw_event_controllers_are_capture_phase(self):
         """Reachability, not logic: this widget is an ANCESTOR of what a press
-        targets (the GtkTextView, or the ink overlay), and their gestures stop
-        the button-10 press before it can bubble up here — so a bubble-phase
-        controller is a correct handler that never runs. The PDF canvas is the
+        targets (the GtkTextView, or the ink overlay), and once their gestures
+        CLAIM the press, neither it nor the motion events after it ever bubble
+        up here — so a bubble-phase controller is a correct handler that never
+        runs. Both matter for the thumb: the legacy controller routes the
+        press, and the motion controller is what drives the pan it started
+        (there is no gesture to report a delta). The PDF canvas is the event
         target itself, which is why it can stay in bubble."""
         tp = sidemark.TextPageView()
-        phases = [c.get_propagation_phase() for c in tp.observe_controllers()
-                  if isinstance(c, Gtk.EventControllerLegacy)
-                  and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE]
-        self.assertTrue(phases, "no capture-phase legacy controller on the sheet")
+        raw = [c for c in tp.observe_controllers()
+               if isinstance(c, (Gtk.EventControllerLegacy,
+                                 Gtk.EventControllerMotion))]
+        self.assertTrue(raw, "the sheet's raw event controllers are gone")
         self.assertEqual(
-            [c for c in tp.observe_controllers()
-             if isinstance(c, Gtk.EventControllerLegacy)
-             and c.get_propagation_phase() != Gtk.PropagationPhase.CAPTURE],
+            [c for c in raw
+             if c.get_propagation_phase() != Gtk.PropagationPhase.CAPTURE],
             [])
 
     def test_pinch_without_page_is_noop(self):
