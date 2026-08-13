@@ -673,6 +673,15 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     page…* / Ctrl+K inserts `[[]]` and opens the picker, so the entry teaches
     the syntax by leaving it on screen; ☰ *Copy link to this page* is row 100's
     link-to-here. A `#` in the query switches the picker to that file's names.
+  - **The way BACK is part of following one**: `_link_return` remembers where
+    the click came from and where it landed, and the notes header shows
+    "↩ Back to p.N" only while you are still on the page the link put you on.
+    Asking "am I where the link left me?" is what retires the offer by itself
+    — no timer, and never a stale jump to somewhere you left ten pages ago.
+  - **Both popups anchor to the LINE, not to a point** (`_position_link_popup`,
+    `_hover_line_rect`, both `halign=START`). Given a zero-height anchor GTK
+    centres the popup on it and flips it back over the very text you are
+    reading — the `[[` you just typed, or the link you are hovering to read.
   - *Not built: backlinks (row 100 item 4) — it needs a cross-file index and an
     invalidation story, and should wait until naming targets proves itself.*
 - **Linked page notes (row 129)** — a page can CONTINUE the one before it, and
@@ -1124,6 +1133,18 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   sheet moved mid-press and GTK resolved the pointer against the moved view,
   landing the caret pages from the click. Turned off in `__init__` — if you
   ever re-wrap the sheet, turn it off again.
+- **`buf.get_text(…, include_hidden_chars)` must be TRUE wherever the text is
+  compared against an OFFSET.** A `GtkTextIter`'s line offset always counts the
+  invisible characters; text fetched without them is a shorter string, so the
+  offset points somewhere else in it — one place per hidden marker earlier on
+  the line. The notes editor hides markers on every line the caret is not on,
+  which is *most* lines, so this fails exactly where the feature is used and
+  works while you test it with the caret in place. It killed two things at
+  once (row 165): `_link_target_at` could not match `[[…]]` at all once the
+  brackets were hidden — no hand cursor, no Ctrl+click, no hover preview — and
+  `_cursor_line_and_col` shifted the `[[` query, so the picker stopped opening
+  on any line that already had a link or a rendered symbol. Read it back the
+  way the buffer stores it, or convert the offset first; never mix the two.
 - **A GtkTextMark displaced by an EDIT moves without a `mark-set` signal.**
   Rewriting a line under the caret (`_buf_replace_line`, how the live-Markdown
   renderer un-renders `α`→`\alpha`) deletes and re-inserts it, and `insert` +

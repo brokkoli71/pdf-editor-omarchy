@@ -240,7 +240,8 @@ number does not.
 bookmarks and chapters, the other open tabs and your recent files; typing `[[`
 opens the same picker, and `#` after a filename lists that document's names.
 **Hover** a link to see the page it goes to; a link whose target is not there
-is ~~struck through~~. ☰ ▸ *Copy link to this page* puts a link to where you
+is ~~struck through~~. After following one, the notes header offers **↩ Back**
+to where you came from until you turn the page. ☰ ▸ *Copy link to this page* puts a link to where you
 are on the clipboard, to paste into another document's notes. The `.md` keeps
 the plain `[[…]]` text, so links round-trip through Obsidian.
 

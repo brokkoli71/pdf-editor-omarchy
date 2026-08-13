@@ -7643,6 +7643,18 @@ def _themed_icon(*candidates):
     return candidates[0]
 
 
+def same_file(a, b):
+    """Do these two paths name one file? Falls back to comparing the strings
+    when either is missing — a document deleted under us is still not the
+    document we are looking at."""
+    if not a or not b:
+        return False
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.abspath(a) == os.path.abspath(b)
+
+
 def notes_path_for(pdf_path):
     return os.path.splitext(pdf_path)[0] + "-notes.md"
 
@@ -8923,9 +8935,16 @@ def _link_candidates(query, files, current_page=None, base_dir=None,
 
     def anchors_of(path):
         try:
-            return list(anchors_cb(path) or []) if anchors_cb else []
+            found = list(anchors_cb(path) or []) if anchors_cb else []
         except Exception:
             return []
+        # YOUR bookmarks first, then the document's own headings. A bookmark
+        # is a place you chose to name; a heading is one the author did, and
+        # there are usually far more of them — so listing headings first buries
+        # the mark you made this morning under someone else's table of
+        # contents. Stable within each group, so page order survives.
+        return ([a for a in found if a.get("kind") == "bookmark"]
+                + [a for a in found if a.get("kind") != "bookmark"])
 
     if '#' in q:
         where, frag = q.split('#', 1)
@@ -10448,14 +10467,27 @@ class MarkdownNotesView(GtkSource.View):
         bx, by = self.window_to_buffer_coords(
             Gtk.TextWindowType.WIDGET, int(wx), int(wy))
         over, it = self.get_iter_at_location(bx, by)
-        if not over or not it.has_tag(self._t["link"]):
+        return self._link_at_iter(it) if over else None
+
+    def _link_at_iter(self, it):
+        """The [[link]] at a buffer position, or None. Split from the hit-test
+        so the part with a rule in it can be tested without a laid-out widget
+        (a bare view has no allocation, so every coordinate is 0)."""
+        if not it.has_tag(self._t["link"]):
             return None
         buf = self.get_buffer()
         ok, ls = buf.get_iter_at_line(it.get_line())
         le = ls.copy()
         if not le.ends_line():
             le.forward_to_line_end()
-        text = buf.get_text(ls, le, False)
+        # INCLUDING the hidden characters, which is the whole point: off the
+        # cursor line the `[[` and `]]` are tagged invisible, so text fetched
+        # without them cannot match `_MD_LINK_RE` at all — and the offset we
+        # compare against counts them regardless. Every line you would
+        # actually hover is one of those, so this returned None for every link
+        # except one on the line the caret was already in: no hand cursor, no
+        # Ctrl+click, no hover preview.
+        text = buf.get_text(ls, le, True)
         off = it.get_line_offset()
         for m in _MD_LINK_RE.finditer(text):
             if m.start() <= off < m.end():
@@ -10558,6 +10590,24 @@ class MarkdownNotesView(GtkSource.View):
         self._hover_id = GLib.timeout_add(
             self.LINK_PREVIEW_MS, self._show_link_preview, link)
 
+    def _hover_line_rect(self):
+        """The LINE under the pointer, as a widget-coordinate rectangle.
+
+        Anchored to a zero-height point, the preview lands on top of the link
+        it is describing — you hover a link to read it, so covering it is the
+        one thing the popup must not do. Given the line's height it sits above
+        or below the line, and halign START keeps its left edge at the pointer
+        rather than centring a 220px picture over the sentence."""
+        x, y = self._hover_at
+        bx, by = self.window_to_buffer_coords(
+            Gtk.TextWindowType.WIDGET, int(x), int(y))
+        _over, it = self.get_iter_at_location(bx, by)
+        rect = self.get_iter_location(it)
+        _lx, ly = self.buffer_to_window_coords(
+            Gtk.TextWindowType.WIDGET, rect.x, rect.y)
+        return Gdk.Rectangle(x=int(x), y=int(ly),
+                             width=1, height=max(1, rect.height))
+
     def _cancel_hover_timer(self):
         if self._hover_id is not None:
             GLib.source_remove(self._hover_id)
@@ -10596,8 +10646,8 @@ class MarkdownNotesView(GtkSource.View):
         pop.set_position(Gtk.PositionType.TOP)
         pop.set_parent(self)
         pop.set_child(box)
-        x, y = self._hover_at
-        pop.set_pointing_to(Gdk.Rectangle(x=int(x), y=int(y), width=1, height=1))
+        pop.set_halign(Gtk.Align.START)
+        pop.set_pointing_to(self._hover_line_rect())
         self._preview_popup = pop
         pop.popup()
         return False
@@ -10608,6 +10658,14 @@ class MarkdownNotesView(GtkSource.View):
     # are intercepted in _on_key while it is visible.
 
     def _cursor_line_and_col(self):
+        """The caret's line and column, both counting the HIDDEN characters.
+
+        A line offset always counts them, so text fetched without them is a
+        different string with a different length — and the column then points
+        somewhere else in it, one place per marker earlier on the line. That
+        is not an off-by-one that shows up as a wrong answer: the `[[` picker
+        simply stopped opening on any line that already had a link or a
+        rendered symbol on it."""
         buf = self.get_buffer()
         it = buf.get_iter_at_mark(buf.get_insert())
         col = it.get_line_offset()
@@ -10615,7 +10673,7 @@ class MarkdownNotesView(GtkSource.View):
         le = ls.copy()
         if not le.ends_line():
             le.forward_to_line_end()
-        return buf.get_text(ls, le, False), col
+        return buf.get_text(ls, le, True), col
 
     def _update_link_popup(self):
         """Refresh the popup: show it when the cursor sits in an open `[[…` with
@@ -10684,13 +10742,24 @@ class MarkdownNotesView(GtkSource.View):
         lb.select_row(lb.get_row_at_index(0))
 
     def _position_link_popup(self):
+        """Anchor the picker to the whole LINE the caret is on, left edge at
+        the caret — the way a context menu behaves.
+
+        Pointing at a zero-height spot let GTK flip the popup back over the
+        text you were typing when there was no room below it, which is the one
+        place it must never cover: you are reading what you have typed to
+        decide what to pick. Given the line's height as the anchor, "above"
+        means above the LINE. And halign START makes it grow to the right of
+        the caret instead of being centred on it, so a wide row cannot hide
+        the `[[` you just typed."""
         buf = self.get_buffer()
         it = buf.get_iter_at_mark(buf.get_insert())
         rect = self.get_iter_location(it)
         bx, by = self.buffer_to_window_coords(
-            Gtk.TextWindowType.WIDGET, rect.x, rect.y + rect.height)
+            Gtk.TextWindowType.WIDGET, rect.x, rect.y)
+        self._link_popup.set_halign(Gtk.Align.START)
         self._link_popup.set_pointing_to(
-            Gdk.Rectangle(x=bx, y=by, width=1, height=1))
+            Gdk.Rectangle(x=bx, y=by, width=1, height=max(1, rect.height)))
 
     def _move_link_selection(self, delta):
         lb = self._link_list
@@ -10723,8 +10792,8 @@ class MarkdownNotesView(GtkSource.View):
         le = ls.copy()
         if not le.ends_line():
             le.forward_to_line_end()
-        line = buf.get_text(ls, le, False)
-        open_at = line.rfind('[[', 0, col)
+        line = buf.get_text(ls, le, True)   # offsets count hidden chars, so
+        open_at = line.rfind('[[', 0, col)  # the text has to as well
         if open_at == -1:
             return
         start = ls.copy(); start.forward_chars(open_at + 2)   # just after [[
@@ -12614,13 +12683,33 @@ class TextPageView(Gtk.Overlay):
         if res is None:
             return
         va = self.scroll.get_vadjustment()
+
+        def again():
+            GLib.timeout_add(
+                40,
+                lambda: self.scroll_to_offset(off, top_frac, tries - 1) and False)
+
+        # The ADJUSTMENT lags the layout, and that is a second wait, not the
+        # same one: the view can already have its height while the viewport
+        # still reports the extent it had before the text changed. Its upper is
+        # then the page size, this reads as "the whole sheet is on screen" —
+        # and the switch from a page to the sheet landed at the top however
+        # right the caret was (row 162).
         span = va.get_upper() - va.get_page_size()
         if span <= 0:
-            return          # the whole sheet is on screen already
+            if tries > 0:
+                again()
+            return          # …or the whole sheet really is on screen
         _ox, oy = self.view.buffer_to_window_coords(
             Gtk.TextWindowType.WIDGET, 0, int(self.view.get_iter_location(it).y))
         target = va.get_value() + res[1] + oy - va.get_page_size() * top_frac
-        va.set_value(max(0.0, min(target, span)))
+        want = max(0.0, min(target, span))
+        va.set_value(want)
+        # A GtkAdjustment CLAMPS against the extent it has, so a value set
+        # against a stale upper silently comes back short — the same trap the
+        # sheet's pinch zoom hit. Ask what it actually took.
+        if abs(va.get_value() - want) > 1.0 and tries > 0:
+            again()
 
     def _buffer_to_overlay(self, bx, by):
         """Buffer → overlay coords, keeping the fraction.
@@ -14828,7 +14917,7 @@ class DocumentSession:
     )
     WIDGETS = (
         "canvas", "_notes_view", "_panel_notes_view", "_notes_box",
-        "_notes_link_check", "_notes_link_hint",
+        "_notes_link_check", "_notes_link_hint", "_notes_back_btn",
         "_search_revealer", "_search_entry", "_search_label", "_paned",
         "_toc_list", "_toc_scroll", "_toc_revealer", "_toc_switch",
         "_toc_seg_outline", "_toc_seg_pages", "_toc_bookmarks_check",
@@ -14901,6 +14990,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._bookmark_pop = None
         # rendered pages for the [[link]] hover preview, keyed by file+mtime+page
         self._preview_cache = {}
+        # where the last followed [[link]] came from, and where it landed —
+        # the notes header's way back (row 165)
+        self._link_return = None
         self._bookmark_name_pop = None      # the "name this bookmark" popup
         self._bookmark_name_entry = None
         self._bookmark_list_scroll = None   # the popover's list, for scrolling
@@ -16140,6 +16232,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._notes_link_hint.set_margin_end(8)
         s._notes_link_hint.set_visible(False)
         header_row.append(s._notes_link_hint)
+        # Following a link costs you the place you were reading, and the way
+        # back has to be somewhere you are already looking — the notes header,
+        # beside the run checkbox (row 165). It appears only on the page a link
+        # brought you to, and goes as soon as you turn the page, because by
+        # then "back" is a claim about somewhere you have already left.
+        s._notes_back_btn = Gtk.Button()
+        s._notes_back_btn.add_css_class("flat")
+        s._notes_back_btn.add_css_class("caption")
+        s._notes_back_btn.set_valign(Gtk.Align.CENTER)
+        s._notes_back_btn.set_margin_end(8)
+        s._notes_back_btn.set_visible(False)
+        s._notes_back_btn.connect("clicked", lambda _b: s.win._go_back_from_link())
+        header_row.append(s._notes_back_btn)
         s._notes_link_check = Gtk.CheckButton()
         s._notes_link_check.add_css_class("caption")
         s._notes_link_check.set_margin_end(10)
@@ -17914,6 +18019,42 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._page_label.set_label(
                 f"{self.canvas.current_page_idx + 1} / {self.canvas.n_pages}")
         self._update_bookmark_ui()
+        self._sync_link_back()
+
+    def _sync_link_back(self):
+        """Show the way back on the page a link brought you to, and nowhere
+        else. Asking "am I still where the link put me?" is what makes it
+        disappear by itself — no timer, and no stale offer to jump somewhere
+        you left ten pages ago."""
+        btn = getattr(self, "_notes_back_btn", None)
+        if btn is None:
+            return
+        r = self._link_return
+        here = (self._path or self._notes_path,
+                None if self._text_mode or self.canvas is None
+                or not self.canvas.document
+                else self.canvas.current_page_idx)
+        if not r or r["to"] != here:
+            btn.set_visible(False)
+            return
+        path, page = r["from"]
+        where = "" if page is None else f"p.{page + 1}"
+        if path and not same_file(path, r["to"][0]):
+            where = f"{os.path.basename(path)} {where}".strip()
+        btn.set_label(f"↩ Back to {where or 'where you were'}")
+        btn.set_tooltip_text("Return to the page you followed the link from")
+        btn.set_visible(True)
+
+    def _go_back_from_link(self):
+        r, self._link_return = self._link_return, None
+        self._sync_link_back()
+        if not r:
+            return
+        path, page = r["from"]
+        if path and not same_file(path, self._path):
+            self.open_file_in_tab(path)
+        if page is not None and self.canvas.document:
+            self._go_to_page(page)
 
     def _on_page_changed(self, idx, n):
         # the counter and the bookmark toggle come from the one place that
@@ -18319,10 +18460,21 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if not ok:
             self._toast(f"Link target not found: {link.get('label') or ''}")
             return
+        came_from = (self._path or self._notes_path,
+                     None if self._text_mode or not self.canvas.document
+                     else self.canvas.current_page_idx)
         if full is not None:
             self.open_file_in_tab(full)
         if idx is not None and self.canvas.document:
             self._go_to_page(idx)
+        # …and offer the way back, but only if it goes somewhere else: a link
+        # to the page you are already on has nothing to return from.
+        here = (self._path or self._notes_path,
+                None if self._text_mode or not self.canvas.document
+                else self.canvas.current_page_idx)
+        self._link_return = None if here == came_from else {
+            "from": came_from, "to": here}
+        self._sync_link_back()
 
     def _link_notes_base_dir(self):
         """The folder the active document's [[links]] resolve against — the

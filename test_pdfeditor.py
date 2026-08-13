@@ -5466,8 +5466,8 @@ class TestAnchorCompletions(unittest.TestCase):
     its bookmarks and headings — and files, never a bare page number."""
 
     ANCHORS = {
-        None: [{"name": "Eigenvalues", "page": 4, "kind": "bookmark"},
-               {"name": "Chapter Two", "page": 9, "kind": "heading"}],
+        None: [{"name": "Chapter Two", "page": 9, "kind": "heading"},
+               {"name": "Eigenvalues", "page": 4, "kind": "bookmark"}],
         "l2.pdf": [{"name": "The kernel trick", "page": 2, "kind": "bookmark"}],
     }
 
@@ -5476,7 +5476,10 @@ class TestAnchorCompletions(unittest.TestCase):
             query, list(files), current_page=page, base_dir="/n",
             anchors_cb=lambda p: self.ANCHORS.get(p, []))
 
-    def test_this_documents_names_come_first(self):
+    def test_this_documents_names_come_first_and_bookmarks_lead(self):
+        """A bookmark is a place YOU named this morning; a heading is one the
+        author named, and a deck has dozens — listing headings first buries
+        your own mark in someone else's table of contents."""
         got = self._c("")
         self.assertEqual([c["insert"] for c in got][:2],
                          ["#Eigenvalues", "#Chapter Two"])
@@ -16029,6 +16032,57 @@ class TestFollowNoteLink(unittest.TestCase):
         self._run_in_window(body)
 
 
+class TestLinkHitTesting(unittest.TestCase):
+    """Finding the link under the pointer, and the `[[` query under the caret.
+    Both read a line back out of the buffer, and both used to ask for it
+    WITHOUT the hidden characters while comparing against offsets that count
+    them — so both worked on the caret's own line (where nothing is hidden yet)
+    and on no other."""
+
+    def _view(self, text, caret=0):
+        v = sidemark.MarkdownNotesView()
+        buf = v.get_buffer()
+        buf.set_text(text)
+        buf.place_cursor(buf.get_iter_at_offset(caret))
+        v._rehighlight()
+        return v, buf
+
+    def test_a_link_is_found_on_a_line_that_is_rendered(self):
+        """Off the cursor line the `[[` and `]]` are invisible, which is every
+        line you would actually hover: no hand cursor, no Ctrl+click, no
+        preview."""
+        v, buf = self._view('see [[#page=4]] here\nsecond line', caret=25)
+        # the first character wearing the link tag, in the middle of the target
+        it = buf.get_start_iter()
+        while not it.is_end() and not it.has_tag(v._t["link"]):
+            it.forward_char()
+        it.forward_chars(3)
+        link = v._link_at_iter(it)       # the hit-test without the geometry
+        self.assertIsNotNone(link)
+        self.assertEqual(link["page"], 4)
+        # and nothing outside the link answers
+        self.assertIsNone(v._link_at_iter(buf.get_start_iter()))
+
+    def test_the_picker_opens_after_something_already_rendered(self):
+        """A hidden marker earlier on the line shifted the query by one
+        character per marker, and the picker stopped opening at all."""
+        v, buf = self._view('see [[#page=4]] and [[')
+        buf.place_cursor(buf.get_end_iter())
+        line, col = v._cursor_line_and_col()
+        self.assertEqual(col, len(line))          # the two agree at last
+        self.assertEqual(sidemark._link_query_at_cursor(line, col), '')
+        buf.insert_at_cursor('l2')
+        line, col = v._cursor_line_and_col()
+        self.assertEqual(sidemark._link_query_at_cursor(line, col), 'l2')
+
+    def test_accepting_a_target_replaces_the_query_it_was_offered_for(self):
+        v, buf = self._view('a [[#page=4]] b [[l2')
+        buf.place_cursor(buf.get_end_iter())
+        v._insert_link_target('l2.pdf#Proof')
+        self.assertEqual(buf.get_text(*buf.get_bounds(), True),
+                         'a [[#page=4]] b [[l2.pdf#Proof]]')
+
+
 class TestLinkHoverArming(unittest.TestCase):
     """When the preview is asked for. The popup itself is not testable here —
     showing a Gtk.Popover kills the headless compositor — but WHEN it fires is
@@ -16331,6 +16385,39 @@ class TestLinkCompletions(unittest.TestCase):
                 self.assertTrue(ok)
                 self.assertIsNone(full)     # nothing to open: it is in front
                 self.assertIsNone(idx)
+        self._run_in_window(body)
+
+    def test_following_a_link_offers_the_way_back_and_then_forgets(self):
+        """Following a link costs you the place you were reading, so the way
+        back sits in the notes header — and goes as soon as you turn the page,
+        because by then it is a claim about somewhere you have already left."""
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=9)
+                win._do_open_file(a)
+                win._go_to_page(1)
+                win._follow_note_link(sidemark._parse_note_link("#page=7"))
+                self.assertEqual(win.canvas.current_page_idx, 6)
+                self.assertTrue(win._notes_back_btn.get_visible())
+                self.assertIn("p.2", win._notes_back_btn.get_label())
+                win._go_to_page(4)                  # …anywhere else
+                self.assertFalse(win._notes_back_btn.get_visible())
+                # and it takes you back where you came from
+                win._go_to_page(6)
+                self.assertTrue(win._notes_back_btn.get_visible())
+                win._go_back_from_link()
+                self.assertEqual(win.canvas.current_page_idx, 1)
+                self.assertFalse(win._notes_back_btn.get_visible())
+        self._run_in_window(body)
+
+    def test_a_link_to_the_page_you_are_on_offers_no_way_back(self):
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=4)
+                win._do_open_file(a)
+                win._go_to_page(2)
+                win._follow_note_link(sidemark._parse_note_link("#page=3"))
+                self.assertFalse(win._notes_back_btn.get_visible())
         self._run_in_window(body)
 
     def test_a_link_to_another_document_resolves_by_name(self):
