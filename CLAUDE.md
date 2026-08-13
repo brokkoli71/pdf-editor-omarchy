@@ -678,10 +678,16 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     "↩ Back to p.N" only while you are still on the page the link put you on.
     Asking "am I where the link left me?" is what retires the offer by itself
     — no timer, and never a stale jump to somewhere you left ten pages ago.
-  - **Both popups anchor to the LINE, not to a point** (`_position_link_popup`,
-    `_hover_line_rect`, both `halign=START`). Given a zero-height anchor GTK
-    centres the popup on it and flips it back over the very text you are
-    reading — the `[[` you just typed, or the link you are hovering to read.
+  - **The picker anchors to the LINE, not to a point** (`_position_link_popup`,
+    `halign=START`). Given a zero-height anchor GTK centres the popup on it and
+    flips it back over the very text you are reading — the `[[` you just typed.
+  - **The preview is a TOOLTIP (`query-tooltip`), and that is not a shortcut.**
+    A popover is a real surface: shown near the pointer it takes the crossing,
+    the view gets a LEAVE, the preview hides, the pointer is back on the link
+    — and it oscillates. The symptom was a preview that appeared once in a
+    while, mostly when you clicked. Tooltips keep away from the pointer by
+    construction, never take it, and time themselves. `set_tip_area` is what
+    stops it re-rendering the target page on every motion event.
   - *Not built: backlinks (row 100 item 4) — it needs a cross-file index and an
     invalidation story, and should wait until naming targets proves itself.*
 - **Linked page notes (row 129)** — a page can CONTINUE the one before it, and

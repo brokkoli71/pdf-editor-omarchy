@@ -16083,41 +16083,33 @@ class TestLinkHitTesting(unittest.TestCase):
                          'a [[#page=4]] b [[l2.pdf#Proof]]')
 
 
-class TestLinkHoverArming(unittest.TestCase):
-    """When the preview is asked for. The popup itself is not testable here —
-    showing a Gtk.Popover kills the headless compositor — but WHEN it fires is
-    the part with a rule in it."""
+class TestLinkHoverPreview(unittest.TestCase):
+    """The preview is a TOOLTIP, not a popover, and that is load-bearing: a
+    popover is a real surface, so shown near the pointer it takes the crossing,
+    the view gets a leave, the preview hides — and the whole thing oscillates.
+    GTK's tooltips keep away from the pointer by construction."""
 
     def _view(self):
         v = sidemark.MarkdownNotesView()
-        v.link_preview_cb = lambda link: None
+        v.link_preview_cb = lambda link: (None, "deck.pdf · p.4")
         return v
 
-    def test_resting_on_a_link_arms_the_preview_and_moving_off_disarms_it(self):
+    def test_the_view_asks_gtk_for_tooltips_at_all(self):
         v = self._view()
-        link = sidemark._parse_note_link("#Eigenvalues")
-        v._hover_link(link, 10, 10)
-        self.assertIsNotNone(v._hover_id)
-        armed = v._hover_id
-        v._hover_link(link, 12, 10)      # the same link, still hovering it
-        self.assertEqual(v._hover_id, armed)
-        v._hover_link(None, 40, 90)      # off the link
-        self.assertIsNone(v._hover_id)
+        self.assertTrue(v.get_has_tooltip())
 
-    def test_nothing_is_armed_without_a_preview_to_show(self):
+    def test_no_preview_without_a_link_under_the_pointer(self):
         v = self._view()
+        v.get_buffer().set_text("plain prose, nothing to preview")
+        # a real Gtk.Tooltip cannot be constructed from outside GTK, and the
+        # handler must decline before it ever touches one
+        self.assertFalse(v._on_query_tooltip(v, 5, 5, False, None))
+
+    def test_no_preview_from_the_keyboard_or_without_a_resolver(self):
+        v = self._view()
+        self.assertFalse(v._on_query_tooltip(v, 5, 5, True, None))
         v.link_preview_cb = None
-        v._hover_link(sidemark._parse_note_link("#x"), 10, 10)
-        self.assertIsNone(v._hover_id)
-
-    def test_leaving_the_text_takes_the_preview_with_it(self):
-        """It is autohide=False, so nothing else would ever take it down."""
-        v = self._view()
-        v._hover_link(sidemark._parse_note_link("#x"), 10, 10)
-        v._on_link_leave()
-        self.assertIsNone(v._hover_id)
-        self.assertIsNone(v._preview_popup)
-        self.assertIsNone(v._hover_target)
+        self.assertFalse(v._on_query_tooltip(v, 5, 5, False, None))
 
 
 class TestDeadLinkRendering(unittest.TestCase):

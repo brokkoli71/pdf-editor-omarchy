@@ -2130,6 +2130,12 @@ BINDING_MODES = tuple(DEFAULT_TABLES)
 
 
 INPUT_DEBUG = bool(os.environ.get("SIDEMARK_INPUT_DEBUG"))
+# SIDEMARK_SCROLL_DEBUG=1 traces every attempt the text sheet makes to bring a
+# position into view: which of the three waits it is in, and what the viewport
+# did with the value. The failure is silent by nature — the caret is in the
+# right place and the sheet is simply at the top — so there is nothing to see
+# without it.
+SCROLL_DEBUG = bool(os.environ.get("SIDEMARK_SCROLL_DEBUG"))
 
 
 def log_press(surface, chord, tool, note=""):
@@ -10357,8 +10363,10 @@ class MarkdownNotesView(GtkSource.View):
         self.add_controller(click)
         motion = Gtk.EventControllerMotion()
         motion.connect("motion", self._on_link_motion)
-        motion.connect("leave", self._on_link_leave)
         self.add_controller(motion)
+        # …and the page a link leads to, on hover (row 165)
+        self.set_has_tooltip(True)
+        self.connect("query-tooltip", self._on_query_tooltip)
 
         # set by the window: called with +1 / -1 / 0 to grow / shrink / reset
         self.font_zoom_cb = None
@@ -10376,10 +10384,6 @@ class MarkdownNotesView(GtkSource.View):
         # `(texture or None, caption)` for the hover preview — or None for
         # "nothing to show".
         self.link_preview_cb = None
-        self._hover_target = None   # the link the pointer is resting on
-        self._hover_at = (0, 0)
-        self._hover_id = None
-        self._preview_popup = None
         self._link_popup = None      # lazily-built Gtk.Popover
         self._link_list = None       # the Gtk.ListBox inside it
         self._link_rows = []         # candidate dicts currently shown, in order
@@ -10538,16 +10542,7 @@ class MarkdownNotesView(GtkSource.View):
                 c.set_state(Gtk.EventSequenceState.DENIED)
         return False
 
-    def _on_link_leave(self, *_a):
-        """The pointer left the text: no link is under it any more. A preview
-        that outlived the hover would sit over the notes with nothing keeping
-        it there — it is autohide=False, so nothing else would take it down."""
-        self._hover_target = None
-        self._cancel_hover_timer()
-        self._hide_link_preview()
-
     def _on_link_click(self, gesture, _n_press, x, y):
-        self._on_link_leave()          # a click answers the question for you
         # Ctrl+click follows the link; a plain click edits as usual
         ev = gesture.get_current_event()
         if not ev or not (ev.get_modifier_state() & Gdk.ModifierType.CONTROL_MASK):
@@ -10558,10 +10553,9 @@ class MarkdownNotesView(GtkSource.View):
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
 
     def _on_link_motion(self, _motion, x, y):
-        link = self._link_target_at(x, y)
+        over = self._link_target_at(x, y) is not None
         self.set_cursor(Gdk.Cursor.new_from_name(
-            "pointer" if link is not None else "text", None))
-        self._hover_link(link, x, y)
+            "pointer" if over else "text", None))
 
     # ── hovering a link shows the page it goes to (row 165) ──────────────────
     #
@@ -10570,87 +10564,57 @@ class MarkdownNotesView(GtkSource.View):
     # twice. The preview is the cheap way to ask "is this the slide I meant?",
     # and it is the same question the strike-through answers for targets that
     # are not there at all.
+    #
+    # It is a TOOLTIP, and that is not a shortcut — it is the only thing that
+    # can hold still. A popover is a real surface: shown near the pointer it
+    # takes the crossing, the text view gets a LEAVE, the preview hides, the
+    # pointer is back over the link, and the whole thing oscillates — the
+    # symptom was a preview that appeared once in a while and mostly when you
+    # clicked. GTK's tooltips are built for exactly this: they keep away from
+    # the pointer, never take it, and come and go on their own timing.
 
-    LINK_PREVIEW_MS = 450       # long enough that reading a line never fires it
-
-    def _hover_link(self, link, x, y):
-        """Arm (or disarm) the preview for the link under the pointer. Nothing
-        happens until the pointer has RESTED on it: a preview that opened as
-        the mouse crossed a link would flash open and shut down a line of
-        prose."""
-        target = None if link is None else link.get("label")
-        if target == self._hover_target:
-            return                        # same link, still hovering it
-        self._hover_target = target
-        self._cancel_hover_timer()
-        self._hide_link_preview()
-        if link is None or self.link_preview_cb is None:
-            return
-        self._hover_at = (x, y)
-        self._hover_id = GLib.timeout_add(
-            self.LINK_PREVIEW_MS, self._show_link_preview, link)
-
-    def _hover_line_rect(self):
-        """The LINE under the pointer, as a widget-coordinate rectangle.
-
-        Anchored to a zero-height point, the preview lands on top of the link
-        it is describing — you hover a link to read it, so covering it is the
-        one thing the popup must not do. Given the line's height it sits above
-        or below the line, and halign START keeps its left edge at the pointer
-        rather than centring a 220px picture over the sentence."""
-        x, y = self._hover_at
-        bx, by = self.window_to_buffer_coords(
-            Gtk.TextWindowType.WIDGET, int(x), int(y))
-        _over, it = self.get_iter_at_location(bx, by)
-        rect = self.get_iter_location(it)
-        _lx, ly = self.buffer_to_window_coords(
-            Gtk.TextWindowType.WIDGET, rect.x, rect.y)
-        return Gdk.Rectangle(x=int(x), y=int(ly),
-                             width=1, height=max(1, rect.height))
-
-    def _cancel_hover_timer(self):
-        if self._hover_id is not None:
-            GLib.source_remove(self._hover_id)
-            self._hover_id = None
-
-    def _hide_link_preview(self):
-        pop, self._preview_popup = self._preview_popup, None
-        if pop is not None:
-            _drop_popover(pop)
-
-    def _show_link_preview(self, link):
-        self._hover_id = None
+    def _on_query_tooltip(self, _w, x, y, keyboard, tooltip):
+        """GTK asking what to show at (x, y). True means "show this"."""
+        if keyboard or self.link_preview_cb is None:
+            return False
+        link = self._link_target_at(x, y)
+        if link is None:
+            return False
         try:
             shot = self.link_preview_cb(link)
         except Exception:
             shot = None                   # a preview must never cost a click
-        if not shot or not self.get_mapped():
+        if not shot:
             return False
         texture, caption = shot
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        box.set_margin_top(6); box.set_margin_bottom(6)
-        box.set_margin_start(6); box.set_margin_end(6)
         if texture is not None:
             pic = Gtk.Picture.new_for_paintable(texture)
-            pic.set_size_request(LINK_PREVIEW_PX,
-                                 int(LINK_PREVIEW_PX * 1.3))
+            pic.set_size_request(LINK_PREVIEW_PX, int(LINK_PREVIEW_PX * 1.3))
             pic.set_can_shrink(True)
             box.append(pic)
         label = Gtk.Label(label=caption or "", xalign=0)
         label.add_css_class("caption")
-        label.set_max_width_chars(28)
+        label.set_max_width_chars(30)
         label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         box.append(label)
-        pop = Gtk.Popover()
-        pop.set_autohide(False)           # it must never take the pointer
-        pop.set_position(Gtk.PositionType.TOP)
-        pop.set_parent(self)
-        pop.set_child(box)
-        pop.set_halign(Gtk.Align.START)
-        pop.set_pointing_to(self._hover_line_rect())
-        self._preview_popup = pop
-        pop.popup()
-        return False
+        tooltip.set_custom(box)
+        # The area the answer is good for: while the pointer stays inside it
+        # GTK neither re-asks nor re-places the tip, so crossing a link does
+        # not re-render its page on every motion event.
+        tooltip.set_tip_area(self._link_tip_area(x, y))
+        return True
+
+    def _link_tip_area(self, x, y):
+        """The line under the pointer, in widget coordinates."""
+        bx, by = self.window_to_buffer_coords(
+            Gtk.TextWindowType.WIDGET, int(x), int(y))
+        _over, it = self.get_iter_at_location(bx, by)
+        rect = self.get_iter_location(it)
+        lx, ly = self.buffer_to_window_coords(
+            Gtk.TextWindowType.WIDGET, rect.x, rect.y)
+        return Gdk.Rectangle(x=int(lx), y=int(ly),
+                             width=max(1, rect.width), height=max(1, rect.height))
 
     # ── [[ autocomplete popup ─────────────────────────────────────────────────
     # Typing `[[` opens a popup of link targets (open tabs / recents / this
@@ -12662,41 +12626,52 @@ class TextPageView(Gtk.Overlay):
             Gtk.TextWindowType.WIDGET, 0, 0)
         return ox + vx, oy + vy
 
-    def scroll_to_offset(self, off, top_frac=0.25, tries=8):
+    def scroll_to_offset(self, off, top_frac=0.25, tries=8, settle=True):
         """Bring a buffer position into view on the sheet.
 
         `scroll_to_mark` does nothing here: the view is a NON-scrollable child
         (see __init__), so it holds no scroll of its own — the viewport does,
-        and the position has to be translated into it by hand. Retried while
-        the sheet has no allocation yet, the thumbnail strip's trap: entering
-        the full-notes view sets the text, shows the sheet and moves the
-        divider in one frame, so at the moment we are asked the view still
-        reports no height and every line is at y=0."""
+        and the position has to be translated into it by hand.
+
+        THREE things can each leave the sheet at the top with the caret
+        perfectly placed, and only the first is obvious:
+        1. the view has no allocation yet (every line reports y=0),
+        2. the ADJUSTMENT still describes the extent it had before the text
+           changed, so `upper - page_size` is 0 — "the whole sheet is on
+           screen" — and a value set against it is silently CLAMPED short,
+        3. the layout SETTLES afterwards. Entering the sheet sets the text,
+           shows it, animates the divider and re-wraps every line to a new
+           width; the offset's y moves with each of those, and a GtkAdjustment
+           does not carry its value along. So the scroll is re-applied while
+           things move (`settle`), not computed once and trusted."""
         buf = self.view.get_buffer()
         it = buf.get_iter_at_offset(max(0, min(int(off), buf.get_char_count())))
         res = self.view.translate_coordinates(self.scroll, 0.0, 0.0)
-        if (res is None or self.view.get_height() <= 1) and tries > 0:
-            GLib.timeout_add(
-                40,
-                lambda: self.scroll_to_offset(off, top_frac, tries - 1) and False)
-            return
-        if res is None:
-            return
         va = self.scroll.get_vadjustment()
 
-        def again():
+        def again(delay=40):
             GLib.timeout_add(
-                40,
-                lambda: self.scroll_to_offset(off, top_frac, tries - 1) and False)
+                delay,
+                lambda: self.scroll_to_offset(off, top_frac, tries - 1,
+                                              settle) and False)
 
-        # The ADJUSTMENT lags the layout, and that is a second wait, not the
-        # same one: the view can already have its height while the viewport
-        # still reports the extent it had before the text changed. Its upper is
-        # then the page size, this reads as "the whole sheet is on screen" —
-        # and the switch from a page to the sheet landed at the top however
-        # right the caret was (row 162).
+        def note(msg, **kw):
+            if not SCROLL_DEBUG:
+                return
+            kw = " ".join(f"{k}={v}" for k, v in kw.items())
+            print(f"[sheet-scroll] off={off} tries={tries} {msg} {kw}",
+                  file=sys.stderr, flush=True)
+            logger.info(f"[sheet-scroll] off={off} tries={tries} {msg} {kw}")
+
+        if res is None or self.view.get_height() <= 1:
+            note("not laid out yet", res=res, h=self.view.get_height())
+            if tries > 0:
+                again()
+            return
         span = va.get_upper() - va.get_page_size()
         if span <= 0:
+            note("viewport has no span", upper=va.get_upper(),
+                 page=va.get_page_size())
             if tries > 0:
                 again()
             return          # …or the whole sheet really is on screen
@@ -12705,11 +12680,23 @@ class TextPageView(Gtk.Overlay):
         target = va.get_value() + res[1] + oy - va.get_page_size() * top_frac
         want = max(0.0, min(target, span))
         va.set_value(want)
-        # A GtkAdjustment CLAMPS against the extent it has, so a value set
-        # against a stale upper silently comes back short — the same trap the
-        # sheet's pinch zoom hit. Ask what it actually took.
-        if abs(va.get_value() - want) > 1.0 and tries > 0:
+        got = va.get_value()
+        note("applied", want=round(want, 1), got=round(got, 1),
+             upper=round(va.get_upper(), 1), page=round(va.get_page_size(), 1),
+             view_h=self.view.get_height(), oy=oy, res_y=res[1])
+        if abs(got - want) > 1.0 and tries > 0:
             again()
+            return
+        if settle:
+            # The value stuck — but a reflow that lands later moves the text
+            # under it, and nothing re-derives the scroll when it does. Re-aim
+            # a few times over the next half second and then leave it alone;
+            # by then the sheet is either settled or the hand has taken over.
+            for delay in (60, 200, 500):
+                GLib.timeout_add(
+                    delay,
+                    lambda d=delay: self.scroll_to_offset(
+                        off, top_frac, 1, settle=False) and False)
 
     def _buffer_to_overlay(self, bx, by):
         """Buffer → overlay coords, keeping the fraction.
