@@ -69,28 +69,34 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     at priority 0, so any tag of ours outranks them — but priority is the order
     tags are ADDED to the table, which is why `noitalic` is created *before*
     `italic`.
-  - **An unbraced script ends at the first non-alphanumeric** (`a_i, b_j`), and
-    a **terminating space is eaten on render**: you are forced to type it
-    (`\alphax` is another command, `a_ib` subscripts "ib"), so showing it puts
-    a hole inside "αx". Two spaces is how you ask for one. Narrowed once, to
-    avoid eating a space nobody was forced to type: only before an
-    alphanumeric, so `\alpha + \beta` keeps its spacing. The **end of the LINE
-    counts as an alphanumeric** (`_MD_SYMBOL_END_RE`, `_MD_SCRIPT_END_RE`):
-    the next character is
-    the one you are about to type, and leaving that space showing parks the
-    caret a gap away from the glyph, then closes the gap as you type — the
-    caret appearing to jump backwards. It is the end of the line, not the end
-    of the string it runs on: rendering goes segment by segment
-    (`_symbolize(seg, at_end=…)`, `iter_scripts(seg, at_end=…)`), and a segment
-    ending mid-line is followed by
-    something that terminated nothing. **Commands and scripts obey one rule**,
-    including the split that makes it work: the space is eaten, but the "is
-    the caret still in this expression?" test uses the expression WITHOUT it
-    (`_MD_COMMAND_RE`, `script_body_end`) — otherwise typing the terminator
-    holds the thing you just finished open under the caret. There is **no
-    per-symbol exception** — an operator's space is eaten too (`\cdot a` is
-    "·a"), because half the table behaving differently is not a rule anyone can
-    hold while writing.
+  - **An unbraced script ends at the first character that is not alphanumeric
+    or a symbol GLYPH** (`a_i, b_j`; but `x^\alpha` lifts the α it became —
+    `_MD_SCRIPT_BODY`, row 163), and a **terminating space is eaten on render**:
+    you are forced to type it (`\alphax` is another command, `a_ib` subscripts
+    "ib"), so showing it puts a hole inside "αx". Two spaces is how you ask for
+    one. **ONE space, whatever follows it** (row 164) — the rule used to ask
+    whether that character could have continued the expression, which rendered
+    `\alpha a`, `\alpha 1` and `\alpha +` three different ways for a reason
+    only the grammar could see. The cost was accepted with eyes open:
+    `\alpha + \beta` reads "α+ β", and an operator that wants its spacing asks
+    with two spaces. There is nothing left for the rule to depend on, which is
+    why `at_end`/`_MD_*_END_RE` are GONE — the end of the line, the end of a
+    `code` segment and an ordinary letter all terminate alike.
+    **Commands and scripts obey one rule**, including the split that makes it
+    work: the space is eaten, but the "is the caret still in this expression?"
+    test uses the expression WITHOUT it (`_MD_COMMAND_RE`, `script_body_end`)
+    — otherwise typing the terminator holds the thing you just finished open
+    under the caret. There is **no per-symbol exception** — an operator's space
+    is eaten too (`\cdot a` is "·a"), because half the table behaving
+    differently is not a rule anyone can hold while writing.
+    **BACKSPACE is the one thing that reads that split backwards**
+    (`_open_eaten_terminator`, row 164): the eaten space is real source the
+    caret is standing behind with nothing drawn for it, so GTK's Backspace
+    landed on the glyph in front of it and the splice took the whole `\alpha `
+    out in one keystroke. It reveals the line first, then defers to GTK. The
+    two directions want opposite things — forwards you have finished writing
+    the expression, backwards you are going back into it — so do not "unify"
+    them by widening the caret test.
   - **A script that abuts the one before it is a script OF it** (`iter_scripts`
     yields a nesting *chain*): `a_i_j` is j indexing i and `a_i^2` puts the 2 on
     top of the i, each level placed on the one it sits on and shrunk again

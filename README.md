@@ -205,6 +205,7 @@ Renders automatically on lines where the cursor isn't; move the cursor to a line
 |--------|-----------|
 | `x^2` or `x^{n+1}` | superscript (until next space, or braced) |
 | `x_ij` or `x_{i,j}` | subscript (until next space, or braced) |
+| `x^\alpha` `x_\mu` | a `\command` can be the script itself (x^α, x_μ) |
 | `\alpha` `\beta` … `\omega` | Greek letters (α β … ω) |
 | `\sum` `\prod` `\int` `\sqrt` | Σ Π ∫ √ (the radical sign only — no overbar) |
 | `\infty` `\approx` `\neq` `\leq` `\geq` | ∞ ≈ ≠ ≤ ≥ |
@@ -212,6 +213,8 @@ Renders automatically on lines where the cursor isn't; move the cursor to a line
 | `\forall` `\exists` `\partial` `\nabla` `\to` | ∀ ∃ ∂ ∇ → |
 | `\R` `\N` `\Q` `\Z` `\C` | number sets ℝ ℕ ℚ ℤ ℂ (also spelled `\realnum`, `\natnum`, `\ratnum`, `\intnum`, `\compnum`) |
 | `\hat{x}` `\bar{x}` `\tilde{x}` `\vec{x}` | accents x̂ x̄ x̃ x⃗ (also `\dot` / `\ddot`; braces optional: `\hat x`) |
+
+The space that *ends* a command or an unbraced script is a terminator, not a gap, so it is not drawn: `\alpha x` reads "αx" and `x^2 y` reads "x²y". Type two spaces where you want one — `\alpha  + \beta` → "α + β".
 
 Inside an inline `` `code` `` span nothing above is applied — the text renders verbatim (so `` `snake_case` ``, `` `2^10` `` or `` `\alpha` `` stay literal), matching how a Markdown viewer treats code.
 

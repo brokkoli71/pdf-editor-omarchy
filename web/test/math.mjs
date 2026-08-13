@@ -32,19 +32,15 @@ check("SCRIPT_SCALE", SCRIPT_SCALE, V.scale);
 
 for (const c of V.cases) {
   const label = JSON.stringify(c.raw);
-  check(`${label} symbolize`, symbolize(c.raw, true), c.symbolize);
-  check(`${label} symbolize(fragment)`, symbolize(c.raw, false), c.symbolize_fragment);
+  check(`${label} symbolize`, symbolize(c.raw), c.symbolize);
   check(`${label} splitMarkup`,
     splitMarkup(c.raw).map((s) => [s.text, s.kind]), c.split);
   check(`${label} scripts`,
-    iterScripts(c.raw, true).map((s) => ({
+    iterScripts(c.raw).map((s) => ({
       from: s.from, to: s.to, body_end: scriptBodyEnd(s.match),
       content: scriptContent(s.match) ?? null, chain: s.chain,
     })),
     c.scripts.map((s) => ({ ...s, content: s.content ?? null })));
-  check(`${label} scripts(fragment)`,
-    iterScripts(c.raw, false).map((s) => ({ from: s.from, to: s.to, chain: s.chain })),
-    c.scripts_fragment);
   check(`${label} renderable`, RENDERABLE_RE.test(c.raw), c.renderable);
 
   // A rendered span has TWO ends: `to` is replaced, `caretTo` is what holds

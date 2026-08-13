@@ -47,8 +47,13 @@ CASES = [
     "a_i_j",               # j indexes i
     "a^t_i",
     "a_i {}^2",            # how you write two scripts of one base
-    # scripts and symbols together
+    # scripts and symbols together: the glyph a command rendered to IS a
+    # script body, so `x^\alpha` superscripts the α it became
     r"x^\alpha",
+    r"e^\lambda t",
+    r"x_\mu",
+    r"a_\alpha_j",         # …and chains like any other body
+    r"x_i \alpha",         # a space you were never forced to type stays
     r"\sum_{i=0}^{n} x_i",
     # accents
     r"\hat{x}",
@@ -79,8 +84,7 @@ def main():
     for raw in CASES:
         entry = {
             "raw": raw,
-            "symbolize": S._symbolize(raw, at_end=True),
-            "symbolize_fragment": S._symbolize(raw, at_end=False),
+            "symbolize": S._symbolize(raw),
             "split": [[seg, kind] for seg, kind in S._split_markup(raw)],
             "scripts": [
                 {
@@ -90,11 +94,7 @@ def main():
                     "content": S.script_content(m),
                     "chain": list(chain),
                 }
-                for m, chain in S.iter_scripts(raw, at_end=True)
-            ],
-            "scripts_fragment": [
-                {"from": m.start(), "to": m.end(), "chain": list(chain)}
-                for m, chain in S.iter_scripts(raw, at_end=False)
+                for m, chain in S.iter_scripts(raw)
             ],
             "renderable": bool(S._MD_RENDERABLE_RE.search(raw)),
         }

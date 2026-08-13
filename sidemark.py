@@ -8658,23 +8658,24 @@ _MD_SYMBOLS = {
     r'\Z': 'ℤ', r'\intnum': 'ℤ',
     r'\C': 'ℂ', r'\compnum': 'ℂ',
 }
-# A space before a LETTER is a TERMINATOR, not a gap: you have to write
+# THE SPACE THAT ENDS A COMMAND IS A TERMINATOR, NOT A GAP: you have to write
 # `\alpha x` because `\alphax` is a different command, so rendering it puts a
 # hole in the middle of "αx". Exactly one such space is eaten with the command
-# it ended — a second one is a real space and survives. One thing narrows it,
-# and it is about not eating a space nobody was forced to type: the lookahead.
-# Nothing but a letter could have continued the command, so `\alpha + \beta`
-# keeps its spacing — and a second space is in the lookahead, so typing two is
-# how you ask for one.
-# END OF LINE counts as "a letter could have followed": you have just typed
-# `\beta ` and the next character is the one you are about to type, so leaving
-# that space showing parks the caret a gap away from the glyph and then closes
-# the gap the moment you type — the caret jumping backwards as you write.
-_MD_SYMBOL_RE = re.compile(r'\\([A-Za-z]+)( (?=[A-Za-z ]))?')
-# …and only at the END OF THE LINE, which is not the end of every string this
-# runs on: it is applied per `code`/link-delimited segment, and a segment that
-# ends mid-line is followed by something that was not typed as a terminator.
-_MD_SYMBOL_END_RE = re.compile(r'\\([A-Za-z]+)( (?=[A-Za-z ]|$))?', re.M)
+# it ended — a second one is a real space and survives, which is how you ask
+# for one (`\alpha  x` → "α x").
+# It is eaten before ANY character, and that is a deliberate reversal (2026-08-13):
+# it used to depend on whether that character could have continued the command,
+# so `\alpha a` closed up while `\alpha 1` and `\alpha +` kept their space —
+# three lines that look like the same construct, rendering three ways, with the
+# reason visible only to somebody who knows the grammar. The cost is real and
+# was accepted with eyes open: `\alpha + \beta` now reads "α+ β", and an equation
+# that wants its operator spaced asks for it with two spaces. A rule you can see
+# beats a rule that is right.
+# The end of the LINE is just another such character: you have typed `\beta `
+# and the next thing is what you are about to write, so leaving the space
+# showing parks the caret a gap away from the glyph and then closes the gap as
+# you type — the caret appearing to jump backwards.
+_MD_SYMBOL_RE = re.compile(r'\\([A-Za-z]+)( )?')
 # The command WITHOUT its terminating space. This is the span the caret has to
 # be in for the expression to stay open: the space is not part of what you are
 # writing any more, so the caret standing after it means you are done and the
@@ -8852,7 +8853,7 @@ def _sub_mapped(rx, repl, text):
     return "".join(out), imap
 
 
-def _symbolize_map(text, protect=None, at_end=True):
+def _symbolize_map(text, protect=None):
     """`_symbolize`, and the index map from the rendered text back to `text`.
 
     The map is what makes a click land on the SYMBOL you aimed at instead of
@@ -8869,17 +8870,15 @@ def _symbolize_map(text, protect=None, at_end=True):
         a, b = protect
         a = max(0, min(a, len(text)))
         b = max(a, min(b, len(text)))
-        head, hmap = _symbolize_map(text[:a], at_end=False)
-        tail, tmap = _symbolize_map(text[b:], at_end=at_end)
+        head, hmap = _symbolize_map(text[:a])
+        tail, tmap = _symbolize_map(text[b:])
         imap = hmap[:-1] + list(range(a, b)) + [b + i for i in tmap]
         return head + text[a:b] + tail, imap
     out, imap, pos = [], [], 0
     segs = _split_markup(text)
-    for n, (seg, kind) in enumerate(segs):
+    for seg, kind in segs:
         if kind == 'text':
-            last = at_end and n == len(segs) - 1
-            sym, smap = _sub_mapped(
-                _MD_SYMBOL_END_RE if last else _MD_SYMBOL_RE, _sub_symbol, seg)
+            sym, smap = _sub_mapped(_MD_SYMBOL_RE, _sub_symbol, seg)
             # Accents run after symbol substitution so \hat{\alpha} → α̂ (the
             # inner \alpha is already α by the time the accent is placed on
             # it), so the two maps compose: rendered → symbolised → source.
@@ -8900,14 +8899,10 @@ def _symbolize_map(text, protect=None, at_end=True):
 _MD_RENDERABLE_RE = re.compile(r'[\\^_*`#]|\[\[|<!--')
 
 
-def _symbolize(text, at_end=True):
+def _symbolize(text):
     """Replace LaTeX-style \\commands with their Unicode symbols (display only),
-    leaving the contents of `code` spans and [[wiki links]] untouched.
-
-    `at_end=False` says this string is a FRAGMENT of a line: a command at its
-    end was not terminated by the end of a line, so its trailing space is a
-    real one."""
-    return _symbolize_map(text, at_end=at_end)[0]
+    leaving the contents of `code` spans and [[wiki links]] untouched."""
+    return _symbolize_map(text)[0]
 
 
 # Shared inline-Markdown / script regexes (used by the notes editor's TextTag
@@ -8922,20 +8917,24 @@ _MD_INLINE_RE = re.compile(r'\*\*(.+?)\*\*|\*([^*\n]+?)\*|`([^`\n]+?)`')
 # ate the `^`/`_` that starts the NEXT script, so `x_i^2` never superscripted.
 # The stop set deliberately includes `^` and `_` themselves: adjacent scripts
 # (`a_i^2`, `a^t_i`) are two matches, each ending where the other begins.
-# Group 4 is the terminating space of an UNBRACED script — the one before an
-# alphanumeric, which is the only place a space was forced on you (`a_ib` would
-# subscript "ib"), eaten on render for the same reason a command's is. A brace
-# terminates by itself, so the braced form never claims one.
+# Group 4 is the terminating space of an UNBRACED script — you were forced to
+# type it (`a_ib` subscripts "ib"), so it is eaten on render exactly as a
+# command's is, by exactly the same rule: one space, whatever follows it, and
+# two is how you ask for one. A brace terminates by itself, so the braced form
+# never claims one.
+# A script body is alphanumerics AND the glyphs a \command renders to. By the
+# time this runs `x^\alpha` is already `x^α` (the editor rewrites the line),
+# and α is not [A-Za-z0-9] — so the superscript silently did not happen and
+# `x^\alpha`, `e^\lambda`, `x_\mu` were the one maths idiom the grammar could
+# not write. The class is exactly the symbol table's values, every one of which
+# is non-ASCII: nothing Markdown or this grammar means by a character can end
+# up in it by accident, so no line that renders today can change meaning.
+# The terminating space is not part of the class — it is group 4's job.
+_MD_SCRIPT_BODY = ('[A-Za-z0-9'
+                   + re.escape(''.join(sorted(set(_MD_SYMBOLS.values()))))
+                   + ']')
 _MD_SCRIPT_RE = re.compile(
-    r'(\^|_)(?:\{([^}]*)\}|([+-]?[A-Za-z0-9]+)( (?=[A-Za-z0-9 ]))?)')
-# …and at the END OF THE LINE, exactly as a `\command`'s space is (see
-# _MD_SYMBOL_END_RE): the next character is the one you are about to type, so
-# a space left showing there parks the caret a gap away from the script and
-# closes the gap as you type. Same split for the same reason — the end of a
-# `code`/link SEGMENT is not the end of the line, and nothing terminated a
-# script there.
-_MD_SCRIPT_END_RE = re.compile(
-    r'(\^|_)(?:\{([^}]*)\}|([+-]?[A-Za-z0-9]+)( (?=[A-Za-z0-9 ]|$))?)', re.M)
+    r'(\^|_)(?:\{([^}]*)\}|([+-]?' + _MD_SCRIPT_BODY + r'+)( )?)')
 
 # A script that starts exactly where the previous one's content ended is a
 # script OF that script — `a_i_j` is "j indexing i", not two indices of `a`
@@ -8953,15 +8952,12 @@ def script_body_end(m):
     return m.end() - len(m.group(4) or '')
 
 
-def iter_scripts(text, at_end=True):
+def iter_scripts(text):
     """Yield `(match, chain)` for every ^/_ script, where `chain` is the kinds
     ('sub'/'sup') from the outermost enclosing script down to this one. A
-    top-level script has a chain of length 1.
-
-    `at_end=False` says this string is a FRAGMENT of a line, so a script
-    against its end has not been terminated by anything."""
+    top-level script has a chain of length 1."""
     chain, prev_end = [], None
-    for m in (_MD_SCRIPT_END_RE if at_end else _MD_SCRIPT_RE).finditer(text):
+    for m in _MD_SCRIPT_RE.finditer(text):
         kind = 'sup' if m.group(1) == '^' else 'sub'
         if prev_end is not None and m.start() == prev_end and \
                 len(chain) < MAX_SCRIPT_DEPTH:
@@ -8994,12 +8990,12 @@ def _notes_to_pango_markup(text):
     *italic* / `code` become the matching tags. Inside a `code` span nothing
     else is rendered — the text is shown verbatim. Markers themselves are
     dropped (like the editor hides them off the cursor line)."""
-    def _scripts(s, at_end):
+    def _scripts(s):
         """Nested `<sub>`/`<sup>`, which is what makes the j of `a_i_j` smaller
         than the i. A tag is opened with its content and closed only once the
         chain ends, so an inner script is emitted INSIDE its outer one."""
         out, pos, open_tags = [], 0, []
-        for m, chain in iter_scripts(s, at_end=at_end):
+        for m, chain in iter_scripts(s):
             if len(chain) == 1:          # a new chain: close the old one first
                 out.append("".join(reversed(open_tags)))
                 open_tags.clear()
@@ -9019,8 +9015,7 @@ def _notes_to_pango_markup(text):
         return f"<tt>{m.group(3)}</tt>"
 
     parts = []
-    segs = _split_markup(text)
-    for n, (seg, kind) in enumerate(segs):
+    for seg, kind in _split_markup(text):
         if kind == 'code':               # `code` → verbatim monospace
             parts.append(f"<tt>{GLib.markup_escape_text(seg[1:-1])}</tt>")
             continue
@@ -9030,9 +9025,8 @@ def _notes_to_pango_markup(text):
             continue
         # symbols first, then escape, then scripts, then bold/italic. The
         # segment has no backticks, so _inline only ever sees bold/italic here.
-        last = (n == len(segs) - 1)
-        s = GLib.markup_escape_text(_symbolize(seg, at_end=last))
-        s = _scripts(s, at_end=last)
+        s = GLib.markup_escape_text(_symbolize(seg))
+        s = _scripts(s)
         parts.append(_MD_INLINE_RE.sub(_inline, s))
     return "".join(parts)
 
@@ -10541,7 +10535,55 @@ class MarkdownNotesView(GtkSource.View):
             # return False so the space/newline still gets inserted afterwards.
             if keyval in (Gdk.KEY_space, Gdk.KEY_Return, Gdk.KEY_KP_Enter):
                 self._expand_snippet()
+            # …and Backspace against a space the render ate opens the line
+            # first, so the keystroke deletes THAT space. Returns False either
+            # way: the deletion itself is an ordinary buffer edit.
+            if keyval == Gdk.KEY_BackSpace:
+                self._open_eaten_terminator()
         return False
+
+    def _open_eaten_terminator(self):
+        """Reveal the line when the caret is standing against a space that was
+        eaten on render, so Backspace deletes the space and not the glyph.
+
+        `\\alpha ` at the end of a line is drawn as "α": the terminating space
+        is real source, and it is exactly what the caret is behind — but
+        nothing is drawn for it, so GTK's Backspace lands on the α instead, and
+        splicing that back through the index map takes the whole `\\alpha ` out
+        in one keystroke. What is left is a line that never had the command in
+        it, from a keystroke that looked like it would delete one glyph.
+
+        Typing the terminator still SETTLES the expression — that is what the
+        caret test's "the span WITHOUT its space" rule is for — because the two
+        directions want opposite things: forwards you have finished writing it,
+        backwards you are going back into it. So this opens on the DELETE only,
+        and only for the eaten space: any other backspace is GTK's. Forward
+        Delete needs nothing — a caret in FRONT of the glyph is inside the
+        command's own span, so the line is open there already."""
+        buf = self.get_buffer()
+        if buf.get_has_selection():
+            return
+        it = buf.get_iter_at_mark(buf.get_insert())
+        ln, rcol = it.get_line(), it.get_line_offset()
+        if self._line_originals.get(ln) is None:
+            return                      # nothing rendered: an ordinary line
+        ok, ls = buf.get_iter_at_line(ln)
+        if not ok:
+            return
+        le = ls.copy()
+        if not le.ends_line():
+            le.forward_to_line_end()
+        cur = buf.get_text(ls, le, True)
+        if rcol < 1 or rcol > len(cur):
+            return
+        src, scol = self._line_source(ln, cur, rcol)
+        if scol is None:
+            return
+        sat = scol - 1
+        if not (0 <= sat < len(src)) or src[sat] != ' ' or cur[rcol - 1] == ' ':
+            return                      # the space is on screen, or is not one
+        self._line_originals.pop(ln, None)
+        self._buf_replace_line(buf, ln, src, cols=(scol, scol))
 
     # typing any of these with a selection wraps it in the (open, close) pair
     _SURROUND_CHARS = {}

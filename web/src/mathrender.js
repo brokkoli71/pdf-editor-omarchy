@@ -55,18 +55,16 @@ export const MD_ACCENTS = {
   dot: "̇", ddot: "̈",
 };
 
-// A space before a LETTER is a TERMINATOR, not a gap: you have to write
+// THE SPACE THAT ENDS A COMMAND IS A TERMINATOR, NOT A GAP: you have to write
 // `\alpha x` because `\alphax` is a different command, so rendering it puts a
 // hole in the middle of "αx". Exactly one such space is eaten with the command
 // it ended — a second one is a real space and survives, which is how you ask
-// for one. The lookahead is what keeps `\alpha + \beta` spaced: nothing but a
-// letter could have continued the command there.
-const SYMBOL_RE = /\\([A-Za-z]+)( (?=[A-Za-z ]))?/g;
-// …and END OF LINE counts as "a letter could have followed": you have just
-// typed `\beta ` and the next character is the one you are about to type, so
-// leaving that space showing parks the caret a gap away from the glyph and then
-// closes the gap the moment you type — the caret jumping backwards as you write.
-const SYMBOL_END_RE = /\\([A-Za-z]+)( (?=[A-Za-z ]|$))?/gm;
+// for one. It is eaten before ANY character, end of line included: the rule
+// used to depend on what followed, so `\alpha a` closed up while `\alpha 1`
+// and `\alpha +` did not — three lines that look alike rendering three ways,
+// for a reason only the grammar could see. The cost is `\alpha + \beta`
+// reading "α+ β", and it was accepted with eyes open (root ideas.csv row 164).
+const SYMBOL_RE = /\\([A-Za-z]+)( )?/g;
 // The command WITHOUT its terminating space. This is the span the caret has to
 // be in for the expression to stay open: the space is not part of what you are
 // writing any more, so the caret standing after it means you are done and the
@@ -85,12 +83,21 @@ const SPAN_RE = new RegExp(CODE_SPAN_RE.source + "|" + LINK_RE.source, "g");
 // sign is part of it, so `x^-1` reads as an exponent). The stop set
 // deliberately includes `^` and `_` themselves: adjacent scripts (`a_i^2`,
 // `a^t_i`) are two matches, each ending where the other begins. Group 4 is the
-// terminating space of an UNBRACED script — the one before an alphanumeric,
-// which is the only place a space was forced on you (`a_ib` would subscript
-// "ib"), eaten on render for the same reason a command's is. A brace terminates
-// by itself, so the braced form never claims one.
-const SCRIPT_RE = /(\^|_)(?:\{([^}]*)\}|([+-]?[A-Za-z0-9]+)( (?=[A-Za-z0-9 ]))?)/g;
-const SCRIPT_END_RE = /(\^|_)(?:\{([^}]*)\}|([+-]?[A-Za-z0-9]+)( (?=[A-Za-z0-9 ]|$))?)/gm;
+// terminating space of an UNBRACED script — you were forced to type it (`a_ib`
+// subscripts "ib"), so it is eaten by exactly the rule a command's is: one
+// space, whatever follows. A brace terminates by itself, so the braced form
+// never claims one.
+// The body is alphanumerics AND the glyphs a \command renders to: by the time
+// this runs `x^\alpha` is already `x^α`, and α is not [A-Za-z0-9] — so the
+// superscript silently did not happen. Every value in the symbol table is
+// non-ASCII, so nothing Markdown or this grammar means by a character can end
+// up in the class by accident. The terminating space is group 4's job, not the
+// body's.
+const SCRIPT_BODY = "[A-Za-z0-9"
+  + Object.values(MD_SYMBOLS).sort().join("").replace(/[\\\]^-]/g, "\\$&")
+  + "]";
+const SCRIPT_RE = new RegExp(
+  "(\\^|_)(?:\\{([^}]*)\\}|([+-]?" + SCRIPT_BODY + "+)( )?)", "g");
 
 export const MAX_SCRIPT_DEPTH = 3;   // beyond this the glyphs are unreadable
 export const SCRIPT_SCALE = 0.65;    // each level shrinks by this much
@@ -135,22 +142,12 @@ function subAccent(whole, name, braced, bare) {
 }
 
 /** Replace LaTeX-style `\commands` with their Unicode symbols (display only),
- * leaving the contents of `code` spans and `[[wiki links]]` untouched.
- *
- * `atEnd = false` says this string is a FRAGMENT of a line: a command at its end
- * was not terminated by the end of a line, so its trailing space is a real one.
- * That distinction is per SEGMENT, not per string — rendering runs segment by
- * segment, and a segment ending mid-line is followed by something that
- * terminated nothing. */
-export function symbolize(text, atEnd = true) {
-  const segs = splitMarkup(text);
+ * leaving the contents of `code` spans and `[[wiki links]]` untouched. */
+export function symbolize(text) {
   let out = "";
-  segs.forEach((seg, n) => {
+  splitMarkup(text).forEach((seg) => {
     if (seg.kind !== "text") { out += seg.text; return; }
-    const last = atEnd && n === segs.length - 1;
-    const re = new RegExp((last ? SYMBOL_END_RE : SYMBOL_RE).source,
-                          last ? "gm" : "g");
-    const sym = seg.text.replace(re, subSymbol);
+    const sym = seg.text.replace(new RegExp(SYMBOL_RE.source, "g"), subSymbol);
     // Accents run AFTER symbol substitution, so `\hat{\alpha}` → α̂: the inner
     // \alpha is already α by the time the accent is placed on it.
     out += sym.replace(new RegExp(ACCENT_RE.source, "g"), subAccent);
@@ -176,8 +173,8 @@ export function scriptContent(m) {
  * script OF that script — `a_i_j` is "j indexing i", not two indices of `a`
  * side by side, and `a_i^2` puts the 2 above the i. Anything between them ends
  * the chain, which is also how you write two scripts of the same base. */
-export function iterScripts(text, atEnd = true) {
-  const re = new RegExp((atEnd ? SCRIPT_END_RE : SCRIPT_RE).source, atEnd ? "gm" : "g");
+export function iterScripts(text) {
+  const re = new RegExp(SCRIPT_RE.source, "g");
   const out = [];
   let chain = [];
   let prevEnd = null;
@@ -251,18 +248,18 @@ export function renderSpans(line) {
     }
   }
 
-  for (const s of iterScripts(line, true)) {
+  for (const s of iterScripts(line)) {
     if (overlaps(s.from, s.to)) continue;
     spans.push({
       from: s.from, to: s.to, caretTo: scriptBodyEnd(s.match),
       kind: "script", chain: s.chain,
       // the body renders too — `x^\alpha` lifts an α, not the word "\alpha"
-      text: symbolize(s.body ?? "", false),
+      text: symbolize(s.body ?? ""),
     });
     claimed.push([s.from, s.to]);
   }
 
-  const symRe = new RegExp(SYMBOL_END_RE.source, "gm");
+  const symRe = new RegExp(SYMBOL_RE.source, "g");
   for (const m of line.matchAll(symRe)) {
     const from = m.index, to = m.index + m[0].length;
     if (overlaps(from, to)) continue;

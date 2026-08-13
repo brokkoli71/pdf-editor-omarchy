@@ -3,7 +3,6 @@
   {
    "raw": "Nothing to render here.",
    "symbolize": "Nothing to render here.",
-   "symbolize_fragment": "Nothing to render here.",
    "split": [
     [
      "Nothing to render here.",
@@ -11,13 +10,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": false
   },
   {
    "raw": "\\alpha",
    "symbolize": "α",
-   "symbolize_fragment": "α",
    "split": [
     [
      "\\alpha",
@@ -25,13 +22,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "\\alpha x",
    "symbolize": "αx",
-   "symbolize_fragment": "αx",
    "split": [
     [
      "\\alpha x",
@@ -39,13 +34,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "\\alpha  x",
    "symbolize": "α x",
-   "symbolize_fragment": "α x",
    "split": [
     [
      "\\alpha  x",
@@ -53,13 +46,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "\\alpha + \\beta",
-   "symbolize": "α + β",
-   "symbolize_fragment": "α + β",
+   "symbolize": "α+ β",
    "split": [
     [
      "\\alpha + \\beta",
@@ -67,13 +58,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "\\cdot a",
    "symbolize": "·a",
-   "symbolize_fragment": "·a",
    "split": [
     [
      "\\cdot a",
@@ -81,13 +70,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "a \\le b",
    "symbolize": "a ≤b",
-   "symbolize_fragment": "a ≤b",
    "split": [
     [
      "a \\le b",
@@ -95,13 +82,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "\\alpha",
    "symbolize": "α",
-   "symbolize_fragment": "α",
    "split": [
     [
      "\\alpha",
@@ -109,13 +94,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "\\notacommand",
    "symbolize": "\\notacommand",
-   "symbolize_fragment": "\\notacommand",
    "split": [
     [
      "\\notacommand",
@@ -123,13 +106,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "\\R and \\realnum",
    "symbolize": "ℝand ℝ",
-   "symbolize_fragment": "ℝand ℝ",
    "split": [
     [
      "\\R and \\realnum",
@@ -137,13 +118,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "\\Real",
    "symbolize": "\\Real",
-   "symbolize_fragment": "\\Real",
    "split": [
     [
      "\\Real",
@@ -151,13 +130,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "x^2",
    "symbolize": "x^2",
-   "symbolize_fragment": "x^2",
    "split": [
     [
      "x^2",
@@ -175,21 +152,11 @@
      ]
     }
    ],
-   "scripts_fragment": [
-    {
-     "from": 1,
-     "to": 3,
-     "chain": [
-      "sup"
-     ]
-    }
-   ],
    "renderable": true
   },
   {
    "raw": "a_i",
    "symbolize": "a_i",
-   "symbolize_fragment": "a_i",
    "split": [
     [
      "a_i",
@@ -207,21 +174,11 @@
      ]
     }
    ],
-   "scripts_fragment": [
-    {
-     "from": 1,
-     "to": 3,
-     "chain": [
-      "sub"
-     ]
-    }
-   ],
    "renderable": true
   },
   {
    "raw": "a_i, b_j",
    "symbolize": "a_i, b_j",
-   "symbolize_fragment": "a_i, b_j",
    "split": [
     [
      "a_i, b_j",
@@ -248,28 +205,11 @@
      ]
     }
    ],
-   "scripts_fragment": [
-    {
-     "from": 1,
-     "to": 3,
-     "chain": [
-      "sub"
-     ]
-    },
-    {
-     "from": 6,
-     "to": 8,
-     "chain": [
-      "sub"
-     ]
-    }
-   ],
    "renderable": true
   },
   {
    "raw": "a_ib",
    "symbolize": "a_ib",
-   "symbolize_fragment": "a_ib",
    "split": [
     [
      "a_ib",
@@ -287,21 +227,11 @@
      ]
     }
    ],
-   "scripts_fragment": [
-    {
-     "from": 1,
-     "to": 4,
-     "chain": [
-      "sub"
-     ]
-    }
-   ],
    "renderable": true
   },
   {
    "raw": "a_i b",
    "symbolize": "a_i b",
-   "symbolize_fragment": "a_i b",
    "split": [
     [
      "a_i b",
@@ -319,21 +249,11 @@
      ]
     }
    ],
-   "scripts_fragment": [
-    {
-     "from": 1,
-     "to": 4,
-     "chain": [
-      "sub"
-     ]
-    }
-   ],
    "renderable": true
   },
   {
    "raw": "x^-1",
    "symbolize": "x^-1",
-   "symbolize_fragment": "x^-1",
    "split": [
     [
      "x^-1",
@@ -351,21 +271,11 @@
      ]
     }
    ],
-   "scripts_fragment": [
-    {
-     "from": 1,
-     "to": 4,
-     "chain": [
-      "sup"
-     ]
-    }
-   ],
    "renderable": true
   },
   {
    "raw": "x^{n+1}",
    "symbolize": "x^{n+1}",
-   "symbolize_fragment": "x^{n+1}",
    "split": [
     [
      "x^{n+1}",
@@ -383,21 +293,11 @@
      ]
     }
    ],
-   "scripts_fragment": [
-    {
-     "from": 1,
-     "to": 7,
-     "chain": [
-      "sup"
-     ]
-    }
-   ],
    "renderable": true
   },
   {
    "raw": "a_i^2",
    "symbolize": "a_i^2",
-   "symbolize_fragment": "a_i^2",
    "split": [
     [
      "a_i^2",
@@ -425,29 +325,11 @@
      ]
     }
    ],
-   "scripts_fragment": [
-    {
-     "from": 1,
-     "to": 3,
-     "chain": [
-      "sub"
-     ]
-    },
-    {
-     "from": 3,
-     "to": 5,
-     "chain": [
-      "sub",
-      "sup"
-     ]
-    }
-   ],
    "renderable": true
   },
   {
    "raw": "a_i_j",
    "symbolize": "a_i_j",
-   "symbolize_fragment": "a_i_j",
    "split": [
     [
      "a_i_j",
@@ -475,29 +357,11 @@
      ]
     }
    ],
-   "scripts_fragment": [
-    {
-     "from": 1,
-     "to": 3,
-     "chain": [
-      "sub"
-     ]
-    },
-    {
-     "from": 3,
-     "to": 5,
-     "chain": [
-      "sub",
-      "sub"
-     ]
-    }
-   ],
    "renderable": true
   },
   {
    "raw": "a^t_i",
    "symbolize": "a^t_i",
-   "symbolize_fragment": "a^t_i",
    "split": [
     [
      "a^t_i",
@@ -525,29 +389,11 @@
      ]
     }
    ],
-   "scripts_fragment": [
-    {
-     "from": 1,
-     "to": 3,
-     "chain": [
-      "sup"
-     ]
-    },
-    {
-     "from": 3,
-     "to": 5,
-     "chain": [
-      "sup",
-      "sub"
-     ]
-    }
-   ],
    "renderable": true
   },
   {
    "raw": "a_i {}^2",
    "symbolize": "a_i {}^2",
-   "symbolize_fragment": "a_i {}^2",
    "split": [
     [
      "a_i {}^2",
@@ -557,7 +403,7 @@
    "scripts": [
     {
      "from": 1,
-     "to": 3,
+     "to": 4,
      "body_end": 3,
      "content": "i",
      "chain": [
@@ -574,28 +420,11 @@
      ]
     }
    ],
-   "scripts_fragment": [
-    {
-     "from": 1,
-     "to": 3,
-     "chain": [
-      "sub"
-     ]
-    },
-    {
-     "from": 6,
-     "to": 8,
-     "chain": [
-      "sup"
-     ]
-    }
-   ],
    "renderable": true
   },
   {
    "raw": "x^\\alpha",
    "symbolize": "x^α",
-   "symbolize_fragment": "x^α",
    "split": [
     [
      "x^\\alpha",
@@ -603,13 +432,79 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
+   "renderable": true
+  },
+  {
+   "raw": "e^\\lambda t",
+   "symbolize": "e^λt",
+   "split": [
+    [
+     "e^\\lambda t",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "renderable": true
+  },
+  {
+   "raw": "x_\\mu",
+   "symbolize": "x_μ",
+   "split": [
+    [
+     "x_\\mu",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "renderable": true
+  },
+  {
+   "raw": "a_\\alpha_j",
+   "symbolize": "a_α_j",
+   "split": [
+    [
+     "a_\\alpha_j",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 8,
+     "to": 10,
+     "body_end": 10,
+     "content": "j",
+     "chain": [
+      "sub"
+     ]
+    }
+   ],
+   "renderable": true
+  },
+  {
+   "raw": "x_i \\alpha",
+   "symbolize": "x_i α",
+   "split": [
+    [
+     "x_i \\alpha",
+     "text"
+    ]
+   ],
+   "scripts": [
+    {
+     "from": 1,
+     "to": 4,
+     "body_end": 3,
+     "content": "i",
+     "chain": [
+      "sub"
+     ]
+    }
+   ],
    "renderable": true
   },
   {
    "raw": "\\sum_{i=0}^{n} x_i",
    "symbolize": "Σ_{i=0}^{n} x_i",
-   "symbolize_fragment": "Σ_{i=0}^{n} x_i",
    "split": [
     [
      "\\sum_{i=0}^{n} x_i",
@@ -646,36 +541,11 @@
      ]
     }
    ],
-   "scripts_fragment": [
-    {
-     "from": 4,
-     "to": 10,
-     "chain": [
-      "sub"
-     ]
-    },
-    {
-     "from": 10,
-     "to": 14,
-     "chain": [
-      "sub",
-      "sup"
-     ]
-    },
-    {
-     "from": 16,
-     "to": 18,
-     "chain": [
-      "sub"
-     ]
-    }
-   ],
    "renderable": true
   },
   {
    "raw": "\\hat{x}",
    "symbolize": "x̂",
-   "symbolize_fragment": "x̂",
    "split": [
     [
      "\\hat{x}",
@@ -683,13 +553,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "\\bar{x}",
    "symbolize": "x̄",
-   "symbolize_fragment": "x̄",
    "split": [
     [
      "\\bar{x}",
@@ -697,13 +565,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "\\vec{A}",
    "symbolize": "A⃗",
-   "symbolize_fragment": "A⃗",
    "split": [
     [
      "\\vec{A}",
@@ -711,13 +577,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "\\hat{\\alpha}",
    "symbolize": "α̂",
-   "symbolize_fragment": "α̂",
    "split": [
     [
      "\\hat{\\alpha}",
@@ -725,13 +589,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "\\dot x",
    "symbolize": "ẋ",
-   "symbolize_fragment": "ẋ",
    "split": [
     [
      "\\dot x",
@@ -739,13 +601,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "`\\alpha` and \\beta",
    "symbolize": "`\\alpha` and β",
-   "symbolize_fragment": "`\\alpha` and β",
    "split": [
     [
      "`\\alpha`",
@@ -757,13 +617,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "[[\\alpha]] and \\beta",
    "symbolize": "[[\\alpha]] and β",
-   "symbolize_fragment": "[[\\alpha]] and β",
    "split": [
     [
      "[[\\alpha]]",
@@ -775,13 +633,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "[[file.pdf#page=3|the proof]]",
    "symbolize": "[[file.pdf#page=3|the proof]]",
-   "symbolize_fragment": "[[file.pdf#page=3|the proof]]",
    "split": [
     [
      "[[file.pdf#page=3|the proof]]",
@@ -789,13 +645,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "![[lecture.pdf]]",
    "symbolize": "![[lecture.pdf]]",
-   "symbolize_fragment": "![[lecture.pdf]]",
    "split": [
     [
      "![[lecture.pdf]]",
@@ -803,13 +657,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "\\alpha `code` \\beta",
-   "symbolize": "α `code` β",
-   "symbolize_fragment": "α `code` β",
+   "symbolize": "α`code` β",
    "split": [
     [
      "\\alpha ",
@@ -825,13 +677,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "*italic* and **bold**",
    "symbolize": "*italic* and **bold**",
-   "symbolize_fragment": "*italic* and **bold**",
    "split": [
     [
      "*italic* and **bold**",
@@ -839,13 +689,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "snake_case_name",
    "symbolize": "snake_case_name",
-   "symbolize_fragment": "snake_case_name",
    "split": [
     [
      "snake_case_name",
@@ -873,29 +721,11 @@
      ]
     }
    ],
-   "scripts_fragment": [
-    {
-     "from": 5,
-     "to": 10,
-     "chain": [
-      "sub"
-     ]
-    },
-    {
-     "from": 10,
-     "to": 15,
-     "chain": [
-      "sub",
-      "sub"
-     ]
-    }
-   ],
    "renderable": true
   },
   {
    "raw": "\\sqrt 2",
-   "symbolize": "√ 2",
-   "symbolize_fragment": "√ 2",
+   "symbolize": "√2",
    "split": [
     [
      "\\sqrt 2",
@@ -903,13 +733,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "\\sqrt{x+1}",
    "symbolize": "√{x+1}",
-   "symbolize_fragment": "√{x+1}",
    "split": [
     [
      "\\sqrt{x+1}",
@@ -917,13 +745,11 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   },
   {
    "raw": "<!-- page:3 -->",
    "symbolize": "<!-- page:3 -->",
-   "symbolize_fragment": "<!-- page:3 -->",
    "split": [
     [
      "<!-- page:3 -->",
@@ -931,7 +757,6 @@
     ]
    ],
    "scripts": [],
-   "scripts_fragment": [],
    "renderable": true
   }
  ],

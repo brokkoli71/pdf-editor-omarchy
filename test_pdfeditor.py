@@ -4553,11 +4553,11 @@ class TestLatexFormatting(unittest.TestCase):
 
     def test_symbol_sub_in_sentence(self):
         v = self._view()
-        self.assertEqual(v._apply_symbol_subs(r'let \alpha = 1'), 'let α = 1')
+        self.assertEqual(v._apply_symbol_subs(r'let \alpha = 1'), 'let α= 1')
 
     def test_symbol_sub_multiple(self):
         v = self._view()
-        self.assertEqual(v._apply_symbol_subs(r'\alpha + \beta'), 'α + β')
+        self.assertEqual(v._apply_symbol_subs(r'\alpha + \beta'), 'α+ β')
 
     def test_symbol_sub_unknown_unchanged(self):
         v = self._view()
@@ -4579,8 +4579,7 @@ class TestLatexFormatting(unittest.TestCase):
         non-letter, so `\\Real` is unknown rather than "ℝeal"."""
         v = self._view()
         self.assertEqual(v._apply_symbol_subs(r'\Real'), r'\Real')
-        # a space before a backslash was never forced on you, so it survives
-        self.assertEqual(v._apply_symbol_subs(r'f: \R \to \R'), 'f: ℝ → ℝ')
+        self.assertEqual(v._apply_symbol_subs(r'f: \R \to \R'), 'f: ℝ→ℝ')
 
     def test_symbol_sub_no_backslash_unchanged(self):
         v = self._view()
@@ -4667,6 +4666,53 @@ class TestLatexFormatting(unittest.TestCase):
                  for m in MarkdownNotesView._SCRIPT_RE.finditer('a^t_i')]
         self.assertEqual(found, [('^', 't'), ('_', 'i')])
 
+    def test_a_command_can_BE_a_script(self):
+        """`x^\\alpha` is `x^α` by the time the script grammar runs, and α was
+        not in the body's character class — so the one maths idiom you cannot
+        write any other way rendered as nothing at all."""
+        v = self._view()
+        rendered = v._apply_symbol_subs(r'x^\alpha')
+        self.assertEqual(rendered, 'x^α')
+        self.assertEqual(
+            [(m.group(1), m.group(3))
+             for m, _c in sidemark.iter_scripts(rendered)],
+            [('^', 'α')])
+        # it chains and mixes with letters like any other body
+        self.assertEqual(
+            [c for _m, c in sidemark.iter_scripts(
+                v._apply_symbol_subs(r'a_\alpha_j'))],
+            [('sub',), ('sub', 'sub')])
+        self.assertEqual(
+            sidemark._MD_SCRIPT_RE.search(
+                v._apply_symbol_subs(r'e^\lambda t')).group(3), 'λt')
+
+    def test_a_symbol_is_a_script_body_but_not_a_script_terminator(self):
+        """The body grew; the terminating space is still group 4's, and one
+        space still ends the script whatever follows it."""
+        v = self._view()
+        rendered = v._apply_symbol_subs(r'x_i \alpha')
+        self.assertEqual(rendered, 'x_i α')      # nothing eats a space BEFORE
+        m = sidemark._MD_SCRIPT_RE.search(rendered)
+        self.assertEqual((m.group(3), m.group(4)), ('i', ' '))
+        # …so that space is the script's terminator and is hidden with it —
+        # and two spaces still leave one on screen
+        m = sidemark._MD_SCRIPT_RE.search(v._apply_symbol_subs(r'x_i  \alpha'))
+        self.assertEqual((m.group(3), m.group(4)), ('i', ' '))
+        self.assertEqual(sidemark._MD_SCRIPT_RE.search('x_α y').group(3), 'α')
+
+    def test_the_script_body_can_not_swallow_markdown(self):
+        """Every character the body gained is non-ASCII, which is what makes
+        the change safe: no line that renders today can change meaning."""
+        for ch in sidemark._MD_SYMBOLS.values():
+            self.assertGreater(ord(ch), 127, f"{ch!r} is ASCII")
+            self.assertEqual(len(ch), 1)
+        for line, bodies in (('x^2+y^2', ['2', '2']), ('a_i, b_j', ['i', 'j']),
+                             ('x_1/x_2', ['1', '2']), ('f(x_n)', ['n']),
+                             ('x^2*y', ['2'])):
+            self.assertEqual(
+                [m.group(3) for m in sidemark._MD_SCRIPT_RE.finditer(line)],
+                bodies, line)
+
     def test_script_re_keeps_a_leading_sign(self):
         from sidemark import MarkdownNotesView
         self.assertEqual(
@@ -4685,10 +4731,14 @@ class TestLatexFormatting(unittest.TestCase):
         self.assertEqual(v._apply_symbol_subs(r'\alpha x'), 'αx')
         self.assertEqual(v._apply_symbol_subs(r'\alpha  x'), 'α x')
         self.assertEqual(v._apply_symbol_subs(r'\alpha'), 'α')
-        # only a LETTER could have continued the command, so only there was a
-        # space forced on you — before an operator it is one you chose
-        self.assertEqual(v._apply_symbol_subs(r'\alpha + \beta'), 'α + β')
-        self.assertEqual(v._apply_symbol_subs(r'\alpha = 1'), 'α = 1')
+        # ONE space, whatever follows it. It used to depend on whether that
+        # character could have continued the command, which rendered three
+        # lines that look alike three ways (`\alpha a` closed up, `\alpha 1`
+        # and `\alpha +` did not) for a reason only the grammar could see.
+        self.assertEqual(v._apply_symbol_subs(r'\alpha 1'), 'α1')
+        self.assertEqual(v._apply_symbol_subs(r'\alpha + \beta'), 'α+ β')
+        self.assertEqual(v._apply_symbol_subs(r'\alpha  + \beta'), 'α + β')
+        self.assertEqual(v._apply_symbol_subs(r'\alpha = 1'), 'α= 1')
         # ...and there is no exception for operator symbols: `\cdot a` is "·a"
         self.assertEqual(v._apply_symbol_subs(r'2 \cdot a'), '2 ·a')
         # an unknown command keeps its space — nothing was substituted
@@ -4699,7 +4749,7 @@ class TestLatexFormatting(unittest.TestCase):
         self.assertEqual(_notes_to_pango_markup('a_i b'), 'a<sub>i</sub>b')
         self.assertEqual(_notes_to_pango_markup('a_i  b'), 'a<sub>i</sub> b')
         self.assertEqual(_notes_to_pango_markup('a_i + b'),
-                         'a<sub>i</sub> + b')
+                         'a<sub>i</sub>+ b')      # same rule as a command's
         # a brace terminates by itself, so the space after it is a real one
         self.assertEqual(_notes_to_pango_markup('a_{i} b'),
                          'a<sub>i</sub> b')
@@ -4894,13 +4944,14 @@ class TestLatexFormatting(unittest.TestCase):
         buf.set_text('other\n' + r'\alpha \beta x')
         buf.place_cursor(buf.get_iter_at_line(0)[1])
         v._rehighlight()
-        self.assertEqual(self._line_text(buf, 1), 'α βx')
-        # delete the rendered α — the whole \alpha goes with it, and \beta
+        self.assertEqual(self._line_text(buf, 1), 'αβx')
+        # delete the rendered α — the whole `\alpha ` goes with it, space
+        # included (it is the command's terminator, not a gap), and \beta
         # survives as a command rather than as a bare glyph
         s = buf.get_iter_at_line_offset(1, 0)[1]
         e = buf.get_iter_at_line_offset(1, 1)[1]
         buf.delete(s, e)
-        self.assertEqual(v.get_source_text(), 'other\n' + r' \beta x')
+        self.assertEqual(v.get_source_text(), 'other\n' + r'\beta x')
 
     def test_typing_a_command_renders_it_once_the_caret_moves_on(self):
         """Typed character by character: the command stays source while it is
@@ -4916,7 +4967,7 @@ class TestLatexFormatting(unittest.TestCase):
             typed += ch
             self.assertEqual(v.get_source_text(), typed)
         # the caret is still against the last command, so only that one is open
-        self.assertEqual(self._line_text(buf, 0), r'f: ℝ → \R')
+        self.assertEqual(self._line_text(buf, 0), r'f: ℝ→\R')
         self.assertEqual(v.get_source_text(), r'f: \R \to \R')
         # walk left off it and it renders; the source never changes
         for i in range(9, -1, -1):
@@ -4925,11 +4976,11 @@ class TestLatexFormatting(unittest.TestCase):
             v._rehighlight()
             self.assertEqual(v.get_source_text(), r'f: \R \to \R')
         # off every command now, so the line reads as maths…
-        self.assertEqual(self._line_text(buf, 0), 'f: ℝ → ℝ')
+        self.assertEqual(self._line_text(buf, 0), 'f: ℝ→ℝ')
         # …and clicking the first ℝ opens that one alone
         buf.place_cursor(buf.get_iter_at_line_offset(0, 3)[1])
         v._rehighlight()
-        self.assertEqual(self._line_text(buf, 0), r'f: \R → ℝ')
+        self.assertEqual(self._line_text(buf, 0), r'f: \R →ℝ')
 
     def test_a_selection_opens_every_line_it_covers(self):
         """Everything marked shows its source — the middle of a multi-line
@@ -4974,12 +5025,13 @@ class TestLatexFormatting(unittest.TestCase):
         self.assertEqual(self._line_text(buf, 0), 'βx')
         self.assertEqual(v.get_source_text(), r'\beta x')
 
-    def test_a_mid_line_segment_end_is_not_a_line_end(self):
-        """The rule is about the end of the LINE. Rendering runs per code/link
-        segment, and a segment that ends mid-line is followed by text that
-        never terminated anything."""
-        self.assertEqual(sidemark._symbolize(r'\alpha `x` b'), 'α `x` b')
+    def test_the_space_is_eaten_wherever_the_command_ends(self):
+        """One rule, and nothing left for it to depend on: a `code` span, the
+        end of the line and an ordinary letter all terminate a command the
+        same way."""
+        self.assertEqual(sidemark._symbolize(r'\alpha `x` b'), 'α`x` b')
         self.assertEqual(sidemark._symbolize(r'\alpha '), 'α')
+        self.assertEqual(sidemark._symbolize(r'\alpha  `x`'), 'α `x`')
 
     def test_triple_click_selects_the_whole_logical_line(self):
         """Everything up to the newline — one Return's worth of typing, however
@@ -5057,9 +5109,8 @@ class TestLatexFormatting(unittest.TestCase):
         # a fragment of a line is not the end of one: nothing terminated the
         # script before `code`, so its space is a real space
         self.assertEqual(
-            [m.group(0) for m, _c in sidemark.iter_scripts('a_i `x`',
-                                                           at_end=False)],
-            ['_i'])
+            [m.group(0) for m, _c in sidemark.iter_scripts('a_i `x`')],
+            ['_i '])
 
     def test_typing_the_space_closes_the_script(self):
         """The caret test uses the script WITHOUT the space it ate — otherwise
@@ -5074,6 +5125,65 @@ class TestLatexFormatting(unittest.TestCase):
         self.assertTrue(buf.get_iter_at_line_offset(0, 1)[1].has_tag(
             v._t["hide"]))                    # the `_` is hidden: rendered
         self.assertEqual(v.get_source_text(), 'a_i ')
+
+    def _backspace(self, v, buf):
+        """One Backspace through the view's key handler, then GTK's own delete
+        (which the handler always defers to by returning False)."""
+        v._on_key(None, Gdk.KEY_BackSpace, 0, Gdk.ModifierType(0))
+        it = buf.get_iter_at_mark(buf.get_insert())
+        start = it.copy()
+        if start.backward_char():
+            buf.delete(start, it)
+        v._rehighlight()
+
+    def test_backspace_takes_the_eaten_space_not_the_glyph(self):
+        """Deleting back to `\\alpha ` used to remove the whole command in one
+        keystroke: the space it ate is real source the caret is standing
+        behind, but nothing is drawn for it, so GTK's Backspace landed on the
+        α and the splice took `\\alpha ` with it."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text(r'\alpha ')
+        buf.place_cursor(buf.get_end_iter())
+        v._rehighlight()
+        self.assertEqual(buf.get_text(*buf.get_bounds(), True), 'α')
+        self._backspace(v, buf)
+        # the space went, the command came back into view to be edited
+        self.assertEqual(v.get_source_text(), r'\alpha')
+        self.assertEqual(buf.get_text(*buf.get_bounds(), True), r'\alpha')
+        # and from there Backspace is ordinary again: one letter at a time
+        self._backspace(v, buf)
+        self.assertEqual(v.get_source_text(), r'\alph')
+
+    def test_backspacing_up_to_a_symbol_stops_at_it(self):
+        """The user's sequence: write `\\alpha + b`, then hold Backspace. The
+        space before `+` is a real one and goes; the one that terminated the
+        command is next, and it is where the deleting stops being blind."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text(r'\alpha + b')
+        buf.place_cursor(buf.get_end_iter())
+        v._rehighlight()
+        for expected in (r'\alpha + ', r'\alpha +', r'\alpha ', r'\alpha'):
+            self._backspace(v, buf)
+            self.assertEqual(v.get_source_text(), expected)
+
+    def test_an_ordinary_backspace_is_left_alone(self):
+        """Only the eaten space opens a line. A space that is ON SCREEN is
+        deleted by GTK like any other character, and so is a glyph the caret
+        is not standing behind."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text(r'\alpha + b')
+        buf.place_cursor(buf.get_end_iter())     # off the command: it renders
+        v._rehighlight()
+        self.assertEqual(buf.get_text(*buf.get_bounds(), True), 'α+ b')
+        buf.place_cursor(buf.get_iter_at_line_offset(0, 2)[1])  # after "α+"
+        v._rehighlight()
+        self._backspace(v, buf)                                # deletes the +
+        self.assertEqual(v.get_source_text(), r'\alpha  b')
+        self._backspace(v, buf)                                # a real space
+        self.assertEqual(v.get_source_text(), r'\alpha b')
 
     def test_a_selection_still_opens_the_whole_line(self):
         """Two ends, two expressions — a selection that changed shape as it
@@ -5468,8 +5578,8 @@ class TestCalloutMarkup(unittest.TestCase):
         return ok
 
     def test_symbols_always_substituted(self):
-        self.assertEqual(self._markup(r'\alpha + \beta'), 'α + β')
-        self.assertEqual(self._markup(r'\sum \mapsto'), 'Σ ↦')
+        self.assertEqual(self._markup(r'\alpha + \beta'), 'α+ β')
+        self.assertEqual(self._markup(r'\sum \mapsto'), 'Σ↦')
 
     def test_superscript_and_subscript(self):
         self.assertEqual(self._markup('x^2'), 'x<sup>2</sup>')
@@ -5500,7 +5610,7 @@ class TestCalloutMarkup(unittest.TestCase):
     def test_rendering_still_applies_outside_code(self):
         self.assertEqual(
             self._markup(r'\alpha `x_1` x^2'),
-            'α <tt>x_1</tt> x<sup>2</sup>')
+            'α<tt>x_1</tt> x<sup>2</sup>')
 
     def test_wiki_link_renders_underlined_and_verbatim(self):
         # a [[link]] shows as an underlined label with nothing else applied
