@@ -17638,6 +17638,31 @@ class TestPDFImageLayer(unittest.TestCase):
             # exporting must not leave the layer painted into the live document
             self.assertEqual(self._our_count(canvas), 0)
 
+    def test_a_stretched_image_is_saved_at_the_rect_it_was_stretched_to(self):
+        """REGRESSION (found via row 167, but never specific to it): the rect
+        is the TRUTH, and `insert_image` treats it as a suggestion — by default
+        it fits the picture inside at the picture's own aspect and centres it.
+        Row 122's side handles stretch one axis on purpose, so the default
+        letterboxed every stretched image and wrote a file that did not match
+        the canvas. Asserts the placement MATRIX, because the file looked
+        plausible and only the numbers show the shift."""
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "in.pdf")
+            make_pdf(src, n_pages=1)
+            canvas = self._canvas(src)
+            im = canvas.add_image(self._png(100, 50), at=(100, 100))
+            # the model's rect is (x, y, W, H) — a 2:1 picture told to fill a
+            # square, which is exactly what a side handle does
+            im["rect"] = (50.0, 50.0, 200.0, 200.0)
+            out = os.path.join(d, "out.pdf")
+            canvas.save(out)
+            content = fitz.open(out)[0].read_contents().decode("latin-1")
+            m = re.search(r"([\d.]+) 0 0 ([\d.]+) ([\d.]+) ([\d.]+) cm", content)
+            self.assertIsNotNone(m, content)
+            w, h = float(m.group(1)), float(m.group(2))
+            self.assertAlmostEqual(w, 200.0, places=1)
+            self.assertAlmostEqual(h, 200.0, places=1)   # NOT 100, and not moved
+
     def test_uniquify_png_changes_bytes_but_not_pixels(self):
         png = self._png()
         out = sidemark.uniquify_png(png)
@@ -17647,10 +17672,345 @@ class TestPDFImageLayer(unittest.TestCase):
         self.assertEqual(sidemark.uniquify_png(b"not a png"), b"not a png")
 
 
+def _doc_with_one_image(rect=(50, 60, 150, 140)):
+    """A one-page document with one plain, importable picture on it — shared
+    with the window-tier test, which lives in another class so that class's
+    window build does not drag the cheap tests here into the slow tier."""
+    src = fitz.open()
+    ip = src.new_page(width=100, height=80)
+    ip.draw_rect(fitz.Rect(0, 0, 100, 80), fill=(0, 0, 1))
+    png = ip.get_pixmap().tobytes("png")
+    doc = fitz.open()
+    doc.new_page(width=300, height=400).insert_image(fitz.Rect(*rect),
+                                                     stream=png)
+    return fitz.open("pdf", doc.tobytes())
+
+
+class TestImportPageImages(unittest.TestCase):
+    """Row 167: a picture that arrived WITH the PDF becomes one of our objects.
+
+    The promise the feature makes is "open it in a browser and it looks the
+    same until you move something", so most of these drive the pixels rather
+    than the bookkeeping — a test that only checks the model would pass while
+    the page renders differently, which is the whole failure mode."""
+
+    def _png(self, w=100, h=80, color=(0, 0, 1)):
+        """The picture's aspect must MATCH the rect it is placed in, or
+        insert_image fits it inside and centres it — and then the rect under
+        test is not the rect that was asked for."""
+        doc = fitz.open()
+        page = doc.new_page(width=w, height=h)
+        page.draw_rect(fitz.Rect(0, 0, w, h), fill=color)
+        return page.get_pixmap().tobytes("png")
+
+    def _doc_with_image(self, rect=(50, 60, 150, 140), n_pages=1, **kw):
+        """A saved-and-reopened document — reopening matters, because an
+        in-memory insert_image has not been through the writer yet."""
+        doc = fitz.open()
+        for _ in range(n_pages):
+            page = doc.new_page(width=300, height=400)
+            page.insert_image(fitz.Rect(*rect), stream=self._png(), **kw)
+        return fitz.open("pdf", doc.tobytes())
+
+    def _canvas_for(self, doc):
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            path = f.name
+        doc.save(path)
+        canvas = PDFCanvas()
+        canvas.load(path)
+        self._tmp = path
+        return canvas
+
+    def tearDown(self):
+        if getattr(self, "_tmp", None) and os.path.exists(self._tmp):
+            os.unlink(self._tmp)
+
+    # ── the classifier ────────────────────────────────────────────────────────
+
+    def test_a_plain_placement_is_found_at_the_rect_it_occupies(self):
+        doc = self._doc_with_image(rect=(50, 60, 150, 140))
+        recs = sidemark.import_candidates(doc, doc[0])
+        self.assertEqual(len(recs), 1)
+        self.assertIsNone(recs[0]["reason"])
+        # our rects run top-left down, the PDF places from the bottom-left
+        self.assertEqual(recs[0]["rect"], (50.0, 60.0, 100.0, 80.0))
+
+    def test_a_rotated_placement_is_refused(self):
+        """Not squeamishness: a tilt is baked into fresh pixels on save
+        (_layer_bytes_for), so a rotated import would come back RESAMPLED —
+        which is exactly the promise being broken, quietly."""
+        doc = self._doc_with_image(rotate=90)
+        reasons = [r["reason"] for r in sidemark.import_candidates(doc, doc[0])]
+        self.assertEqual(len(reasons), 1)
+        self.assertIsNotNone(reasons[0])
+
+    def test_an_image_used_on_another_page_is_imported_as_its_own_copy(self):
+        """Importing marks the OBJECT ours, and ownership is what the save
+        strips — so REUSING a logo that is page content on 40 other slides
+        would delete it from all of them. That is an argument for giving the
+        import its own object, not for declining: measured on real lecture
+        PDFs, sharing is the normal case (70 of 124 placements), so refusing it
+        left the feature working on a third of real pictures."""
+        doc = self._doc_with_image(n_pages=2)
+        recs = sidemark.import_candidates(doc, doc[0])
+        self.assertEqual(len(recs), 1)
+        self.assertIsNone(recs[0]["reason"])
+        self.assertTrue(recs[0]["shared"])
+        _png, reuse = sidemark.import_image_bytes(doc, recs[0]["xref"],
+                                                  recs[0]["shared"])
+        self.assertEqual(reuse, 0)      # a copy, so the original is untouched
+
+    def test_importing_a_shared_image_leaves_the_other_page_alone(self):
+        """The corruption this guards against, driven end to end: page 2 must
+        still render its copy after page 1's has been imported AND saved."""
+        canvas = self._canvas_for(self._doc_with_image(n_pages=2))
+        original = fitz.open(self._tmp)
+        imported, _skipped = canvas.import_page_images(0)
+        self.assertEqual(len(imported), 1)
+        out = self._tmp + ".out.pdf"
+        try:
+            canvas.save(out)
+            saved = fitz.open(out)
+            self.assertTrue(sidemark.render_matches(original[1], saved[1]))
+            self.assertTrue(sidemark.render_matches(original[0], saved[0]))
+        finally:
+            if os.path.exists(out):
+                os.unlink(out)
+
+    def test_an_image_drawn_twice_on_one_page_becomes_two_objects(self):
+        """Each placement is its own object, at its own rect, on its own copy
+        of the pixels — so moving one does not move the other. REGRESSION on
+        the counting: PyMuPDF hands out a FRESH resource name when it re-places
+        an existing xref, so counting by NAME says "drawn once" about a picture
+        that is on the page twice. The count is by xref."""
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=400)
+        xref = page.insert_image(fitz.Rect(10, 10, 70, 70), stream=self._png())
+        page.insert_image(fitz.Rect(100, 100, 160, 160), xref=xref)
+        doc = fitz.open("pdf", doc.tobytes())
+        recs = sidemark.import_candidates(doc, doc[0])
+        self.assertEqual(len(recs), 2)
+        self.assertTrue(all(r["reason"] is None for r in recs))
+        self.assertTrue(all(r["shared"] for r in recs))      # …so each copies
+        self.assertEqual(len({r["rect"] for r in recs}), 2)  # two places
+
+    def test_do_inside_a_string_is_not_a_placement(self):
+        """The tokeniser earns its keep here: a content stream is not text, and
+        a regex for `/Name Do` matches inside a string a page is drawing."""
+        stream = b"BT /F1 12 Tf (a /Thing Do b) Tj ET"
+        self.assertEqual(sidemark.content_placements(stream), [])
+
+    def test_the_ctm_is_tracked_through_q_and_cm(self):
+        """A placement's position can be built up across operations, so the
+        matrix in force is not the last `cm` in the stream."""
+        stream = b"q 2 0 0 2 10 10 cm q 3 0 0 3 1 1 cm /Im Do Q Q"
+        (name, ctm, _s, _e), = sidemark.content_placements(stream)
+        self.assertEqual(name, "Im")
+        self.assertEqual(tuple(round(v, 3) for v in ctm), (6, 0, 0, 6, 12, 12))
+
+    # ── the render check, which is what tests the promise ─────────────────────
+
+    def test_an_image_under_something_is_refused_by_the_render(self):
+        """The check no rule could make. Our layer is APPENDED, so an imported
+        picture draws on top of the whole page — fine for a figure with nothing
+        over it, wrong for one under a caption box. Only rendering both ways
+        can tell which this is."""
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=400)
+        page.insert_image(fitz.Rect(50, 50, 250, 250), stream=self._png())
+        page.draw_rect(fitz.Rect(80, 80, 200, 120), fill=(1, 0, 0))  # over it
+        doc = fitz.open("pdf", doc.tobytes())
+        canvas = self._canvas_for(doc)
+        imported, skipped = canvas.import_page_images(0)
+        self.assertEqual(imported, [])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("look different", skipped[0][1])
+
+    def test_a_figure_with_nothing_over_it_is_imported(self):
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=400)
+        page.insert_image(fitz.Rect(50, 50, 150, 130), stream=self._png(100, 80))
+        page.insert_text((40, 300), "a caption, well clear of it")
+        doc = fitz.open("pdf", doc.tobytes())
+        canvas = self._canvas_for(doc)
+        imported, skipped = canvas.import_page_images(0)
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(imported), 1)
+        self.assertEqual(imported[0]["rect"], (50.0, 50.0, 100.0, 80.0))
+        self.assertIn(imported[0], canvas.all_images[0])
+
+    def test_an_image_with_a_soft_mask_keeps_its_transparency(self):
+        """A logo with a transparent background is the COMMON case in a real
+        deck (two of the first three tried), and `extract_image` returns the
+        base image WITHOUT its mask — so importing one naively puts an opaque
+        block on the page. Found by the render check, which is the argument for
+        having one: nothing here anticipated soft masks."""
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=400)
+        # a picture that is half transparent: PyMuPDF stores the alpha as an
+        # /SMask on a separate xref, which is the shape being tested
+        base = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 100, 80), False)
+        base.clear_with(40)                 # a dark, flat picture…
+        mask = fitz.Pixmap(fitz.csGRAY, fitz.IRect(0, 0, 100, 80), False)
+        mask.clear_with(128)                # …that is half see-through
+        rgba = fitz.Pixmap(base, mask)
+        page.insert_image(fitz.Rect(50, 50, 150, 130),
+                          stream=rgba.tobytes("png"))
+        doc = fitz.open("pdf", doc.tobytes())
+        recs = sidemark.import_candidates(doc, doc[0])
+        self.assertEqual(len(recs), 1)
+        png, reuse = sidemark.import_image_bytes(doc, recs[0]["xref"])
+        out = fitz.Pixmap(png)
+        if not doc.extract_image(recs[0]["xref"]).get("smask"):
+            self.skipTest("this PyMuPDF stored the alpha inline, not as /SMask")
+        self.assertTrue(out.alpha)      # the mask came back with the pixels
+        self.assertEqual(reuse, 0)      # …so there is nothing to re-place by
+        canvas = self._canvas_for(doc)
+        imported, skipped = canvas.import_page_images(0)
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(imported), 1)
+
+    # ── what the user actually gets ───────────────────────────────────────────
+
+    def test_an_imported_image_is_an_object_like_any_other(self):
+        """The whole point: it must be selectable, movable and deletable by the
+        SAME code paths as a pasted one — not a special kind of image."""
+        canvas = self._canvas_for(self._doc_with_image())
+        canvas.tool = "lasso"
+        imported, _ = canvas.import_page_images(0)
+        im = imported[0]
+        self.assertTrue(canvas.has_lasso_selection())   # ready to drag
+        x, y, w, h = im["rect"]
+        self.assertIsNotNone(canvas._object_at(x + w / 2, y + h / 2))
+        canvas.delete_selected_strokes()
+        self.assertNotIn(im, canvas.all_images.get(0, []))
+
+    def test_the_page_stops_drawing_what_the_model_now_holds(self):
+        """Both halves or it renders twice — the ghost that row 118's
+        `_detach_image_layer` exists to prevent, in the other direction."""
+        canvas = self._canvas_for(self._doc_with_image())
+        before = canvas.document[0].read_contents()
+        imported, _ = canvas.import_page_images(0)
+        self.assertEqual(len(imported), 1)
+        after = canvas.document[0].read_contents()
+        self.assertLess(len(after), len(before))
+        self.assertEqual(sidemark.import_candidates(
+            canvas.document, canvas.document[0], canvas._image_ocg()), [])
+
+    def test_the_saved_file_looks_the_same_as_the_one_that_went_in(self):
+        """THE test. Import, save, and compare the rendered pages — this is
+        the promise the feature makes, and the only assertion that checks it
+        end to end rather than in pieces."""
+        canvas = self._canvas_for(self._doc_with_image())
+        original = fitz.open(self._tmp)
+        imported, _ = canvas.import_page_images(0)
+        self.assertEqual(len(imported), 1)
+        out = self._tmp + ".out.pdf"
+        try:
+            canvas.save(out)
+            self.assertTrue(sidemark.render_matches(original[0],
+                                                    fitz.open(out)[0]))
+        finally:
+            if os.path.exists(out):
+                os.unlink(out)
+
+    def test_the_saved_image_keeps_its_original_bytes(self):
+        """Re-placed BY REFERENCE, never re-encoded — which is what makes the
+        render test above pass exactly rather than nearly, and why only
+        axis-aligned placements are taken."""
+        canvas = self._canvas_for(self._doc_with_image())
+        imported, _ = canvas.import_page_images(0)
+        was = imported[0]["_xref"]
+        out = self._tmp + ".out.pdf"
+        try:
+            canvas.save(out)
+            saved = fitz.open(out)
+            self.assertEqual(
+                fitz.Pixmap(saved.extract_image(
+                    [x for x in range(1, saved.xref_length())
+                     if saved.xref_get_key(x, "Subtype")[1] == "/Image"][0]
+                )["image"]).samples,
+                fitz.Pixmap(imported[0]["data"]).samples)
+            self.assertGreater(was, 0)
+        finally:
+            if os.path.exists(out):
+                os.unlink(out)
+
+    def test_an_import_is_one_undo_and_puts_the_page_back(self):
+        """Undo has to restore BOTH halves — drop the object AND put the paint
+        operation back — or the picture vanishes off the page entirely."""
+        canvas = self._canvas_for(self._doc_with_image())
+        before = canvas.document[0].read_contents()
+        original = fitz.open(self._tmp)
+        canvas.import_page_images(0)
+        canvas.undo_last()
+        self.assertEqual(canvas.all_images.get(0, []), [])
+        self.assertTrue(sidemark.render_matches(original[0],
+                                                canvas.document[0]))
+        canvas.redo_last()
+        self.assertEqual(len(canvas.all_images.get(0, [])), 1)
+        self.assertNotEqual(canvas.document[0].read_contents(), before)
+
+    def test_our_own_pasted_images_are_not_offered_for_import(self):
+        """They are already objects. Offering them would be a no-op at best and
+        a double placement at worst."""
+        canvas = self._canvas_for(self._doc_with_image())
+        canvas.add_image(self._png(), at=(200, 300))
+        canvas.save(self._tmp)
+        again = PDFCanvas()
+        again.load(self._tmp)
+        again.attach_images(None)          # adopts the layer, then detaches it
+        recs = sidemark.import_candidates(again.document, again.document[0],
+                                          again._image_ocg())
+        # exactly the document's OWN picture is on offer — ours is already an
+        # object, and offering it back would place it on the page twice
+        self.assertEqual(len(recs), 1)
+        self.assertIsNone(recs[0]["reason"])
+        self.assertEqual(len(again.all_images.get(0, [])), 1)
+
+    def test_a_page_with_no_pictures_reports_nothing(self):
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            self._tmp = f.name
+        make_pdf(self._tmp, n_pages=1)
+        canvas = PDFCanvas()
+        canvas.load(self._tmp)
+        self.assertEqual(canvas.import_page_images(0), ([], []))
+
+
 class TestPDFImageSidecarInWindow(unittest.TestCase):
     """The window-level round trip. The canvas-level test above passes even
     when the window's save gate drops the file — that is exactly how the text
     side lost image-only pages (row 118), so drive the window's own methods."""
+
+    def test_the_menu_entry_reaches_the_import(self):
+        """The reachability trap: the canvas tests above all pass while the ☰
+        entry is wired to nothing, or is hidden in the mode you are in. Drives
+        the WINDOW method the menu item calls, on a real document."""
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.importimages")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "figures.pdf")
+                    _doc_with_one_image().save(pdf)
+                    win = PDFEditorWindow(a)
+                    win._do_open_file(pdf)
+                    win._import_page_images()
+                    self.assertEqual(len(win.canvas.all_images.get(0, [])), 1)
+                    # …and it is one of the PDF-only entries, so a text page
+                    # never offers a verb it cannot perform
+                    self.assertTrue(win._pdf_menu_items)
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
 
     def _run_in_window(self, body):
         errors = []

@@ -22,6 +22,7 @@ import struct
 import zlib
 import uuid
 from typing import NamedTuple
+from collections import Counter
 
 RECENT_PATH = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
@@ -4214,6 +4215,113 @@ class PDFCanvas(Gtk.DrawingArea):
         self._add_images([im])
         return im
 
+    def import_page_images(self, idx=None):
+        """Take the page's OWN images — the ones that arrived with the PDF —
+        into the model, so they move, rotate, resize and delete like a pasted
+        one (row 167). Returns (imported, skipped), skipped as
+        [(name, reason)] for the report.
+
+        Nothing is imported that would not look the same afterwards. The
+        classifier rejects what our model cannot hold; the RENDER decides the
+        rest, because z-order is not something a rule can read off a placement.
+        A page whose images all pass costs one render pair; only a page that
+        fails pays for the per-image bisect."""
+        idx = self.current_page_idx if idx is None else idx
+        if self.document is None or not (0 <= idx < self.n_pages):
+            return [], []
+        ocg = self._image_ocg()
+        cands = import_candidates(self.document, self.document[idx], ocg)
+        skipped = [(r["name"], r["reason"]) for r in cands if r["reason"]]
+        ready = [r for r in cands if r["reason"] is None]
+        if not ready:
+            return [], skipped
+        good, moved = self._importable_by_render(idx, ready)
+        skipped += [(r["name"], "it would look different once it is on top")
+                    for r in moved]
+        if not good:
+            return [], skipped
+        return self._commit_image_import(idx, good), skipped
+
+    def _importable_by_render(self, idx, ready):
+        """Split `ready` into (looks the same, would move). All of them
+        together first — the answer on almost every page, for one render pair
+        — and only then one at a time."""
+        page = self.document[idx]
+        if render_matches(page, _trial_page(self.document, idx, ready)[0]):
+            return ready, []
+        good, moved = [], []
+        for rec in ready[:IMPORT_MAX_TRIALS]:
+            trial = _trial_page(self.document, idx, [rec])
+            (good if render_matches(page, trial[0]) else moved).append(rec)
+        moved += ready[IMPORT_MAX_TRIALS:]
+        # each is fine alone, but two that overlap EACH OTHER can still swap
+        # order once both are on top, so the set has to be re-tested as a set
+        while good and not render_matches(
+                page, _trial_page(self.document, idx, good)[0]):
+            moved.append(good.pop())
+        return good, moved
+
+    def _commit_image_import(self, idx, accepted):
+        """Move `accepted` out of the page's content and into the model.
+
+        The spans are re-derived here, after `clean_contents()`: cleaning
+        rewrites the stream, so every offset measured before it is stale.
+        Identity across that is (xref, RECT), never the xref alone — one image
+        can be placed twice on a page, and matching on the object would strip
+        both placements when only one was accepted."""
+        page = self.document[idx]
+        before = page.read_contents()
+        page.clean_contents()
+        wanted = {(r["xref"], r["rect"]) for r in accepted}
+        fresh = [r for r in import_candidates(self.document, page,
+                                              self._image_ocg())
+                 if (r["xref"], r["rect"]) in wanted and r["reason"] is None]
+        if not fresh:
+            return []
+        images = []
+        for rec in fresh:
+            try:
+                png, reuse = import_image_bytes(self.document, rec["xref"],
+                                                rec["shared"])
+            except (RuntimeError, KeyError, TypeError):
+                continue
+            texture = _texture_from_png(png)
+            if texture is None:
+                continue     # unreadable bytes: leave it as page content
+            images.append({
+                "data": png, "texture": texture,
+                "rect": rec["rect"], "rotate": 0.0,
+                # `reuse` re-places BY REFERENCE on save, so the bytes never
+                # change — the whole point of only importing what is
+                # axis-aligned. A recomposed soft mask has no xref to reuse.
+                "_xref": reuse, "_baked": 0.0,
+            })
+        if not images:
+            return []
+        strip_placements(self.document, page, fresh)
+        after = page.read_contents()
+        self.all_images.setdefault(idx, []).extend(images)
+        self._undo_stack.append(("import_images", idx, list(images),
+                                 before, after))
+        self._redo_stack.clear()
+        # the re-render FIRST: _load_page clears the selection (it is per-page
+        # and transient), so selecting before it hands back nothing to drag
+        self._load_page(idx)          # the page render must lose them too
+        self._set_selected([], list(images))
+        if self.on_change:
+            self.on_change()
+        logger.info(f"import: {len(images)} image(s) off page {idx + 1} "
+                    f"into the model")
+        return images
+
+    def _set_page_content(self, idx, content):
+        """Replace one page's content stream — how an import is undone."""
+        page = self.document[idx]
+        streams = page.get_contents()
+        if streams:
+            self.document.update_stream(streams[0], content)
+            self._load_page(idx)
+
     def _add_images(self, images):
         """Put `images` on the current page as ONE undo entry, and select them
         — a paste you can immediately move is the point of the lasso."""
@@ -7002,6 +7110,11 @@ class PDFCanvas(Gtk.DrawingArea):
                     op = self._undo_stack.pop()
                     popped.append(op)
                     self._undo_add_op(page, op)
+        elif op[0] == "import_images":
+            # an import moved pixels between two places that both draw them;
+            # putting it back means BOTH halves, or the page shows it twice
+            self._undo_add_op(page, ("add_images", page, op[2]))
+            self._set_page_content(page, op[3])
         elif op[0] == "lasso_move":
             _, _, refs, imgs, dx, dy = op
             for s in refs:
@@ -7065,6 +7178,9 @@ class PDFCanvas(Gtk.DrawingArea):
         elif ops[0][0] == "reshape":
             for st, _old, new_pts in ops[0][2]:
                 st["pts"] = list(new_pts)
+        elif ops[0][0] == "import_images":
+            self._redo_add_op(page, ("add_images", page, ops[0][2]))
+            self._set_page_content(page, ops[0][4])
         elif ops[0][0] == "lasso_move":
             _, _, refs, imgs, dx, dy = ops[0]
             for s in refs:
@@ -7246,9 +7362,17 @@ class PDFCanvas(Gtk.DrawingArea):
                     xref = 0    # its object is gone (a new document, a reload)
                 if xref and im.get("_baked") != im.get("rotate", 0.0):
                     xref = 0    # the tilt changed, so the BYTES changed
+                # keep_proportion=False, or the rect is a SUGGESTION: by
+                # default insert_image fits the picture INSIDE it at the
+                # picture's own aspect and centres it. Our rect is the truth —
+                # row 122's side handles stretch one axis on purpose — so the
+                # default silently letterboxed every stretched image, writing
+                # a file that did not match the canvas. Found through the
+                # import (row 167), where a full-page scan came back shifted
+                # 1.8pt down, but it was never specific to importing.
                 new = page.insert_image(
                     rect, xref=xref, stream=None if xref else uniquify_png(data),
-                    oc=ocg)
+                    oc=ocg, keep_proportion=False)
                 im["_xref"] = new or xref
                 im["_baked"] = im.get("rotate", 0.0)
                 placed += 1
@@ -8073,6 +8197,343 @@ def layer_images_as_sidecar(doc, ocg):
         if found:
             pages[str(i)] = found
     return pages
+
+
+# ── importing the document's OWN images (row 167) ─────────────────────────────
+# Everything above this line is about images SIDEMARK placed. This section is
+# the other direction: take an image that arrived with the PDF — from Word,
+# LaTeX, a scanner — and make it one of our objects, so it can be moved,
+# rotated, resized and deleted like a pasted one.
+#
+# The promise is "open it in a browser and it looks the same until you move
+# something", and the whole design is about keeping that a promise rather than
+# a hope. A placement is only importable when it round-trips BIT-IDENTICALLY,
+# which rules out more than it sounds:
+#
+#   * Z-ORDER. Our layer is appended, so everything we place draws on top of
+#     the whole page. A figure with nothing over it looks identical up there;
+#     a watermark under the text does not.
+#   * A ROTATED placement. `_layer_bytes_for` bakes a tilt into fresh pixels
+#     (a PDF placement carries no free angle), so a rotated image would come
+#     back RESAMPLED — visibly softer, and a bigger file. Only an axis-aligned,
+#     unflipped, unskewed placement can be re-placed by reference.
+#   * An image used MORE THAN ONCE. Importing marks the xref `/OC` ours, and
+#     ownership is what `strip_image_layer` acts on — so adopting a logo that
+#     is also page content on 40 other slides would have those placements
+#     stripped on the next save. That is a corrupted document, not a bad
+#     import.
+#
+# The classifier below rejects the last two by reading the placement. It
+# cannot reason about the first, so nothing does: `render_matches` RENDERS the
+# page as it is and as it would be saved, and compares the pixels. That is the
+# only check that actually tests the promise, and it catches in one step
+# everything a static analysis would have to enumerate — soft masks, blend
+# modes, clipping paths, a figure under a caption.
+
+# how far two renders may drift and still count as "the same page": a placement
+# re-fitted to our float rect can land a hair differently, so the test is how
+# MANY pixels moved, not whether any did
+IMPORT_RENDER_DPI = 110
+IMPORT_DIFF_CHANNEL = 16      # a pixel counts as changed past this
+IMPORT_DIFF_FRACTION = 0.002  # …and this share of them may change
+IMPORT_MAX_TRIALS = 12        # bisecting a page costs a render each
+
+
+def _skip_content_string(data, i):
+    """Index just past the literal string starting at data[i] == '('."""
+    depth, i = 0, i
+    while i < len(data):
+        ch = data[i:i + 1]
+        if ch == b"\\":
+            i += 2
+            continue
+        if ch == b"(":
+            depth += 1
+        elif ch == b")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return len(data)
+
+
+def content_placements(content):
+    """Every `/Name Do` in a content stream, as
+    (name, ctm, start, end) — the CTM in force at that point, and the byte
+    span of the `/Name Do` itself.
+
+    Only the `Do` is spanned, and that is deliberate: removing exactly the one
+    paint operation can never corrupt the page. The `cm` that positioned it may
+    be shared with whatever is drawn next, and an empty `q … cm … Q` left
+    behind is a no-op.
+
+    A tokeniser rather than a regex because a content stream is not a text
+    format: `Do` can appear inside a string, a matrix can be split across
+    operations, and an inline image's binary data can contain anything at all.
+    The Resources dict plus the stream are ground truth here — the same rule
+    as `our_placements` (row 118)."""
+    out, i, n = [], 0, len(content)
+    ctm = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    stack, nums, name, name_at = [], [], None, 0
+    while i < n:
+        ch = content[i:i + 1]
+        if ch in b" \t\r\n\f\x00":
+            i += 1
+            continue
+        if ch == b"%":
+            j = content.find(b"\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if ch == b"(":
+            i = _skip_content_string(content, i)
+            continue
+        if ch == b"<":                      # hex string or dict — neither is
+            if content[i + 1:i + 2] == b"<":  # an operand we care about
+                i += 2
+                continue
+            j = content.find(b">", i)
+            i = n if j < 0 else j + 1
+            continue
+        if ch in b">[]{}":
+            i += 1
+            continue
+        if ch == b"/":
+            j = i + 1
+            while j < n and content[j:j + 1] not in b" \t\r\n\f/[]<>(){}%":
+                j += 1
+            name, name_at = content[i + 1:j].decode("latin-1"), i
+            i = j
+            continue
+        if ch in b"+-.0123456789":
+            j = i
+            while j < n and content[j:j + 1] in b"+-.0123456789eE":
+                j += 1
+            try:
+                nums.append(float(content[i:j]))
+            except ValueError:
+                nums.append(0.0)
+            i = j
+            continue
+        j = i
+        while j < n and content[j:j + 1] not in b" \t\r\n\f/[]<>(){}%":
+            j += 1
+        op, i = content[i:j], j
+        if op == b"q":
+            stack.append(ctm)
+        elif op == b"Q":
+            ctm = stack.pop() if stack else (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        elif op == b"cm" and len(nums) >= 6:
+            a, b, c, d, e, f = nums[-6:]
+            A, B, C, D, E, F = ctm
+            ctm = (a * A + b * C, a * B + b * D,
+                   c * A + d * C, c * B + d * D,
+                   e * A + f * C + E, e * B + f * D + F)
+        elif op == b"Do" and name is not None:
+            out.append((name, ctm, name_at, j))
+        elif op == b"BI":               # an inline image's data is arbitrary
+            k = content.find(b"EI", i)  # bytes: skip to the end of it or the
+            i = n if k < 0 else k + 2   # tokeniser will read it as operators
+        if op != b"Do":
+            name = None
+        nums = []
+    return out
+
+
+def page_image_names(doc, page):
+    """{resource name: xref} of the page's image XObjects, from the Resources
+    dict — the only thing that does not lie about which xref a name means."""
+    key = doc.xref_get_key(page.xref, "Resources/XObject")
+    if key[0] != "dict":
+        return {}
+    out = {}
+    for name, xref in re.findall(r"/([^\s/]+)\s+(\d+) 0 R", key[1]):
+        xref = int(xref)
+        try:
+            if doc.xref_get_key(xref, "Subtype")[1] == "/Image":
+                out[name] = xref
+        except (RuntimeError, ValueError):
+            continue
+    return out
+
+
+def _xref_page_uses(doc, xref):
+    """How many pages reference `xref` in their Resources. Importing marks the
+    object as ours, so an image that is ALSO page content somewhere else would
+    have that placement stripped on the next save."""
+    uses = 0
+    needle = f"{xref} 0 R"
+    for i in range(len(doc)):
+        key = doc.xref_get_key(doc[i].xref, "Resources/XObject")
+        if key[0] == "dict" and needle in key[1]:
+            uses += 1
+            if uses > 1:
+                break
+    return uses
+
+
+def import_candidates(doc, page, ocg=None):
+    """Every image placement on `page` that did not come from us, classified.
+
+    Each record is {name, xref, span, rect, reason}: `rect` in our top-left
+    document units, `reason` None when it can be imported and a sentence for
+    the report when it cannot. Reporting the rejects is the feature — an
+    import that silently takes two of five images teaches nothing."""
+    content = page.read_contents()
+    names = page_image_names(doc, page)
+    ours = {n for n, _x in our_placements(doc, page, ocg)} if ocg else set()
+    placements = content_placements(content)
+    # counted by XREF, never by resource name: one image can be reached through
+    # two names on the same page (PyMuPDF hands out a fresh name per
+    # insert_image even when re-placing an existing xref), and ownership is a
+    # property of the OBJECT — so a name-based count says "drawn once" about a
+    # picture that is on the page twice
+    drawn = Counter(names.get(n) for n, _c, _s, _e in placements)
+    out = []
+    for name, ctm, start, end in placements:
+        xref = names.get(name)
+        if xref is None or name in ours:
+            continue            # not an image, or already one of our objects
+        a, b, c, d, e, f = ctm
+        rec = {"name": name, "xref": xref, "span": (start, end),
+               "rect": None, "reason": None, "shared": False}
+        if abs(b) > 1e-6 or abs(c) > 1e-6 or a <= 0 or d <= 0:
+            # rotated, flipped or skewed: our model is a rect plus an angle,
+            # and even the angle would be re-rendered on save rather than
+            # re-placed, so the picture would come back resampled
+            rec["reason"] = "it is rotated, flipped or skewed"
+        else:
+            # A SHARED picture is imported as its own COPY, not refused.
+            # Ownership is a property of the object, so marking a logo that is
+            # also on 40 other slides would strip it from all of them — but
+            # that is an argument for giving the import its own object, not for
+            # declining. Measured on 12 real lecture PDFs: sharing is the
+            # NORMAL case (70 of 124 placements — every template logo), so
+            # refusing it left the feature working on a third of real pictures.
+            # The copy costs one re-encode and nothing else; the original
+            # object is never touched, so the other pages keep their placement.
+            rec["shared"] = (drawn[xref] > 1 or _xref_page_uses(doc, xref) > 1)
+            # PDF places from the BOTTOM-left, our rects run top-left down
+            rec["rect"] = (round(e, 2), round(page.rect.height - f - d, 2),
+                           round(a, 2), round(d, 2))
+        out.append(rec)
+    return out
+
+
+def import_image_bytes(doc, xref, shared=False):
+    """(PNG bytes, xref to re-place by) for an image we are importing. A zero
+    xref means "no object to reuse — encode these bytes fresh on save".
+
+    Usually the object's own bytes, re-placed by reference so nothing is
+    re-encoded. Two things give that up, and both are the common case rather
+    than the exception:
+
+    * `shared` — the object is placed somewhere else as well. Importing marks
+      it `/OC` ours and ownership is what the save strips, so reusing it would
+      delete a template logo from every other slide. Its own copy costs one
+      re-encode and leaves the original untouched.
+    * A SOFT MASK. `extract_image` returns the base image WITHOUT its mask, so
+      a logo with a transparent background would import as an opaque block.
+      Recomposed into an RGBA PNG here.
+
+    The second was found by the render check rather than by reasoning —
+    nothing anticipated soft masks, and two of the three images in the first
+    real deck had one. That is the argument for checking the pixels instead of
+    enumerating the ways a page can differ."""
+    info = doc.extract_image(xref)
+    smask = info.get("smask") or 0
+    if not smask:
+        return info["image"], (0 if shared else xref)
+    try:
+        pix = fitz.Pixmap(doc, xref)
+        if pix.alpha:                       # already carries its own alpha
+            return pix.tobytes("png"), 0
+        if pix.colorspace is None or pix.colorspace.n > 3:
+            pix = fitz.Pixmap(fitz.csRGB, pix)   # a mask needs RGB or grey
+        return fitz.Pixmap(pix, fitz.Pixmap(doc, smask)).tobytes("png"), 0
+    except (RuntimeError, ValueError, TypeError):
+        # not fatal: the plain bytes go to the render check like anything
+        # else, and it refuses them if the page would look different
+        return info["image"], xref
+
+
+def render_matches(page_a, page_b, dpi=IMPORT_RENDER_DPI):
+    """Do these two pages LOOK the same?
+
+    The only check that tests what an import promises. A static rule would
+    have to enumerate every way a page can layer itself — soft masks, blend
+    modes, clipping, a caption drawn over a figure — and would still be a guess
+    about the renderer; two pixmaps are the answer itself."""
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    pa, pb = page_a.get_pixmap(matrix=mat), page_b.get_pixmap(matrix=mat)
+    if (pa.width, pa.height, pa.n) != (pb.width, pb.height, pb.n):
+        return False
+    a = np.frombuffer(pa.samples, dtype=np.uint8).astype(np.int16)
+    b = np.frombuffer(pb.samples, dtype=np.uint8).astype(np.int16)
+    if a.size != b.size or a.size == 0:
+        return False
+    changed = np.abs(a - b) > IMPORT_DIFF_CHANNEL
+    return changed.mean() <= IMPORT_DIFF_FRACTION
+
+
+def _trial_page(doc, idx, records):
+    """A one-page document with `records` moved from page content into an
+    image layer — i.e. the page exactly as a save would leave it.
+
+    "Exactly" is load-bearing and was got wrong once: this must place each
+    image the way `_write_image_layer` will, BY REFERENCE when the commit path
+    would reuse the object. Re-encoding from bytes here instead makes the
+    trial fail for images the save would have placed perfectly — a scanned
+    page is one JPEG with an ICC profile, and the re-encode drops the profile
+    and shifts every colour on it. The trial then reports "it would look
+    different" about its own extra step."""
+    trial = fitz.open()
+    trial.insert_pdf(doc, from_page=idx, to_page=idx)
+    page = trial[0]
+    page.clean_contents()
+    # matched by RECT, the one identity that survives the copy: `insert_pdf`
+    # renumbers every xref and `clean_contents` may rewrite resource names, so
+    # neither of the two identities used elsewhere means anything here
+    wanted = {r["rect"]: r for r in records}
+    mine = [r for r in import_candidates(trial, page) if r["rect"] in wanted]
+    strip_placements(trial, page, mine)
+    ocg = trial.add_ocg(IMAGE_OCG_NAME, on=True)
+    for rec in mine:
+        try:
+            # the TRIAL's own xref: insert_pdf copied the object into it,
+            # ICC profile and all, and that copy is what a save would re-place
+            png, reuse = import_image_bytes(trial, rec["xref"],
+                                            wanted[rec["rect"]]["shared"])
+        except (RuntimeError, KeyError, TypeError):
+            continue
+        x, y, w, h = rec["rect"]
+        page.insert_image(fitz.Rect(x, y, x + w, y + h), xref=reuse,
+                          stream=None if reuse else uniquify_png(png), oc=ocg,
+                          keep_proportion=False)   # the rect is the truth
+    return trial
+
+
+def strip_placements(doc, page, records):
+    """Delete the `Do` of every record in `records` from the page's content.
+
+    Only the paint operation goes — never the `cm` before it, which may be
+    shared with what is drawn next, and never the resource, which may be used
+    elsewhere. Spans are removed back-to-front so the earlier ones stay valid.
+
+    Callers pass records derived from the CONTENT THEY ARE STRIPPING, never
+    from an earlier reading of it: `clean_contents()` and `insert_pdf` both
+    rewrite resource names and renumber xrefs, so a record carried across
+    either one names the wrong operator."""
+    content = page.read_contents()
+    spans = sorted((r["span"] for r in records), reverse=True)
+    if not spans:
+        return content
+    for start, end in spans:
+        content = content[:start] + content[end:]
+    streams = page.get_contents()
+    if streams:
+        doc.update_stream(streams[0], content)
+    return content
 
 
 def images_from_sidecar(data):
@@ -15336,6 +15797,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             _menu_item("Notes file…",
                        lambda: (menu_pop.popdown(), self._choose_notes_file()),
                        "Choose which Markdown file this document's notes are saved to"),
+            _menu_item("Import this page's images",
+                       lambda: (menu_pop.popdown(), self._import_page_images()),
+                       "Turn the pictures already on this page into objects you "
+                       "can move, resize and rotate — only the ones that will "
+                       "still look the same"),
         )
         # text-page-only actions — the inverse of the group above
         self._text_menu_items = (
@@ -18257,6 +18723,42 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         Gdk.Display.get_default().get_clipboard().set(f"[[{target}]]")
         self._toast(f"Copied [[{target}]]")
+
+    def _import_page_images(self):
+        """Take this page's own pictures into the model (row 167).
+
+        The REPORT is half the feature, not a courtesy: an import that takes
+        three of five images and says nothing teaches the user that Sidemark
+        is unreliable, when in fact it declined the two it could not have kept
+        looking the same."""
+        if self._text_mode or self.canvas is None or self.canvas.document is None:
+            self._toast("Open a PDF to import its images")
+            return
+        page_no = self.canvas.current_page_idx + 1
+        imported, skipped = self.canvas.import_page_images()
+        if not imported and not skipped:
+            self._toast(f"No pictures on page {page_no} to import")
+            return
+        if imported and not skipped:
+            self._toast(f"Imported {len(imported)} "
+                        f"picture{'s' if len(imported) != 1 else ''} — "
+                        f"lasso one to move it")
+            return
+        # something was left behind, so say what and why
+        reasons = Counter(r for _n, r in skipped).most_common()
+        lines = [f"• {n} picture{'s' if n != 1 else ''} left as part of "
+                 f"the page because {r}" for r, n in reasons]
+        head = (f"Imported {len(imported)} of {len(imported) + len(skipped)} "
+                f"pictures on page {page_no}" if imported
+                else f"Nothing on page {page_no} could be imported")
+        dlg = Adw.AlertDialog.new(
+            head,
+            "\n".join(lines) + "\n\nWhat is left behind still prints and "
+            "exports exactly as before — it just cannot be moved. Only text "
+            "and vector drawings are never imported.")
+        dlg.add_response("ok", "OK")
+        dlg.set_default_response("ok")
+        dlg.present(self)
 
     def _begin_note_link(self):
         """Start a link where the caret is: insert `[[]]`, put the caret

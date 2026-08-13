@@ -1463,6 +1463,81 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   - Do NOT trust `get_image_info(xrefs=True)` or `get_image_rects()`: they
     resolve placements by visual match and lie about xrefs. The content stream
     plus the Resources dict are ground truth.
+  - **`insert_image` treats the rect as a SUGGESTION** — by default it fits
+    the picture inside at the picture's own aspect and centres it. Our rect is
+    the truth (row 122's side handles stretch one axis on purpose), so
+    `keep_proportion=False` is required or every stretched image is written
+    letterboxed and displaced: a saved file that does not match the canvas,
+    and one that still looks plausible, which is why nothing caught it for so
+    long. Assert the placement MATRIX, not the pixels — the shift shows
+    nowhere else.
+- **Importing the document's OWN images (row 167)** — ☰ *Import this page's
+  images* turns a picture that arrived WITH the PDF into one of our objects.
+  Everything else in this file is about images Sidemark placed; this is the
+  other direction, and its promise is "open it in a browser and it looks the
+  same until you move something".
+  - **The promise is CHECKED, not assumed.** The one thing
+    `import_candidates` refuses outright is a **rotated/flipped/skewed**
+    placement: a tilt is baked into fresh pixels by `_layer_bytes_for`, so it
+    would come back *resampled*.
+  - **A SHARED image is COPIED, never refused.** Importing marks the xref
+    `/OC` ours and ownership is what `strip_image_layer` acts on, so *reusing*
+    the object for a logo that is page content on 40 other slides would strip
+    it from all of them — an argument for giving the import its own object,
+    not for declining. This shipped as a refusal first and the refusal was
+    wrong: measured over 12 real lecture PDFs, sharing is the NORMAL case (70
+    of 124 placements — every template logo), so refusing it left the feature
+    working on 38% of real pictures against 98% now. Same answer for one image
+    drawn twice on a page: two placements, two objects, two rects. **Measure
+    the rule on real documents** — every rejection in the first version was
+    defensible in the abstract and one was rejecting the majority case.
+  - **Z-order cannot be read off a placement, so nothing tries.** Our layer is
+    APPENDED, so anything we place draws above the whole page: invisible for a
+    figure with nothing over it, wrong for a watermark under the text.
+    `render_matches` renders the page as it is and as it would be SAVED and
+    compares pixels — the only check that tests the promise, and it catches
+    soft masks, blend modes, clipping and a caption over a figure in one step.
+    All candidates are tried together first (one render pair, the answer on
+    almost every page); only a failing page pays for the per-image bisect, and
+    the survivors are re-tested AS A SET, since two images that each look fine
+    alone can still swap order against *each other* once both are on top.
+  - **The trial must place the image the way the SAVE will**, or it measures
+    its own extra step. `_trial_page` re-encoded from bytes while
+    `_write_image_layer` re-places BY REFERENCE — so a scanned page (one big
+    JPEG with an ICC profile) lost the profile in the trial, shifted every
+    colour, and was refused. It uses the trial's own copied xref
+    (`insert_pdf` brings the object across, profile and all) and mirrors the
+    save's `xref`/`stream`/`oc`/`keep_proportion` call exactly.
+  - **A SOFT MASK is the common case, and the render check is what found
+    it.** `extract_image` returns the base image *without* its `/SMask`, so a
+    logo with a transparent background imports as an opaque block — two of the
+    three images in the first real deck tried. `import_image_bytes` recomposes
+    base+mask into an RGBA PNG and is shared by the trial and the commit path,
+    or the trial stops predicting the save. That costs the by-reference
+    re-placement (new bytes ⇒ `_xref` 0, one re-encode), which is the right
+    trade. Nothing in the design anticipated soft masks; the pixels caught them
+    anyway. *ceiling: a trial render is ~1.3 s for a 5000-px image and the
+    bisect pays it once per image, so `IMPORT_MAX_TRIALS` bounds the count but
+    not the size.*
+  - **`content_placements` is a tokeniser, not a regex** — `Do` appears inside
+    strings a page draws, a matrix can be built across operations, and an
+    inline image's bytes can contain anything. It tracks the CTM through
+    `q`/`Q`/`cm` and spans **only the `/Name Do`**: removing exactly the one
+    paint operation cannot corrupt the page, where deleting the enclosing
+    `q … cm … Q` would take a transform the next operator may share.
+  - **Count placements by XREF, never by resource name.** PyMuPDF hands out a
+    fresh name when it re-places an existing xref, so a name-based count says
+    "drawn once" about a picture that is on the page twice. Ownership is a
+    property of the object.
+  - `_load_page` clears the selection (it is per-page and transient), so the
+    re-render comes BEFORE selecting the imported images or there is nothing
+    to drag. Undo restores **both** halves — the objects and the page's content
+    stream — or the picture vanishes off the page altogether.
+  - PDF-only, and not a parity gap: a text-first page has no page content to
+    import from. *Not built: text and vector art (no model behind either),
+    whole-document import, and inserting an image from a FILE — dropping a
+    `.png` is still refused by `classify_import_paths`, which is the other half
+    of the gap row 167 started from.*
 - Logging: `logger` writes a per-session file under `~/.cache/sidemark/logs/`,
   auto-deleted on clean exit, kept on errors.
 
