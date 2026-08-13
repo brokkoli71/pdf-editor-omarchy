@@ -8798,6 +8798,8 @@ def _parse_note_link(inner):
 # strike a live link through.
 _ANCHOR_CACHE = {}
 ANCHOR_CACHE_MAX = 64
+LINK_PREVIEW_PX = 220         # the hovered page, wide enough to recognise
+LINK_PREVIEW_CACHE = 24       # rendered pages of documents that are not open
 
 
 def _document_anchors_uncached(pdf_path):
@@ -10336,6 +10338,7 @@ class MarkdownNotesView(GtkSource.View):
         self.add_controller(click)
         motion = Gtk.EventControllerMotion()
         motion.connect("motion", self._on_link_motion)
+        motion.connect("leave", self._on_link_leave)
         self.add_controller(motion)
 
         # set by the window: called with +1 / -1 / 0 to grow / shrink / reset
@@ -10350,6 +10353,14 @@ class MarkdownNotesView(GtkSource.View):
         # ever struck through — this widget is also a plain Markdown editor.
         self.link_resolver = None
         self._link_live = {}       # target text → (is it live?, when we asked)
+        # set by the window: called with a _parse_note_link() dict, returns
+        # `(texture or None, caption)` for the hover preview — or None for
+        # "nothing to show".
+        self.link_preview_cb = None
+        self._hover_target = None   # the link the pointer is resting on
+        self._hover_at = (0, 0)
+        self._hover_id = None
+        self._preview_popup = None
         self._link_popup = None      # lazily-built Gtk.Popover
         self._link_list = None       # the Gtk.ListBox inside it
         self._link_rows = []         # candidate dicts currently shown, in order
@@ -10495,7 +10506,16 @@ class MarkdownNotesView(GtkSource.View):
                 c.set_state(Gtk.EventSequenceState.DENIED)
         return False
 
+    def _on_link_leave(self, *_a):
+        """The pointer left the text: no link is under it any more. A preview
+        that outlived the hover would sit over the notes with nothing keeping
+        it there — it is autohide=False, so nothing else would take it down."""
+        self._hover_target = None
+        self._cancel_hover_timer()
+        self._hide_link_preview()
+
     def _on_link_click(self, gesture, _n_press, x, y):
+        self._on_link_leave()          # a click answers the question for you
         # Ctrl+click follows the link; a plain click edits as usual
         ev = gesture.get_current_event()
         if not ev or not (ev.get_modifier_state() & Gdk.ModifierType.CONTROL_MASK):
@@ -10506,9 +10526,81 @@ class MarkdownNotesView(GtkSource.View):
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
 
     def _on_link_motion(self, _motion, x, y):
-        over = self._link_target_at(x, y) is not None
+        link = self._link_target_at(x, y)
         self.set_cursor(Gdk.Cursor.new_from_name(
-            "pointer" if over else "text", None))
+            "pointer" if link is not None else "text", None))
+        self._hover_link(link, x, y)
+
+    # ── hovering a link shows the page it goes to (row 165) ──────────────────
+    #
+    # A link is a promise about somewhere you cannot see, and following one
+    # costs you the place you were reading — so a wrong guess is expensive
+    # twice. The preview is the cheap way to ask "is this the slide I meant?",
+    # and it is the same question the strike-through answers for targets that
+    # are not there at all.
+
+    LINK_PREVIEW_MS = 450       # long enough that reading a line never fires it
+
+    def _hover_link(self, link, x, y):
+        """Arm (or disarm) the preview for the link under the pointer. Nothing
+        happens until the pointer has RESTED on it: a preview that opened as
+        the mouse crossed a link would flash open and shut down a line of
+        prose."""
+        target = None if link is None else link.get("label")
+        if target == self._hover_target:
+            return                        # same link, still hovering it
+        self._hover_target = target
+        self._cancel_hover_timer()
+        self._hide_link_preview()
+        if link is None or self.link_preview_cb is None:
+            return
+        self._hover_at = (x, y)
+        self._hover_id = GLib.timeout_add(
+            self.LINK_PREVIEW_MS, self._show_link_preview, link)
+
+    def _cancel_hover_timer(self):
+        if self._hover_id is not None:
+            GLib.source_remove(self._hover_id)
+            self._hover_id = None
+
+    def _hide_link_preview(self):
+        pop, self._preview_popup = self._preview_popup, None
+        if pop is not None:
+            _drop_popover(pop)
+
+    def _show_link_preview(self, link):
+        self._hover_id = None
+        try:
+            shot = self.link_preview_cb(link)
+        except Exception:
+            shot = None                   # a preview must never cost a click
+        if not shot or not self.get_mapped():
+            return False
+        texture, caption = shot
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_top(6); box.set_margin_bottom(6)
+        box.set_margin_start(6); box.set_margin_end(6)
+        if texture is not None:
+            pic = Gtk.Picture.new_for_paintable(texture)
+            pic.set_size_request(LINK_PREVIEW_PX,
+                                 int(LINK_PREVIEW_PX * 1.3))
+            pic.set_can_shrink(True)
+            box.append(pic)
+        label = Gtk.Label(label=caption or "", xalign=0)
+        label.add_css_class("caption")
+        label.set_max_width_chars(28)
+        label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        box.append(label)
+        pop = Gtk.Popover()
+        pop.set_autohide(False)           # it must never take the pointer
+        pop.set_position(Gtk.PositionType.TOP)
+        pop.set_parent(self)
+        pop.set_child(box)
+        x, y = self._hover_at
+        pop.set_pointing_to(Gdk.Rectangle(x=int(x), y=int(y), width=1, height=1))
+        self._preview_popup = pop
+        pop.popup()
+        return False
 
     # ── [[ autocomplete popup ─────────────────────────────────────────────────
     # Typing `[[` opens a popup of link targets (open tabs / recents / this
@@ -14807,6 +14899,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._bookmark_updating = False     # the same guard for the bookmark toggle
         self._bookmark_lists = []           # every live copy of the list widget
         self._bookmark_pop = None
+        # rendered pages for the [[link]] hover preview, keyed by file+mtime+page
+        self._preview_cache = {}
         self._bookmark_name_pop = None      # the "name this bookmark" popup
         self._bookmark_name_entry = None
         self._bookmark_list_scroll = None   # the popover's list, for scrolling
@@ -16067,6 +16161,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._notes_view.on_follow_link = lambda link: s.win._follow_note_link(link)
         s._notes_view.link_candidates_cb = lambda q: s.win._link_completions(q)
         s._notes_view.link_resolver = lambda link: s.win._resolve_note_link(link)[2]
+        s._notes_view.link_preview_cb = lambda link: s.win._link_preview(link)
         s._notes_view.get_buffer().connect("changed", lambda *a: s.win._on_notes_changed(*a))
         s._notes_view.get_buffer().connect("notify::cursor-position", lambda *a: s.win._on_notes_cursor_moved(*a))
         notes_scroll.set_child(s._notes_view)
@@ -16264,6 +16359,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         tp.view.on_follow_link = lambda link: s.win._follow_note_link(link)
         tp.view.link_candidates_cb = lambda q: s.win._link_completions(q)
         tp.view.link_resolver = lambda link: s.win._resolve_note_link(link)[2]
+        tp.view.link_preview_cb = lambda link: s.win._link_preview(link)
         tp.view.get_buffer().connect(
             "changed", lambda *a: s.win._on_notes_changed(*a))
         tp.on_ink_action = lambda: s.win._on_ink_action()
@@ -18010,15 +18106,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
              else f"Bookmark page {page}")
             + " (Ctrl+B) — hold for the list of bookmarks")
 
-    def link_target_to_here(self, for_dir=None):
+    def link_target_to_here(self):
         """The `[[target]]` that points at what you are looking at now.
 
         A NAME if this page has one — its bookmark, or a heading that starts
         here — because that is what survives a page being inserted above it;
-        the page number only when it has none. `for_dir` is the folder the
-        link will be WRITTEN in: from anywhere else the file has to be named,
-        while a link inside this document's own notes stays a bare `#name`
-        and keeps working when the file is renamed."""
+        the page number only when it has none.
+
+        It ALWAYS names the file, even for a link that ends up in this
+        document's own notes where a bare `#name` would do. This goes on the
+        clipboard, and a clipboard does not know where it will be pasted: a
+        bare anchor pasted into another document's notes silently resolves
+        against THAT document, which is a link that works and goes to the
+        wrong place."""
         path = self._path or self._notes_path
         if not path:
             return None
@@ -18034,19 +18134,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                         break
             if here is None:
                 here = f"page={idx + 1}"
-        same = False
-        if for_dir is not None:
-            try:
-                same = os.path.samefile(for_dir, os.path.dirname(path)) and \
-                    self._link_notes_base_dir() and os.path.samefile(
-                        for_dir, self._link_notes_base_dir())
-            except OSError:
-                same = False
-        file_part = "" if same and for_dir is not None else \
-            _link_insert_path(path, for_dir)
-        if here is None:
-            return file_part or os.path.basename(path)
-        return f"{file_part}#{here}"
+        file_part = os.path.basename(path)
+        return file_part if here is None else f"{file_part}#{here}"
 
     def _copy_link_to_here(self):
         """Put a link to this page on the clipboard, ready to paste into
@@ -18083,6 +18172,63 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         it.backward_chars(2)
         buf.place_cursor(it)
         view.open_link_picker()
+
+    def _link_preview(self, link):
+        """`(texture, caption)` for the page a [[link]] leads to, or None.
+
+        A link is a promise about a page you cannot see, and following one
+        costs you the place you were reading — so the preview is the cheap way
+        to ask "is that the slide I meant?". It shows the page as it is on
+        DISK: the target may be another tab, an unopened file, or this very
+        document, and rendering each of those a different way is three answers
+        to one question."""
+        full, idx, ok = self._resolve_note_link(link)
+        if not ok:
+            return None
+        page = 0 if idx is None else idx
+        path = full or self._path
+        caption = f"{os.path.basename(path)} · p.{page + 1}" if path else ""
+        if full is None and self.canvas.document is not None:
+            # the open document: its own pixmap, so unsaved pages preview too
+            tex = self._preview_texture(self.canvas.document, page)
+        elif full is not None:
+            tex = self._preview_file_texture(full, page)
+        else:
+            tex = None
+        if tex is None and not caption:
+            return None
+        return tex, caption
+
+    def _preview_texture(self, doc, idx):
+        try:
+            page = doc[max(0, min(idx, doc.page_count - 1))]
+            s = LINK_PREVIEW_PX / page.rect.width
+            pix = page.get_pixmap(matrix=fitz.Matrix(s, s), alpha=False)
+            return Gdk.MemoryTexture.new(
+                pix.width, pix.height, Gdk.MemoryFormat.R8G8B8,
+                GLib.Bytes.new(pix.samples), pix.stride)
+        except Exception:
+            return None
+
+    def _preview_file_texture(self, path, idx):
+        """A page of a document that is not open, cached by (file, mtime,
+        page): hovering along a list of links to one deck must not reopen it
+        once per link."""
+        try:
+            key = (os.path.abspath(path), os.path.getmtime(path), idx)
+        except OSError:
+            return None
+        if key in self._preview_cache:
+            return self._preview_cache[key]
+        try:
+            with fitz.open(path) as doc:
+                tex = self._preview_texture(doc, idx)
+        except Exception:
+            tex = None
+        if len(self._preview_cache) >= LINK_PREVIEW_CACHE:
+            self._preview_cache.clear()
+        self._preview_cache[key] = tex
+        return tex
 
     def _forget_link_status(self):
         """Every notes editor in the window re-asks what its links resolve to.
@@ -18134,10 +18280,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         path, page, anchor = (link.get("path"), link.get("page"),
                               link.get("anchor"))
         full = None
+        named_a_file = False
         if path:
             full = self._link_full_path(path)
             if not os.path.isfile(full):
                 return None, None, False
+            named_a_file = True
             try:
                 if self._path and os.path.samefile(full, self._path):
                     full = None             # the document already in front
@@ -18149,8 +18297,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             page = anchor_page(anchors, anchor)
             if page is None:
                 return full, None, False
-        if full is None and page is None:
-            # a same-document link with nothing to aim at
+        if not named_a_file and page is None:
+            # a same-document link with nothing to aim at. Naming THIS file is
+            # different and stays live: `[[a.pdf]]` from inside a.pdf's own
+            # notes is a link to a document that is there, and following it is
+            # simply staying where you are.
             return None, None, False
         idx = None if page is None else max(0, page - 1)
         if full is None and idx is not None and self.canvas.document \

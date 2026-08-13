@@ -226,14 +226,23 @@ Wiki-style `[[…]]` links in the notes jump to another slide — in the same de
 
 | Syntax | Follows to |
 |--------|-----------|
-| `[[#page=12]]` or `[[#12]]` | page 12 of the current document |
+| `[[#Eigenvalues]]` | the bookmark or chapter of that name, in this document |
+| `[[lecture2.pdf#Eigenvalues]]` | opens `lecture2.pdf` at that bookmark or chapter |
 | `[[lecture2.pdf]]` | opens `lecture2.pdf` (in a tab) |
-| `[[lecture2.pdf#page=5]]` or `[[lecture2.pdf#5]]` | opens `lecture2.pdf` at page 5 |
-| `[[lecture2.pdf#page=5\|the proof]]` | same, but shows *the proof* in the text |
+| `[[#page=12]]` or `[[#12]]` | page 12 of the current document |
+| `[[lecture2.pdf#page=5\|the proof]]` | page 5, shown as *the proof* in the text |
 
-Typing `[[` opens an **autocomplete popup** (open tabs, recent files, *This
-page*), and `|display text` sets an Obsidian-style alias. The `.md` keeps the
-plain `[[…]]` text, so links round-trip through Obsidian.
+**Point at a name, not a page number** — a bookmark or a chapter follows its
+page when you insert a slide, reorder a chapter or merge two decks, and a page
+number does not.
+
+**Ctrl+K** (or ☰ ▸ *Link to a page…*) starts one and offers this document's
+bookmarks and chapters, the other open tabs and your recent files; typing `[[`
+opens the same picker, and `#` after a filename lists that document's names.
+**Hover** a link to see the page it goes to; a link whose target is not there
+is ~~struck through~~. ☰ ▸ *Copy link to this page* puts a link to where you
+are on the clipboard, to paste into another document's notes. The `.md` keeps
+the plain `[[…]]` text, so links round-trip through Obsidian.
 
 ### Search
 

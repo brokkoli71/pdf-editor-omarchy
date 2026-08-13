@@ -16029,6 +16029,43 @@ class TestFollowNoteLink(unittest.TestCase):
         self._run_in_window(body)
 
 
+class TestLinkHoverArming(unittest.TestCase):
+    """When the preview is asked for. The popup itself is not testable here —
+    showing a Gtk.Popover kills the headless compositor — but WHEN it fires is
+    the part with a rule in it."""
+
+    def _view(self):
+        v = sidemark.MarkdownNotesView()
+        v.link_preview_cb = lambda link: None
+        return v
+
+    def test_resting_on_a_link_arms_the_preview_and_moving_off_disarms_it(self):
+        v = self._view()
+        link = sidemark._parse_note_link("#Eigenvalues")
+        v._hover_link(link, 10, 10)
+        self.assertIsNotNone(v._hover_id)
+        armed = v._hover_id
+        v._hover_link(link, 12, 10)      # the same link, still hovering it
+        self.assertEqual(v._hover_id, armed)
+        v._hover_link(None, 40, 90)      # off the link
+        self.assertIsNone(v._hover_id)
+
+    def test_nothing_is_armed_without_a_preview_to_show(self):
+        v = self._view()
+        v.link_preview_cb = None
+        v._hover_link(sidemark._parse_note_link("#x"), 10, 10)
+        self.assertIsNone(v._hover_id)
+
+    def test_leaving_the_text_takes_the_preview_with_it(self):
+        """It is autohide=False, so nothing else would ever take it down."""
+        v = self._view()
+        v._hover_link(sidemark._parse_note_link("#x"), 10, 10)
+        v._on_link_leave()
+        self.assertIsNone(v._hover_id)
+        self.assertIsNone(v._preview_popup)
+        self.assertIsNone(v._hover_target)
+
+
 class TestDeadLinkRendering(unittest.TestCase):
     """A link with nothing at the other end is struck through (row 165) — the
     one signal that tells you a target has moved before you click it."""
@@ -16281,6 +16318,21 @@ class TestLinkCompletions(unittest.TestCase):
                         sidemark._parse_note_link(target))[2], target)
         self._run_in_window(body)
 
+    def test_a_link_naming_this_very_document_is_live(self):
+        """`[[a.pdf]]` written in a.pdf's own notes points at a file that is
+        there — following it is simply staying where you are — so it must not
+        be struck through as a dead target."""
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=3)
+                win._do_open_file(a)
+                full, idx, ok = win._resolve_note_link(
+                    sidemark._parse_note_link("a.pdf"))
+                self.assertTrue(ok)
+                self.assertIsNone(full)     # nothing to open: it is in front
+                self.assertIsNone(idx)
+        self._run_in_window(body)
+
     def test_a_link_to_another_document_resolves_by_name(self):
         def body(win):
             with tempfile.TemporaryDirectory() as d:
@@ -16317,6 +16369,9 @@ class TestLinkCompletions(unittest.TestCase):
         self._run_in_window(body, present=False)
 
     def test_a_link_to_here_names_the_page_rather_than_numbering_it(self):
+        """It always names the FILE too: this goes on the clipboard, and a bare
+        `#name` pasted into another document's notes resolves against that
+        document — a link that works and goes to the wrong place."""
         def body(win):
             with tempfile.TemporaryDirectory() as d:
                 a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=5)
@@ -16326,10 +16381,36 @@ class TestLinkCompletions(unittest.TestCase):
                 self.assertEqual(win.link_target_to_here(), "a.pdf#page=3")
                 win.notes_model.add_bookmark(2, "Eigenvalues")
                 self.assertEqual(win.link_target_to_here(), "a.pdf#Eigenvalues")
-                # written INSIDE this document's own notes it needs no filename
-                self.assertEqual(win.link_target_to_here(for_dir=d),
-                                 "#Eigenvalues")
         self._run_in_window(body)
+
+
+    def test_hovering_a_link_previews_the_page_it_leads_to(self):
+        """A link is a promise about a page you cannot see, and following one
+        costs you your place (row 165). The preview answers it in place."""
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=5)
+                b = os.path.join(d, "l2.pdf"); make_pdf(b, n_pages=4)
+                win._do_open_file(a)
+                win.notes_model.add_bookmark(3, "Eigenvalues")
+                tex, caption = win._link_preview(
+                    sidemark._parse_note_link("#Eigenvalues"))
+                self.assertIsNotNone(tex)
+                self.assertGreater(tex.get_width(), 0)
+                self.assertIn("p.4", caption)          # the page it names
+                self.assertIn("a.pdf", caption)
+                # …and a document that is not open renders from disk, once
+                tex2, caption2 = win._link_preview(
+                    sidemark._parse_note_link("l2.pdf#page=3"))
+                self.assertIsNotNone(tex2)
+                self.assertIn("l2.pdf", caption2)
+                self.assertEqual(len(win._preview_cache), 1)
+                win._link_preview(sidemark._parse_note_link("l2.pdf#page=3"))
+                self.assertEqual(len(win._preview_cache), 1)   # cached
+                # a target that is not there has nothing to show
+                self.assertIsNone(win._link_preview(
+                    sidemark._parse_note_link("#Nothing")))
+        self._run_in_window(body, present=False)
 
 
 # ── pasted images on a text page ──────────────────────────────────────────────

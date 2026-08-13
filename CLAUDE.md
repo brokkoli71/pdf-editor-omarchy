@@ -641,14 +641,40 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 - **`[[wiki links]]` (the linking workflow)** — this is the feature the project
   was designed around and it has shipped (ideas.csv row 99). In notes,
   `[[target]]` is a clickable link (Ctrl+click follows, hover shows a hand).
-  `_parse_note_link()` resolves the body into `{path, page, label}`:
-  `[[#page=N]]` jumps within the current document; `[[file]]` /
-  `[[file#page=N]]` opens another document via `open_file_in_tab`. Rendering
-  keeps the brackets hidden off the cursor line but leaves link/`code` contents
-  verbatim — the parsing lives in `_notes_to_pango_markup` / `_split_markup`
-  (`_MD_LINK_RE`, negative lookbehind so the `![[embed]]` line is left alone).
-  When extending linking, keep link targets un-mangled and test both same-doc
-  and cross-doc forms.
+  `_parse_note_link()` resolves the body into `{path, page, anchor, label}`.
+  Rendering keeps the brackets hidden off the cursor line but leaves
+  link/`code` contents verbatim — the parsing lives in
+  `_notes_to_pango_markup` / `_split_markup` (`_MD_LINK_RE`, negative
+  lookbehind so the `![[embed]]` line is left alone). When extending linking,
+  keep link targets un-mangled and test both same-doc and cross-doc forms.
+  - **A LINK POINTS AT A NAME (row 165)** — a bookmark (row 134) or an outline
+    heading, the two things here that have both a name and a page:
+    `[[#Eigenvalues]]`, `[[l2.pdf#Chapter Two]]`. That is not a syntax
+    preference, it is the fix for the defect: nothing re-keys a `#page=N` when
+    a slide is inserted, a chapter is dragged (row 123) or two decks are
+    merged, while a bookmark follows its page. **The page forms stay readable
+    for ever** — written notes are full of them — they are just never what the
+    picker offers.
+  - **`document_anchors()` indexes a document that is not open** (headings from
+    the PDF, bookmarks parsed straight out of the sidecar's markers), cached on
+    BOTH files' mtimes because what changes anchors is often not ours. The OPEN
+    document is read LIVE (`_own_anchors`) instead, or a bookmark you have just
+    made — precisely the one you are linking to — would not resolve until you
+    saved.
+  - **`_resolve_note_link` is the ONE resolver**, for following, for the
+    strike-through and for the hover preview. Two would drift, and a link that
+    looks live and does nothing is the worst of the three.
+  - **A dead link is struck through, never under the caret**: a target is
+    unresolvable for most of the time you spend typing one. The per-view memo
+    EXPIRES (5 s) rather than being invalidated — another window edits what it
+    resolves against — and `_populate_toc` drops it explicitly, since that runs
+    on exactly the edits (bookmark, rename, outline) a dead link is waiting for.
+  - **Discoverability is part of the feature, not a garnish**: ☰ *Link to a
+    page…* / Ctrl+K inserts `[[]]` and opens the picker, so the entry teaches
+    the syntax by leaving it on screen; ☰ *Copy link to this page* is row 100's
+    link-to-here. A `#` in the query switches the picker to that file's names.
+  - *Not built: backlinks (row 100 item 4) — it needs a cross-file index and an
+    invalidation story, and should wait until naming targets proves itself.*
 - **Linked page notes (row 129)** — a page can CONTINUE the one before it, and
   a run of linked pages shares ONE body stored once on the run's first page
   (`NotesModel._links`, `run_start`/`run_pages`/`run_end`; the sidecar marker
@@ -949,6 +975,15 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 - Tests set `SIDEMARK_TEST=1` and use the system `/usr/bin/python3` (not venv
   shims). Window tests build a real `PDFEditorWindow` inside a throwaway
   `Adw.Application` and pump the main loop (`_settle()` pattern — copy it).
+- **Showing a `Gtk.Popover` in a PRESENTED test window kills the compositor.**
+  It creates a Wayland surface the headless Weston cannot give, and weston
+  dies — taking the rest of that run with it, so every later window test fails
+  at `Gtk couldn't be initialized` and looks like a bug in itself. Reach popup
+  UI through an UNPRESENTED window (`_run_in_window(present=False)`): the
+  widgets that pop up guard their show on `get_mapped()` and fill their model
+  either way, which is the seam to assert on. Same failure with another cause:
+  a stale `$RT/$SOCK` after a crash or `--stop` — `run_tests.sh` now removes
+  one unless the weston process is actually alive.
 - **Layout needs a live frame clock, and a full run does not have one.**
   Allocation happens in the frame clock's layout phase, which is driven by the
   compositor's frame callbacks — and by late in a full suite Weston has taken
