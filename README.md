@@ -226,7 +226,8 @@ Wiki-style `[[…]]` links in the notes jump to another slide — in the same de
 
 | Syntax | Follows to |
 |--------|-----------|
-| `[[#Eigenvalues]]` | the bookmark or chapter of that name, in this document |
+| `![[#Eigenvalues]]` | the bookmark or chapter of that name — shown as its page |
+| `[[#Eigenvalues]]` | the same, as a plain link |
 | `[[lecture2.pdf#Eigenvalues]]` | opens `lecture2.pdf` at that bookmark or chapter |
 | `[[lecture2.pdf]]` | opens `lecture2.pdf` (in a tab) |
 | `[[#page=12]]` or `[[#12]]` | page 12 of the current document |
@@ -239,9 +240,11 @@ number does not.
 **Ctrl+K** (or ☰ ▸ *Link to a page…*) starts one and offers this document's
 bookmarks and chapters, the other open tabs and your recent files; typing `[[`
 opens the same picker, and `#` after a filename lists that document's names.
-Put the caret in a link and **the page it leads to appears under it**, with
-your notes moved down to make room; **hover** any other link to see the same
-thing. A link whose target is not there is ~~struck through~~. After following one, the notes header offers **↩ Back**
+Write **`![[target]]`** and the page it leads to is shown under the line, with
+your notes moved down to make room — Obsidian's embed syntax, and what the
+picker inserts by default. Plain `[[target]]` is the same link without the
+picture; **hover** it to see the page anyway. A link whose target is not there
+is ~~struck through~~. After following one, the notes header offers **↩ Back**
 to where you came from until you turn the page. ☰ ▸ *Copy link to this page* puts a link to where you
 are on the clipboard, to paste into another document's notes. The `.md` keeps
 the plain `[[…]]` text, so links round-trip through Obsidian.

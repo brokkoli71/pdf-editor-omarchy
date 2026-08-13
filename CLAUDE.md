@@ -681,17 +681,28 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   - **The picker anchors to the LINE, not to a point** (`_position_link_popup`,
     `halign=START`). Given a zero-height anchor GTK centres the popup on it and
     flips it back over the very text you are reading — the `[[` you just typed.
-  - **The link the caret is STANDING IN previews inline**, under its line
-    (`_sync_inline_preview`, `_snapshot_inline_preview`). The space is a real
-    tag (`preview_gap`'s `pixels-below-lines`), so the notes below MOVE DOWN
-    for it and the picture never lands on top of your writing — and it needs
-    no buffer edit, which a `GtkTextView` paintable would (the buffer is the
-    `.md` source, and the index map maps characters to characters). It is the
-    rule the editor already has, row 141's: what the caret touches opens up.
-    Not every link, for the same reason the whole line does not fall back to
-    source — a page of notes would become a stack of thumbnails. The render is
-    memoised on the target string because `_rehighlight` runs per keystroke.
-    The sheet is the same widget, so text-first mode gets it unchanged.
+  - **`![[target]]` is an EMBED: the same link, showing the page it leads
+    to**, under its line (`_MD_EMBED_RE`, `_sync_inline_preview`,
+    `_snapshot_inline_preview`). Obsidian's syntax for exactly this, and
+    already Sidemark's own — a sidecar's first line is `![[lecture.pdf]]`.
+    `[[!target]]` would be neither, and was asked for; say so. **The MARKER
+    decides, never the caret**: a preview that came and went as you moved
+    through the text could not be read. `_MD_ANY_LINK_RE` is what most of the
+    grammar wants (both forms follow, both render their body verbatim); the
+    `!` only changes how many brackets are hidden and whether a page is drawn.
+    The picker INSERTS the embed form — you asked for a link to a page, and
+    the page is what you meant — and typing `[[` yourself keeps the plain one.
+    - The space is a **tag** (`pixels-below-lines`, one per height via
+      `_gap_tag`), so the notes below MOVE DOWN and the picture never lands on
+      your writing. It cannot be a paintable in the buffer, which is what
+      "render it like `\alpha`" would mean: symbol rendering swaps text for
+      text, while a paintable is a real character — and this buffer IS the
+      `.md` source, spliced back through a character-to-character index map.
+    - Renders are memoised on the target string (`_rehighlight` runs per
+      keystroke, over every line) and dropped by `forget_previews()` when the
+      document changes. One per LINE — a second embed on the same line is just
+      a link, because a line has one gap.
+    - The sheet is the same widget, so text-first mode gets it unchanged.
   - **Every other link answers on HOVER, and that preview is a TOOLTIP
     (`query-tooltip`) — not a shortcut.**
     A popover is a real surface: shown near the pointer it takes the crossing,

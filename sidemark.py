@@ -8749,7 +8749,20 @@ def _apply_accents(text):
 _MD_COMMENT_RE = re.compile(r'<!--.*?-->')
 _MD_CODE_SPAN_RE = re.compile(r'`[^`\n]+?`')
 _MD_LINK_RE = re.compile(r'(?<!\!)\[\[([^\[\]\n]+?)\]\]')
-_MD_SPAN_RE = re.compile(_MD_CODE_SPAN_RE.pattern + '|' + _MD_LINK_RE.pattern)
+# `![[target]]` is an EMBED — the same link, shown as the page it leads to
+# (row 165). It is Obsidian's syntax for exactly this, and it is already
+# Sidemark's own: the first line of a sidecar embeds the PDF it belongs to.
+# `[[!target]]` would be neither. Both forms follow on Ctrl+click and render
+# their body verbatim, so most of the grammar wants ANY of the two.
+_MD_EMBED_RE = re.compile(r'!\[\[([^\[\]\n]+?)\]\]')
+_MD_ANY_LINK_RE = re.compile(r'!?\[\[([^\[\]\n]+?)\]\]')
+_MD_SPAN_RE = re.compile(_MD_CODE_SPAN_RE.pattern + '|'
+                         + _MD_ANY_LINK_RE.pattern)
+
+
+def link_body(span):
+    """The target inside a `[[…]]` or `![[…]]` span."""
+    return span[3:-2] if span.startswith('!') else span[2:-2]
 
 
 def _split_markup(text):
@@ -8889,15 +8902,15 @@ def anchor_page(anchors, name):
 
 def _link_query_at_cursor(line_text, cursor_col):
     """If the cursor sits inside an *open* `[[…` on this line (no closing `]]`
-    yet and not the `![[embed]]` marker), return the text typed between `[[` and
-    the cursor — the autocomplete query. Otherwise None. `cursor_col` is a
-    character offset into `line_text`."""
+    yet), return the text typed between `[[` and the cursor — the autocomplete
+    query. Otherwise None. `cursor_col` is a character offset into
+    `line_text`."""
     before = line_text[:cursor_col]
     open_at = before.rfind('[[')
     if open_at == -1:
         return None
-    if open_at > 0 and before[open_at - 1] == '!':
-        return None                      # ![[embed]] marker, not a link
+    # `![[` is an embed, which is a link that shows its page (row 165) — it is
+    # completed exactly like a plain one.
     query = before[open_at + 2:]
     if ']' in query or '[' in query:     # link already closed, or a fresh [[
         return None
@@ -9184,7 +9197,7 @@ def _notes_to_pango_markup(text):
             parts.append(f"<tt>{GLib.markup_escape_text(seg[1:-1])}</tt>")
             continue
         if kind == 'link':               # [[link]] → underlined label (verbatim)
-            label = _parse_note_link(seg[2:-2])["label"]
+            label = _parse_note_link(link_body(seg))["label"]
             parts.append(f"<u>{GLib.markup_escape_text(label)}</u>")
             continue
         # symbols first, then escape, then scripts, then bold/italic. The
@@ -10328,10 +10341,6 @@ class MarkdownNotesView(GtkSource.View):
             # thing to have in notes.
             "deadlink":    tag("deadlink",    underline=0, strikethrough=True,
                                foreground="#8b8b8b"),
-            # The gap the inline preview is painted into (row 165). It is real
-            # LAYOUT space, which is the whole point: everything below the link
-            # moves down for it, so the picture never lands on top of the notes.
-            "preview_gap": tag("preview_gap", pixels_below_lines=0),
         }
 
         self._cursor_line = 0
@@ -10390,12 +10399,10 @@ class MarkdownNotesView(GtkSource.View):
         # `(texture or None, caption)` for the hover preview — or None for
         # "nothing to show".
         self.link_preview_cb = None
-        # The preview drawn UNDER the link the caret is standing in: its
-        # target string, its texture and its caption. Kept because
-        # `_rehighlight` runs on every keystroke and rendering a page is not
-        # something to do per keystroke.
-        self._inline_link = None            # (target, texture, caption)
-        self._inline_line = None            # the buffer line it is drawn under
+        # line → (texture, draw width, draw height) for every `![[embed]]`,
+        # and the rendered pages behind them, keyed by target string
+        self._inline_previews = {}
+        self._preview_cache = {}
         self._link_popup = None      # lazily-built Gtk.Popover
         self._link_list = None       # the Gtk.ListBox inside it
         self._link_rows = []         # candidate dicts currently shown, in order
@@ -10505,7 +10512,7 @@ class MarkdownNotesView(GtkSource.View):
         # Ctrl+click, no hover preview.
         text = buf.get_text(ls, le, True)
         off = it.get_line_offset()
-        for m in _MD_LINK_RE.finditer(text):
+        for m in _MD_ANY_LINK_RE.finditer(text):
             if m.start() <= off < m.end():
                 return _parse_note_link(m.group(1))
         return None
@@ -10617,74 +10624,84 @@ class MarkdownNotesView(GtkSource.View):
         tooltip.set_tip_area(self._link_tip_area(x, y))
         return True
 
-    # ── the preview of the link the caret is IN, drawn under its line ────────
+    # ── `![[embeds]]` show the page they lead to, under their line ───────────
     #
-    # The rule the editor already has (row 141): what the caret is touching
-    # opens up, everything else stays as it reads. Standing in a link shows
-    # you the page it leads to, in place, with the notes below it moved down
-    # to make room — so it is never a picture lying on top of your writing.
-    # Every other link answers on hover instead; drawing them all would turn a
-    # page of notes into a stack of thumbnails.
+    # Obsidian's syntax for the same idea, and already Sidemark's own: the
+    # first line of a sidecar is `![[lecture.pdf]]`, the document these notes
+    # belong to. `[[target]]` is a link you can follow; `![[target]]` is that
+    # link showing what is at the other end. It is the MARKER that decides, not
+    # where the caret is standing — a preview that came and went as you moved
+    # through the text could not be read, which is what a whole line of notes
+    # reflowing under the caret costs.
+    #
+    # The space is a TAG (`pixels-below-lines`), so the notes below move down
+    # for it and the picture never lands on top of your writing. It cannot be
+    # a paintable in the buffer, which is what "render it like \alpha" would
+    # mean: symbol rendering swaps text for text, while a paintable is a real
+    # character — and this buffer IS the .md source, spliced back through an
+    # index map that maps characters to characters.
 
     INLINE_PREVIEW_PAD = 8            # around the picture, in px
 
-    def _inline_preview_for(self, buf):
-        """`(target, texture, caption, line)` for the link the caret is
-        standing in, or None. The render is memoised on the target string:
-        this is asked on every keystroke."""
-        if self.link_preview_cb is None:
-            return None
-        it = buf.get_iter_at_mark(buf.get_insert())
-        ln, col = it.get_line(), it.get_line_offset()
-        ok, ls = buf.get_iter_at_line(ln)
-        if not ok:
-            return None
-        le = ls.copy()
-        if not le.ends_line():
-            le.forward_to_line_end()
-        text = buf.get_text(ls, le, True)
-        for m in _MD_LINK_RE.finditer(text):
-            if not (m.start() <= col <= m.end()):
-                continue
-            target = m.group(1)
-            if self._inline_link and self._inline_link[0] == target:
-                return (*self._inline_link, ln)
-            try:
-                shot = self.link_preview_cb(_parse_note_link(target))
-            except Exception:
-                shot = None
-            if not shot or shot[0] is None:
-                return None
-            self._inline_link = (target, shot[0], shot[1])
-            return (*self._inline_link, ln)
-        return None
+    def _gap_tag(self, height):
+        """A tag reserving `height` px under its line. One per height, made on
+        demand — a GtkTextTag carries the spacing itself, so two lines wanting
+        different pictures cannot share one."""
+        name = f"gap{int(height)}"
+        tag = self._t.get(name)
+        if tag is None:
+            tag = self.get_buffer().create_tag(
+                name, pixels_below_lines=int(height))
+            self._t[name] = tag
+        return tag
+
+    def _preview_for_target(self, target):
+        """The rendered page for a link body, memoised. `_rehighlight` runs on
+        every keystroke and every line, so this is asked far more often than a
+        page can be rendered."""
+        if target in self._preview_cache:
+            return self._preview_cache[target]
+        try:
+            shot = self.link_preview_cb(_parse_note_link(target))
+        except Exception:
+            shot = None
+        tex = shot[0] if shot else None
+        self._preview_cache[target] = tex
+        return tex
 
     def _sync_inline_preview(self, buf):
-        """Reserve (or release) the space under the caret's line. Called from
-        the render pass, which already runs whenever the caret moves."""
-        found = self._inline_preview_for(buf)
-        gap = self._t["preview_gap"]
-        buf.remove_tag(gap, buf.get_start_iter(), buf.get_end_iter())
-        if found is None:
-            if self._inline_line is not None:
-                self._inline_line = None
-                self._inline_link = None
-                self.queue_draw()
-            return
-        _target, texture, _caption, ln = found
-        height = self._preview_draw_size(texture)[1]
-        gap.set_property("pixels-below-lines",
-                         int(height + self.INLINE_PREVIEW_PAD * 2))
-        ok, ls = buf.get_iter_at_line(ln)
-        if not ok:
-            return
-        le = ls.copy()
-        if not le.ends_line():
-            le.forward_to_line_end()
-        buf.apply_tag(gap, ls, le)
-        if self._inline_line != ln:
-            self._inline_line = ln
+        """Reserve the space under every `![[embed]]`, and remember what to
+        paint there. Called from the render pass, which has just cleared every
+        tag in the buffer."""
+        was = self._inline_previews
+        self._inline_previews = {}
+        if self.link_preview_cb is not None:
+            for ln in range(buf.get_line_count()):
+                ok, ls = buf.get_iter_at_line(ln)
+                if not ok:
+                    continue
+                le = ls.copy()
+                if not le.ends_line():
+                    le.forward_to_line_end()
+                text = buf.get_text(ls, le, True)
+                if '![[' not in text:
+                    continue
+                m = _MD_EMBED_RE.search(text)
+                if m is None:
+                    continue          # …one per line: a second is just a link
+                tex = self._preview_for_target(m.group(1))
+                if tex is None:
+                    continue          # nothing at the other end to show
+                draw_w, draw_h = self._preview_draw_size(tex)
+                self._inline_previews[ln] = (tex, draw_w, draw_h)
+                buf.apply_tag(
+                    self._gap_tag(draw_h + self.INLINE_PREVIEW_PAD * 2), ls, le)
+        if self._inline_previews != was:
             self.queue_draw()
+
+    def forget_previews(self):
+        """Drop the rendered pages — the document they came from has changed."""
+        self._preview_cache.clear()
 
     def _preview_draw_size(self, texture):
         """How big the picture is drawn: its own width, but never wider than
@@ -10698,29 +10715,31 @@ class MarkdownNotesView(GtkSource.View):
         return draw_w, h * (draw_w / w)
 
     def _snapshot_inline_preview(self, snapshot):
-        """Paint it into the gap its tag reserved, in BUFFER coordinates."""
-        if self._inline_link is None or self._inline_line is None:
+        """Paint each one into the gap its tag reserved, in BUFFER
+        coordinates."""
+        if not self._inline_previews:
             return
         buf = self.get_buffer()
-        ok, ls = buf.get_iter_at_line(self._inline_line)
-        if not ok:
-            return
-        _target, texture, _caption = self._inline_link
-        y, height = self.get_line_yrange(ls)
-        draw_w, draw_h = self._preview_draw_size(texture)
-        pad = self.INLINE_PREVIEW_PAD
-        x = self.get_left_margin() + pad
-        top = y + height - draw_h - pad
-        # A page is white on a panel that is nearly white, so without an edge
-        # the preview reads as text floating in a gap rather than as a page.
-        # A hairline, from a grey that works either way round rather than a
-        # theme colour a TextView cannot ask for.
-        edge = Gdk.RGBA(); edge.parse("#8a8a8a")
+        edge = Gdk.RGBA()
+        edge.parse("#8a8a8a")
         edge.alpha = 0.55
-        snapshot.append_color(
-            edge, Graphene.Rect().init(x - 1, top - 1, draw_w + 2, draw_h + 2))
-        snapshot.append_texture(
-            texture, Graphene.Rect().init(x, top, draw_w, draw_h))
+        pad = self.INLINE_PREVIEW_PAD
+        for ln, (texture, draw_w, draw_h) in self._inline_previews.items():
+            ok, ls = buf.get_iter_at_line(ln)
+            if not ok:
+                continue
+            y, height = self.get_line_yrange(ls)
+            x = self.get_left_margin() + pad
+            top = y + height - draw_h - pad
+            # A page is white on a panel that is nearly white, so without an
+            # edge the preview reads as text floating in a gap rather than as
+            # a page. A hairline, from a grey that works either way round
+            # rather than a theme colour a TextView cannot ask for.
+            snapshot.append_color(
+                edge, Graphene.Rect().init(x - 1, top - 1,
+                                           draw_w + 2, draw_h + 2))
+            snapshot.append_texture(
+                texture, Graphene.Rect().init(x, top, draw_w, draw_h))
 
     def _link_tip_area(self, x, y):
         """The line under the pointer, in widget coordinates."""
@@ -10877,6 +10896,11 @@ class MarkdownNotesView(GtkSource.View):
         open_at = line.rfind('[[', 0, col)  # the text has to as well
         if open_at == -1:
             return
+        # A picked target becomes an EMBED unless you typed a plain `[[`
+        # yourself: you asked for a link to a PAGE, and the page is what you
+        # meant to see. `!` is the one character that turns it back into a
+        # bare link, and it is Obsidian's.
+        bang = open_at > 0 and line[open_at - 1] == '!'
         start = ls.copy(); start.forward_chars(open_at + 2)   # just after [[
         closer = '' if line[col:col + 2] == ']]' else ']]'    # keep a stray ]]
         self._accepting_link = True
@@ -10891,6 +10915,13 @@ class MarkdownNotesView(GtkSource.View):
         if closer == '':
             end.forward_chars(2)         # step past the pre-existing ]]
         buf.place_cursor(end)
+        if not bang:
+            at = buf.get_iter_at_line_offset(ls.get_line(), open_at)[1]
+            self._accepting_link = True
+            try:
+                buf.insert(at, "!")
+            finally:
+                self._accepting_link = False
 
     def _hide_link_popup(self):
         if self._link_popup is not None and self._link_popup.get_visible():
@@ -11620,7 +11651,7 @@ class MarkdownNotesView(GtkSource.View):
         code_ranges = [(m.start(), m.end())
                        for m in _MD_CODE_SPAN_RE.finditer(text)]
         link_ranges = [(m.start(), m.end())
-                       for m in _MD_LINK_RE.finditer(text)
+                       for m in _MD_ANY_LINK_RE.finditer(text)
                        if not any(cs <= m.start() and m.end() <= ce
                                   for cs, ce in code_ranges)]
 
@@ -11705,20 +11736,21 @@ class MarkdownNotesView(GtkSource.View):
         # The link tag covers the whole inner (so a click anywhere follows it),
         # but an optional `target|label` alias hides the `target|` prefix too,
         # leaving only the label visible off the cursor line.
-        for m in _MD_LINK_RE.finditer(text):
+        for m in _MD_ANY_LINK_RE.finditer(text):
             a, b = m.start(), m.end()
             if in_code(a, b):
                 continue                     # [[..]] inside `code` is literal
-            apply("link", a + 2, b - 2)
+            head = 3 if text[a] == '!' else 2      # `![[` or `[[`
+            apply("link", a + head, b - 2)
             # …and struck through when it resolves to nothing. Never while the
             # caret is in it: a target is unwritten for most of the time you
             # spend typing it, and a line that strikes itself out under your
             # hands reads as an error you have made rather than one you are
             # about to fix.
             if not caret_in(a, b) and not self._link_is_live(m.group(1)):
-                apply("deadlink", a + 2, b - 2)
-            bar = text.find('|', a + 2, b - 2)
-            hide(a, bar + 1 if bar != -1 else a + 2, within=(a, b))
+                apply("deadlink", a + head, b - 2)
+            bar = text.find('|', a + head, b - 2)
+            hide(a, bar + 1 if bar != -1 else a + head, within=(a, b))
             hide(b - 2, b, within=(a, b))    # ]]
 
         # Inline: bold / italic / code (combined regex handles priority)
@@ -18410,8 +18442,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if not target:
             self._toast("Nothing to link to yet — save the document first")
             return
-        Gdk.Display.get_default().get_clipboard().set(f"[[{target}]]")
-        self._toast(f"Copied [[{target}]]")
+        Gdk.Display.get_default().get_clipboard().set(f"![[{target}]]")
+        self._toast(f"Copied ![[{target}]]")
 
     def _begin_note_link(self):
         """Start a link where the caret is: insert `[[]]`, put the caret
@@ -18430,7 +18462,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         try:
             if buf.get_has_selection():
                 buf.delete_selection(True, True)
-            buf.insert_at_cursor("[[]]")
+            buf.insert_at_cursor("![[]]")
         finally:
             buf.end_user_action()
         it = buf.get_iter_at_mark(buf.get_insert())
@@ -18505,6 +18537,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                          else None):
                 if view is not None:
                     view.forget_link_status()
+                    view.forget_previews()
 
     def _own_anchors(self):
         """This document's named places, live — its outline headings and its
