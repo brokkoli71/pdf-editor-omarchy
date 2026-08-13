@@ -3368,8 +3368,10 @@ class PDFCanvas(Gtk.DrawingArea):
         # controller: it has to run BEFORE the drag gesture, because pressed
         # ahead of the tip — how a hand holds a pen — the barrel would
         # otherwise claim the drag and the tip's press would never produce a
-        # drag-begin at all. The thumb's controller above stays bubble-phase
-        # on purpose; button 10 reaches no gesture, so it never needed this.
+        # drag-begin at all. The thumb's controller above stays bubble-phase:
+        # button 10 reaches no gesture, and this widget is itself the event
+        # target so nothing can swallow the press on the way. (The text sheet
+        # is an ancestor of its target and therefore needs capture there.)
         barrel = Gtk.EventControllerLegacy()
         barrel.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         barrel.connect("event", self._on_barrel_event)
@@ -11565,6 +11567,14 @@ class TextPageView(Gtk.Overlay):
         motion.connect("leave", self._on_sheet_leave)
         self.add_controller(motion)
         thumb = Gtk.EventControllerLegacy()
+        # CAPTURE, unlike the PDF canvas's — the reachability trap, not the
+        # barrel's claim-order one. The canvas IS the event target, so a bubble
+        # controller on it always runs; this widget is an ANCESTOR of the sheet,
+        # and the press targets the GtkTextView (or the ink overlay), whose own
+        # gestures take the button-10 press and STOP it before it ever bubbles
+        # up here. Capture runs root-down, so this sees it first; the handler
+        # returns False, so nothing below it loses the event.
+        thumb.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         thumb.connect("event", self._on_thumb_event)
         self.add_controller(thumb)
 
@@ -11572,8 +11582,7 @@ class TextPageView(Gtk.Overlay):
         # controller: it has to run BEFORE the drag gesture, because pressed
         # ahead of the tip — how a hand holds a pen — the barrel would
         # otherwise claim the drag and the tip's press would never produce a
-        # drag-begin at all. The thumb's controller above stays bubble-phase
-        # on purpose; button 10 reaches no gesture, so it never needed this.
+        # drag-begin at all.
         barrel = Gtk.EventControllerLegacy()
         barrel.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         barrel.connect("event", self._on_barrel_event)

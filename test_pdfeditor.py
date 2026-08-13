@@ -881,6 +881,37 @@ class TestPinchZoom(unittest.TestCase):
         tp._on_sheet_pinch_scale(g, 2.0)
         self.assertGreater(tp.zoom, before)
 
+    def test_the_sheets_thumb_button_runs_its_bound_tool(self):
+        """The thumb is a real button on the sheet too — button 10 reaches no
+        gesture, so it is replayed through the one press router."""
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text("alpha\nbeta\n")
+        tp.bindings.bind(sidemark.chord_id(sidemark.BTN_THUMB), "pen",
+                         mode="text")
+        tp._mouse_xy = (100.0, 100.0)
+        tp._on_thumb_event(None, types.SimpleNamespace(
+            get_event_type=lambda: Gdk.EventType.BUTTON_PRESS,
+            get_button=lambda: sidemark.BTN_THUMB,
+            get_modifier_state=lambda: Gdk.ModifierType(0)))
+        self.assertEqual(tp._press_tool, "pen")
+
+    def test_the_sheets_thumb_controller_is_capture_phase(self):
+        """Reachability, not logic: this widget is an ANCESTOR of what a press
+        targets (the GtkTextView, or the ink overlay), and their gestures stop
+        the button-10 press before it can bubble up here — so a bubble-phase
+        controller is a correct handler that never runs. The PDF canvas is the
+        target itself, which is why it can stay in bubble."""
+        tp = sidemark.TextPageView()
+        phases = [c.get_propagation_phase() for c in tp.observe_controllers()
+                  if isinstance(c, Gtk.EventControllerLegacy)
+                  and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE]
+        self.assertTrue(phases, "no capture-phase legacy controller on the sheet")
+        self.assertEqual(
+            [c for c in tp.observe_controllers()
+             if isinstance(c, Gtk.EventControllerLegacy)
+             and c.get_propagation_phase() != Gtk.PropagationPhase.CAPTURE],
+            [])
+
     def test_pinch_without_page_is_noop(self):
         c = self._canvas()
         c.page = None
