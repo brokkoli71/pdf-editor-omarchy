@@ -10243,6 +10243,8 @@ class MarkdownNotesView(GtkSource.View):
         and reflows with the buffer, and text drawn over it stays legible."""
         if layer == Gtk.TextViewLayer.BELOW_TEXT and self.on_snapshot_below:
             self.on_snapshot_below(snapshot)
+        if layer == Gtk.TextViewLayer.BELOW_TEXT:
+            self._snapshot_inline_preview(snapshot)
 
     # Inline-Markdown / script regexes (module-level; shared with callout markup)
     _INLINE = _MD_INLINE_RE
@@ -10326,6 +10328,10 @@ class MarkdownNotesView(GtkSource.View):
             # thing to have in notes.
             "deadlink":    tag("deadlink",    underline=0, strikethrough=True,
                                foreground="#8b8b8b"),
+            # The gap the inline preview is painted into (row 165). It is real
+            # LAYOUT space, which is the whole point: everything below the link
+            # moves down for it, so the picture never lands on top of the notes.
+            "preview_gap": tag("preview_gap", pixels_below_lines=0),
         }
 
         self._cursor_line = 0
@@ -10384,6 +10390,12 @@ class MarkdownNotesView(GtkSource.View):
         # `(texture or None, caption)` for the hover preview — or None for
         # "nothing to show".
         self.link_preview_cb = None
+        # The preview drawn UNDER the link the caret is standing in: its
+        # target string, its texture and its caption. Kept because
+        # `_rehighlight` runs on every keystroke and rendering a page is not
+        # something to do per keystroke.
+        self._inline_link = None            # (target, texture, caption)
+        self._inline_line = None            # the buffer line it is drawn under
         self._link_popup = None      # lazily-built Gtk.Popover
         self._link_list = None       # the Gtk.ListBox inside it
         self._link_rows = []         # candidate dicts currently shown, in order
@@ -10604,6 +10616,111 @@ class MarkdownNotesView(GtkSource.View):
         # not re-render its page on every motion event.
         tooltip.set_tip_area(self._link_tip_area(x, y))
         return True
+
+    # ── the preview of the link the caret is IN, drawn under its line ────────
+    #
+    # The rule the editor already has (row 141): what the caret is touching
+    # opens up, everything else stays as it reads. Standing in a link shows
+    # you the page it leads to, in place, with the notes below it moved down
+    # to make room — so it is never a picture lying on top of your writing.
+    # Every other link answers on hover instead; drawing them all would turn a
+    # page of notes into a stack of thumbnails.
+
+    INLINE_PREVIEW_PAD = 8            # around the picture, in px
+
+    def _inline_preview_for(self, buf):
+        """`(target, texture, caption, line)` for the link the caret is
+        standing in, or None. The render is memoised on the target string:
+        this is asked on every keystroke."""
+        if self.link_preview_cb is None:
+            return None
+        it = buf.get_iter_at_mark(buf.get_insert())
+        ln, col = it.get_line(), it.get_line_offset()
+        ok, ls = buf.get_iter_at_line(ln)
+        if not ok:
+            return None
+        le = ls.copy()
+        if not le.ends_line():
+            le.forward_to_line_end()
+        text = buf.get_text(ls, le, True)
+        for m in _MD_LINK_RE.finditer(text):
+            if not (m.start() <= col <= m.end()):
+                continue
+            target = m.group(1)
+            if self._inline_link and self._inline_link[0] == target:
+                return (*self._inline_link, ln)
+            try:
+                shot = self.link_preview_cb(_parse_note_link(target))
+            except Exception:
+                shot = None
+            if not shot or shot[0] is None:
+                return None
+            self._inline_link = (target, shot[0], shot[1])
+            return (*self._inline_link, ln)
+        return None
+
+    def _sync_inline_preview(self, buf):
+        """Reserve (or release) the space under the caret's line. Called from
+        the render pass, which already runs whenever the caret moves."""
+        found = self._inline_preview_for(buf)
+        gap = self._t["preview_gap"]
+        buf.remove_tag(gap, buf.get_start_iter(), buf.get_end_iter())
+        if found is None:
+            if self._inline_line is not None:
+                self._inline_line = None
+                self._inline_link = None
+                self.queue_draw()
+            return
+        _target, texture, _caption, ln = found
+        height = self._preview_draw_size(texture)[1]
+        gap.set_property("pixels-below-lines",
+                         int(height + self.INLINE_PREVIEW_PAD * 2))
+        ok, ls = buf.get_iter_at_line(ln)
+        if not ok:
+            return
+        le = ls.copy()
+        if not le.ends_line():
+            le.forward_to_line_end()
+        buf.apply_tag(gap, ls, le)
+        if self._inline_line != ln:
+            self._inline_line = ln
+            self.queue_draw()
+
+    def _preview_draw_size(self, texture):
+        """How big the picture is drawn: its own width, but never wider than
+        the panel it has to fit in — a notes panel is often narrower than the
+        page it is previewing."""
+        w = texture.get_width() or 1
+        h = texture.get_height() or 1
+        avail = max(80, self.get_width() - self.get_left_margin()
+                    - self.get_right_margin() - self.INLINE_PREVIEW_PAD * 2)
+        draw_w = min(float(w), float(avail))
+        return draw_w, h * (draw_w / w)
+
+    def _snapshot_inline_preview(self, snapshot):
+        """Paint it into the gap its tag reserved, in BUFFER coordinates."""
+        if self._inline_link is None or self._inline_line is None:
+            return
+        buf = self.get_buffer()
+        ok, ls = buf.get_iter_at_line(self._inline_line)
+        if not ok:
+            return
+        _target, texture, _caption = self._inline_link
+        y, height = self.get_line_yrange(ls)
+        draw_w, draw_h = self._preview_draw_size(texture)
+        pad = self.INLINE_PREVIEW_PAD
+        x = self.get_left_margin() + pad
+        top = y + height - draw_h - pad
+        # A page is white on a panel that is nearly white, so without an edge
+        # the preview reads as text floating in a gap rather than as a page.
+        # A hairline, from a grey that works either way round rather than a
+        # theme colour a TextView cannot ask for.
+        edge = Gdk.RGBA(); edge.parse("#8a8a8a")
+        edge.alpha = 0.55
+        snapshot.append_color(
+            edge, Graphene.Rect().init(x - 1, top - 1, draw_w + 2, draw_h + 2))
+        snapshot.append_texture(
+            texture, Graphene.Rect().init(x, top, draw_w, draw_h))
 
     def _link_tip_area(self, x, y):
         """The line under the pointer, in widget coordinates."""
@@ -11471,6 +11588,10 @@ class MarkdownNotesView(GtkSource.View):
                     self._line_originals.pop(ln, None)
 
             self._highlight_line(buf, ls, ln, text)
+        # …and the preview of the link the caret is standing in, whose gap is
+        # a tag like any other and so has to be re-applied after the sweep
+        # above cleared every tag in the buffer.
+        self._sync_inline_preview(buf)
         return False
 
     def _script_tag(self, chain):
@@ -16515,7 +16636,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # the page is still there behind the sheet, collapsed — pulling the
             # handle back out is how it comes back
             if pos >= self.MODE_PAGE_BACK:
-                self._pull_page_in(s)
+                # …and the page comes back the width you pulled it to. Where
+                # the divider stood BEFORE the sheet opened is a fact about a
+                # layout you have just spent a while away from; the drag you
+                # have this second is the one you meant.
+                self._pull_page_in(s, at=pos)
         elif pos <= self.FULL_NOTES_EDGE and s._notes_box.get_visible():
             self._enter_full_notes_view(s)
         return GLib.SOURCE_REMOVE
@@ -16581,14 +16706,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.toast_overlay.add_toast(toast)
         return True
 
-    def _leave_full_notes_view(self, s=None):
-        """The mirror: the pages come back and the notes return to the panel."""
+    def _leave_full_notes_view(self, s=None, at=None):
+        """The mirror: the pages come back and the notes return to the panel.
+
+        `at` is where a drag let go, and it WINS over the position the divider
+        had before the sheet opened — that one describes a layout you left a
+        while ago, this one is the width you just asked for."""
         s = s or self._active_session
         if not self._full_notes_view(s):
             return False
         self._commit_note_for(s)          # sheet → model, parsed back per page
         target = self._full_notes_target_page(s)
-        self._leave_text_mode(s)
+        self._leave_text_mode(s, at=at)
         s._full_notes_from = s._full_notes_caret = None
         if s is self._active_session:
             self._set_notes_shown(True)
@@ -16642,16 +16771,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return home
         return home if home in s.notes_model.run_pages(page) else page
 
-    def _pull_page_in(self, s=None):
+    def _pull_page_in(self, s=None, at=None):
         """The left-edge pull. On a PDF's notes sheet it brings the pages back;
         on a text-first page the document GAINS a blank page — an untitled temp
         PDF, so an accidental pull litters nothing next to the .md and is
-        undone by dragging the divider back out."""
+        undone by dragging the divider back out.
+
+        `at` is where the drag ended: the page comes back that wide."""
         s = s or self._active_session
         if not s._text_mode:
             return False
         if s._path:
-            return self._leave_full_notes_view(s)
+            return self._leave_full_notes_view(s, at=at)
         self._commit_note_for(s)
         text = s.notes_model.to_text() if s.notes_model.has_content() else \
             s.notes_model.get(0)
@@ -16708,8 +16839,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # CLICKING to move the caret that wants the caret tool.
             tp.view.grab_focus()
 
-    def _leave_text_mode(self, s=None):
-        """Back to the PDF layout (a PDF got opened into this tab)."""
+    def _leave_text_mode(self, s=None, at=None):
+        """Back to the PDF layout (a PDF got opened into this tab).
+
+        `at` is a divider position a drag has just chosen; without one the
+        layout goes back to where it stood before the sheet took over."""
         s = s or self._active_session
         if not s._text_mode:
             return
@@ -16723,6 +16857,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._paned.remove_css_class("page-edge")
         s._paned.set_cursor(None)
         w = self.get_width() or 1280
+        if at is not None and 100 < at < w - 150:
+            s._saved_pane_pos = int(at)   # …and it is remembered, like any
+                                          # other divider position
         if not (100 < s._saved_pane_pos < w - 150):
             s._saved_pane_pos = int(w * 0.62)
         self._settle_pane_at(s, s._saved_pane_pos)

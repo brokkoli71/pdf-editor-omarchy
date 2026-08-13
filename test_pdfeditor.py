@@ -3057,6 +3057,24 @@ class TestModeGestures(unittest.TestCase):
 
         self._run_in_window(2, body, md=md)
 
+    def test_the_page_comes_back_the_width_you_pulled_it_to(self):
+        """Where the divider stood before the sheet opened is a fact about a
+        layout you left a while ago; the drag you have this second is the one
+        you meant."""
+        def body(win):
+            s = win._active_session
+            s._paned.set_position(700)          # the layout before the sheet
+            win._enter_full_notes_view()
+            self.assertEqual(s._saved_pane_pos, 700)
+            win._leave_full_notes_view(at=420)  # …pulled back out to here
+            self.assertEqual(s._saved_pane_pos, 420)
+            # and with no drag behind it, the old position still applies
+            win._enter_full_notes_view()
+            win._leave_full_notes_view()
+            self.assertEqual(s._saved_pane_pos, 420)
+
+        self._run_in_window(2, body, md="<!-- page:0 -->\nnote\n")
+
     def test_a_pdf_in_the_sheet_view_still_saves_per_page(self):
         """The distinction the whole codebase uses: a text-first page has no
         `_path`. This one has, so it is a VIEW and saves sectioned."""
@@ -16081,6 +16099,75 @@ class TestLinkHitTesting(unittest.TestCase):
         v._insert_link_target('l2.pdf#Proof')
         self.assertEqual(buf.get_text(*buf.get_bounds(), True),
                          'a [[#page=4]] b [[l2.pdf#Proof]]')
+
+
+class TestInlineLinkPreview(unittest.TestCase):
+    """The link the caret is STANDING IN shows its page under it, with the
+    notes below moved down for it (row 165). The rule the editor already has
+    — what the caret touches opens up — and the reason it is not every link:
+    a page of notes would become a stack of thumbnails."""
+
+    def _texture(self, w=40, h=52):
+        data = GLib.Bytes.new(b"\xc8" * (w * h * 3))
+        return Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.R8G8B8, data, w * 3)
+
+    def _view(self, text, caret):
+        v = sidemark.MarkdownNotesView()
+        self.asked = []
+
+        def preview(link):
+            self.asked.append(link.get("label"))
+            return self._texture(), "deck.pdf · p.4"
+        v.link_preview_cb = preview
+        buf = v.get_buffer()
+        buf.set_text(text)
+        buf.place_cursor(buf.get_iter_at_offset(caret))
+        v._rehighlight()
+        return v, buf
+
+    def _gap(self, v):
+        return v._t["preview_gap"].get_property("pixels-below-lines")
+
+    def test_standing_in_a_link_reserves_room_and_holds_its_page(self):
+        v, buf = self._view("before\nsee [[#page=4]] here\nafter", caret=12)
+        self.assertIsNotNone(v._inline_link)
+        self.assertEqual(v._inline_line, 1)
+        self.assertGreater(self._gap(v), 0)
+        # the gap is real layout space on that line, so what follows moves down
+        ls = buf.get_iter_at_line(1)[1]
+        self.assertTrue(ls.has_tag(v._t["preview_gap"]))
+
+    def test_leaving_the_link_gives_the_room_back(self):
+        v, buf = self._view("before\nsee [[#page=4]] here\nafter", caret=12)
+        buf.place_cursor(buf.get_iter_at_line(2)[1])
+        v._rehighlight()
+        self.assertIsNone(v._inline_link)
+        self.assertIsNone(v._inline_line)
+        self.assertFalse(
+            buf.get_iter_at_line(1)[1].has_tag(v._t["preview_gap"]))
+
+    def test_the_page_is_rendered_once_per_target(self):
+        """`_rehighlight` runs on every keystroke; rendering a page is not
+        something to do per keystroke."""
+        v, buf = self._view("see [[#page=4]] here", caret=8)
+        for _ in range(4):
+            v._rehighlight()
+        self.assertEqual(self.asked, ["#page=4"])
+
+    def test_a_link_the_caret_is_not_in_shows_nothing_inline(self):
+        v, _buf = self._view("see [[#page=4]] here", caret=0)
+        self.assertIsNone(v._inline_link)
+        self.assertEqual(self.asked, [])
+
+    def test_nothing_inline_without_a_page_to_show(self):
+        v = sidemark.MarkdownNotesView()
+        v.link_preview_cb = lambda link: None      # unresolvable target
+        buf = v.get_buffer()
+        buf.set_text("see [[#Nowhere]] here")
+        buf.place_cursor(buf.get_iter_at_offset(8))
+        v._rehighlight()
+        self.assertIsNone(v._inline_link)
+        self.assertEqual(self._gap(v), 0)
 
 
 class TestLinkHoverPreview(unittest.TestCase):
