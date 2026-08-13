@@ -5393,16 +5393,10 @@ class TestLatexFormatting(unittest.TestCase):
         self.assertTrue(label.has_tag(v._t["link"]))
         self.assertFalse(label.has_tag(v._t["hide"]))
 
-    def test_an_embed_is_a_link_that_shows_its_page(self):
-        """`![[target]]` is Obsidian's embed syntax and Sidemark's own (a
-        sidecar's first line embeds its PDF). It is the same link — styled,
-        followable — that also renders the page it leads to."""
+    def test_embed_marker_is_not_linkified(self):
         v, buf = self._render_line0('![[deck.pdf]]')
-        it = buf.get_iter_at_line(0)[1]; it.forward_chars(4)      # inside ![[
-        self.assertTrue(it.has_tag(v._t["link"]))
-        for col in range(3):                                     # the `![[`
-            self.assertTrue(
-                buf.get_iter_at_line_offset(0, col)[1].has_tag(v._t["hide"]))
+        it = buf.get_iter_at_line(0)[1]; it.forward_chars(3)          # inside [[
+        self.assertFalse(it.has_tag(v._t["link"]))
 
     # ── heading markers ──────────────────────────────────────────────────────
     def test_heading_marker_hidden_off_the_cursor_line(self):
@@ -5559,8 +5553,8 @@ class TestLinkAutocompleteHelpers(unittest.TestCase):
         # cursor sits after a completed [[..]] — nothing to complete
         self.assertIsNone(self._q('[[a.pdf]] '))
 
-    def test_an_embed_is_completed_like_any_other_link(self):
-        self.assertEqual(self._q('![[deck'), 'deck')
+    def test_embed_marker_is_not_a_query(self):
+        self.assertIsNone(self._q('![[deck.pdf'))
 
     def test_query_uses_cursor_column_not_line_end(self):
         # cursor in the middle: only text up to the cursor is the query
@@ -5616,23 +5610,15 @@ class TestLinkAutocompletePopup(unittest.TestCase):
         v._insert_link_target('lecture.pdf')
         self.assertEqual(buf.get_text(buf.get_start_iter(),
                                       buf.get_end_iter(), True),
-                         'see ![[lecture.pdf]]')
+                         'see [[lecture.pdf]]')
         self.assertTrue(buf.get_iter_at_mark(buf.get_insert()).is_end())
-
-    def test_a_bang_you_typed_yourself_is_not_doubled(self):
-        v = self._view(); buf = v.get_buffer()
-        self._cursor_after(buf, 'see ![[le', 'le')
-        v._insert_link_target('lecture.pdf')
-        self.assertEqual(buf.get_text(buf.get_start_iter(),
-                                      buf.get_end_iter(), True),
-                         'see ![[lecture.pdf]]')
 
     def test_insert_reuses_existing_closing_brackets(self):
         v = self._view(); buf = v.get_buffer()
         self._cursor_after(buf, '[[le]]', 'le')     # cursor sits before the ]]
         v._insert_link_target('lec.pdf')
         self.assertEqual(buf.get_text(buf.get_start_iter(),
-                                      buf.get_end_iter(), True), '![[lec.pdf]]')
+                                      buf.get_end_iter(), True), '[[lec.pdf]]')
 
     def test_popup_populates_on_open_query(self):
         cands = [{"insert": "a.pdf", "label": "a.pdf", "detail": "", "kind": "open"}]
@@ -5648,12 +5634,12 @@ class TestLinkAutocompletePopup(unittest.TestCase):
         v._update_link_popup()
         self.assertEqual(v._link_rows, [])
 
-    def test_an_embed_opens_the_popup_too(self):
+    def test_embed_marker_does_not_open_popup(self):
         v = self._view(cb=lambda q: [{"insert": "x", "label": "x"}])
         buf = v.get_buffer()
         self._cursor_after(buf, '![[a', 'a')
         v._update_link_popup()
-        self.assertEqual([c["insert"] for c in v._link_rows], ["x"])
+        self.assertEqual(v._link_rows, [])
 
     def test_accept_inserts_selected_and_hides(self):
         cands = [{"insert": "a.pdf", "label": "a.pdf", "detail": "", "kind": "open"}]
@@ -5661,10 +5647,8 @@ class TestLinkAutocompletePopup(unittest.TestCase):
         self._cursor_after(buf, '[[a', 'a')
         v._update_link_popup()
         v._accept_link_selection()
-        # a picked target becomes an EMBED: you asked for a link to a page,
-        # and the page is what you meant to see
         self.assertEqual(buf.get_text(buf.get_start_iter(),
-                                      buf.get_end_iter(), True), '![[a.pdf]]')
+                                      buf.get_end_iter(), True), '[[a.pdf]]')
         self.assertEqual(v._link_rows, [])
 
 
@@ -5729,10 +5713,9 @@ class TestCalloutMarkup(unittest.TestCase):
         self.assertEqual(self._markup('[[l2.pdf#page=3|the proof]]'),
                          '<u>the proof</u>')
 
-    def test_an_embed_renders_as_its_label(self):
-        # `![[…]]` is a link that shows its page; a callout has no room for a
-        # picture, so it shows what any other link would
-        self.assertEqual(self._markup('![[deck.pdf]]'), '<u>deck.pdf</u>')
+    def test_embed_line_is_not_a_link(self):
+        # the ![[name.pdf]] embed marker must not be treated as a wiki link
+        self.assertEqual(self._markup('![[deck.pdf]]'), '![[deck.pdf]]')
 
 
 # ── export ────────────────────────────────────────────────────────────────────
@@ -16115,108 +16098,7 @@ class TestLinkHitTesting(unittest.TestCase):
         buf.place_cursor(buf.get_end_iter())
         v._insert_link_target('l2.pdf#Proof')
         self.assertEqual(buf.get_text(*buf.get_bounds(), True),
-                         'a [[#page=4]] b ![[l2.pdf#Proof]]')
-
-
-class TestInlineLinkPreview(unittest.TestCase):
-    """`![[target]]` shows the page it leads to, under its line, with the notes
-    below moved down for it (row 165). The MARKER decides, not where the caret
-    is: a preview that came and went as you moved through the text could not be
-    read. `[[target]]` is the same link without the picture."""
-
-    def _texture(self, w=40, h=52):
-        data = GLib.Bytes.new(b"\xc8" * (w * h * 3))
-        return Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.R8G8B8, data, w * 3)
-
-    def _view(self, text, shot=True):
-        v = sidemark.MarkdownNotesView()
-        self.asked = []
-
-        def preview(link):
-            self.asked.append(link.get("label"))
-            return (self._texture(), "deck.pdf · p.4") if shot else None
-        v.link_preview_cb = preview
-        buf = v.get_buffer()
-        buf.set_text(text)
-        buf.place_cursor(buf.get_start_iter())
-        v._rehighlight()
-        return v, buf
-
-    def _gap_of(self, v, buf, ln):
-        """The space reserved under line `ln`, in px."""
-        it = buf.get_iter_at_line(ln)[1]
-        return max([t.get_property("pixels-below-lines")
-                    for t in (it.get_tags() or [])] or [0])
-
-    def test_an_embed_reserves_room_and_holds_its_page(self):
-        v, buf = self._view("before\nsee ![[#page=4]] here\nafter")
-        self.assertIn(1, v._inline_previews)
-        # the gap is real layout space on that line, so what follows moves down
-        self.assertGreater(self._gap_of(v, buf, 1), 0)
-        self.assertEqual(self._gap_of(v, buf, 0), 0)
-
-    def test_a_plain_link_shows_nothing_inline(self):
-        v, buf = self._view("see [[#page=4]] here")
-        self.assertEqual(v._inline_previews, {})
-        self.assertEqual(self.asked, [])
-        self.assertEqual(self._gap_of(v, buf, 0), 0)
-
-    def test_the_preview_does_not_depend_on_where_the_caret_is(self):
-        v, buf = self._view("see ![[#page=4]] here\nfar away")
-        buf.place_cursor(buf.get_iter_at_line(1)[1])
-        v._rehighlight()
-        self.assertIn(0, v._inline_previews)
-
-    def test_several_embeds_each_get_their_own_room(self):
-        v, buf = self._view("![[#page=2]]\nprose\n![[#page=5]]")
-        self.assertEqual(sorted(v._inline_previews), [0, 2])
-        self.assertGreater(self._gap_of(v, buf, 0), 0)
-        self.assertEqual(self._gap_of(v, buf, 1), 0)
-
-    def test_the_page_is_rendered_once_per_target(self):
-        """`_rehighlight` runs on every keystroke and over every line, so this
-        is asked far more often than a page can be rendered."""
-        v, _buf = self._view("![[#page=4]] and ![[#page=4]] again")
-        for _ in range(4):
-            v._rehighlight()
-        self.assertEqual(self.asked, ["#page=4"])
-        v.forget_previews()                  # the document changed under it
-        v._rehighlight()
-        self.assertEqual(self.asked, ["#page=4", "#page=4"])
-
-    def test_nothing_inline_without_a_page_to_show(self):
-        v, buf = self._view("see ![[#Nowhere]] here", shot=False)
-        self.assertEqual(v._inline_previews, {})
-        self.assertEqual(self._gap_of(v, buf, 0), 0)
-
-
-class TestLinkHoverPreview(unittest.TestCase):
-    """The preview is a TOOLTIP, not a popover, and that is load-bearing: a
-    popover is a real surface, so shown near the pointer it takes the crossing,
-    the view gets a leave, the preview hides — and the whole thing oscillates.
-    GTK's tooltips keep away from the pointer by construction."""
-
-    def _view(self):
-        v = sidemark.MarkdownNotesView()
-        v.link_preview_cb = lambda link: (None, "deck.pdf · p.4")
-        return v
-
-    def test_the_view_asks_gtk_for_tooltips_at_all(self):
-        v = self._view()
-        self.assertTrue(v.get_has_tooltip())
-
-    def test_no_preview_without_a_link_under_the_pointer(self):
-        v = self._view()
-        v.get_buffer().set_text("plain prose, nothing to preview")
-        # a real Gtk.Tooltip cannot be constructed from outside GTK, and the
-        # handler must decline before it ever touches one
-        self.assertFalse(v._on_query_tooltip(v, 5, 5, False, None))
-
-    def test_no_preview_from_the_keyboard_or_without_a_resolver(self):
-        v = self._view()
-        self.assertFalse(v._on_query_tooltip(v, 5, 5, True, None))
-        v.link_preview_cb = None
-        self.assertFalse(v._on_query_tooltip(v, 5, 5, False, None))
+                         'a [[#page=4]] b [[l2.pdf#Proof]]')
 
 
 class TestDeadLinkRendering(unittest.TestCase):
@@ -16547,9 +16429,93 @@ class TestLinkCompletions(unittest.TestCase):
                 win._begin_note_link()
                 buf = win._notes_view.get_buffer()
                 self.assertEqual(
-                    buf.get_text(*buf.get_bounds(), False), "![[]]")
+                    buf.get_text(*buf.get_bounds(), False), "[[]]")
                 it = buf.get_iter_at_mark(buf.get_insert())
-                self.assertEqual(it.get_line_offset(), 3)   # between them
+                self.assertEqual(it.get_line_offset(), 2)   # between them
+                self.assertIn("#Eigenvalues",
+                              [c["insert"] for c in win._notes_view._link_rows])
+        self._run_in_window(body, present=False)
+
+    def test_a_link_to_here_names_the_page_rather_than_numbering_it(self):
+        """It always names the FILE too: this goes on the clipboard, and a bare
+        `#name` pasted into another document's notes resolves against that
+        document — a link that works and goes to the wrong place."""
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=5)
+                win._do_open_file(a)
+                win._go_to_page(2)
+                # nothing names this page yet, so the number is all there is
+                self.assertEqual(win.link_target_to_here(), "a.pdf#page=3")
+                win.notes_model.add_bookmark(2, "Eigenvalues")
+                self.assertEqual(win.link_target_to_here(), "a.pdf#Eigenvalues")
+        self._run_in_window(body)
+
+
+    def test_following_a_link_offers_the_way_back_and_then_forgets(self):
+        """Following a link costs you the place you were reading, so the way
+        back sits in the notes header — and goes as soon as you turn the page,
+        because by then it is a claim about somewhere you have already left."""
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=9)
+                win._do_open_file(a)
+                win._go_to_page(1)
+                win._follow_note_link(sidemark._parse_note_link("#page=7"))
+                self.assertEqual(win.canvas.current_page_idx, 6)
+                self.assertTrue(win._notes_back_btn.get_visible())
+                self.assertIn("p.2", win._notes_back_btn.get_label())
+                win._go_to_page(4)                  # …anywhere else
+                self.assertFalse(win._notes_back_btn.get_visible())
+                # and it takes you back where you came from
+                win._go_to_page(6)
+                self.assertTrue(win._notes_back_btn.get_visible())
+                win._go_back_from_link()
+                self.assertEqual(win.canvas.current_page_idx, 1)
+                self.assertFalse(win._notes_back_btn.get_visible())
+        self._run_in_window(body)
+
+    def test_a_link_to_the_page_you_are_on_offers_no_way_back(self):
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=4)
+                win._do_open_file(a)
+                win._go_to_page(2)
+                win._follow_note_link(sidemark._parse_note_link("#page=3"))
+                self.assertFalse(win._notes_back_btn.get_visible())
+        self._run_in_window(body)
+
+    def test_a_link_to_another_document_resolves_by_name(self):
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=2)
+                b = os.path.join(d, "l2.pdf"); make_pdf(b, n_pages=8)
+                with open(sidemark.notes_path_for(b), "w",
+                          encoding="utf-8") as f:
+                    f.write('<!-- page:5 bookmark="Proof" -->\nx\n')
+                win._do_open_file(a)
+                full, idx, ok = win._resolve_note_link(
+                    sidemark._parse_note_link("l2.pdf#Proof"))
+                self.assertTrue(ok)
+                self.assertTrue(os.path.samefile(full, b))
+                self.assertEqual(idx, 5)
+        self._run_in_window(body)
+
+
+    def test_the_menu_verb_starts_a_link_and_opens_the_picker(self):
+        """Discoverability (row 165): `[[` was the only way in and nothing said
+        so. The entry has to LEAVE the syntax on screen, with targets offered."""
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=3)
+                win._do_open_file(a)
+                win.notes_model.add_bookmark(1, "Eigenvalues")
+                win._begin_note_link()
+                buf = win._notes_view.get_buffer()
+                self.assertEqual(
+                    buf.get_text(*buf.get_bounds(), False), "[[]]")
+                it = buf.get_iter_at_mark(buf.get_insert())
+                self.assertEqual(it.get_line_offset(), 2)   # between them
                 self.assertIn("#Eigenvalues",
                               [c["insert"] for c in win._notes_view._link_rows])
         self._run_in_window(body, present=False)

@@ -681,6 +681,28 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   - **The picker anchors to the LINE, not to a point** (`_position_link_popup`,
     `halign=START`). Given a zero-height anchor GTK centres the popup on it and
     flips it back over the very text you are reading — the `[[` you just typed.
+  - **PREVIEWS ARE DEFERRED (row 166), and the row is worth reading before
+    rebuilding them.** Hovering a link and `![[embeds]]` both shipped and were
+    both pulled the same day after a GTK abort ("Byte index N is off the end of
+    the line") in the notes editor. The design that survives is in row 166,
+    including which parts were sound (the marker, not the caret; a tag's
+    `pixels-below-lines` rather than a paintable; a tooltip rather than a
+    popover) and the leading suspect for the crash.
+  - **The way BACK is part of following one**: `_link_return` remembers where
+    the click came from and where it landed, and the notes header shows
+    "↩ Back to p.N" only while you are still on the page the link put you on.
+    Asking "am I where the link left me?" is what retires the offer by itself
+    — no timer, and never a stale jump to somewhere you left ten pages ago.
+  - **The picker anchors to the LINE, not to a point** (`_position_link_popup`,
+    `halign=START`). Given a zero-height anchor GTK centres the popup on it and
+    flips it back over the very text you are reading — the `[[` you just typed.
+  - **PREVIEWS ARE DEFERRED (row 166), and the row is worth reading before
+    rebuilding them.** Hovering a link and `![[embeds]]` both shipped and were
+    both pulled the same day after a GTK abort ("Byte index N is off the end of
+    the line") in the notes editor. The design that survives is in row 166,
+    including which parts were sound (the marker, not the caret; a tag's
+    `pixels-below-lines` rather than a paintable; a tooltip rather than a
+    popover) and the leading suspect for the crash.
   - **`![[target]]` is an EMBED: the same link, showing the page it leads
     to**, under its line (`_MD_EMBED_RE`, `_sync_inline_preview`,
     `_snapshot_inline_preview`). Obsidian's syntax for exactly this, and
@@ -1170,7 +1192,7 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   which is *most* lines, so this fails exactly where the feature is used and
   works while you test it with the caret in place. It killed two things at
   once (row 165): `_link_target_at` could not match `[[…]]` at all once the
-  brackets were hidden — no hand cursor, no Ctrl+click, no hover preview — and
+  brackets were hidden — no hand cursor and no Ctrl+click — and
   `_cursor_line_and_col` shifted the `[[` query, so the picker stopped opening
   on any line that already had a link or a rendered symbol. Read it back the
   way the buffer stores it, or convert the offset first; never mix the two.
