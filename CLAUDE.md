@@ -1539,7 +1539,60 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     `.png` is still refused by `classify_import_paths`, which is the other half
     of the gap row 167 started from.*
 - Logging: `logger` writes a per-session file under `~/.cache/sidemark/logs/`,
-  auto-deleted on clean exit, kept on errors.
+  auto-deleted on clean exit, **kept when anything logged at WARNING or above**
+  and pruned to `LOG_KEEP`. Warning, not error, is deliberate: every warning
+  site here is something having gone wrong, and the diagnostics that matter
+  most — a GTK critical, a stalled loop, a slow render pass — all belong to a
+  session that then exits perfectly cleanly, so an error-only rule deleted the
+  log of exactly the run worth reading.
+  - **A FREEZE is a blocked main loop, and only a thread outside it can see one
+    (row 169).** The symptom users report is typing that stops appearing and
+    then lands all at once: nothing is lost, the events were QUEUED while the
+    loop was busy, so nothing inside the app notices anything wrong.
+    `_watchdog` is a daemon thread watching a `STALL_BEAT_MS` heartbeat; once
+    the loop is `STALL_WARN_MS` late it samples the MAIN thread's Python stack
+    (`sys._current_frames()`) until it returns, and reports the busiest frames.
+    Naming the frame is the whole point — "stalled 400 ms" is the symptom the
+    user could already see. Reports are rate-limited (`STALL_REPEAT_S`), since
+    the shape to expect is work repeating on every keystroke, and the thread
+    never touches GTK. `SIDEMARK_NO_WATCHDOG=1` switches it off. Do not start
+    it in the suite: `_loop_beat` frozen at the end of one test's loop makes
+    every later moment look like a hang, and a stray warning breaks any test
+    counting `assertLogs` records — test the pieces instead.
+  - **A GTK abort writes NOTHING by itself, so two hooks make it readable (row
+    169).** `g_error` kills the process from C: no exception, no
+    `sys.excepthook`, and a log that just stops mid-session — which is all the
+    2026-08-14 crash left behind, and why `coredumpctl` was the only thing that
+    could answer it. `faulthandler` (pointed at the log's own stream) writes
+    the PYTHON frames at SIGABRT/SIGSEGV, which is what names the handler;
+    `_glib_log_writer` copies GTK's message in beside them, with a stack and an
+    immediate flush. Four platform facts hold it up, all measured, and each is
+    the opposite of the obvious guess:
+    - **`g_log_set_handler` cannot see them** — modern GTK logs through the
+      STRUCTURED API, so `g_log_set_writer_func` is the only hook that catches
+      both paths.
+    - **The writer cannot suppress a crash**: glib aborts in the caller ABOVE
+      it whatever it returns. It is purely additive, and delegates to
+      `g_log_writer_default` so stderr and the journal are unchanged.
+    - **`FLAG_FATAL` is not set on the way in** — fatality is decided after the
+      writer returns, so an always-fatal critical arrives as a plain level 8.
+      `_glib_log_kind` classifies on `LEVEL_ERROR`, and gives a critical a
+      stack too.
+    - **`g_log_set_writer_func` may be called ONCE per process**; the second
+      call is itself a `g_error`, so `_install_glib_log_bridge` is guarded — an
+      unguarded re-install aborts the app with exactly the crash the hook
+      exists to explain.
+    PyGObject hands the writer the raw `GLogField` array, so values are
+    gpointers read with `ctypes` (`_glib_log_fields`); the structured path also
+    carries `CODE_FILE`/`LINE`/`FUNC`, naming the GTK source line that gave up.
+  - **The row 166 crash is still LIVE, and it is not the previews' fault.** The
+    2026-08-14 abort was `gtk_text_iter_set_visible_line_index` reached from
+    `_on_link_motion` → `_link_target_at` — the hover hit-test, which survived
+    the pull of the previews and calls the same GTK path. It bit on an
+    805-page document's full-notes sheet, where `_rehighlight` walks the whole
+    sidecar; the size is the suspected trigger, not proven. The breadcrumbs on
+    that path (the switch logs the sheet's size, `REHIGHLIGHT_SLOW_MS` warns on
+    a slow render pass) are there so the next occurrence arrives diagnosed.
 
 ## The browser port (`web/`)
 
@@ -1574,7 +1627,22 @@ when something lands, fold its invariants upward and delete it from here rather
 than writing a line about having finished it. The chronology lives in
 `ideas.csv` and git.
 
-**START HERE (2026-08-11). Still a VALIDATION session, not a feature one —
+**START HERE (2026-08-14). There is an APPROVED, UNSTARTED plan waiting:
+`notes/text-objects-plan.md` (row 168) — type your own text on a page, stored
+like a drawing and written into the PDF as REAL selectable text. It was agreed
+with the user on 2026-08-14, its phase 0 is a standalone fix for a live bug
+(the notes export writes `α ∑ ℝ →` as `?????`, because base-14 `helv` cannot
+encode them), and it opens with the design decisions already made — read it
+before designing anything in that area. Editing the PDF's OWN text was analysed
+and REJECTED there with the user's agreement; don't reopen it.**
+
+Two smaller things are also queued and unstarted: **inserting an image from a
+FILE** (dropping a `.png` is still refused by `classify_import_paths`, and
+there is no menu entry — the gap row 167 started from, and small), and **row
+160's `HOLD_SLOP_PX = 16.0` still wants judging in the hand**, since 16 was
+chosen on a 1.5× display.
+
+**The older thread below is a VALIDATION session, not a feature one —
 `notes/validation-session.md` is the checklist.** The ink/latency thread
 (rows 139/143/147) is CLOSED; do not reopen it without a new measurement.
 **The INPUT thread is closed too**: row 135's stylus block and §1b's three
@@ -1643,6 +1711,12 @@ one validation session; `notes/validation-session.md` is its checklist.**
 
 **Loose ends, roughly in order of how ready they are:**
 
+- **Row 168 — text objects on the page.** Approved and planned in full
+  (`notes/text-objects-plan.md`); see START HERE above. Phase 0 (embed a
+  Unicode font) is a standalone bug fix and can land on its own.
+- **Row 167's leftover — insert an image from a FILE.** Small: a drop path
+  through `classify_import_paths` plus a ☰ entry. Both modes; the model,
+  rendering and persistence all exist already.
 - **Row 145 — audit the test suite, and restructure THIS FILE using it as the
   instrument.** The suite is 905 tests / ~140 s, of which the window tier is a
   third of the tests and 87% of the time, and 26 of those are ≤6-line tests

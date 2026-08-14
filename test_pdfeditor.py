@@ -13,6 +13,8 @@ import json
 import tempfile
 import time
 import types
+import threading
+import logging
 import unittest
 
 # Keep tests from writing the user's real recently-used.xbel — they run on the
@@ -3071,6 +3073,26 @@ class TestModeGestures(unittest.TestCase):
         app.run([])
         if errors:
             raise AssertionError(errors[0])
+
+    def test_the_switch_leaves_a_breadcrumb_naming_the_sheet_size(self):
+        """The switch is the last thing the log records before the kind of
+        crash that writes nothing itself (a GTK abort kills the process from
+        C). It has to say how big the sheet is: on a long document this is the
+        largest text the editor is ever handed, and the size is the whole
+        reason the entry is worth having."""
+        md = "<!-- page:0 -->\n\nfirst page note\n"
+
+        def body(win):
+            with self.assertLogs(sidemark.logger, level="INFO") as caught:
+                win._enter_full_notes_view()
+            entered = "\n".join(caught.output)
+            self.assertIn("full-notes view: ON", entered)
+            self.assertIn("chars", entered)
+            with self.assertLogs(sidemark.logger, level="INFO") as caught:
+                win._leave_full_notes_view()
+            self.assertIn("full-notes view: OFF", "\n".join(caught.output))
+
+        self._run_in_window(2, body, md=md)
 
     def test_the_sheet_shows_the_whole_sidecar_and_the_way_back_parses_it(self):
         """One buffer cannot hold a per-page model any other way — so the sheet
@@ -18965,6 +18987,212 @@ class TestPenSettingsInWindow(unittest.TestCase):
             self.assertAlmostEqual(fresh.canvas.smoothing, 0.9)
 
         self._in_window(body)
+
+
+def _glib_fields_for(domain, message):
+    """A GLogField array as glib would hand one to a writer func.
+
+    `value` is a raw gpointer, so the buffers behind it have to outlive the
+    call — they are parked on the field objects to keep a reference."""
+    import ctypes
+    fields = []
+    for key, val in (("GLIB_DOMAIN", domain), ("MESSAGE", message)):
+        f = GLib.LogField()
+        buf = ctypes.create_string_buffer(val.encode("utf-8"))
+        f.key = key
+        f.value = ctypes.addressof(buf)
+        f.length = -1
+        f._keepalive = buf
+        fields.append(f)
+    return fields, len(fields)
+
+
+class TestGlibLogBridge(unittest.TestCase):
+    """A GTK abort kills the process from C: no exception, no excepthook, and a
+    log that simply stops mid-session (the 2026-08-14 crash in
+    `gtk_text_iter_set_visible_line_index`). The bridge is what gets GTK's own
+    message, and the Python frames under it, into the file before the abort."""
+
+    def setUp(self):
+        sidemark._glib_log_seen.clear()
+
+    def tearDown(self):
+        sidemark._glib_log_seen.clear()
+
+    def test_g_error_is_classified_fatal_and_a_warning_is_not(self):
+        """`g_error` is LEVEL_ERROR and fatal by definition — it is the level
+        the real abort arrived at, and the one that must carry a stack."""
+        L = GLib.LogLevelFlags
+        self.assertEqual(sidemark._glib_log_kind(L.LEVEL_ERROR), "fatal")
+        self.assertEqual(sidemark._glib_log_kind(L.LEVEL_CRITICAL), "critical")
+        self.assertEqual(sidemark._glib_log_kind(L.LEVEL_WARNING), "warn")
+
+    def test_chatter_is_dropped(self):
+        """The writer runs for EVERY glib message, debug included — routing
+        those into the session log would bury the one line that matters."""
+        L = GLib.LogLevelFlags
+        self.assertIsNone(sidemark._glib_log_kind(L.LEVEL_DEBUG))
+        self.assertIsNone(sidemark._glib_log_kind(L.LEVEL_INFO))
+        self.assertIsNone(sidemark._glib_log_kind(L.LEVEL_MESSAGE))
+
+    def test_a_critical_made_fatal_still_arrives_as_a_critical(self):
+        """The measured fact the classifier is built on: glib decides fatality
+        AFTER the writer returns, so an always-fatal critical arrives as a
+        plain LEVEL_CRITICAL with no FLAG_FATAL on it. Classifying on that flag
+        alone would file the real abort under chatter — which is why a critical
+        earns a stack of its own rather than being trusted to be survivable."""
+        L = GLib.LogLevelFlags
+        self.assertEqual(sidemark._glib_log_kind(L.LEVEL_CRITICAL), "critical")
+        # …and the flag is still honoured on the paths that do set it
+        self.assertEqual(
+            sidemark._glib_log_kind(L.LEVEL_CRITICAL | L.FLAG_FATAL), "fatal")
+
+    def test_installing_the_bridge_twice_is_a_no_op(self):
+        """`g_log_set_writer_func` may be called ONCE per process — the second
+        call is itself a `g_error`, so an unguarded re-install aborts the app
+        with exactly the crash this hook exists to explain."""
+        sidemark._install_glib_log_bridge()
+        sidemark._install_glib_log_bridge()      # must not abort
+        self.assertTrue(sidemark._glib_log_bridged)
+
+    def test_a_gtk_warning_reaches_our_log_with_the_python_stack(self):
+        """End to end through GTK itself: the point is that the frames name the
+        handler that called in, which is the whole reason the hook exists."""
+        sidemark._install_glib_log_bridge()
+        with self.assertLogs(sidemark.logger, level="WARNING") as caught:
+            def a_handler_of_ours():
+                # any GTK critical will do; this one is a one-liner
+                Gtk.Box().remove(Gtk.Label.new("x"))
+            a_handler_of_ours()
+        blob = "\n".join(caught.output)
+        self.assertIn("[gtk]", blob)
+        self.assertIn("gtk_box_remove", blob)
+        self.assertIn("a_handler_of_ours", blob)
+        # the writer's own frame says nothing and must not be in it
+        self.assertNotIn("_glib_log_writer", blob)
+
+    def test_a_repeating_critical_is_logged_once_and_counted(self):
+        """A critical raised in a draw or motion handler repeats every frame.
+        Unlimited, one bad frame fills the disk; dropped silently, the log lies
+        about how often it happened."""
+        sidemark._install_glib_log_bridge()
+        with self.assertLogs(sidemark.logger, level="WARNING") as caught:
+            for _ in range(6):
+                Gtk.Box().remove(Gtk.Label.new("x"))
+        self.assertEqual(len(caught.output), 1)
+        # pretend the quiet window has passed: the next one says what it ate
+        (msg, (_when, count)), = sidemark._glib_log_seen.items()
+        self.assertEqual(count, 5)
+        sidemark._glib_log_seen[msg] = (
+            time.monotonic() - sidemark.GLIB_LOG_REPEAT_S - 1.0, count)
+        with self.assertLogs(sidemark.logger, level="WARNING") as again:
+            Gtk.Box().remove(Gtk.Label.new("x"))
+        self.assertIn("+5 more", "\n".join(again.output))
+
+    def test_the_bridge_does_not_swallow_the_message(self):
+        """It delegates to the default writer, so stderr and the journal see
+        exactly what they saw before — a diagnostic that silences the thing it
+        reports is worse than none."""
+        sidemark._install_glib_log_bridge()
+        out = sidemark._glib_log_writer(
+            GLib.LogLevelFlags.LEVEL_WARNING,
+            *_glib_fields_for("Sidemark-Test", "delegation check"), None)
+        self.assertEqual(out, GLib.LogWriterOutput.HANDLED)
+
+
+class TestLoopWatchdog(unittest.TestCase):
+    """A freeze that ends with every queued keystroke landing at once is a
+    BLOCKED MAIN LOOP: nothing was lost, so nothing inside the app sees
+    anything wrong. Only a thread outside the loop can notice, and it samples
+    the main thread so the report names the work and not just the delay."""
+
+    def setUp(self):
+        sidemark._stall_last_report = 0.0
+
+    def tearDown(self):
+        sidemark._stall_last_report = 0.0
+        sidemark._loop_beat = 0.0
+
+    def test_a_sample_names_the_function_the_loop_is_in(self):
+        """The whole value of the report: 'stalled 400 ms' is a symptom, the
+        frame it stalled IN is the bug."""
+        # sampled from ANOTHER thread, which is the only way it is ever used:
+        # the main thread is by definition busy when there is a stall to report
+        main_id = threading.main_thread().ident
+        got, blocking = {}, threading.Event()
+
+        def sampler():
+            blocking.wait(2.0)
+            time.sleep(0.05)          # let the main thread get into it
+            got["sample"] = sidemark._main_thread_sample(main_id)
+
+        watcher = threading.Thread(target=sampler)
+        watcher.start()
+
+        def the_slow_thing():
+            blocking.set()
+            time.sleep(0.25)
+
+        the_slow_thing()
+        watcher.join(2.0)
+        label, stack = got["sample"]
+        self.assertIn("the_slow_thing", label)
+        self.assertIn("the_slow_thing", stack)
+
+    def test_the_report_names_the_busiest_frame(self):
+        labels = ["a.py:1 in rehighlight"] * 8 + ["b.py:2 in something_else"]
+        with self.assertLogs(sidemark.logger, level="WARNING") as caught:
+            self.assertTrue(sidemark._report_stall(400.0, labels, "a stack"))
+        out = "\n".join(caught.output)
+        self.assertIn("400 ms", out)
+        self.assertIn("rehighlight", out)
+        self.assertIn("8/9", out)          # how much of the stall it was
+
+    def test_a_repeating_stall_is_reported_once_in_a_while(self):
+        """The shape to expect is a render pass on EVERY keystroke — a stack
+        per keystroke would be unreadable and would bury the rest."""
+        with self.assertLogs(sidemark.logger, level="WARNING"):
+            self.assertTrue(sidemark._report_stall(400.0, ["a.py:1 in x"], "s"))
+        self.assertFalse(sidemark._report_stall(400.0, ["a.py:1 in x"], "s"))
+        sidemark._stall_last_report -= sidemark.STALL_REPEAT_S + 1.0
+        with self.assertLogs(sidemark.logger, level="WARNING"):
+            self.assertTrue(sidemark._report_stall(400.0, ["a.py:1 in x"], "s"))
+
+    def test_a_stall_with_no_samples_says_nothing(self):
+        """Better silent than a report that names no frame — the delay alone
+        is what the user could already see."""
+        self.assertFalse(sidemark._report_stall(400.0, [], None))
+
+    def test_the_heartbeat_keeps_re_arming(self):
+        """It is the loop saying it is alive; returning False once would make
+        every later moment look like a permanent hang."""
+        sidemark._loop_beat = 0.0
+        self.assertTrue(sidemark._loop_heartbeat())
+        self.assertGreater(sidemark._loop_beat, 0.0)
+
+    def test_the_watchdog_can_be_switched_off(self):
+        """It samples the interpreter from another thread; there has to be a
+        way to take it out of the picture when diagnosing something else."""
+        os.environ["SIDEMARK_NO_WATCHDOG"] = "1"
+        try:
+            sidemark._loop_beat = 0.0
+            sidemark._install_loop_watchdog()
+            self.assertEqual(sidemark._loop_beat, 0.0)   # nothing armed
+        finally:
+            os.environ.pop("SIDEMARK_NO_WATCHDOG", None)
+
+    def test_a_stalled_session_keeps_its_log(self):
+        """A freeze is a WARNING and the session then exits perfectly cleanly —
+        with the old error-only rule the log of exactly the run you wanted to
+        read was the one that got deleted."""
+        rec = logging.LogRecord("x", logging.WARNING, __file__, 1, "m", (), None)
+        was = sidemark._log_had_error
+        try:
+            sidemark._log_had_error = False
+            sidemark._flag_errors(rec)
+            self.assertTrue(sidemark._log_had_error)
+        finally:
+            sidemark._log_had_error = was
 
 
 if __name__ == "__main__":

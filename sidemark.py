@@ -9,6 +9,8 @@ import threading
 import tempfile
 import logging
 import atexit
+import faulthandler
+import ctypes
 import traceback
 import hashlib
 import difflib
@@ -302,10 +304,35 @@ logger = logging.getLogger(__name__)
 
 
 def _flag_errors(record):
+    """Decide whether this session's log is worth keeping.
+
+    WARNING, not ERROR: every warning site in this file is something having
+    gone wrong, and the diagnostics that matter most — a GTK critical, a
+    stalled main loop, a slow render pass — are all warnings about a session
+    that then exits perfectly cleanly. Flagging only errors deleted the log of
+    exactly the run you wanted to read."""
     global _log_had_error
-    if record.levelno >= logging.ERROR:
+    if record.levelno >= logging.WARNING:
         _log_had_error = True
     return True
+
+
+LOG_KEEP = 20      # kept logs, newest first — they are only written when
+                   # something went wrong, but that must not accumulate for ever
+
+
+def _prune_logs():
+    try:
+        files = [os.path.join(LOG_DIR, n) for n in os.listdir(LOG_DIR)
+                 if n.startswith("session_") and n.endswith(".log")]
+        files.sort(key=os.path.getmtime, reverse=True)
+        for old in files[LOG_KEEP:]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def _setup_logging(verbose=False):
@@ -321,6 +348,7 @@ def _setup_logging(verbose=False):
     logger.addHandler(file_handler)
     logger.addFilter(_flag_errors)
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    _prune_logs()
     logger.info("session started" + (" (verbose)" if verbose else ""))
 
     def _excepthook(exc_type, exc, tb):
@@ -328,17 +356,271 @@ def _setup_logging(verbose=False):
         sys.__excepthook__(exc_type, exc, tb)
     sys.excepthook = _excepthook
 
+    # A crash inside GTK never reaches that excepthook. An aborting `g_error`
+    # kills the process from C, so there is no exception to catch and no
+    # traceback to print: the log simply STOPS mid-session, which is exactly
+    # what it did for the 2026-08-14 abort in `gtk_text_iter_set_visible_line_
+    # index`. These two hooks are the whole of what turns that into something
+    # readable — one writes the Python frames at the signal, the other writes
+    # GTK's own message just before it.
+    try:
+        faulthandler.enable(file=file_handler.stream, all_threads=True)
+    except Exception:
+        pass                          # a crash dump is a bonus, never a cost
+    _install_glib_log_bridge()
+    _install_loop_watchdog()
+
     atexit.register(_cleanup_log)
+
+
+# A critical raised inside a draw or motion handler repeats every frame, so the
+# same text is logged at most this often (with a count of what it swallowed).
+GLIB_LOG_REPEAT_S = 10.0
+_glib_log_seen = {}
+
+
+def _glib_log_fields(fields, n_fields):
+    """A GLogField array as a plain dict.
+
+    PyGObject hands the fields through untouched, so `value` is a raw gpointer
+    and the strings have to be read out by hand: length -1 is nul-terminated,
+    anything else is a counted blob."""
+    out = {}
+    for i in range(n_fields):
+        try:
+            f = fields[i]
+            if f.length == -1:
+                raw = ctypes.cast(f.value, ctypes.c_char_p).value or b""
+            else:
+                raw = ctypes.string_at(f.value, f.length)
+            out[f.key] = raw.decode("utf-8", "replace")
+        except Exception:
+            continue                  # one unreadable field must not lose the rest
+    return out
+
+
+def _caller_stack():
+    """The Python frames that led into GTK — without this writer's own, which
+    is always the last one and says nothing."""
+    return "".join(traceback.format_stack()[:-2])
+
+
+def _glib_log_kind(level):
+    """How much of a GLib log message we want: None, "warn", "critical" or
+    "fatal".
+
+    Levels are ordered by BIT and the lowest is the worst — ERROR 4,
+    CRITICAL 8, WARNING 16 — so everything above WARNING is chatter and is
+    dropped. LEVEL_ERROR is `g_error`, fatal BY DEFINITION, and is the level
+    the 2026-08-14 abort came in at.
+
+    Do NOT test FLAG_FATAL here instead: glib decides fatality AFTER the writer
+    returns and does not set that bit on the way in — measured, a critical made
+    fatal by `g_log_set_always_fatal` still arrives as a plain 8. Which is also
+    why a critical earns a stack of its own: it is the level GTK complains at
+    just before things go wrong, and a run under G_DEBUG makes it fatal."""
+    raw = int(level)
+    bits = raw & int(GLib.LogLevelFlags.LEVEL_MASK)
+    if (bits & int(GLib.LogLevelFlags.LEVEL_ERROR)
+            or raw & int(GLib.LogLevelFlags.FLAG_FATAL)):
+        return "fatal"
+    if bits & int(GLib.LogLevelFlags.LEVEL_CRITICAL):
+        return "critical"
+    if bits and bits <= int(GLib.LogLevelFlags.LEVEL_WARNING):
+        return "warn"
+    return None
+
+
+def _glib_log_writer(level, fields, n_fields, _user_data):
+    """Copy GTK's own warnings into our log, with the Python stack for a fatal.
+
+    GTK's fatal errors are the only crashes this app has had that leave NO
+    trace: `g_error` aborts from C, and the message goes to a stderr nobody is
+    reading. This is the one hook that sees them — the legacy
+    `g_log_set_handler` does not, because modern GTK logs through the
+    STRUCTURED API — and it runs before the abort, which is why the fatal
+    branch flushes rather than trusting the handlers to be drained later.
+
+    It cannot change whether the process dies: glib aborts in the caller ABOVE
+    the writer, whatever this returns (measured against a fatal critical). So
+    everything here is additive, and it ends by delegating to the default
+    writer so stderr and the journal see precisely what they saw before."""
+    try:
+        kind = _glib_log_kind(level)
+        if kind is not None:
+            f = _glib_log_fields(fields, n_fields)
+            msg = f.get("MESSAGE", "")
+            where = ""
+            # only the structured API carries these, and for the abort we care
+            # about they name the GTK source line that gave up
+            if f.get("CODE_FILE"):
+                where = " [%s:%s %s]" % (f.get("CODE_FILE"), f.get("CODE_LINE", "?"),
+                                         f.get("CODE_FUNC", "?"))
+            text = "[gtk] %s: %s%s" % (f.get("GLIB_DOMAIN", "?"), msg, where)
+            fatal = kind == "fatal"
+            want_stack = kind in ("fatal", "critical")
+            if fatal:
+                # The last thing this process will ever log. The Python stack is
+                # the point of it: a GTK abort is almost always raised under one
+                # of our own signal handlers, and this is what names it.
+                logger.error("FATAL %s\nPython stack at the abort:\n%s",
+                             text, _caller_stack())
+            else:
+                now = time.monotonic()
+                seen = _glib_log_seen.get(msg)
+                if seen is None or now - seen[0] >= GLIB_LOG_REPEAT_S:
+                    if seen is not None and seen[1]:
+                        text += "  (+%d more in the last %.0fs)" % (seen[1],
+                                                                    now - seen[0])
+                    if len(_glib_log_seen) > 200:
+                        _glib_log_seen.clear()
+                    _glib_log_seen[msg] = (now, 0)
+                    if want_stack:
+                        text += "\nPython stack:\n" + _caller_stack()
+                    logger.warning(text)
+                else:
+                    _glib_log_seen[msg] = (seen[0], seen[1] + 1)
+                    want_stack = False
+            if fatal or want_stack:
+                # the abort can be microseconds away — an unflushed handler is
+                # a log that stops one line before the answer
+                for h in logger.handlers:
+                    try:
+                        h.flush()
+                    except Exception:
+                        pass
+    except Exception:
+        pass                          # never let the log bridge break logging
+    try:
+        return GLib.log_writer_default(level, fields, None)
+    except Exception:
+        return GLib.LogWriterOutput.UNHANDLED
+
+
+# ── the main-loop watchdog ───────────────────────────────────────────────────
+# The symptom is a UI that freezes for a moment and then catches up in a burst:
+# typing stops appearing, then every letter lands at once. Nothing was lost —
+# the events were QUEUED while the loop was busy elsewhere — which is exactly
+# why nothing inside the app notices. Only a thread outside the loop can.
+STALL_WARN_MS = 250.0      # a hitch a hand notices; below this a slow frame is
+                           # just a slow frame, and reporting it buries the rest
+STALL_BEAT_MS = 100        # how often the loop says it is alive
+STALL_SAMPLE_S = 0.02      # between stack samples once a stall is suspected
+STALL_MAX_SAMPLES = 150    # a real hang must still be reported, not sampled for ever
+STALL_REPEAT_S = 5.0
+_loop_beat = 0.0
+_stall_last_report = 0.0
+
+
+def _loop_heartbeat():
+    global _loop_beat
+    _loop_beat = time.monotonic()
+    return True
+
+
+def _main_thread_sample(main_id):
+    """(deepest frame label, whole stack) for the main thread, right now.
+
+    `sys._current_frames()` is what makes this possible from another thread: it
+    reads the frame the interpreter is standing on, so the sample names the
+    WORK rather than only the delay."""
+    frame = sys._current_frames().get(main_id)
+    if frame is None:
+        return None, None
+    stack = traceback.extract_stack(frame)
+    if not stack:
+        return None, None
+    top = stack[-1]
+    return ("%s:%d in %s" % (os.path.basename(top.filename), top.lineno,
+                             top.name),
+            "".join(traceback.format_list(stack)))
+
+
+def _report_stall(ms, labels, stack):
+    """One line naming how long the loop was gone and what it was doing.
+
+    Rate-limited: a stall that repeats (a render pass on every keystroke is the
+    shape to expect) would otherwise write a stack per keystroke."""
+    global _stall_last_report
+    now = time.monotonic()
+    if now - _stall_last_report < STALL_REPEAT_S or not labels:
+        return False
+    _stall_last_report = now
+    busiest = Counter(labels).most_common(3)
+    where = ", ".join("%s (%d/%d)" % (lbl, n, len(labels)) for lbl, n in busiest)
+    logger.warning("main loop stalled %.0f ms — busiest: %s\nmain thread was "
+                   "here at the last sample:\n%s", ms, where, stack or "?")
+    return True
+
+
+def _watchdog(main_id):
+    """Watch the loop from OUTSIDE it. Never touches GTK — a thread that did
+    would be the next bug reported."""
+    global _stall_last_report
+    while True:
+        time.sleep(STALL_BEAT_MS / 1000.0)
+        beat = _loop_beat
+        if not beat or (time.monotonic() - beat) * 1000.0 < STALL_WARN_MS:
+            continue
+        labels, stack = [], None
+        while (time.monotonic() - _loop_beat) * 1000.0 >= STALL_WARN_MS:
+            lbl, st = _main_thread_sample(main_id)
+            if lbl:
+                labels.append(lbl)
+                stack = st
+            if len(labels) >= STALL_MAX_SAMPLES:
+                break            # a hang: report what we have and start again
+            time.sleep(STALL_SAMPLE_S)
+        _report_stall((time.monotonic() - beat) * 1000.0, labels, stack)
+
+
+def _install_loop_watchdog():
+    """Off with SIDEMARK_NO_WATCHDOG=1. The cost is one main-loop wakeup every
+    STALL_BEAT_MS and a thread that sleeps between checks; the sampling only
+    happens while something is already wrong."""
+    global _loop_beat
+    if os.environ.get("SIDEMARK_NO_WATCHDOG"):
+        return
+    _loop_beat = time.monotonic()
+    GLib.timeout_add(STALL_BEAT_MS, _loop_heartbeat)
+    threading.Thread(target=_watchdog, args=(threading.main_thread().ident,),
+                     name="sidemark-watchdog", daemon=True).start()
+
+
+_glib_log_bridged = False
+
+
+def _install_glib_log_bridge():
+    """Install the writer — ONCE, and the guard is not defensive tidiness.
+
+    `g_log_set_writer_func` may be called a single time in the life of a
+    process: the second call is itself a `g_error`, so a duplicate install
+    aborts the app with the very kind of crash this hook exists to explain."""
+    global _glib_log_bridged
+    if _glib_log_bridged:
+        return
+    try:
+        GLib.log_set_writer_func(_glib_log_writer, None)
+        _glib_log_bridged = True
+    except Exception:
+        logger.debug("GLib log bridge unavailable", exc_info=True)
 
 
 def _cleanup_log():
     logger.info("session ended cleanly")
+    # before the handlers close: faulthandler holds the log's raw fd, and a
+    # dump written into a closed one lands wherever that number got reused
+    try:
+        faulthandler.disable()
+    except Exception:
+        pass
     logging.shutdown()
     if not _log_path:
         return
     if _log_had_error:
         # Keep the log — it is the only record of what went wrong.
-        print(f"Errors were logged this session — log kept at {_log_path}", file=sys.stderr)
+        print(f"Warnings were logged this session — log kept at {_log_path}",
+              file=sys.stderr)
         return
     try:
         os.remove(_log_path)
@@ -10716,6 +10998,14 @@ class NotesModel:
         os.replace(tmp, path)
 
 
+# Above this many characters a notes buffer is "the sheet, on a long document"
+# rather than one page's notes — the size class worth naming in the log, since
+# every render pass over it walks the whole thing. Diagnostic only: nothing
+# behaves differently either side of it.
+NOTES_BIG_BUFFER = 50_000
+REHIGHLIGHT_SLOW_MS = 80.0     # a render pass this long has missed several frames
+
+
 class MarkdownNotesView(GtkSource.View):
     """
     GtkSource.View with Typora-style in-place markdown rendering.
@@ -11846,6 +12136,7 @@ class MarkdownNotesView(GtkSource.View):
 
     def _rehighlight(self):
         self._rehighlight_id = None
+        started = time.monotonic()
         buf = self.get_buffer()
         self._cursor_line = buf.get_iter_at_mark(buf.get_insert()).get_line()
         # every line the selection touches shows its source, not just the two
@@ -11893,6 +12184,17 @@ class MarkdownNotesView(GtkSource.View):
                     self._line_originals.pop(ln, None)
 
             self._highlight_line(buf, ls, ln, text)
+        # This pass walks EVERY line and rewrites the ones whose rendering
+        # changed, so on a whole-sidecar sheet it is both the slowest thing in
+        # the editor and the one that churns GTK's line-display cache hardest.
+        # Logging the slow ones puts a timestamp beside the buffer size when a
+        # text-iter assertion follows — and says plainly whether the editor was
+        # still busy when the pointer moved over it.
+        ms = (time.monotonic() - started) * 1000.0
+        if ms >= REHIGHLIGHT_SLOW_MS:
+            logger.warning("notes render pass took %.0f ms for %d line(s) / "
+                           "%d chars", ms, buf.get_line_count(),
+                           buf.get_char_count())
         return False
 
     def _script_tag(self, chain):
@@ -17009,6 +17311,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._place_full_notes_caret(s, s._full_notes_from)
         if remember and not s._is_untitled:
             _remember_recent_full_notes(s._path, True)
+        # A breadcrumb for the crash that has no traceback: this switch fills
+        # ONE buffer with the whole sidecar, so on a long document it is the
+        # largest thing the notes editor is ever asked to render — and a GTK
+        # abort a moment later is much easier to read with the size in front of
+        # it. Cheap: a mode switch is a gesture, not a frame.
+        _nb = s._notes_view.get_buffer()
+        logger.info("full-notes view: ON for %s — %d page(s), from page %d, "
+                    "sheet holds %d chars / %d line(s)",
+                    os.path.basename(s._path or "?"), s.canvas.n_pages,
+                    s._full_notes_from + 1, _nb.get_char_count(),
+                    _nb.get_line_count())
         toast = Adw.Toast.new("Notes as one page — drag the left edge back out "
                               "to bring the pages back")
         toast.set_button_label("Back")
@@ -17042,6 +17355,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._populate_toc()
         if not s._is_untitled:
             _remember_recent_full_notes(s._path, False)
+        logger.info("full-notes view: OFF for %s — back to page %s",
+                    os.path.basename(s._path or "?"),
+                    "unchanged" if target is None else target + 1)
         return True
 
     def _place_full_notes_caret(self, s, idx):
@@ -19039,12 +19355,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             tp = None
         carry = tp.anchor_records() if tp is not None else None
         old_lines = tp.view.get_source_text().split("\n") if carry else None
+        was = buf.get_char_count()
         buf.begin_irreversible_action()
         buf.set_text(text)
         buf.end_irreversible_action()
         if carry:
             tp.reanchor(carry,
                         TextPageView.line_map(old_lines, text.split("\n")))
+        # Every wholesale buffer replacement passes through here, and each one
+        # invalidates GTK's line-display cache for the entire text — so it is
+        # the event to have in the log when the editor dies in a text-iter
+        # assertion afterwards. A page turn does this too, which is why only a
+        # BIG one is worth an INFO line: those are the sheet, and the sheet is
+        # where the size is the story.
+        now = buf.get_char_count()
+        logger.log(logging.INFO if max(was, now) >= NOTES_BIG_BUFFER
+                   else logging.DEBUG,
+                   "notes buffer replaced: %d -> %d chars, %d anchor(s) carried",
+                   was, now, len(carry or ()))
 
     def _restore_note(self):
         self._suppress_dirty = True
