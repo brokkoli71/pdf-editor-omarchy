@@ -639,6 +639,27 @@ import fitz          # PyMuPDF
 import numpy as np
 
 
+def _defuse_pymupdf_timing_test():
+    """Neutralise a debug loop PyMuPDF calls on every `Annot.update()`.
+
+    `Annot.update()` in PyMuPDF 1.27.2.3 unconditionally calls
+    `Annot.update_timing_test()` — a leftover benchmark that counts to 30,000
+    in pure Python and whose result the caller discards. It costs 0.68 ms per
+    annotation here: 144 ms of the ~420 ms it takes to write 212 ink strokes,
+    burnt doing nothing, on the main loop. Replacing it is safe precisely
+    because nothing reads what it returns.
+    ceiling: an upstream fix will simply stop calling it, and this becomes a
+    no-op — it is guarded by hasattr, so a version without it is fine too."""
+    try:
+        if hasattr(fitz.Annot, "update_timing_test"):
+            fitz.Annot.update_timing_test = staticmethod(lambda: 0)
+    except Exception:
+        pass          # a faster save is a bonus, never a reason to fail to start
+
+
+_defuse_pymupdf_timing_test()
+
+
 def _draw_zoom_marquee(ctx, x, y, w, h, rgb):
     """The zoom-to-region rubber-band — one look shared by both the PDF canvas
     and the text sheet (a translucent accent fill plus a dashed accent border),
@@ -15624,6 +15645,7 @@ class DocumentSession:
     # the property declarations in the window class body.
     STATE = (
         "_path", "_notes_path", "_active_notes_path", "_is_untitled", "_dirty",
+        "_pdf_dirty",
         "notes_model", "_undo_timeline", "_redo_timeline", "_notes_burst_open",
         "_burst_base", "_anchor_line_nos", "_anchor_para_ends", "_search_hits",
         "_note_hits", "_search_matches", "_search_current", "_presenter",
@@ -15651,6 +15673,7 @@ class DocumentSession:
         self._active_notes_path = None
         self._is_untitled = False
         self._dirty = False
+        self._pdf_dirty = False
         self.notes_model = NotesModel()
         self._undo_timeline = []
         self._redo_timeline = []
@@ -18470,9 +18493,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     # ── dirty tracking ────────────────────────────────────────────────────────
 
-    def _mark_dirty(self, *_):
+    def _mark_dirty(self, *_, pdf=True):
+        """Something changed. `pdf=False` means it was ONLY the notes.
+
+        The default is the expensive answer on purpose. An autosave snapshot is
+        a data-safety feature, so a caller nobody has audited must cost a
+        needless PDF write, never a lost recovery — the opt-out is opt-IN, and
+        it is taken by the notes buffer alone (measured: re-serialising an
+        805-page document for a keystroke froze the UI for 923 ms a minute)."""
         if not self._suppress_dirty:
             self._dirty = True
+            if pdf:
+                self._pdf_dirty = True
         # bump the revision so any live phone-share view knows to refresh
         self._share_revision += 1
         if self._presenter is not None:
@@ -18496,7 +18528,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 # the next character opens a fresh burst from here
                 self._notes_burst_open = False
                 self._burst_base = self._notes_view.get_source_text()
-        self._mark_dirty()
+        # the notes live in the .md sidecar: the PDF itself is untouched
+        self._mark_dirty(pdf=False)
         self._update_canvas_anchors()
 
     @staticmethod
@@ -18508,6 +18541,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _clear_dirty(self):
         self._dirty = False
+        self._pdf_dirty = False
 
     # ── autosave ──────────────────────────────────────────────────────────────
 
@@ -18531,7 +18565,20 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _write_autosave_for(self, s):
         d = _autosave_dir_for(s._path)
         os.makedirs(d, exist_ok=True)
-        s.canvas.save_copy(os.path.join(d, "doc.pdf"))
+        # THE expensive step, and usually an unnecessary one. Re-serialising the
+        # document costs ~500 ms on a long PDF — most of it re-creating every
+        # ink annotation, not the save — and it blocks the main loop, which is
+        # a UI that freezes for half a second and then catches up in a burst.
+        # Typing notes cannot change the PDF, so it must not pay for one.
+        # The snapshot is still WRITTEN if there is none: recovery reads
+        # doc.pdf, so notes must never be the only half of a pair.
+        snap = os.path.join(d, "doc.pdf")
+        if s._pdf_dirty or not os.path.exists(snap):
+            t0 = time.monotonic()
+            s.canvas.save_copy(snap)
+            s._pdf_dirty = False
+            logger.debug("autosave: pdf snapshot took %.0f ms",
+                         (time.monotonic() - t0) * 1000.0)
         self._commit_note_for(s)
         s.notes_model.save(os.path.join(d, "notes.md"))
         # pasted images live in the sidecar, not in the PDF — snapshot them

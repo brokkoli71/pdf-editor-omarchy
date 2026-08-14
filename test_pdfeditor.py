@@ -12289,6 +12289,60 @@ class TestAutosave(unittest.TestCase):
         if errors:
             raise errors[0]
 
+    def test_typing_notes_does_not_rewrite_the_pdf_snapshot(self):
+        """The autosave re-serialises the whole document, which on a long PDF
+        is ~500 ms of blocked main loop — a UI that freezes and then catches up
+        in a burst. Notes live in the .md sidecar and cannot change the PDF, so
+        typing must not pay for one; the snapshot still has to EXIST, because
+        recovery reads doc.pdf and notes must never be half a pair."""
+        errors = []
+        sm = self.sm
+        pdf = self._make_pdf()
+        app = Adw.Application(application_id="test.sidemark.autosave2")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                win._do_open_file(pdf)
+                snap = os.path.join(sm._autosave_dir_for(pdf), "doc.pdf")
+
+                # a notes edit alone still produces a snapshot the first time
+                win._notes_view.get_buffer().set_text("hello")
+                if not win._dirty:
+                    raise AssertionError("typing did not mark the tab dirty")
+                if win._pdf_dirty:
+                    raise AssertionError("typing marked the PDF dirty")
+                win._autosave_tick()
+                if not os.path.exists(snap):
+                    raise AssertionError("no doc.pdf for a fresh snapshot")
+
+                # …and from then on typing leaves it alone
+                was = os.stat(snap).st_mtime_ns
+                time.sleep(0.01)
+                win._notes_view.get_buffer().set_text("hello again")
+                win._autosave_tick()
+                if os.stat(snap).st_mtime_ns != was:
+                    raise AssertionError("typing rewrote the PDF snapshot")
+
+                # but drawing does write it again
+                win.canvas.current_stroke = [(10, 10), (50, 50)]
+                win.canvas._on_drag_end(None, 0, 0)
+                if not win._pdf_dirty:
+                    raise AssertionError("drawing did not mark the PDF dirty")
+                win._autosave_tick()
+                if os.stat(snap).st_mtime_ns == was:
+                    raise AssertionError("drawing did not rewrite the snapshot")
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
     def test_text_page_autosave_tick_and_cleanup_on_save(self):
         """A dirty text-first page (no _path — the .md IS the document) must
         snapshot on the tick and clean up on save; text pages used to be
@@ -19005,6 +19059,24 @@ def _glib_fields_for(domain, message):
         f._keepalive = buf
         fields.append(f)
     return fields, len(fields)
+
+
+class TestPyMuPDFWorkarounds(unittest.TestCase):
+    """Upstream bugs we neutralise at import. Each one needs a test that fails
+    if the neutralising is dropped — they are invisible otherwise."""
+
+    def test_the_debug_timing_loop_is_defused(self):
+        """PyMuPDF 1.27.2.3 calls Annot.update_timing_test() on EVERY
+        Annot.update() — a leftover benchmark counting to 30,000 in pure
+        Python, whose result the caller discards. Left alone it is 144 ms of
+        the ~420 ms spent writing one document's ink, on the main loop."""
+        if not hasattr(fitz.Annot, "update_timing_test"):
+            self.skipTest("upstream has dropped it")
+        started = time.monotonic()
+        for _ in range(200):
+            fitz.Annot.update_timing_test()
+        # 200 of the real ones cost ~136 ms; a bound, not the tuned value
+        self.assertLess(time.monotonic() - started, 0.05)
 
 
 class TestGlibLogBridge(unittest.TestCase):

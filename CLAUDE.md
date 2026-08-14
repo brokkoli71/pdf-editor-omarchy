@@ -1538,6 +1538,26 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     whole-document import, and inserting an image from a FILE — dropping a
     `.png` is still refused by `classify_import_paths`, which is the other half
     of the gap row 167 started from.*
+- **Autosave snapshots only what CHANGED, and the default is the expensive
+  answer (row 170).** Re-serialising the document costs ~500 ms on a long PDF
+  — most of it re-creating every ink annotation, not the save itself — and it
+  runs on the main loop, which the user sees as a UI that freezes for half a
+  second and then catches up in a burst. Notes live in the `.md` sidecar and
+  cannot change the PDF, so `_mark_dirty(pdf=False)` (the notes buffer, and
+  ONLY the notes buffer) leaves `_pdf_dirty` alone and the tick skips
+  `save_copy`. **The opt-out is opt-IN on purpose**: a snapshot is a
+  data-safety feature, so a caller nobody has audited must cost a needless
+  write, never a lost recovery. The snapshot is still written when there is
+  none, because recovery reads `doc.pdf` and notes must never be half a pair.
+  *Not done: per-page ink rewriting, which would cut the drawing case too —
+  it needs to know which pages' ink changed, and getting that wrong loses
+  strokes.*
+- **PyMuPDF 1.27.2.3 calls a debug benchmark on every `Annot.update()`**
+  (`update_timing_test`, counting to 30,000 in pure Python, result discarded):
+  144 ms of the 420 ms it takes to write one lecture's ink.
+  `_defuse_pymupdf_timing_test()` replaces it at import. Verified to leave the
+  written PDF byte-identical apart from the trailer's random `/ID`, which
+  differs between any two saves anyway.
 - Logging: `logger` writes a per-session file under `~/.cache/sidemark/logs/`,
   auto-deleted on clean exit, **kept when anything logged at WARNING or above**
   and pruned to `LOG_KEEP`. Warning, not error, is deliberate: every warning
