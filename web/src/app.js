@@ -266,6 +266,11 @@ window.__sidemark = {
   get selected() { return surface.selected; },
   get bindings() { return bindings; },
   get pen() { return pen; },
+  get notes() { return notes; },
+  get sidebar() { return sidebar; },
+  // The divider IS the way between the modes, so driving it is how the sheet
+  // gets opened without a synthetic drag that carries no user activation.
+  setSplit(frac) { wireDivider.setSplit(frac, { remember: false }); },
 };
 
 // The view follows its container through a ResizeObserver inside the Surface,

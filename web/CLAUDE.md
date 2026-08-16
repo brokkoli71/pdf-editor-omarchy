@@ -142,7 +142,23 @@ which will bite again:
   CDP, or a hand.
 
 Unlike the desktop, this side CAN be driven by an agent through Chrome — see
-the memory note on handing off GUI checks.
+the memory note on handing off GUI checks. When the Chrome extension is not
+connected, `test/drive.mjs` is the fallback and needs nothing installed: node's
+global `WebSocket` speaks CDP to a headless Chromium directly.
+
+```sh
+python3 -m http.server 8321 --bind 127.0.0.1 &
+chromium --headless=new --remote-debugging-port=9222 --user-data-dir=/tmp/x about:blank &
+node test/drive.mjs http://127.0.0.1:8321/index.html "$(cat probe.js)"
+```
+
+The probe is evaluated in the page and returns JSON, so it reads the LIVE model
+through `window.__sidemark` rather than a screenshot — which answers "do these
+two hold the same page?", where a picture answers only "is there a sidebar?".
+Two things it can do that a synthetic click cannot: a real `DragEvent` carrying
+a `DataTransfer` of `File`s exercises the whole open/pair path, and
+`__sidemark.setSplit(0)` opens the notes sheet without a drag that carries no
+user activation.
 
 ## A document is two files, and the browser cannot find the second one
 
