@@ -414,6 +414,8 @@ button:disabled:hover { background: transparent; }
 }
 .page-menu button:hover { background: var(--btn-hover); }
 .page-menu button.danger { color: rgb(224, 27, 36); }
+/* one colour for "this removes something", wherever the verb is offered */
+.menu-item.danger { color: rgb(224, 27, 36); }
 
 /* the sidebar drop gap */
 .row.gap-before::after {

@@ -282,7 +282,11 @@ export class NotesView {
    * cross without losing your place is one you will cross mid-sentence. */
   setFull(on, page = null) {
     if (!this.model || on === this.full) return null;
-    const within = this._offsetInBody();   // read BEFORE the commit trims it
+    // Read BEFORE the commit trims the buffer. A SELECTION crosses too: it is
+    // the same two offsets, so carrying both costs nothing — and text you had
+    // marked, then lost by widening the window, is a selection you have to make
+    // again for no reason you can see.
+    const span = this._spanInBody();
     this.commitFull();                 // write the view being left
     if (!on) {
       const target = this.fullTargetPage();
@@ -291,13 +295,14 @@ export class NotesView {
       this._markers = null;
       if (target !== null) this.page = target;
       const body = this.model.get(this.page);
-      this._fill(body, Math.min(within, body.length));
+      this._fill(body, Math.min(span.head, body.length),
+                 Math.min(span.anchor, body.length));
       return target;
     }
     this._fullFrom = page === null ? this.page : page;
     this.full = true;
     this._fill(this.model.toText(), 0);
-    this._placeCaretForPage(this._fullFrom, within);
+    this._placeCaretForPage(this._fullFrom, span);
     // The page you came FROM, never the section the caret landed in: a linked
     // run's body lives on the run's first page, so reading the offset back
     // would move the sidebar off the page you were actually reading the moment
@@ -313,15 +318,18 @@ export class NotesView {
    * so the lookup asks for the RUN — the page you were reading has no text of
    * its own to go to. */
   _placeCaretForPage(idx, within = 0) {
+    const span = typeof within === "number" ? { anchor: within, head: within } : within;
     const text = this.view.state.doc.toString();
     const start = noteOffsetForPage(text, this.model.runStart(idx));
     // `within` is how far into that page's BODY the caret stood; a page with no
     // notes has no body, and the offset the table gives back is then the point
     // the section would be inserted at, which nothing may be added to.
     const body = this.model.get(idx).length;
-    const off = Math.max(0, Math.min(text.length, start + Math.min(within, body)));
-    this.view.dispatch({ selection: { anchor: off }, scrollIntoView: true });
-    this._fullCaret = off;
+    const put = (n) => Math.max(0, Math.min(text.length, start + Math.min(n, body)));
+    const head = put(span.head);
+    this.view.dispatch({ selection: { anchor: put(span.anchor), head },
+                         scrollIntoView: true });
+    this._fullCaret = head;
   }
 
   /** How far into the current page's body the caret stands — the coordinate the
@@ -332,17 +340,24 @@ export class NotesView {
    * which belongs to no page at all) reads as 0 rather than as a negative.
    * In the PANEL it is the offset itself, less whatever leading whitespace the
    * commit is about to trim off the front. */
-  _offsetInBody() {
+  _offsetInBody(off = null) {
     if (!this.model) return 0;
-    const head = this.view.state.selection.main.head;
+    const at = off === null ? this.view.state.selection.main.head : off;
     if (!this.full) {
       const raw = this.view.state.doc.toString();
-      return Math.max(0, head - (raw.length - raw.trimStart().length));
+      return Math.max(0, at - (raw.length - raw.trimStart().length));
     }
     const text = this.view.state.doc.toString();
-    const page = notePageAtOffset(text, head);
+    const page = notePageAtOffset(text, at);
     if (page === null) return 0;
-    return Math.max(0, head - noteOffsetForPage(text, this.model.runStart(page)));
+    return Math.max(0, at - noteOffsetForPage(text, this.model.runStart(page)));
+  }
+
+  /** Both ends of the selection, in body coordinates. A collapsed caret is the
+   * degenerate case, so there is one path and not two. */
+  _spanInBody() {
+    const sel = this.view.state.selection.main;
+    return { anchor: this._offsetInBody(sel.anchor), head: this._offsetInBody(sel.head) };
   }
 
   /** The caret's page, reported to the sidebar so the outline's "where you are"
@@ -442,14 +457,16 @@ export class NotesView {
     this._fill(this.model.get(page));
   }
 
-  _fill(text, caret = null) {
+  _fill(text, caret = null, anchorAt = null) {
     this._loading = true;      // our own fill must not mark the file dirty
-    const anchor = caret === null
+    const clamp = (n) => Math.max(0, Math.min(text.length, n));
+    const head = caret === null
       ? Math.min(text.length, this.view.state.selection.main.anchor)
-      : Math.max(0, Math.min(text.length, caret));
+      : clamp(caret);
+    const anchor = anchorAt === null ? head : clamp(anchorAt);
     this.view.dispatch({
       changes: { from: 0, to: this.view.state.doc.length, insert: text },
-      selection: { anchor },
+      selection: { anchor, head },
     });
     this._loading = false;
   }

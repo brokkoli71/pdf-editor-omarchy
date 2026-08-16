@@ -222,6 +222,13 @@ export class NotesModel {
 
   dropBookmark(idx) { delete this._bookmarks[idx]; }
 
+  /** Set a page aside, or bring it back. Like a bookmark it is a property OF
+   * one page, so it needs no adjacency rule — it just follows its page. */
+  setHidden(idx, on = true) {
+    if (on) this._hidden.add(idx);
+    else this._hidden.delete(idx);
+  }
+
   storedBookmarkName(idx) { return this._bookmarks[idx] ?? null; }
 
   /** The label for a bookmark: the stored name if it was renamed, else DERIVED
@@ -383,8 +390,21 @@ export class NotesModel {
     }
   }
 
-  /** Re-key notes after `count` pages were inserted at `idx`. */
+  /** Re-key notes after `count` pages were inserted at `idx`.
+   *
+   * The one thing here that is not arithmetic: a page inserted INSIDE a linked
+   * run belongs to that run. A run's body is stored ONCE, on its first page, so
+   * breaking the link at the insertion point does not split the notes in two —
+   * it deletes them from every page after the gap, which is writing vanishing
+   * off pages that had it. Carrying the run through the new pages loses
+   * nothing, and unticking the box is one click if the new page really did
+   * start a new section.
+   *
+   * Asked BEFORE the shift, and it can only be true when the old page at `idx`
+   * was itself continued — at a run's START the blank pages precede it and the
+   * run simply moves, which needs no rule at all. */
   shiftForInsert(idx, count = 1) {
+    const inRun = this._links.has(idx);
     const notes = {};
     for (const [k, v] of Object.entries(this._notes)) {
       const n = Number(k);
@@ -402,9 +422,7 @@ export class NotesModel {
     this._bookmarks = bookmarks;
     // …and so does a hidden flag: the inserted pages are new and visible
     this._hidden = new Set([...this._hidden].map((k) => (k >= idx ? k + count : k)));
-    // the new pages are blank and unlinked, so the run is broken anyway: cut
-    // the tail loose rather than let its text reach across the gap
-    this._links.delete(idx + count);
+    if (inRun) for (let i = 0; i < count; i++) this._links.add(idx + i);
   }
 
   /** Drop the note of deleted page `idx`; re-key later pages.

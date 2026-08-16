@@ -760,6 +760,18 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   (`link()` would append it into the run — the one outcome you cannot see
   coming from a checkbox); `unlink_forward` breaks the run at that page and
   every page after it. One tick covers a run of slides, one untick undoes it.
+  **A page inserted INSIDE a run joins it** (`shift_for_insert`), and that is
+  not a nicety: the body is stored once, so breaking the link at the gap does
+  not split the notes in two — it DELETES them from every page after the
+  insertion point, and the pages look fine until you read them. It shipped that
+  way in both apps, asserted by a test phrased "the tail is cut loose", which
+  reads like a decision until you count the pages it empties. The question is
+  asked BEFORE the shift and can only be true when the old page at `idx` was
+  itself continued; at a run's START the blank pages precede it and the run just
+  moves. The invariant to test re-keying against is **no page loses its text**,
+  never "page N equals page M" — an insert inside a run legitimately gives the
+  NEW page the run's text too, and an equality has to be relaxed to allow that,
+  which is exactly how the loss went unnoticed.
   **Ctrl+Z reaches it**, as a `("links", snapshot)` op on the shared
   `_undo_timeline` — a whole-model `snapshot()`/`restore()`, because linking
   MERGES two bodies and no page/text pair describes that. A snapshot is keyed
@@ -892,6 +904,18 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   merge) fires the callback through `PDFCanvas._load_page`, so those were never
   the problem; a TAB SWITCH changes which page is in front without any page
   changing, and so fires nothing at all.
+- **The thumbnail strip selects like a text editor** (row 171): SHIFT marks the
+  region from the anchor to the clicked page, CTRL adds or removes one, and a
+  plain click starts again from there — one anchor shared by both, so Ctrl to
+  pick a start then Shift to take the run works, and Ctrl+Shift adds a second
+  region. It is ONE capture-phase handler (`_on_thumb_select_pressed`) and
+  cannot be left to `GtkListBox`: the row carries a `DragSource` in the same
+  phase which swallows a stationary press, so Ctrl never deselected and Shift
+  never reached the listbox's range code at all. A Shift press is CLAIMED, so
+  the row is not activated — marking a region is not a request to go to its last
+  page — while a plain press falls through and still turns the page. The anchor
+  is per session and dropped by `_populate_thumbnails`, since the rows it
+  pointed into are gone.
 - **Hidden pages (row 158)** — a page can be set aside: still in the document
   and still editable, but **skipped when paging, skipped when presenting, and
   left out of an export** (the PowerPoint "hide slide" meaning, not a sidebar

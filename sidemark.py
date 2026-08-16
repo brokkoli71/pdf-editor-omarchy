@@ -10886,7 +10886,20 @@ class NotesModel:
     # slides. A wrong flag makes one page's notes vanish behind another's.
 
     def shift_for_insert(self, idx, count=1):
-        """Re-key notes after count pages were inserted at idx."""
+        """Re-key notes after count pages were inserted at idx.
+
+        The one thing here that is not arithmetic: a page inserted INSIDE a
+        linked run belongs to that run. A run's body is stored ONCE, on its
+        first page, so breaking the link at the insertion point does not split
+        the notes in two — it deletes them from every page after the gap, which
+        is writing vanishing off pages that had it. Carrying the run through the
+        new pages loses nothing, and unticking the box is one click if the new
+        page really did start a new section.
+
+        Asked BEFORE the shift, and it can only be true when the old page at
+        idx was itself continued — at a run's START the blank pages precede it
+        and the run simply moves, which needs no rule at all."""
+        in_run = idx in self._links
         self._notes = {
             (k + count if k >= idx else k): v
             for k, v in self._notes.items()
@@ -10898,9 +10911,8 @@ class NotesModel:
                            for k, v in self._bookmarks.items()}
         # …and so does a hidden flag: the inserted pages are new and visible
         self._hidden = {(k + count if k >= idx else k) for k in self._hidden}
-        # the new pages are blank and unlinked, so the run is broken anyway:
-        # cut the tail loose rather than let its text reach across the gap
-        self._links.discard(idx + count)
+        if in_run:
+            self._links.update(range(idx, idx + count))
 
     def shift_for_delete(self, idx):
         """Drop the note of deleted page idx; re-key later pages.
@@ -15652,6 +15664,7 @@ class DocumentSession:
         "_search_query", "_search_pending", "_search_scan_at", "_search_scan_id",
         "_last_anchor_mark", "_link_hint_shown", "_saved_pane_pos", "_pane_anim",
         "_thumb_idle_id", "_current_thumb_row", "_thumb_centred_page",
+        "_thumb_anchor",
         "_drag_export_dir",
         "_has_toc", "_toc_thumbs", "_drop_indicator_row", "_text_mode",
         "_pane_settling", "_pane_watch_id", "_pane_settle_id",
@@ -15699,6 +15712,7 @@ class DocumentSession:
         self._thumb_idle_id = None
         self._current_thumb_row = None
         self._thumb_centred_page = None
+        self._thumb_anchor = None       # where a Shift range measures FROM
         self._drag_export_dir = None
         # the page the full-notes sheet was opened from, and the caret offset
         # it was opened AT (row 162) — the way back out asks both
@@ -16197,6 +16211,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._thumb_idle_id = None
         self._current_thumb_row = None   # row carrying the .current-page CSS marker
         self._thumb_centred_page = None  # page the strip was last scrolled to
+        self._thumb_anchor = None        # where a Shift range measures FROM
         self._drop_indicator_row = None  # row carrying the drop-gap CSS marker
         self._drag_export_dir = None   # lazily created temp dir for drag-exported pages
         self._toc_btn = Gtk.ToggleButton()
@@ -20675,6 +20690,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # listbox selection, so the two never fight (see _select_thumb).
         self._toc_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
         self._current_thumb_row = None
+        # the rows an anchor pointed into are gone, and a stale index would
+        # measure a range from a page nobody chose
+        self._active_session._thumb_anchor = None
         pictures = []
         for i in range(len(doc)):
             rect = doc[i].rect
@@ -20837,23 +20855,58 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         finsert.connect("drop", self._on_thumb_file_drop, idx)
         row.add_controller(finsert)
 
-        # Ctrl+click toggles this page in/out of the multi-page export selection
-        # (file-manager / Preview behaviour). Handled in the capture phase and
-        # claimed so neither the row's DragSource nor GtkListBox's own selection
-        # also acts on it — otherwise a stationary Ctrl+click can be swallowed by
-        # the drag source and never deselect. Plain/Shift clicks fall through.
-        ctrl_click = Gtk.GestureClick()
-        ctrl_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        ctrl_click.connect("pressed", self._on_thumb_ctrl_pressed, row)
-        row.add_controller(ctrl_click)
+        # The whole selection grammar, in ONE capture-phase handler. It cannot be
+        # left to GtkListBox: the row carries a DragSource, which is in the same
+        # phase and swallows a stationary press, so a Ctrl+click never deselected
+        # and a Shift+click never reached the listbox's own range code at all.
+        # Handling both here is also what lets the two share one anchor.
+        select_click = Gtk.GestureClick()
+        select_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        select_click.connect("pressed", self._on_thumb_select_pressed, row, idx)
+        row.add_controller(select_click)
 
-    def _on_thumb_ctrl_pressed(self, gesture, _n_press, _x, _y, row):
+    def _on_thumb_select_pressed(self, gesture, _n_press, _x, _y, row, idx):
+        """The strip selects the way a text editor and a file manager do: SHIFT
+        marks the region from the anchor to here, CTRL adds or removes one page,
+        and a plain click starts again from here.
+
+        The anchor is what makes the two agree — Ctrl+clicking a page then
+        Shift+clicking a later one takes the range between them, which is the
+        behaviour the convention actually promises. A Shift+click does NOT move
+        it, so widening and narrowing a range from the same origin is one
+        gesture repeated rather than a new range each time."""
         state = gesture.get_current_event_state()
-        # only plain Ctrl (no Shift) toggles; Ctrl+Shift stays a native range op
-        if (state & Gdk.ModifierType.CONTROL_MASK
-                and not (state & Gdk.ModifierType.SHIFT_MASK)):
-            self._toggle_thumb_selection(row)
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        s = self._active_session
+
+        if shift and s._thumb_anchor is not None:
+            # Ctrl+Shift ADDS the range to what is already selected; Shift alone
+            # replaces it. Same split as every file manager.
+            if not ctrl:
+                self._toc_list.unselect_all()
+            lo, hi = sorted((s._thumb_anchor, idx))
+            for i in range(lo, hi + 1):
+                r = self._toc_list.get_row_at_index(i)
+                if r is not None:
+                    self._toc_list.select_row(r)
+            # Claimed, so neither the DragSource nor the listbox's own selection
+            # collapses the range back to the one row that was clicked — and so
+            # the row is not ACTIVATED, since marking a region is not a request
+            # to go to its last page.
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            return
+
+        if ctrl:
+            self._toggle_thumb_selection(row)
+            s._thumb_anchor = idx
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            return
+
+        # A plain click falls through — the listbox selects the row and the
+        # activation turns the page — but it is still where the next range will
+        # measure from.
+        s._thumb_anchor = idx
 
     def _toggle_thumb_selection(self, row):
         """Add/remove a single page from the multi-page export selection."""

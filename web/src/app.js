@@ -842,8 +842,7 @@ function toggleHidden(index, unhide = null) {
   if (!doc) return;
   const notes = doc.notes;
   const hidden = unhide === null ? notes.isHidden(index) : unhide;
-  if (hidden) notes._hidden.delete(index);
-  else notes._hidden.add(index);
+  notes.setHidden(index, !hidden);
   markDirty(true);
   rememberSession();
   sidebar.setDoc(doc);
@@ -1284,6 +1283,11 @@ function wireDocument() {
   document.getElementById("new-btn").addEventListener("click", () => newDocument());
   document.getElementById("add-page-btn").addEventListener("click",
                                                            () => addPageAfter(surface.pageIndex));
+  // The strip's right-click menu had the only Delete, which is a verb you have
+  // to already know is there. `removePages` is the same entry point, so the two
+  // cannot disagree about what deleting a page does to the notes.
+  document.getElementById("del-page-btn").addEventListener("click",
+                                                           () => removePages([surface.pageIndex]));
   window.addEventListener("beforeunload", (e) => {
     // nothing is written until you say so, so leaving with unsaved work has to
     // be a deliberate act — but a SANDBOX has nothing of yours in it, and a

@@ -81,7 +81,8 @@ npm test                                              # all the runners
 | `lasso.mjs` | 184 | handle points, anchors, scale factors, chip, polygon |
 | `shapes.mjs` | 100 | 13 strokes through the recogniser |
 | `inkpdf.mjs` | — | annots, appearance, profile, regeneration, foreign ink |
-| `crossing.mjs` | 23 | where the caret lands crossing the divider (row 162) |
+| `crossing.mjs` | 27 | where the caret and its selection land crossing the divider |
+| `paging.mjs` | 885 | insert/delete/reorder re-key notes, runs, bookmarks, hidden, outline |
 | `wiring.mjs` | — | callbacks supplied, bare calls resolve, DOM ids exist |
 
 The ink vectors are **real captured strokes** from `notes/*.jsonl` — the same
@@ -190,6 +191,10 @@ top of the right section is still landing somewhere you were not; a divider you
 can cross without losing your place is one you will cross mid-sentence. Clamped
 to the body's length, or a long position walks into the next page's marker.
 
+A SELECTION crosses too — it is the same two offsets (`_spanInBody`), so
+carrying both costs nothing, and text you had marked and then lost by widening
+the window is a selection you have to make again for no reason you can see.
+
 **A linked RUN lights up as a whole in the sidebar** (`Sidebar._runPages`,
 `.in-run`): a run's body is stored once (row 129), so inside one there is no
 single answer to "which page am I reading?", and the page you are actually on
@@ -259,6 +264,29 @@ anyone tries to "fix" it: the browser can drag out a file that already EXISTS
 written yet needs `DownloadURL`, the file-promise type Chromium implements on
 **Windows and macOS only**. Extracted pages live in memory, so there is no file
 to point at. Export writes one — which is what the tour teaches instead.
+
+## Re-keying pages: the invariant is that NOTHING IS LOST
+
+Notes, linked runs, bookmarks and hidden flags are all stored against a page
+index, so every insert, delete and reorder re-keys four things at once — three
+of them invisible state that exists nowhere else. The failure mode is never a
+crash; it is a page quietly showing somebody else's notes, or none.
+
+**A page inserted INSIDE a linked run joins it.** A run's body is stored once,
+on its first page, so breaking the link at the gap does not split the notes in
+two — it deletes them from every page after the insertion point. That shipped in
+both apps.
+
+**Test it as "no page loses its text", never as "page N equals page M"**: an
+insert inside a run legitimately gives the NEW page the run's text too, and an
+equality has to be relaxed to allow that — relaxing it is exactly how the loss
+went unnoticed. `paging.mjs` walks every insertion and deletion point and checks
+that whatever a page showed, it still shows wherever it moved to.
+
+Images need no re-keying of their own: they live in the same per-page map as
+ink (`Doc.open` folds them in), so one map is re-keyed and both follow. What is
+NOT carried is the undo stack — `setDoc` clears it, so a structural edit is the
+end of undo history here, unlike the desktop, which re-keys its stack.
 
 ## Verbs the keyboard cannot reach
 

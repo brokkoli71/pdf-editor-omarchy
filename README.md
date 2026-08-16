@@ -160,7 +160,7 @@ pip install pymupdf
 | `Ctrl+Shift+Delete` | Delete current page |
 | `F5` | Toggle presenter view — mirror the page fullscreen on a second screen (`Esc` to close) |
 | `Ctrl+T` | Toggle outline / page-thumbnail sidebar (Outline ⇄ Pages switcher when the PDF has both) |
-| Click / `Ctrl+click` thumbnail | Click selects a single page; `Ctrl+click` adds or removes a page from the multi-page selection |
+| Click / `Shift` / `Ctrl+click` thumbnail | Click selects a single page; `Shift+click` marks every page between it and the last one you clicked; `Ctrl+click` adds or removes one |
 | Drag thumbnail → thumbnail | Reorder pages (in the page-thumbnail sidebar) |
 | Drop a PDF → between thumbnails | Insert that PDF's pages at the drop point (a drop line shows where) |
 | Drag thumbnail(s) → file manager / desktop | Export the dragged page(s) as a standalone PDF (notes appended), like macOS Preview |

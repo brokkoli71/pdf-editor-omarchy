@@ -111,7 +111,7 @@ function placed(model, idx, within, text) {
   const self = {
     model,
     view: { state: { doc: { toString: () => text } },
-            dispatch: (tr) => { anchor = tr.selection.anchor; } },
+            dispatch: (tr) => { anchor = tr.selection.head ?? tr.selection.anchor; } },
   };
   NotesView.prototype._placeCaretForPage.call(self, idx, within);
   return { anchor, fullCaret: self._fullCaret };
@@ -134,6 +134,32 @@ check("on the sheet, a caret above every marker belongs to no page and reads 0",
       inBody(plain, { full: true, text: plainText, head: 0 }), 0);
 check("inside a run the offset is measured from the body's one home",
       inBody(run, { full: true, text: runText, head: runBody + 4 }), 4);
+
+// A SELECTION crosses too — it is the same two offsets, so carrying both costs
+// nothing, and text you had marked and then lost by widening the window is a
+// selection you have to make again for no reason you can see.
+function span(model, { full, text, anchor, head }) {
+  const self = {
+    model, full,
+    _offsetInBody: NotesView.prototype._offsetInBody,
+    view: { state: { doc: { toString: () => text },
+                     selection: { main: { anchor, head } } } },
+  };
+  return NotesView.prototype._spanInBody.call(self);
+}
+
+check("a marked region reads as two body offsets, not one",
+      span(plain, { full: false, text: body3, anchor: 4, head: 11 }),
+      { anchor: 4, head: 11 });
+check("…and on the sheet the same region reads back the same",
+      span(plain, { full: true, text: plainText,
+                    anchor: openedAt(3) + 4, head: openedAt(3) + 11 }),
+      { anchor: 4, head: 11 });
+check("a collapsed caret is the same path, not a second one",
+      span(plain, { full: false, text: body3, anchor: 5, head: 5 }),
+      { anchor: 5, head: 5 });
+check("panel → sheet moves both ends together",
+      placed(plain, 3, { anchor: 4, head: 11 }, plainText).anchor, openedAt(3) + 11);
 
 // ── the sidebar's readout follows the caret ──────────────────────────────────
 //

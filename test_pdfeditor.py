@@ -2362,13 +2362,52 @@ class TestLinkedPageNotes(unittest.TestCase):
         m.set_links({1})
         self.assertTrue(m.has_content())
 
-    def test_insert_cuts_the_run_at_the_gap(self):
+    def test_a_page_inserted_inside_a_run_joins_it(self):
+        """A run's body is stored ONCE, on its first page — so breaking the link
+        at the gap does not split the notes in two, it DELETES them from every
+        page after the gap. This asserted the loss for a long time, phrased as
+        "the tail is cut loose", which sounds like a decision until you read the
+        pages it empties."""
         m = self._run()
         m.shift_for_insert(3)            # a blank page lands mid-run
-        self.assertEqual(m.own_text(2), "the long thought")
-        self.assertEqual(m.get(3), "")   # the inserted page
-        self.assertEqual(m.get(4), "")   # the tail is cut loose, not reaching back
-        self.assertEqual(m.links(), {5})
+        for page in (2, 3, 4, 5):
+            self.assertEqual(m.get(page), "the long thought")
+        self.assertEqual(m.run_pages(5), [2, 3, 4, 5])
+
+    def test_a_page_inserted_at_a_run_start_stays_outside_it(self):
+        """The blank page precedes the run, so the run simply moves — which is
+        why this needs no rule of its own."""
+        m = self._run()
+        m.shift_for_insert(2)
+        self.assertEqual(m.get(2), "")
+        self.assertEqual(m.run_pages(3), [3, 4, 5])
+
+    def test_no_page_loses_its_notes_to_an_insert_or_a_delete(self):
+        """The invariant behind both of the above, over every insertion and
+        deletion point: whatever a page showed, it still shows at wherever it
+        moved to. Stated as "nothing is LOST" rather than as an equality,
+        because an insert inside a run legitimately gives the NEW page the
+        run's text too — and an equality would have to be relaxed to allow
+        that, which is exactly how the loss went unnoticed."""
+        pages = 8
+        before = [self._run().get(p) for p in range(pages)]
+        for at in range(pages):
+            for count in (1, 3):
+                m = self._run()
+                m.shift_for_insert(at, count)
+                for old in range(pages):
+                    new = old + count if old >= at else old
+                    self.assertEqual(
+                        m.get(new), before[old],
+                        f"insert {count} at {at}: page {old} → {new}")
+            m = self._run()
+            m.shift_for_delete(at)
+            for old in range(pages):
+                if old == at:
+                    continue        # it went, and its own notes went with it
+                new = old - 1 if old > at else old
+                self.assertEqual(m.get(new), before[old],
+                                 f"delete {at}: page {old} → {new}")
 
     def test_deleting_a_run_start_hands_the_body_on(self):
         """The trap: dropping the deleted page's note would vaporise the whole
@@ -7577,6 +7616,100 @@ class TestThumbSelectionClearing(unittest.TestCase):
             win._toc_list.unselect_all()
             win._toggle_thumb_selection(rows[2])
             self.assertEqual(self._selected_pages(win), [2])
+
+        self._run_in_window(body)
+
+    def _press(self, win, idx, *, ctrl=False, shift=False):
+        """Drive the strip's selection handler as a real press would.
+
+        A stub gesture, because what is under test is the GRAMMAR — which rows
+        end up selected for which modifiers — and the alternative is a synthetic
+        click that the row's DragSource may swallow, which is the very trap this
+        handler exists to get around."""
+        state = 0
+        if ctrl:
+            state |= Gdk.ModifierType.CONTROL_MASK
+        if shift:
+            state |= Gdk.ModifierType.SHIFT_MASK
+
+        class _Stub:
+            claimed = False
+
+            def get_current_event_state(self):
+                return state
+
+            def set_state(self, _s):
+                self.claimed = True
+
+        stub = _Stub()
+        row = win._toc_list.get_row_at_index(idx)
+        win._on_thumb_select_pressed(stub, 1, 0, 0, row, idx)
+        # A press the handler did not CLAIM goes on to the listbox, which selects
+        # just that row. Standing in for it here is what makes "falls through"
+        # testable at all — and a Shift+click with no anchor has to fall through,
+        # or it would mark nothing and look broken.
+        if not stub.claimed:
+            win._toc_list.unselect_all()
+            win._toc_list.select_row(row)
+
+    def test_shift_click_marks_the_region_between_two_pages(self):
+        def body(win):
+            self._open(win, n_pages=8)
+            self._press(win, 1)
+            self._press(win, 4, shift=True)
+            self.assertEqual(self._selected_pages(win), [1, 2, 3, 4])
+            # and it reaches backwards from the same anchor, replacing the range
+            self._press(win, 0, shift=True)
+            self.assertEqual(self._selected_pages(win), [0, 1])
+
+        self._run_in_window(body)
+
+    def test_shift_measures_from_the_anchor_a_ctrl_click_set(self):
+        """The two modifiers share ONE anchor, which is what the convention
+        actually promises: Ctrl to pick a starting page, Shift to take the run
+        from there."""
+        def body(win):
+            self._open(win, n_pages=8)
+            win._toc_list.unselect_all()
+            self._press(win, 2, ctrl=True)
+            self._press(win, 5, shift=True)
+            self.assertEqual(self._selected_pages(win), [2, 3, 4, 5])
+
+        self._run_in_window(body)
+
+    def test_ctrl_shift_adds_a_second_region(self):
+        def body(win):
+            self._open(win, n_pages=8)
+            self._press(win, 0)
+            self._press(win, 1, shift=True)
+            self._press(win, 4, ctrl=True)
+            self._press(win, 5, ctrl=True, shift=True)
+            self.assertEqual(self._selected_pages(win), [0, 1, 4, 5])
+
+        self._run_in_window(body)
+
+    def test_a_plain_click_starts_the_region_again(self):
+        def body(win):
+            self._open(win, n_pages=8)
+            self._press(win, 1)
+            self._press(win, 4, shift=True)
+            self._press(win, 6)
+            self.assertEqual(self._selected_pages(win), [6])
+            self._press(win, 7, shift=True)
+            self.assertEqual(self._selected_pages(win), [6, 7])
+
+        self._run_in_window(body)
+
+    def test_shift_with_no_anchor_does_not_select_a_range(self):
+        """A rebuilt strip drops its anchor — the rows it pointed into are gone,
+        and measuring from a stale index marks a region nobody chose."""
+        def body(win):
+            self._open(win, n_pages=8)
+            self._press(win, 3)
+            win._populate_thumbnails()
+            win._toc_list.unselect_all()
+            self._press(win, 6, shift=True)
+            self.assertEqual(self._selected_pages(win), [6])
 
         self._run_in_window(body)
 
