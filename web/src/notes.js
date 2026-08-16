@@ -17,6 +17,7 @@ import {
   Decoration, WidgetType, ViewPlugin, RangeSetBuilder,
 } from "../vendor/codemirror.js";
 import { renderSpans, scriptStyle, RENDERABLE_RE } from "./mathrender.js";
+import { noteOffsetForPage, notePageAtOffset } from "./notes-model.js";
 
 // ── the live rendering ───────────────────────────────────────────────────────
 //
@@ -199,6 +200,8 @@ export class NotesView {
     this.model = null;
     this.page = 0;
     this.full = false;          // the whole sidecar, rather than one page
+    this._fullFrom = null;      // the page the sheet was opened at (row 162)
+    this._fullCaret = null;     // where it put the caret, so "never moved" is knowable
     this.onDirty = opts.onDirty || (() => {});
     this._loading = false;
 
@@ -235,6 +238,7 @@ export class NotesView {
     this.model = model;
     this.page = 0;
     this.full = false;
+    this._fullFrom = this._fullCaret = null;
     this.showPage(0);
   }
 
@@ -244,13 +248,66 @@ export class NotesView {
    * you.
    *
    * A VIEW state, never a conversion: nothing is written either way, so a drag
-   * that crosses the line and comes back leaves no trace. */
-  setFull(on) {
-    if (!this.model || on === this.full) return;
+   * that crosses the line and comes back leaves no trace.
+   *
+   * THE CARET CROSSES WITH YOU, both ways (row 162): the sheet opens at the
+   * page you were reading, and closing it returns the page the caret is in —
+   * which is what `setFull(false)` gives back, `null` when there is nothing to
+   * say. A page index and a character offset are two coordinate systems for the
+   * same notes; `noteOffsetForPage`/`notePageAtOffset` are the one marker table
+   * both directions read, because two readings of it is exactly how the caret
+   * comes back on a different page than it left. */
+  setFull(on, page = null) {
+    if (!this.model || on === this.full) return null;
     this.commitFull();                 // write the view being left
-    this.full = on;
-    const text = on ? this.model.toText() : this.model.get(this.page);
-    this._fill(text);
+    if (!on) {
+      const target = this.fullTargetPage();
+      this.full = false;
+      this._fullFrom = this._fullCaret = null;
+      if (target !== null) this.page = target;
+      this._fill(this.model.get(this.page), 0);
+      return target;
+    }
+    this._fullFrom = page === null ? this.page : page;
+    this.full = true;
+    this._fill(this.model.toText(), 0);
+    this._placeCaretForPage(this._fullFrom);
+    return null;
+  }
+
+  /** Open the sheet at page `idx`'s notes — caret in them, scrolled to them.
+   *
+   * The sheet is the whole sidecar, so "the page you were on" is a position in
+   * one long text. A linked run stores its body once, on the run's first page,
+   * so the lookup asks for the RUN — the page you were reading has no text of
+   * its own to go to. */
+  _placeCaretForPage(idx) {
+    const text = this.view.state.doc.toString();
+    const off = Math.max(0, Math.min(text.length,
+                                     noteOffsetForPage(text, this.model.runStart(idx))));
+    this.view.dispatch({ selection: { anchor: off }, scrollIntoView: true });
+    this._fullCaret = off;
+  }
+
+  /** Which page to come back to when the sheet closes — the page the caret is
+   * in, `null` when there is nothing to say.
+   *
+   * Two of the three answers come from the page the sheet was OPENED at,
+   * because a character offset cannot carry them. A run of linked pages shares
+   * one body (row 129), so a caret in it says the RUN and not which of its
+   * pages you were reading; and a caret that never MOVED from where the sheet
+   * put it has learnt nothing since — including the case where the page had no
+   * notes at all and the caret went to where they would go, which is somebody
+   * else's section. */
+  fullTargetPage() {
+    if (!this.model) return null;
+    const text = this.view.state.doc.toString();
+    const off = this.view.state.selection.main.head;
+    const page = notePageAtOffset(text, off);
+    const home = this._fullFrom;
+    if (home === null || home === undefined) return page;
+    if (page === null || off === this._fullCaret) return home;
+    return this.model.runPages(page).includes(home) ? home : page;
   }
 
   /** Commit whichever view is on screen. The two paths have to say which they
@@ -283,11 +340,14 @@ export class NotesView {
     this._fill(this.model.get(page));
   }
 
-  _fill(text) {
+  _fill(text, caret = null) {
     this._loading = true;      // our own fill must not mark the file dirty
+    const anchor = caret === null
+      ? Math.min(text.length, this.view.state.selection.main.anchor)
+      : Math.max(0, Math.min(text.length, caret));
     this.view.dispatch({
       changes: { from: 0, to: this.view.state.doc.length, insert: text },
-      selection: { anchor: Math.min(text.length, this.view.state.selection.main.anchor) },
+      selection: { anchor },
     });
     this._loading = false;
   }

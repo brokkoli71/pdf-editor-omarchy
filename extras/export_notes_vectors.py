@@ -53,6 +53,16 @@ CASES = {
 }
 
 
+def _probe_offsets(raw):
+    """Where in the text to ask the question. Every marker's own start and end
+    plus the character after it — an off-by-one at a boundary is the whole of
+    what can go wrong here — and the ends of the file."""
+    offs = {0, len(raw)}
+    for _f, _l, start, end in S.note_marker_spans(raw):
+        offs.update({max(0, start - 1), start, end, min(len(raw), end + 1)})
+    return sorted(offs)
+
+
 def main():
     out = {}
     for name, raw in CASES.items():
@@ -75,6 +85,15 @@ def main():
             "get": {str(p): model.get(p) for p in pages},
             "own_text": {str(p): model.own_text(p) for p in pages},
             "run_start": {str(p): model.run_start(p) for p in pages},
+            # The two coordinate systems for one set of notes (row 162): the
+            # sheet is one long text and the canvas is on a page, and crossing
+            # the divider translates between them. Two readings of this table
+            # is exactly how the caret comes back on a different page than it
+            # left, so both directions are pinned against the oracle.
+            "offset_for_page": {str(p): S.note_offset_for_page(raw, p)
+                                for p in pages},
+            "page_at_offset": {str(o): S.note_page_at_offset(raw, o)
+                               for o in _probe_offsets(raw)},
         }
     json.dump(out, sys.stdout, indent=1)
 

@@ -76,11 +76,12 @@ npm test                                              # all the runners
 |---|---|---|
 | `conformance.mjs` | 766 | 32 strokes, 24 of them real captures |
 | `merge.mjs` | — | chapters, ink re-keying, insert-at-gap |
-| `notes.mjs` | 282 | 12 sidecar shapes, byte-identical round trips |
+| `notes.mjs` | 405 | 12 sidecar shapes, byte-identical round trips, page↔offset |
 | `math.mjs` | 226 | 37 lines of maths source |
 | `lasso.mjs` | 184 | handle points, anchors, scale factors, chip, polygon |
 | `shapes.mjs` | 100 | 13 strokes through the recogniser |
 | `inkpdf.mjs` | — | annots, appearance, profile, regeneration, foreign ink |
+| `crossing.mjs` | 10 | which page the sheet closes onto (row 162) |
 | `wiring.mjs` | — | callbacks supplied, bare calls resolve, DOM ids exist |
 
 The ink vectors are **real captured strokes** from `notes/*.jsonl` — the same
@@ -142,6 +143,40 @@ which will bite again:
 
 Unlike the desktop, this side CAN be driven by an agent through Chrome — see
 the memory note on handing off GUI checks.
+
+## A document is two files, and the browser cannot find the second one
+
+The desktop opens a `.pdf` and reads the `.md` beside it. A browser is handed
+FILES, never the directory they came from, so the sidecar can only arrive if the
+user selects it too — which is why the open picker offers `.md` alongside `.pdf`
+(inserting pages does not: a `.md` means nothing there) and why the button, the
+drop overlay and the README all say to pick both.
+
+`pairSources` is the ONE pairing rule, shared by the drop and the picker: base
+name first, but one PDF and one `.md` opened together are paired whatever they
+are called — the desktop lets you choose a notes file by hand and those are
+often named for the course. It also carries the sidecar's **handle**, which is
+the real payoff: with it a later save writes the notes back in place instead of
+`saveDocument` returning `notesPending` and asking for a second gesture.
+
+## The caret crosses the divider (row 162)
+
+Dragging the notes to full width makes them one sheet, and going either way is a
+translation between two coordinate systems for the same notes — a page index and
+a character offset. `noteOffsetForPage` / `notePageAtOffset` are the one marker
+table both directions read; two readings of it is exactly how the caret comes
+back on a different page than it left.
+
+Two of the three answers cannot come from the offset, so `NotesView` also
+remembers the page the sheet was opened at and the offset it put the caret at: a
+linked run shares one body (row 129), so a caret in it says the RUN and not which
+of its pages you were reading, and a caret that never MOVED has learnt nothing
+since — which is also the only honest answer for a page with no notes, whose
+caret was parked in somebody else's section.
+
+`setModel` resets the panel to one page, and the divider's state outlives a
+document change — so every path that swaps the model calls `syncFullNotes()` to
+re-enter the sheet. Without it the panel is full width, showing one page.
 
 ## Browser differences (measured, not assumed)
 

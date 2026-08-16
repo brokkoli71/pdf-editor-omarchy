@@ -32,6 +32,61 @@ const PAGE_MARKER_RE = new RegExp(
 const PAGE_MARKER_SPLIT = new RegExp(PAGE_MARKER_RE.source, "g");
 const EMBED_RE = /^\s*!\[\[.*?\]\]\n+/;
 
+/** [{first, last, start, end}] for every page marker in a sidecar's text, in
+ * the order they appear. A range marker (`<!-- page:13-40 continued -->`)
+ * covers every page in it. */
+export function noteMarkerSpans(text) {
+  const re = new RegExp(PAGE_MARKER_RE.source, "g");
+  const out = [];
+  let m;
+  while ((m = re.exec(String(text ?? "")))) {
+    const first = Number(m[1]);
+    const last = m[2] ? Number(m[2]) : first;
+    out.push({ first, last: Math.max(first, last), start: m.index, end: re.lastIndex });
+  }
+  return out;
+}
+
+/** Which page's notes the caret at `off` is in — the page of the last marker at
+ * or before it. `null` above the first marker (the `![[embed]]` line, or a file
+ * with no markers at all), which is a real answer: the caret is in the file,
+ * not in any page. */
+export function notePageAtOffset(text, off) {
+  let page = null;
+  for (const span of noteMarkerSpans(text)) {
+    if (span.start > off) break;
+    page = span.first;
+  }
+  return page;
+}
+
+/** Where page `idx`'s notes begin in a sidecar's text.
+ *
+ * The first character of its body; the end of its marker when the page is
+ * marked but empty (the caret then sits on the marker, which reveals it and
+ * says which page you are on); and where the section WOULD be inserted when the
+ * page has none at all — the start of the first later section, else the end of
+ * the file. That last case cannot round-trip through `notePageAtOffset`, which
+ * is why the caller also remembers the page it came from rather than trusting
+ * the offset alone. */
+export function noteOffsetForPage(text, idx) {
+  text = String(text ?? "");
+  const spans = noteMarkerSpans(text);
+  for (let i = 0; i < spans.length; i++) {
+    const s = spans[i];
+    if (s.first <= idx && idx <= s.last) {
+      const limit = i + 1 < spans.length ? spans[i + 1].start : text.length;
+      let body = s.end;
+      while (body < limit && " \t\r\n".includes(text[body])) body += 1;
+      // a section with no body of its own: stay on the marker line rather than
+      // drifting onto the next page's marker
+      return body < limit ? body : s.end;
+    }
+  }
+  for (const s of spans) if (s.first > idx) return s.start;
+  return text.length;
+}
+
 /** A bookmark name, safe inside a marker. Escaping `>` is what makes `-->`
  * unrepresentable, so a name can never terminate the comment it lives in. */
 function escMarker(text) {

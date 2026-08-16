@@ -11,7 +11,8 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { parseNoteSections, NotesModel } from "../src/notes-model.js";
+import { parseNoteSections, NotesModel, noteOffsetForPage, notePageAtOffset }
+  from "../src/notes-model.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const V = JSON.parse(readFileSync(join(here, "notes-vectors.json"), "utf8"));
@@ -54,6 +55,18 @@ for (const [name, want] of Object.entries(V)) {
   }
   for (const [page, start] of Object.entries(want.run_start)) {
     check(`${name}/runStart(${page})`, model.runStart(Number(page)), start);
+  }
+
+  // The page ↔ offset table the caret crosses the divider on (row 162). Both
+  // directions, at every marker boundary — an off-by-one here does not fail
+  // loudly, it lands you on the neighbouring page.
+  for (const [page, off] of Object.entries(want.offset_for_page)) {
+    check(`${name}/offsetForPage(${page})`,
+          noteOffsetForPage(want.raw, Number(page)), off);
+  }
+  for (const [off, page] of Object.entries(want.page_at_offset)) {
+    check(`${name}/pageAtOffset(${off})`,
+          notePageAtOffset(want.raw, Number(off)), page);
   }
 
   // writing the text back out and re-reading it must be a fixed point — a

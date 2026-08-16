@@ -153,13 +153,22 @@ export async function saveNotesAs(doc) {
 
 /** Open a PDF through the picker, keeping the handle so a later save can write
  * back to the same file. Returns [{bytes, name, handle}] or null if cancelled. */
-export async function openWithPicker(multiple = true) {
+export async function openWithPicker(multiple = true, { notes = false } = {}) {
   if (!canSaveInPlace) return null;               // fall back to <input type=file>
   let handles;
   try {
     handles = await window.showOpenFilePicker({
       multiple,
-      types: [{ description: "PDF document", accept: { "application/pdf": [".pdf"] } }],
+      // A document is a `.pdf` plus the `.md` beside it, and the picker is the
+      // only place the browser lets you say so — it hands out files, never the
+      // directory a sidecar could be found in. So OPENING offers both and the
+      // caller pairs them; INSERTING pages does not, where a `.md` would mean
+      // nothing. The sidecar's handle is the payoff: picked here, a later save
+      // writes the notes back in place instead of asking for them separately.
+      types: notes
+        ? [{ description: "Sidemark document",
+             accept: { "application/pdf": [".pdf"], "text/markdown": [".md"] } }]
+        : [{ description: "PDF document", accept: { "application/pdf": [".pdf"] } }],
     });
   } catch (err) {
     if (err.name === "AbortError") return null;

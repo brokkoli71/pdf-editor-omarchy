@@ -368,6 +368,7 @@ async function setDoc(doc, title) {
   sidebar.setDoc(doc);
   sidebar.setPage(0);
   notes.setModel(doc.notes);
+  syncFullNotes();
   search.stop();
   search.clearCache();
   search.matches = [];
@@ -386,6 +387,16 @@ async function setDoc(doc, title) {
 }
 
 /** The divider between the page and the notes. GtkPaned's position, by hand. */
+/** Re-enter the sheet on a model that has just been swapped in. `setModel`
+ * resets the panel to one page's notes — the divider's state outlives a
+ * document change, so without this the panel is full width and showing one
+ * page, and the caret has nothing to cross with (row 162). */
+function syncFullNotes() {
+  if (document.getElementById("paned").classList.contains("full-notes")) {
+    notes.setFull(true, surface.pageIndex);
+  }
+}
+
 function wireDivider() {
   const divider = document.getElementById("divider");
   const paned = document.getElementById("paned");
@@ -410,7 +421,14 @@ function wireDivider() {
     // A VIEW state, never a conversion: the PDF is still there behind the
     // sheet, its notes are still per page, and nothing is written either way —
     // so a drag that crosses the line and comes back leaves no trace.
-    notes.setFull(full);
+    //
+    // The CARET crosses with you (row 162): going in, the sheet opens at the
+    // page you were reading; coming out, `setFull` hands back the page the
+    // caret ended up in and the canvas turns to it.
+    const target = notes.setFull(full, surface.pageIndex);
+    if (!full && target !== null && target !== surface.pageIndex) {
+      surface.setPage(target);
+    }
     if (remember && !full) store.set("pane_fraction", frac);
     store.set("full_notes", full);
     surface.requestDraw();
@@ -462,50 +480,83 @@ function syncPageChrome() {
     !doc || surface.pageIndex >= doc.pageCount - 1;
 }
 
-async function readFiles(files) {
-  const list = [...files];
+/** Pair each PDF with the `.md` beside it. ONE rule, shared by the drop and the
+ * file picker — the two ways in cannot be allowed to disagree about what a pair
+ * means.
+ *
+ * A `.md` opened alongside its PDF is that PDF's SIDECAR — the same pairing the
+ * desktop makes, where a document is a `.pdf` plus the `.md` beside it. Base
+ * name FIRST, because that is the rule the file layout encodes; but the desktop
+ * also remembers a notes file chosen by hand, and those are often named for the
+ * course rather than the file (`0_merged.pdf` beside `26-sose-inhalte_nlp.md`).
+ * So one PDF and one `.md` opened together are paired whatever they are called
+ * — there is nothing else they could mean.
+ *
+ * `items` are {name, bytes, handle?}; the handles are what make a later save
+ * write both files back in place. */
+function pairSources(items) {
+  const base = (name) => name.replace(/\.[^.]+$/, "");
+  const dec = new TextDecoder();
   const pdfs = [];
-  // A `.md` dropped alongside its PDF is that PDF's SIDECAR — the same pairing
-  // the desktop makes, where a document is a `.pdf` plus the `.md` beside it.
-  // Base name FIRST, because that is the rule the file layout encodes; but the
-  // desktop also remembers a notes file chosen by hand, and those are often
-  // named for the course rather than the file (`0_merged.pdf` beside
-  // `26-sose-inhalte_nlp.md`). So one PDF and one `.md` dropped together are
-  // paired whatever they are called — there is nothing else they could mean.
   const sidecars = new Map();
-  for (const f of list) {
-    if (/\.md$/i.test(f.name)) {
-      sidecars.set(f.name.replace(/\.[^.]+$/, ""), await f.text());
+  for (const it of items) {
+    if (/\.md$/i.test(it.name)) {
+      sidecars.set(base(it.name), { text: dec.decode(it.bytes), handle: it.handle || null });
     }
   }
-  for (const f of list) {
-    if (!/\.pdf$/i.test(f.name) && f.type !== "application/pdf") continue;
+  for (const it of items) {
+    if (!/\.pdf$/i.test(it.name) && it.type !== "application/pdf") continue;
+    const side = sidecars.get(base(it.name)) || null;
     pdfs.push({
-      bytes: new Uint8Array(await f.arrayBuffer()),
-      name: f.name,
-      notesText: sidecars.get(f.name.replace(/\.[^.]+$/, "")) ?? null,
+      bytes: it.bytes,
+      name: it.name,
+      handle: it.handle || null,
+      notesText: side ? side.text : null,
+      notesHandle: side ? side.handle : null,
     });
   }
   if (pdfs.length === 1 && sidecars.size === 1 && !pdfs[0].notesText) {
-    pdfs[0].notesText = [...sidecars.values()][0];
+    const only = [...sidecars.values()][0];
+    pdfs[0].notesText = only.text;
+    pdfs[0].notesHandle = only.handle;
   }
   // a `.md` on its own is a notes file for the document already open
   if (!pdfs.length && sidecars.size && surface.doc) {
-    return { loneNotes: [...sidecars.values()][0] };
+    const only = [...sidecars.values()][0];
+    return { loneNotes: only.text, loneNotesHandle: only.handle };
   }
   return pdfs;
+}
+
+async function readFiles(files) {
+  const items = [];
+  for (const f of [...files]) {
+    items.push({ name: f.name, type: f.type, bytes: new Uint8Array(await f.arrayBuffer()) });
+  }
+  return pairSources(items);
 }
 
 /** One file OPENS; several MERGE into one document with a chapter per file.
  * That is the whole point of dropping more than one at once — you get a single
  * document whose outline names where each source began, not a pile of tabs. */
 async function openFiles(files) {
-  const sources = await readFiles(files);
+  return openPaired(await readFiles(files));
+}
+
+/** What `pairSources` produced: a PDF (or several to merge), or a lone sidecar
+ * for the document already open. Both ways in — the drop and the picker — land
+ * here, so neither can grow its own idea of what opening a `.md` means. */
+async function openPaired(sources) {
   if (sources.loneNotes !== undefined) {
     // a sidecar for the document already open
     surface.doc.notes.setFromText(sources.loneNotes);
+    if (sources.loneNotesHandle) {
+      surface.doc.handles = surface.doc.handles || {};
+      surface.doc.handles.notes = sources.loneNotesHandle;
+    }
     notes.setModel(surface.doc.notes);
     notes.showPage(surface.pageIndex);
+    syncFullNotes();
     markDirty(false);
     return toast("Notes loaded");
   }
@@ -515,11 +566,22 @@ async function openFiles(files) {
 /** `sources` are {bytes, name, handle?, notesText?} — one OPENS, several MERGE
  * into one document with a chapter per file. */
 async function openSources(sources) {
-  if (!sources.length) return toast("No PDFs in that drop");
+  // Reachable from the picker too, now that it takes `.md` — and there the
+  // useful answer is not "wrong file" but the pairing rule itself.
+  if (!sources.length) {
+    return toast("No PDF in that \u2014 a .md is a PDF's notes, so open the two together");
+  }
   try {
     if (sources.length === 1) {
       const doc = await Doc.open(sources[0].bytes, sources[0].name);
-      if (sources[0].handle) doc.handles = { pdf: sources[0].handle };
+      // Both handles, so a later save writes the PDF *and* its notes back where
+      // they came from — the sidecar cannot be derived from the PDF's handle
+      // (the API hands out a file, never its directory), so picking it here is
+      // the only way to have it.
+      if (sources[0].handle || sources[0].notesHandle) {
+        doc.handles = { pdf: sources[0].handle || null,
+                        notes: sources[0].notesHandle || null };
+      }
       if (sources[0].notesText) doc.notes.setFromText(sources[0].notesText);
       await setDoc(doc, sources[0].name);
       toast(sources[0].notesText ? `Opened ${sources[0].name} with its notes`
@@ -933,6 +995,7 @@ function openNotesFile() {
     surface.doc.notes.setFromText(await f.text());
     notes.setModel(surface.doc.notes);
     notes.showPage(surface.pageIndex);
+    syncFullNotes();
     sidebar.setDoc(surface.doc);
     syncPageChrome();
     markDirty(true);
@@ -1179,9 +1242,9 @@ function wireDocument() {
     // The picker is preferred over <input type=file> because it hands back a
     // HANDLE — which is what lets a later save write to the same file instead
     // of dropping a copy in ~/Downloads.
-    const picked = canSaveInPlace ? await openWithPicker(true) : null;
+    const picked = canSaveInPlace ? await openWithPicker(true, { notes: true }) : null;
     if (picked === null) { if (!canSaveInPlace) input.click(); return; }
-    if (picked.length) openSources(picked);
+    if (picked.length) openPaired(pairSources(picked));
   });
   input.addEventListener("change", () => {
     if (input.files.length) openFiles(input.files);
@@ -1243,8 +1306,11 @@ function wireDocument() {
     // an internal page drag is not an offer to open anything
     if (!n) return;
     depth++;
+    // A drag exposes its data TYPES, never its file names, so the title cannot
+    // know whether two files are two PDFs to merge or a PDF and its sidecar.
+    // It says how many; the sub-line below says what each case means.
     document.getElementById("drop-title").textContent =
-      n > 1 ? `Drop to merge ${n} files` : "Drop to open";
+      n > 1 ? `Drop ${n} files` : "Drop to open";
     hint.hidden = false;
   });
   window.addEventListener("dragover", (e) => { e.preventDefault(); });

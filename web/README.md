@@ -29,7 +29,13 @@ Safari is not supported.
 - **Draw** with a pressure-sensitive pen, highlighter and eraser — saved as
   native PDF ink annotations, so they open anywhere.
 - **Notes beside the page**, per page, on a draggable divider. `\alpha` becomes
-  α and `x^2` lifts as you type, while the `.md` keeps the plain source.
+  α and `x^2` lifts as you type, while the `.md` keeps the plain source. Drag
+  the divider all the way across and the notes become one sheet, opened at the
+  page you were reading; drag it back and the page turns to wherever the caret
+  ended up.
+- **Open both files.** A document is a `.pdf` plus the `.md` notes beside it, so
+  select the two together in the file picker (or drop them together) and they
+  come back paired — the browser cannot go looking for a sidecar on its own.
 - **Tools live on mouse buttons** — left draws, right erases and middle lassos
   *at the same time*. Click a tool with the button you want it on. A stylus
   needs no setup: the tip draws and the eraser barrel erases.
