@@ -175,6 +175,15 @@ const surface = new Surface(document.getElementById("page"), pen, bindings, {
 
 const notes = new NotesView(document.getElementById("notes"), {
   onDirty: () => { markDirty(true); rememberSession(); },
+  // WHERE YOU ARE follows the caret while the sheet is open (row 153): the
+  // pages are off screen, so the sidebar's current row and its outline line are
+  // the only thing left saying which page you are writing on — and pointing
+  // `setPage` at it scrolls the strip to that row for free.
+  //
+  // The SIDEBAR only. The canvas is not turned until the sheet closes: it would
+  // re-render a page nobody can see on every keystroke, and it is `setFull` on
+  // the way out that knows how to read a caret that never moved.
+  onCaretPage: (page) => sidebar.setPage(page),
 });
 
 const presenter = new Presenter({
@@ -193,7 +202,10 @@ const timer = new Timer(() => {
 });
 
 const sidebar = new Sidebar(document.getElementById("sidebar"), {
-  onGoToPage: (page) => surface.setPage(page),   // absolute nav, never a flip
+  // Absolute nav, never a flip — and on the sheet "go to page" can only mean
+  // "go to its notes", or the row you just clicked would light up while nothing
+  // moved. `goToPage` is a no-op unless the sheet is open.
+  onGoToPage: (page) => { surface.setPage(page); notes.goToPage(page); },
   onDropFiles: (files, gap) => importAt(files, gap),
   onMovePage: (from, to) => movePage(from, to),
   onDeletePages: (pages) => removePages(pages),

@@ -81,7 +81,7 @@ npm test                                              # all the runners
 | `lasso.mjs` | 184 | handle points, anchors, scale factors, chip, polygon |
 | `shapes.mjs` | 100 | 13 strokes through the recogniser |
 | `inkpdf.mjs` | — | annots, appearance, profile, regeneration, foreign ink |
-| `crossing.mjs` | 10 | which page the sheet closes onto (row 162) |
+| `crossing.mjs` | 15 | which page the sheet closes onto, and the caret readout |
 | `wiring.mjs` | — | callbacks supplied, bare calls resolve, DOM ids exist |
 
 The ink vectors are **real captured strokes** from `notes/*.jsonl` — the same
@@ -173,6 +173,17 @@ linked run shares one body (row 129), so a caret in it says the RUN and not whic
 of its pages you were reading, and a caret that never MOVED has learnt nothing
 since — which is also the only honest answer for a page with no notes, whose
 caret was parked in somebody else's section.
+
+**The sidebar follows the caret while the sheet is open**, and only the
+sidebar: `onCaretPage` points `Sidebar.setPage` at the page the caret is in, so
+the current thumbnail, the outline's "where you are" line (row 153) and the
+scroll all follow the text you are writing in. The canvas is NOT turned — it
+would re-render a page nobody can see on every keystroke, and it is `setFull` on
+the way out that knows how to read a caret that never moved. Clicking a row goes
+the other way (`NotesView.goToPage`), and moves the page the sheet was opened at
+with it, or closing would take you back to where you started rather than where
+you asked to be. The readout is DEBOUNCED and its marker table cached: the scan
+is over the whole sidecar and typing must not pay for it per character.
 
 `setModel` resets the panel to one page, and the divider's state outlives a
 document change — so every path that swaps the model calls `syncFullNotes()` to

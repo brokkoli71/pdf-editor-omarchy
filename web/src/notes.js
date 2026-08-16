@@ -17,7 +17,7 @@ import {
   Decoration, WidgetType, ViewPlugin, RangeSetBuilder,
 } from "../vendor/codemirror.js";
 import { renderSpans, scriptStyle, RENDERABLE_RE } from "./mathrender.js";
-import { noteOffsetForPage, notePageAtOffset } from "./notes-model.js";
+import { noteOffsetForPage, notePageAtOffset, noteMarkerSpans } from "./notes-model.js";
 
 // ── the live rendering ───────────────────────────────────────────────────────
 //
@@ -33,6 +33,11 @@ import { noteOffsetForPage, notePageAtOffset } from "./notes-model.js";
 //   * a SELECTION reveals every line it covers, entirely. What you have
 //     selected is what you are about to cut or replace, and a selection whose
 //     text re-shaped itself as it grew is worse than lines that settle once.
+
+// How long the sidebar's page readout may lag the caret. Long enough that a
+// burst of typing costs ONE scan of the sidecar, short enough that moving the
+// caret and looking at the strip feels like one action.
+const CARET_PAGE_MS = 120;
 
 class GlyphWidget extends WidgetType {
   constructor(text, cls) { super(); this.text = text; this.cls = cls; }
@@ -203,6 +208,14 @@ export class NotesView {
     this._fullFrom = null;      // the page the sheet was opened at (row 162)
     this._fullCaret = null;     // where it put the caret, so "never moved" is knowable
     this.onDirty = opts.onDirty || (() => {});
+    // Where the caret is, in PAGES — the sidebar's readout while the sheet is
+    // open (row 153's "where you are"). Only ever a readout: the canvas is not
+    // turned until you close the sheet, or the page would re-render under every
+    // keystroke.
+    this.onCaretPage = opts.onCaretPage || (() => {});
+    this._caretPage = null;
+    this._markers = null;       // the marker table, invalidated by an edit
+    this._caretTimer = null;
     this._loading = false;
 
     this.view = new EditorView({
@@ -219,7 +232,9 @@ export class NotesView {
           EditorView.lineWrapping,
           placeholder("Notes for this page…"),
           EditorView.updateListener.of((u) => {
+            if (u.docChanged) this._markers = null;
             if (u.docChanged && !this._loading) this._onEdit();
+            if (u.docChanged || u.selectionSet) this._scheduleCaretPage();
           }),
         ],
       }),
@@ -238,7 +253,8 @@ export class NotesView {
     this.model = model;
     this.page = 0;
     this.full = false;
-    this._fullFrom = this._fullCaret = null;
+    this._fullFrom = this._fullCaret = this._caretPage = null;
+    this._markers = null;
     this.showPage(0);
   }
 
@@ -263,7 +279,8 @@ export class NotesView {
     if (!on) {
       const target = this.fullTargetPage();
       this.full = false;
-      this._fullFrom = this._fullCaret = null;
+      this._fullFrom = this._fullCaret = this._caretPage = null;
+      this._markers = null;
       if (target !== null) this.page = target;
       this._fill(this.model.get(this.page), 0);
       return target;
@@ -272,6 +289,11 @@ export class NotesView {
     this.full = true;
     this._fill(this.model.toText(), 0);
     this._placeCaretForPage(this._fullFrom);
+    // The page you came FROM, never the section the caret landed in: a linked
+    // run's body lives on the run's first page, so reading the offset back
+    // would move the sidebar off the page you were actually reading the moment
+    // the sheet opened.
+    this._caretPage = this._fullFrom;
     return null;
   }
 
@@ -287,6 +309,52 @@ export class NotesView {
                                      noteOffsetForPage(text, this.model.runStart(idx))));
     this.view.dispatch({ selection: { anchor: off }, scrollIntoView: true });
     this._fullCaret = off;
+  }
+
+  /** The caret's page, reported to the sidebar so the outline's "where you are"
+   * line and the thumbnail strip follow the text you are writing in.
+   *
+   * DEBOUNCED, and allowed to lag a keystroke: the marker table is a scan of
+   * the WHOLE sidecar, which on a long document is the largest thing this
+   * editor is ever asked to do, and typing must not pay for it per character.
+   * The table itself is cached and dropped by an edit — a selection moving
+   * through unchanged text costs a binary search and nothing else. */
+  _scheduleCaretPage() {
+    if (!this.full) return;
+    if (this._caretTimer !== null) return;      // one pending pass, not one per key
+    this._caretTimer = setTimeout(() => {
+      this._caretTimer = null;
+      this._reportCaretPage();
+    }, CARET_PAGE_MS);
+  }
+
+  _reportCaretPage() {
+    if (!this.full || !this.model) return;
+    if (this._markers === null) {
+      this._markers = noteMarkerSpans(this.view.state.doc.toString());
+    }
+    const off = this.view.state.selection.main.head;
+    let page = null;
+    for (const span of this._markers) {
+      if (span.start > off) break;
+      page = span.first;
+    }
+    if (page === null || page === this._caretPage) return;
+    this._caretPage = page;
+    this.onCaretPage(page);
+  }
+
+  /** Put the caret in page `idx`'s notes — the sidebar's own navigation while
+   * the sheet is open, where "go to page" can only mean "go to its notes".
+   *
+   * It moves the page the sheet was opened AT as well, because that is what you
+   * have just said: without it, closing the sheet would take you back to where
+   * you started rather than where you asked to be. */
+  goToPage(idx) {
+    if (!this.full || !this.model) return;
+    this._fullFrom = idx;
+    this._placeCaretForPage(idx);
+    this._caretPage = idx;      // the page you asked for, for setFull's reason
   }
 
   /** Which page to come back to when the sheet closes — the page the caret is

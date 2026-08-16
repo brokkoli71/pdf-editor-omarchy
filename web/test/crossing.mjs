@@ -93,6 +93,36 @@ check("arriving at the run from outside it lands on the run's first page",
       target(sheet(run, { head: runBody + 5, from: 9,
                           caret: noteOffsetForPage(runText, 9) })), 2);
 
+// ── the sidebar's readout follows the caret ──────────────────────────────────
+//
+// While the sheet is open the pages are off screen, so the sidebar's current
+// row is the only thing saying which page you are writing on.
+
+function reader(model, head, { caretPage = null } = {}) {
+  const text = model.toText();
+  const seen = [];
+  const self = {
+    model, full: true, _markers: null, _caretPage: caretPage,
+    onCaretPage: (p) => seen.push(p),
+    view: { state: { doc: { toString: () => text },
+                     selection: { main: { head } } } },
+  };
+  NotesView.prototype._reportCaretPage.call(self);
+  return { seen, self };
+}
+
+check("the caret in a page's notes names that page",
+      reader(plain, openedAt(7) + 2).seen, [7]);
+check("a caret that has not left its page reports nothing — a rebuild per "
+      + "keystroke is a strip that flickers while you type",
+      reader(plain, openedAt(3) + 1, { caretPage: 3 }).seen, []);
+check("above the first marker there is no page, so the readout holds",
+      reader(plain, 0, { caretPage: 3 }).seen, []);
+check("inside a run, every page of it reads as the page the body is stored on",
+      reader(run, runBody + 5).seen, [2]);
+check("the marker table is cached, and an edit is what drops it",
+      reader(plain, openedAt(7) + 2).self._markers.length > 0, true);
+
 if (failures) {
   console.error(`\n✗ ${failures} of ${checks} crossing checks failed.`);
   process.exit(1);
