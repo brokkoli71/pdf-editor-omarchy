@@ -342,6 +342,15 @@ button:disabled:hover { background: transparent; }
 .thumb.hidden-page .thumb-img { opacity: .35; }
 .thumb.hidden-page .thumb-no { text-decoration: line-through; color: var(--dim); }
 .thumb.current .thumb-no { color: var(--window-fg); font-weight: 700; }
+/* A LINKED RUN shares one body (row 129), so every page of it is a page these
+   notes are for. Lit as a group — a tinted row and a dashed edge — while the
+   one you are actually on keeps the solid outline: the run says which notes,
+   the outline says which page. */
+.thumb.in-run { background: color-mix(in srgb, var(--accent-bg) 12%, transparent); }
+.thumb.in-run .thumb-img { outline: 2px dashed color-mix(in srgb, var(--accent-bg) 55%, transparent);
+                           outline-offset: 1px; }
+.thumb.in-run.current .thumb-img { outline: 2px solid var(--accent-bg); }
+.thumb.in-run .thumb-no { color: var(--window-fg); }
 
 .outline-row { padding-right: 8px; }
 .outline-title {
@@ -358,6 +367,10 @@ button:disabled:hover { background: transparent; }
   content: ""; position: absolute; left: 0; top: 4px; bottom: 4px;
   width: 3px; border-radius: 2px; background: var(--accent-bg);
 }
+/* an outline entry sitting on a page of the run reads as part of it too */
+.outline-row.in-run { background: color-mix(in srgb, var(--accent-bg) 12%, transparent); }
+.outline-row.in-run.current { background: var(--btn-bg); }
+
 /* the entry you fall UNDER keeps only a faint tint */
 .outline-row.containing { background: color-mix(in srgb, var(--accent-bg) 10%, transparent); }
 

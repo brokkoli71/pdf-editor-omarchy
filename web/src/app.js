@@ -1277,6 +1277,13 @@ function wireDocument() {
 
   document.getElementById("save-btn").addEventListener("click", () => doSave());
   document.getElementById("insert-btn").addEventListener("click", insertPagesFromPicker);
+  // The keyboard cannot reach these two in a browser: Ctrl+N and Ctrl+Shift+N
+  // are the browser's own window and incognito window, reserved before a page
+  // sees them, so `preventDefault` never runs. The shortcuts stay for the
+  // desktop build's sake; the menu is what makes the verbs exist here.
+  document.getElementById("new-btn").addEventListener("click", () => newDocument());
+  document.getElementById("add-page-btn").addEventListener("click",
+                                                           () => addPageAfter(surface.pageIndex));
   window.addEventListener("beforeunload", (e) => {
     // nothing is written until you say so, so leaving with unsaved work has to
     // be a deliberate act — but a SANDBOX has nothing of yours in it, and a

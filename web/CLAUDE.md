@@ -81,7 +81,7 @@ npm test                                              # all the runners
 | `lasso.mjs` | 184 | handle points, anchors, scale factors, chip, polygon |
 | `shapes.mjs` | 100 | 13 strokes through the recogniser |
 | `inkpdf.mjs` | — | annots, appearance, profile, regeneration, foreign ink |
-| `crossing.mjs` | 15 | which page the sheet closes onto, and the caret readout |
+| `crossing.mjs` | 23 | where the caret lands crossing the divider (row 162) |
 | `wiring.mjs` | — | callbacks supplied, bare calls resolve, DOM ids exist |
 
 The ink vectors are **real captured strokes** from `notes/*.jsonl` — the same
@@ -183,6 +183,19 @@ a character offset. `noteOffsetForPage` / `notePageAtOffset` are the one marker
 table both directions read; two readings of it is exactly how the caret comes
 back on a different page than it left.
 
+**And it is the EXACT position, not the page.** Both buffers hold the SAME body,
+so the offset within it is the same number on both sides and only where the body
+STARTS changes — `_offsetInBody` is the whole of the translation. Landing at the
+top of the right section is still landing somewhere you were not; a divider you
+can cross without losing your place is one you will cross mid-sentence. Clamped
+to the body's length, or a long position walks into the next page's marker.
+
+**A linked RUN lights up as a whole in the sidebar** (`Sidebar._runPages`,
+`.in-run`): a run's body is stored once (row 129), so inside one there is no
+single answer to "which page am I reading?", and the page you are actually on
+keeps the solid outline. Only when the run has more than one page, so a page
+standing alone looks exactly as it always did.
+
 Two of the three answers cannot come from the offset, so `NotesView` also
 remembers the page the sheet was opened at and the offset it put the caret at: a
 linked run shares one body (row 129), so a caret in it says the RUN and not which
@@ -246,6 +259,15 @@ anyone tries to "fix" it: the browser can drag out a file that already EXISTS
 written yet needs `DownloadURL`, the file-promise type Chromium implements on
 **Windows and macOS only**. Extracted pages live in memory, so there is no file
 to point at. Export writes one — which is what the tour teaches instead.
+
+## Verbs the keyboard cannot reach
+
+**Ctrl+N and Ctrl+Shift+N never arrive.** They are the browser's own new window
+and incognito window, reserved before a page sees the event, so `preventDefault`
+is never even reached — a verb living only on those keys is a verb nobody in a
+browser has. New document and Add a blank page are therefore in the ☰ menu, and
+anything new must be checked against the browser's reserved set before its
+shortcut is called done.
 
 ## Deliberately not here
 

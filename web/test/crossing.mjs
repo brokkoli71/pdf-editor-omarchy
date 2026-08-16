@@ -93,6 +93,48 @@ check("arriving at the run from outside it lands on the run's first page",
       target(sheet(run, { head: runBody + 5, from: 9,
                           caret: noteOffsetForPage(runText, 9) })), 2);
 
+// ── the caret keeps its EXACT place, not just its page ───────────────────────
+//
+// The two buffers hold the same body — the panel shows a page's notes, the
+// sheet shows them inside the whole file — so the offset within that body is
+// the same number on both sides and only the start moves.
+
+function inBody(model, { full, text, head }) {
+  return NotesView.prototype._offsetInBody.call({
+    model, full, view: { state: { doc: { toString: () => text },
+                                  selection: { main: { head } } } },
+  });
+}
+
+function placed(model, idx, within, text) {
+  let anchor = null;
+  const self = {
+    model,
+    view: { state: { doc: { toString: () => text } },
+            dispatch: (tr) => { anchor = tr.selection.anchor; } },
+  };
+  NotesView.prototype._placeCaretForPage.call(self, idx, within);
+  return { anchor, fullCaret: self._fullCaret };
+}
+
+const body3 = plain.get(3);
+check("in the panel, the offset within the body IS the caret offset",
+      inBody(plain, { full: false, text: body3, head: 7 }), 7);
+check("…less the leading whitespace the commit is about to trim",
+      inBody(plain, { full: false, text: `\n\n${body3}`, head: 9 }), 7);
+check("panel → sheet keeps the offset, moving only where the body starts",
+      placed(plain, 3, 7, plainText).anchor, openedAt(3) + 7);
+check("sheet → panel reads it back the same",
+      inBody(plain, { full: true, text: plainText, head: openedAt(3) + 7 }), 7);
+check("a caret past the end of a body cannot walk into the next page",
+      placed(plain, 3, 999, plainText).anchor, openedAt(3) + body3.length);
+check("a page with no body of its own takes the caret to its marker, never past",
+      placed(plain, 5, 999, plainText).anchor, openedAt(5));
+check("on the sheet, a caret above every marker belongs to no page and reads 0",
+      inBody(plain, { full: true, text: plainText, head: 0 }), 0);
+check("inside a run the offset is measured from the body's one home",
+      inBody(run, { full: true, text: runText, head: runBody + 4 }), 4);
+
 // ── the sidebar's readout follows the caret ──────────────────────────────────
 //
 // While the sheet is open the pages are off screen, so the sidebar's current

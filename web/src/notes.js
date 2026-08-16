@@ -272,9 +272,17 @@ export class NotesView {
    * say. A page index and a character offset are two coordinate systems for the
    * same notes; `noteOffsetForPage`/`notePageAtOffset` are the one marker table
    * both directions read, because two readings of it is exactly how the caret
-   * comes back on a different page than it left. */
+   * comes back on a different page than it left.
+   *
+   * And it is the EXACT position, not the page: the two buffers hold the same
+   * body — the panel shows a page's notes, the sheet shows them inside the
+   * whole file — so the offset within that body is the same number on both
+   * sides, and only where the body STARTS changes. Landing at the top of the
+   * right section is still landing somewhere you were not; a divider you can
+   * cross without losing your place is one you will cross mid-sentence. */
   setFull(on, page = null) {
     if (!this.model || on === this.full) return null;
+    const within = this._offsetInBody();   // read BEFORE the commit trims it
     this.commitFull();                 // write the view being left
     if (!on) {
       const target = this.fullTargetPage();
@@ -282,13 +290,14 @@ export class NotesView {
       this._fullFrom = this._fullCaret = this._caretPage = null;
       this._markers = null;
       if (target !== null) this.page = target;
-      this._fill(this.model.get(this.page), 0);
+      const body = this.model.get(this.page);
+      this._fill(body, Math.min(within, body.length));
       return target;
     }
     this._fullFrom = page === null ? this.page : page;
     this.full = true;
     this._fill(this.model.toText(), 0);
-    this._placeCaretForPage(this._fullFrom);
+    this._placeCaretForPage(this._fullFrom, within);
     // The page you came FROM, never the section the caret landed in: a linked
     // run's body lives on the run's first page, so reading the offset back
     // would move the sidebar off the page you were actually reading the moment
@@ -303,12 +312,37 @@ export class NotesView {
    * one long text. A linked run stores its body once, on the run's first page,
    * so the lookup asks for the RUN — the page you were reading has no text of
    * its own to go to. */
-  _placeCaretForPage(idx) {
+  _placeCaretForPage(idx, within = 0) {
     const text = this.view.state.doc.toString();
-    const off = Math.max(0, Math.min(text.length,
-                                     noteOffsetForPage(text, this.model.runStart(idx))));
+    const start = noteOffsetForPage(text, this.model.runStart(idx));
+    // `within` is how far into that page's BODY the caret stood; a page with no
+    // notes has no body, and the offset the table gives back is then the point
+    // the section would be inserted at, which nothing may be added to.
+    const body = this.model.get(idx).length;
+    const off = Math.max(0, Math.min(text.length, start + Math.min(within, body)));
     this.view.dispatch({ selection: { anchor: off }, scrollIntoView: true });
     this._fullCaret = off;
+  }
+
+  /** How far into the current page's body the caret stands — the coordinate the
+   * two views share.
+   *
+   * On the SHEET it is measured from the start of the section the caret is in,
+   * so a caret sitting on a hidden marker line (or in the `![[embed]]` header,
+   * which belongs to no page at all) reads as 0 rather than as a negative.
+   * In the PANEL it is the offset itself, less whatever leading whitespace the
+   * commit is about to trim off the front. */
+  _offsetInBody() {
+    if (!this.model) return 0;
+    const head = this.view.state.selection.main.head;
+    if (!this.full) {
+      const raw = this.view.state.doc.toString();
+      return Math.max(0, head - (raw.length - raw.trimStart().length));
+    }
+    const text = this.view.state.doc.toString();
+    const page = notePageAtOffset(text, head);
+    if (page === null) return 0;
+    return Math.max(0, head - noteOffsetForPage(text, this.model.runStart(page)));
   }
 
   /** The caret's page, reported to the sidebar so the outline's "where you are"

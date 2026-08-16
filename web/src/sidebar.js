@@ -145,10 +145,23 @@ export class Sidebar {
     }
   }
 
+  /** The pages the current one shares its notes with (row 129), when there is
+   * more than one — a run's body is stored ONCE, so "which page am I reading?"
+   * has no single answer inside one and highlighting the whole run is the only
+   * honest thing the strip can say. Empty when the page stands alone, which is
+   * what keeps the ordinary case looking exactly as it did. */
+  _runPages() {
+    if (!this.doc || this.page === null || this.page === undefined) return new Set();
+    const pages = this.doc.notes.runPages(this.page);
+    return pages.length > 1 ? new Set(pages) : new Set();
+  }
+
   _buildPages() {
+    const run = this._runPages();
     for (let i = 0; i < this.doc.pageCount; i++) {
       const row = document.createElement("button");
       row.className = "row thumb" + (i === this.page ? " current" : "")
+        + (run.has(i) ? " in-run" : "")
         + (this.doc.notes.isHidden(i) ? " hidden-page" : "");
       row.dataset.page = String(i);
 
@@ -368,6 +381,7 @@ export class Sidebar {
 
   _buildOutline() {
     const entries = this._mergedOutline();
+    const run = this._runPages();
     // WHERE YOU ARE IS A LINE when no entry names your page (row 153): on an
     // entry's own page that row gets the bar and a bold title; anywhere else a
     // rule carrying the page number is inserted BETWEEN the two entries you
@@ -386,6 +400,7 @@ export class Sidebar {
       row.className = "row outline-row";
       if (i === exact) row.classList.add("current");
       else if (exact < 0 && i === insertAt - 1) row.classList.add("containing");
+      if (run.has(entry.page)) row.classList.add("in-run");
       row.style.paddingLeft = `${10 + entry.level * 14}px`;
       row.dataset.page = String(entry.page);
 

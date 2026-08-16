@@ -43,6 +43,11 @@ async function evalJs(expr) {
 
 await send("Page.enable");
 await send("Runtime.enable");
+// Chrome will re-serve index.html from its memory cache across navigations to
+// the same URL, so an edit you just made is invisible and the probe fails on an
+// element that IS in the file. Never debug that twice.
+await send("Network.enable");
+await send("Network.setCacheDisabled", { cacheDisabled: true });
 const url = process.argv[2] || "http://127.0.0.1:8321/index.html";
 await send("Page.navigate", { url });
 await new Promise((r) => setTimeout(r, 4000));

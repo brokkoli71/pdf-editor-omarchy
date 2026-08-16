@@ -48,9 +48,9 @@ Safari is not supported.
   lasso selection.
 - **Paste an image** (`Ctrl+V`) — it lands as an object you can move, resize
   and rotate forever, never a flattened stamp.
-- **Pages** — flip, reorder, insert blank ones with the four rulings, hide
-  pages, bookmark them, and merge several dropped PDFs into one document with a
-  chapter each.
+- **Pages** — start a new blank document, flip, reorder, insert blank pages with
+  the four rulings, hide pages, bookmark them, and merge several dropped PDFs
+  into one document with a chapter each.
 - **Find things** — search across the PDF text and your notes, plus an outline
   and thumbnail sidebar.
 - **Present** (`F5`) — a bare mirror for a second screen with your ink

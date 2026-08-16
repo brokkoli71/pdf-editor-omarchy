@@ -1662,6 +1662,28 @@ there is no menu entry — the gap row 167 started from, and small), and **row
 160's `HOLD_SLOP_PX = 16.0` still wants judging in the hand**, since 16 was
 chosen on a 1.5× display.
 
+**Two refinements to row 162 shipped on the WEB first and are owed to the
+desktop** (2026-08-16, both verified in a browser, both small):
+
+- **The caret must keep its EXACT position, not just its page.** Today
+  `_place_full_notes_caret` goes to the START of the page's section and
+  `_restore_note` refills the panel from the top, so crossing the divider
+  mid-sentence loses your place — which is most of the times you cross it. The
+  two buffers hold the SAME body (the panel shows a page's notes, the sheet
+  shows them inside the whole file), so the offset within that body is the same
+  number on both sides and only where the body STARTS changes. The web's
+  `_offsetInBody` is the whole of it: in the panel it is the caret offset less
+  the leading whitespace the commit is about to trim, on the sheet it is the
+  offset less `note_offset_for_page(run_start(page))`. Clamp it to the body's
+  length, or a long caret position walks into the next page's marker; a page
+  with no body clamps to 0, which is the marker it was already going to.
+- **A linked RUN should light up as a whole in the sidebar.** A run's body is
+  stored once (row 129), so inside one there is no single answer to "which page
+  am I reading?" — highlighting every page of the run is the only honest thing
+  the thumbnail strip and the outline can say, with the page you are actually
+  on keeping the solid outline. Only when the run has more than one page, so
+  the ordinary case looks exactly as it does now.
+
 **The older thread below is a VALIDATION session, not a feature one —
 `notes/validation-session.md` is the checklist.** The ink/latency thread
 (rows 139/143/147) is CLOSED; do not reopen it without a new measurement.
