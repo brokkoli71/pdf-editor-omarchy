@@ -9449,7 +9449,7 @@ _MD_SYMBOLS = {
     # for the same reason: `\sqrt{x+1}` renders "√{x+1}", which at least
     # delimits it.
     r'\sqrt': '√',
-    r'\infty': '∞', r'\approx': '≈', r'\neq': '≠',
+    r'\infty': '∞', r'\approx': '≈', r'\neq': '≠', r'\propto': '∝',
     r'\leq': '≤', r'\geq': '≥', r'\le': '≤', r'\ge': '≥',
     r'\pm': '±', r'\times': '×',
     r'\div': '÷', r'\cdot': '·', r'\to': '→', r'\gets': '←', r'\mapsto': '↦',
@@ -9807,6 +9807,42 @@ def _sub_mapped(rx, repl, text):
     return "".join(out), imap
 
 
+# A task-list box: `- [ ] milk` / `* [x] eggs`, at the start of a line.
+# The state character between the brackets is substituted ONE FOR ONE (space →
+# ☐, x → ☑) and the brackets around it are hidden with tags — so the construct
+# is five columns of source and one glyph on screen, and the render's index map
+# stays the identity across it. A box that CHANGED the line's length would have
+# to be mapped like a \command, for no gain: nobody types a box, they type the
+# brackets.
+_MD_TASK_RE = re.compile(r'^([ \t]*)([-*+] )\[([ xX])\](?=[ \t]|$)')
+_MD_TASK_BOX = {' ': '☐', 'x': '☑', 'X': '☑'}
+# the same construct as the buffer HOLDS it: the state character may already be
+# the glyph. The highlighter reads rendered text, so it needs this one.
+_MD_TASK_ANY_RE = re.compile(r'^([ \t]*)([-*+] )\[([ xX☐☑])\](?=[ \t]|$)')
+
+# A list item's opening, for Enter-continues-the-list. Bullets, numbers and
+# task boxes are one construct here: what Enter has to do with each is repeat
+# the marker, and for a number, count on.
+_MD_LIST_ITEM_RE = re.compile(
+    r'^(?P<indent>[ \t]*)'
+    r'(?:(?P<bullet>[-*+])|(?P<num>\d+)(?P<dot>[.)]))'
+    r'(?P<gap>[ \t]+)'
+    r'(?P<task>\[[ xX]\][ \t]+)?')
+
+
+def _boxify(rendered, source):
+    """Put the task box into an already-symbolised line. 1:1, so the caller's
+    index map is untouched — and safe at the same column in both strings,
+    because nothing before a box is a \\command (the prefix is `- [`)."""
+    m = _MD_TASK_RE.match(source)
+    if m is None:
+        return rendered
+    i = m.start(3)
+    if i >= len(rendered) or rendered[i] != m.group(3):
+        return rendered     # something re-shaped the prefix; leave it alone
+    return rendered[:i] + _MD_TASK_BOX[m.group(3)] + rendered[i + 1:]
+
+
 def _symbolize_map(text, protect=None):
     """`_symbolize`, and the index map from the rendered text back to `text`.
 
@@ -9827,7 +9863,10 @@ def _symbolize_map(text, protect=None):
         head, hmap = _symbolize_map(text[:a])
         tail, tmap = _symbolize_map(text[b:])
         imap = hmap[:-1] + list(range(a, b)) + [b + i for i in tmap]
-        return head + text[a:b] + tail, imap
+        # `text` is the whole line here, box and all: a protected span is an
+        # expression the caret is sitting in somewhere further along, and it
+        # has no business un-rendering the box at the start of the line
+        return _boxify(head + text[a:b] + tail, text), imap
     out, imap, pos = [], [], 0
     segs = _split_markup(text)
     for seg, kind in segs:
@@ -9844,7 +9883,7 @@ def _symbolize_map(text, protect=None):
             imap.extend(range(pos, pos + len(seg)))
         pos += len(seg)
     imap.append(len(text))
-    return "".join(out), imap
+    return _boxify("".join(out), text), imap
 
 
 # Anything that renders as something other than itself. Used to decide whether
@@ -11138,6 +11177,23 @@ class MarkdownNotesView(GtkSource.View):
                                foreground="#8b8b8b"),
         }
 
+        # Search highlights live OUTSIDE `self._t`, and that is what makes them
+        # work: `_rehighlight` clears every tag in that table on every pass,
+        # while a highlight has to outlive a render — you search, then type.
+        # Created LAST, so they outrank `code`'s background: a hit inside a
+        # `code` span still has to look like a hit. The colours are the PAGE's
+        # own (see PDFCanvas draw), so the notes and the PDF say the same thing
+        # about the same search; the foreground is forced because a dark
+        # scheme's pale text on yellow is unreadable.
+        self._search_t = {
+            "hit":     tag("search-hit",     background="#ffe000",
+                           foreground="#1a1a1a"),
+            "current": tag("search-current", background="#ff8c00",
+                           foreground="#1a1a1a"),
+        }
+        self._search_query = ""
+        self._search_marks = None       # the current match, as a mark pair
+
         self._cursor_line = 0
         self._rehighlight_id = None
         self._in_highlight = False
@@ -11232,6 +11288,70 @@ class MarkdownNotesView(GtkSource.View):
                 self.font_zoom_cb(-1 if dy > 0 else 1)
             return True
         return False
+
+    # ── search highlights ─────────────────────────────────────────────────────
+
+    def set_search_query(self, query):
+        """The term to paint in this buffer, or "" for none.
+
+        Highlighting SEARCHES THE BUFFER rather than mapping the window's model
+        offsets onto it: a rendered line is not its source (`\\alpha` is one
+        glyph on screen), so a stored offset points at the wrong column the
+        moment the line renders, while the text on screen is always right about
+        itself."""
+        query = query or ""
+        if query == self._search_query:
+            return
+        self._search_query = query
+        if not query:
+            self.set_search_current(None, None)
+            return          # set_search_current already repainted
+        self._apply_search_tags()
+
+    def set_search_current(self, start, end):
+        """Mark the one match the window has stepped to, by BUFFER offset.
+
+        Kept as MARKS, not offsets: the render pass rewrites whole lines around
+        it (`_buf_replace_line` carries every mark on a line across, which is
+        exactly what this relies on), so an offset would not survive the first
+        keystroke after the jump."""
+        buf = self.get_buffer()
+        if self._search_marks:
+            for m in self._search_marks:
+                if not m.get_deleted():
+                    buf.delete_mark(m)
+            self._search_marks = None
+        if start is not None and end is not None and end > start:
+            self._search_marks = (
+                buf.create_mark(None, buf.get_iter_at_offset(start), True),
+                buf.create_mark(None, buf.get_iter_at_offset(end), False))
+        self._apply_search_tags()
+
+    def _apply_search_tags(self):
+        buf = self.get_buffer()
+        s, e = buf.get_start_iter(), buf.get_end_iter()
+        for tg in self._search_t.values():
+            buf.remove_tag(tg, s, e)
+        q = self._search_query.lower()
+        if q:
+            # include_hidden_chars=True: offsets into this string have to BE
+            # buffer offsets, and every hidden marker earlier in the text
+            # shifts them by its own length otherwise.
+            text = buf.get_text(s, e, True).lower()
+            pos = text.find(q)
+            while pos != -1:
+                a = buf.get_iter_at_offset(pos)
+                if not a.has_tag(self._t["hide"]):
+                    # a hit inside a hidden page marker is one nobody can see,
+                    # and tagging it paints a stripe of colour on a blank line
+                    buf.apply_tag(self._search_t["hit"], a,
+                                  buf.get_iter_at_offset(pos + len(q)))
+                pos = text.find(q, pos + 1)
+        if self._search_marks:
+            a = buf.get_iter_at_mark(self._search_marks[0])
+            b = buf.get_iter_at_mark(self._search_marks[1])
+            if not a.equal(b):
+                buf.apply_tag(self._search_t["current"], a, b)
 
     # ── [[wiki links]] ────────────────────────────────────────────────────────
 
@@ -11346,10 +11466,115 @@ class MarkdownNotesView(GtkSource.View):
                 c.set_state(Gtk.EventSequenceState.DENIED)
         return False
 
+    def _continue_list(self):
+        """Enter inside a list item opens the NEXT one: the same bullet, the
+        next number, an EMPTY task box (you are writing a new task, not copying
+        the state of the one above). Enter on an item with nothing in it ENDS
+        the list — that is how you stop, and without it the only way out is to
+        delete a marker you did not ask for.
+
+        Only at the END of the line. Enter anywhere else is a SPLIT, which is
+        ordinary editing and not a request for a new item — and the caret's
+        column is a rendered column, which would have to be mapped back through
+        the index map to mean anything here.
+
+        The marker is read from the line's SOURCE, never from the buffer: `- [
+        ]` is one box glyph on screen, and repeating what is rendered would
+        write the glyph itself into the .md."""
+        buf = self.get_buffer()
+        if buf.get_has_selection():
+            return False
+        it = buf.get_iter_at_mark(buf.get_insert())
+        if not it.ends_line():
+            return False
+        ln = it.get_line()
+        ok, ls = buf.get_iter_at_line(ln)
+        if not ok:
+            return False
+        rendered = buf.get_text(ls, it, True)
+        src = self._line_source(ln, rendered)[0]
+        m = _MD_LIST_ITEM_RE.match(src)
+        if m is None:
+            return False
+        if m.end() >= len(src):
+            # an empty item: the marker goes, the caret stays on the line
+            buf.begin_user_action()
+            buf.delete(buf.get_iter_at_line(ln)[1], it)
+            buf.end_user_action()
+            return True
+        marker = (m.group("bullet") if m.group("bullet")
+                  else "%d%s" % (int(m.group("num")) + 1, m.group("dot")))
+        opener = m.group("indent") + marker + m.group("gap")
+        if m.group("task"):
+            opener += "[ ] "
+        buf.begin_user_action()
+        buf.insert(it, "\n" + opener)
+        buf.end_user_action()
+        return True
+
+    def _task_box_at(self, x, y):
+        """The line whose task box sits under this widget point, or None.
+
+        The target is the box GLYPH and nothing else — one character wide. A
+        checkbox you can tick is also a line you can type in, so the click that
+        means "put the caret here" must not be able to tick it by accident."""
+        bx, by = self.window_to_buffer_coords(Gtk.TextWindowType.WIDGET,
+                                              int(x), int(y))
+        over, it = self.get_iter_at_location(bx, by)
+        if not over:
+            return None
+        ln = it.get_line()
+        buf = self.get_buffer()
+        ok, ls = buf.get_iter_at_line(ln)
+        if not ok:
+            return None
+        le = ls.copy()
+        if not le.ends_line():
+            le.forward_to_line_end()
+        m = _MD_TASK_ANY_RE.match(buf.get_text(ls, le, True))
+        return ln if m and it.get_line_offset() == m.start(3) else None
+
+    def toggle_task(self, ln):
+        """Tick or untick the box on line `ln`, as an ordinary buffer edit.
+
+        It writes the STATE CHARACTER over the glyph and lets the render pass
+        splice that back onto the source through the index map — the same path
+        as typing over a rendered `α`. Rewriting the source line by hand would
+        be a second way of doing the one thing `_line_source` exists for."""
+        buf = self.get_buffer()
+        ok, ls = buf.get_iter_at_line(ln)
+        if not ok:
+            return False
+        le = ls.copy()
+        if not le.ends_line():
+            le.forward_to_line_end()
+        m = _MD_TASK_ANY_RE.match(buf.get_text(ls, le, True))
+        if m is None:
+            return False
+        a = ls.copy(); a.forward_chars(m.start(3))
+        b = a.copy();  b.forward_char()
+        now = "x" if m.group(3) in (" ", "☐") else " "
+        buf.begin_user_action()
+        buf.delete(a, b)
+        buf.insert(buf.get_iter_at_line_offset(ln, m.start(3))[1], now)
+        buf.end_user_action()
+        return True
+
     def _on_link_click(self, gesture, _n_press, x, y):
-        # Ctrl+click follows the link; a plain click edits as usual
         ev = gesture.get_current_event()
-        if not ev or not (ev.get_modifier_state() & Gdk.ModifierType.CONTROL_MASK):
+        mods = ev.get_modifier_state() if ev else 0
+        # A plain click on the box ticks it. Deliberately not gated on a
+        # modifier: a checkbox nobody can click is a glyph, and the box is a
+        # single character, so the target says plainly what it does.
+        if not (mods & (Gdk.ModifierType.CONTROL_MASK
+                        | Gdk.ModifierType.ALT_MASK
+                        | Gdk.ModifierType.SHIFT_MASK)):
+            ln = self._task_box_at(x, y)
+            if ln is not None and self.toggle_task(ln):
+                gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            return
+        # Ctrl+click follows the link; a plain click edits as usual
+        if not (mods & Gdk.ModifierType.CONTROL_MASK):
             return
         link = self._link_target_at(x, y)
         if link and self.on_follow_link:
@@ -11357,7 +11582,8 @@ class MarkdownNotesView(GtkSource.View):
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
 
     def _on_link_motion(self, _motion, x, y):
-        over = self._link_target_at(x, y) is not None
+        over = (self._link_target_at(x, y) is not None
+                or self._task_box_at(x, y) is not None)
         self.set_cursor(Gdk.Cursor.new_from_name(
             "pointer" if over else "text", None))
 
@@ -11545,6 +11771,13 @@ class MarkdownNotesView(GtkSource.View):
                 self._accept_link_selection(); return True
             if keyval == Gdk.KEY_Escape:
                 self._hide_link_popup();       return True
+
+        if (keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter)
+                and not (state & (Gdk.ModifierType.CONTROL_MASK
+                                  | Gdk.ModifierType.ALT_MASK
+                                  | Gdk.ModifierType.SHIFT_MASK))
+                and self._continue_list()):
+            return True
 
         ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
         alt_held = bool(state & Gdk.ModifierType.ALT_MASK)
@@ -12217,6 +12450,12 @@ class MarkdownNotesView(GtkSource.View):
                     self._line_originals.pop(ln, None)
 
             self._highlight_line(buf, ls, ln, text)
+        # The search tags are not in `self._t`, so the wipe above left them
+        # alone — but a line this pass REWROTE dropped the ones it carried, and
+        # a line that has just rendered may match in a place it did not before.
+        # Cheap to redo and impossible to patch up piecemeal.
+        if self._search_query or self._search_marks:
+            self._apply_search_tags()
         # This pass walks EVERY line and rewrites the ones whose rendering
         # changed, so on a whole-sidecar sheet it is both the slowest thing in
         # the editor and the one that churns GTK's line-display cache hardest.
@@ -12336,6 +12575,18 @@ class MarkdownNotesView(GtkSource.View):
             # pushed sideways, never re-rendered.
             hide(0, m.end(), within=(0, len(text)))
             return
+
+        # A task box: `- [ ] milk` reads as `☐ milk`. The state character has
+        # already been substituted for the glyph (_boxify); what is left is to
+        # hide the `- [` in front of it and the `]` behind, which leaves a box
+        # and a space exactly where a plain bullet leaves a dash and a space.
+        # Opened from ANYWHERE on the line, like a heading marker and for the
+        # same reason: it is a property of the whole line, and revealing it
+        # only pushes the line sideways — nothing on it re-renders.
+        m = _MD_TASK_ANY_RE.match(text)
+        if m:
+            hide(m.start(2), m.start(3), within=(0, len(text)))
+            hide(m.end(3), m.end(3) + 1, within=(0, len(text)))
 
         # [[wiki links]] → styled + clickable; brackets hidden off cursor line.
         # The link tag covers the whole inner (so a click anywhere follows it),
@@ -17483,6 +17734,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         tp = self._ensure_text_page(s)
         s._text_mode = True
         s._notes_view = tp.view
+        self._carry_search_query(s)
         # the paned STAYS: the page side collapses to nothing instead of
         # disappearing, so the handle is still there to pull it back out and
         # the page slides rather than pops (row 130)
@@ -17514,6 +17766,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         s._text_mode = False
         s._notes_view = s._panel_notes_view
+        self._carry_search_query(s)
         if s._text_page is not None:
             s._text_page.set_visible(False)
         s._paned.set_visible(True)
@@ -24140,6 +24393,21 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.canvas.search_rects = []
         self.canvas.search_current_rect = None
         self.canvas.queue_draw()
+        self._notes_view.set_search_query("")
+
+    def _carry_search_query(self, s):
+        """Hand the live search term to whichever notes view is now showing.
+
+        Crossing the divider swaps `_notes_view` between the panel and the
+        sheet, and the highlights belong to the VIEW — so without this a search
+        made on one side is invisible the moment you cross, and the side you
+        left keeps painting a term nobody is searching for any more."""
+        q = (self._search_entry.get_text()
+             if self._search_revealer.get_reveal_child() else "")
+        for v in (s._panel_notes_view,
+                  s._text_page.view if s._text_page is not None else None):
+            if v is not None:
+                v.set_search_query(q if v is s._notes_view else "")
 
     def _on_search_key(self, ctrl, keyval, keycode, state):
         if keyval == Gdk.KEY_Up:
@@ -24180,6 +24448,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._search_matches = []
         self._search_current = -1
         self._search_query = query
+        # the notes view paints its own hits, from the term rather than from
+        # the match list: it is the one surface whose text can RE-RENDER under
+        # the highlight, so it re-finds them itself on every pass
+        self._notes_view.set_search_query(query)
         if not query:
             self._search_entry.remove_css_class("error")
             self._search_label.set_label("")
@@ -24422,19 +24694,54 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         else:
             self._update_search_canvas()
         if match[0] == "note":
-            self._select_note_match(match[2], match[3])
+            self._select_note_match(match[1], match[2], match[3])
+        else:
+            # every notes hit stays yellow, but none of them is THE one now
+            self._notes_view.set_search_current(None, None)
         self._update_search_label()
 
-    def _select_note_match(self, start, end):
-        """Select a notes hit. _restore_note loads the raw stored text into the
-        buffer synchronously (before rehighlight substitutes \\alpha→α on
-        non-cursor lines), so the model offsets map exactly."""
+    def _select_note_match(self, page_idx, start, end):
+        """Go to a notes hit: caret on it, scrolled to it, painted orange by the
+        view's own search tags.
+
+        NOT selected. A selection here wears the window's selection colour,
+        which reads as grey beside the page's yellow — and row 141 shows the
+        SOURCE of every line a selection covers, so landing on a match would
+        un-render the line you were sent to read.
+
+        The offsets are into the PAGE's stored notes, and where that text lives
+        depends on which view is showing it: the panel holds exactly that page,
+        while the sheet holds the whole sidecar with the page markers in it. On
+        the sheet they are rebased through row 162's own translation, asked for
+        the RUN because a linked page stores no body of its own.
+
+        _restore_note loads the raw stored text into the buffer synchronously
+        (before rehighlight substitutes \\alpha→α on non-cursor lines), so the
+        model offsets map exactly at this instant."""
         self._restore_note()
-        buf = self._notes_view.get_buffer()
-        s = buf.get_iter_at_offset(start)
-        e = buf.get_iter_at_offset(end)
-        buf.select_range(s, e)   # insert at start → that line becomes the cursor line
-        self._notes_view.scroll_to_iter(s, 0.1, False, 0.0, 0.5)
+        view = self._notes_view
+        buf = view.get_buffer()
+        base = 0
+        if self._full_notes_view():
+            text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+            base = note_offset_for_page(text,
+                                        self.notes_model.run_start(page_idx))
+        n = buf.get_char_count()
+        start = max(0, min(base + start, n))
+        end = max(start, min(base + end, n))
+        buf.place_cursor(buf.get_iter_at_offset(start))
+        view.set_search_current(start, end)
+        # The sheet is a NON-SCROLLABLE child inside a viewport, so it holds no
+        # scroll of its own and `scroll_to_iter` there does nothing whatsoever
+        # — which is why Ctrl+F in text mode found every match and went to none
+        # of them. `scroll_to_offset` is the sheet's own way to do this, and it
+        # retries, because the view may not have been laid out yet.
+        tp = self._text_page if self._text_mode else None
+        if tp is not None and tp.view is view:
+            tp.scroll_to_offset(start)
+        else:
+            view.scroll_to_iter(buf.get_iter_at_offset(start), 0.1,
+                                False, 0.0, 0.5)
 
     def _update_search_canvas(self):
         page_idx = self.canvas.current_page_idx

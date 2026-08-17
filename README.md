@@ -37,7 +37,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 
 ### Notes
 
-- **Live Markdown** with syntax highlighting, inline math (`x^2`, `\alpha`, `\sum` …) and formatting shortcuts (`Ctrl+B`, `Ctrl+I`, `Ctrl+E`). Symbols render for display only — the `.md` always keeps the source `\commands`, so notes round-trip cleanly through other editors. `Ctrl+±` / `Ctrl+scroll` zooms the notes font (remembered between sessions)
+- **Live Markdown** with syntax highlighting, inline math (`x^2`, `\alpha`, `\sum` …) and formatting shortcuts (`Ctrl+B`, `Ctrl+I`, `Ctrl+E`). Task boxes (`- [ ]`) render as a checkbox you click to tick, and `Enter` carries a bullet, numbered or task list on to the next item. Symbols render for display only — the `.md` always keeps the source `\commands`, so notes round-trip cleanly through other editors. `Ctrl+±` / `Ctrl+scroll` zooms the notes font (remembered between sessions)
 - **Anchor markers** (`Ctrl+Alt+click`) — numbered circles placed on the PDF that link to the corresponding paragraph in your notes
 - **Callout boxes** (`Ctrl+Alt+drag`) — an anchor plus its note paragraph rendered in a box on the PDF, arrow included; drag the anchor or the box to reposition. Renders the same inline math and Markdown as the notes; included in exports
 - **Standalone text boxes** (`Ctrl+Alt+right-click`) — drop typed text straight on the page, no anchor; edit it in the notes panel, drag it to reposition; included in exports
@@ -208,7 +208,7 @@ Renders automatically on lines where the cursor isn't; move the cursor to a line
 | `x^\alpha` `x_\mu` | a `\command` can be the script itself (x^α, x_μ) |
 | `\alpha` `\beta` … `\omega` | Greek letters (α β … ω) |
 | `\sum` `\prod` `\int` `\sqrt` | Σ Π ∫ √ (the radical sign only — no overbar) |
-| `\infty` `\approx` `\neq` `\leq` `\geq` | ∞ ≈ ≠ ≤ ≥ |
+| `\infty` `\approx` `\neq` `\leq` `\geq` `\propto` | ∞ ≈ ≠ ≤ ≥ ∝ |
 | `\in` `\notin` `\subset` `\cup` `\cap` `\emptyset` | ∈ ∉ ⊂ ∪ ∩ ∅ |
 | `\forall` `\exists` `\partial` `\nabla` `\to` | ∀ ∃ ∂ ∇ → |
 | `\R` `\N` `\Q` `\Z` `\C` | number sets ℝ ℕ ℚ ℤ ℂ (also spelled `\realnum`, `\natnum`, `\ratnum`, `\intnum`, `\compnum`) |

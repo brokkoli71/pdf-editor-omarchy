@@ -4609,6 +4609,115 @@ class TestMarkdownLineOps(unittest.TestCase):
         self.assertTrue(buf.get_has_selection())
 
 
+class TestTaskLists(unittest.TestCase):
+    """`- [ ]` is a box you can tick, and Enter carries a list on."""
+
+    def _view(self):
+        from sidemark import MarkdownNotesView
+        return MarkdownNotesView()
+
+    def _text(self, buf):
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+
+    def _render(self, v, text):
+        """What the buffer holds once the line has rendered, with the caret
+        parked away from it."""
+        buf = v.get_buffer()
+        buf.set_text(text + "\n\n")
+        buf.place_cursor(buf.get_end_iter())
+        v._rehighlight()
+        ok, ls = buf.get_iter_at_line(0)
+        le = ls.copy()
+        if not le.ends_line():
+            le.forward_to_line_end()
+        return buf.get_text(ls, le, True)
+
+    def test_a_box_renders_one_glyph_per_state_character(self):
+        # 1:1 is the whole design: five columns of source, five columns on
+        # screen, three of them hidden — so the index map stays the identity
+        # and nothing else on the line has to know about boxes.
+        from sidemark import _symbolize_map
+        for src, want in (("- [ ] milk", "- [☐] milk"),
+                          ("  * [x] eggs", "  * [☑] eggs"),
+                          ("+ [X] a", "+ [☑] a")):
+            out, imap = _symbolize_map(src)
+            self.assertEqual(out, want)
+            self.assertEqual(len(out), len(src))
+            self.assertEqual(imap, list(range(len(src) + 1)))
+
+    def test_what_is_not_a_box_is_left_alone(self):
+        from sidemark import _symbolize_map
+        for src in ("- [] b", "- [ ]b", "- [y] c", "1. one", "not - [ ] here"):
+            self.assertEqual(_symbolize_map(src)[0], src)
+
+    def test_the_brackets_are_hidden_and_the_box_is_not(self):
+        v = self._view()
+        self.assertEqual(self._render(v, "- [ ] milk"), "- [☐] milk")
+        buf = v.get_buffer()
+        hide = v._t["hide"]
+        shown = "".join(
+            buf.get_iter_at_line_offset(0, c)[1].get_char()
+            for c in range(len("- [☐] milk"))
+            if not buf.get_iter_at_line_offset(0, c)[1].has_tag(hide))
+        # a box and a space, exactly where a plain bullet leaves a dash and a
+        # space — the source keeps its brackets
+        self.assertEqual(shown, "☐ milk")
+
+    def test_clicking_the_box_ticks_it_in_the_source(self):
+        v = self._view()
+        self._render(v, "- [ ] milk")
+        self.assertTrue(v.toggle_task(0))
+        v._rehighlight()
+        # the SOURCE is what matters: the .md must gain an x, not a glyph
+        self.assertEqual(v.get_source_text().split("\n")[0], "- [x] milk")
+        self.assertTrue(v.toggle_task(0))
+        v._rehighlight()
+        self.assertEqual(v.get_source_text().split("\n")[0], "- [ ] milk")
+
+    def test_a_tick_leaves_the_rest_of_the_line_as_source(self):
+        # the toggle is spliced back through the index map, like typing over a
+        # rendered symbol — so the \command beside it must survive as a command
+        v = self._view()
+        self._render(v, "- [ ] \\alpha decay")
+        self.assertTrue(v.toggle_task(0))
+        v._rehighlight()
+        self.assertEqual(v.get_source_text().split("\n")[0],
+                         "- [x] \\alpha decay")
+
+    def _enter(self, v, text, line, col):
+        buf = v.get_buffer()
+        buf.set_text(text)
+        it = buf.get_iter_at_line(line)[1]
+        it.forward_chars(col)
+        buf.place_cursor(it)
+        return v._continue_list()
+
+    def test_enter_continues_each_kind_of_list(self):
+        for src, want in (("- milk",        "- milk\n- "),
+                          ("* milk",        "* milk\n* "),
+                          ("  1. one",      "  1. one\n  2. "),
+                          ("9) nine",       "9) nine\n10) "),
+                          ("- [x] milk",    "- [x] milk\n- [ ] ")):
+            v = self._view()
+            self.assertTrue(self._enter(v, src, 0, len(src)), src)
+            # a NEW task starts unticked: you are writing the next task, not
+            # copying the state of the one above
+            self.assertEqual(v.get_source_text(), want)
+
+    def test_enter_on_an_empty_item_ends_the_list(self):
+        for src in ("- milk\n- ", "1. one\n2. ", "- [ ] milk\n- [ ] "):
+            v = self._view()
+            self.assertTrue(self._enter(v, src, 1, len(src.split("\n")[1])))
+            self.assertEqual(v.get_source_text(), src.split("\n")[0] + "\n")
+
+    def test_enter_elsewhere_is_an_ordinary_newline(self):
+        v = self._view()
+        # not at the end of the line: Enter SPLITS, which is ordinary editing
+        self.assertFalse(self._enter(v, "- milk", 0, 3))
+        # and a line that is not a list item is not one
+        self.assertFalse(self._enter(v, "just prose", 0, len("just prose")))
+
+
 class TestMarkdownSnippets(unittest.TestCase):
 
     def _view(self):
@@ -10558,13 +10667,35 @@ class TestNotesSearch(unittest.TestCase):
         doc.save(path)
         doc.close()
 
-    def _sel(self, win):
+    def _cur(self, win):
+        """The text the CURRENT-match tag spans in the notes view.
+
+        A hit is no longer SELECTED: the selection colour reads as grey beside
+        the page's yellow, and row 141 shows the source of every line a
+        selection covers, so landing on a match un-rendered the line you were
+        sent to read. The orange tag is the marker now.
+        """
+        view = win._notes_view
+        buf = view.get_buffer()
+        it = buf.get_start_iter()
+        tag = view._search_t["current"]
+        if not it.starts_tag(tag) and not it.forward_to_tag_toggle(tag):
+            return ""
+        end = it.copy()
+        end.forward_to_tag_toggle(tag)
+        return buf.get_text(it, end, True)
+
+    def _hit_count(self, win):
+        """How many occurrences are painted yellow."""
         buf = win._notes_view.get_buffer()
-        a = buf.get_iter_at_mark(buf.get_insert())
-        b = buf.get_iter_at_mark(buf.get_selection_bound())
-        if a.compare(b) > 0:
-            a, b = b, a
-        return buf.get_text(a, b, False)
+        tag = win._notes_view._search_t["hit"]
+        it, n = buf.get_start_iter(), 0
+        if it.starts_tag(tag):
+            n += 1
+        while it.forward_to_tag_toggle(tag):
+            if it.starts_tag(tag):
+                n += 1
+        return n
 
     def test_search_works_on_a_text_first_page(self):
         """Ctrl+F did nothing on a text page: the search bar lived inside the
@@ -10599,10 +10730,72 @@ class TestNotesSearch(unittest.TestCase):
                 self.assertEqual([m[0] for m in win._search_matches],
                                  ["note", "note"])
                 self.assertEqual(win._search_label.get_label(), "1 / 2")
-                self.assertEqual(self._sel(win), "needle")
+                self.assertEqual(self._cur(win), "needle")
+                # EVERY occurrence is painted, not just the one you are on —
+                # that is the half of the search the notes never had
+                self.assertEqual(self._hit_count(win), 2)
                 win._search_next()
                 self.assertEqual(win._search_label.get_label(), "2 / 2")
-                self.assertEqual(self._sel(win), "needle")
+                self.assertEqual(self._cur(win), "needle")
+                self.assertEqual(self._hit_count(win), 2)
+        self._run_in_window(body)
+
+    def test_a_text_page_hit_scrolls_the_sheet(self):
+        """The sheet is a NON-scrollable child inside a viewport, so it holds no
+        scroll of its own: `scroll_to_iter` on it does nothing whatsoever, and
+        Ctrl+F in text mode found every match and went to none of them. The
+        assertion is the CALL, not a scroll position — a full run has no live
+        frame clock, so the sheet may never lay out at all."""
+        def body(a):
+            win = PDFEditorWindow(a); win.present()
+            with tempfile.TemporaryDirectory() as d:
+                md = os.path.join(d, "note.md")
+                with open(md, "w", encoding="utf-8") as f:
+                    f.write("filler\n" * 200 + "the needle is here\n")
+                win._do_open_file(md)
+                self.assertTrue(win._text_mode)
+
+                asked = []
+                win._text_page.scroll_to_offset = lambda off, *a, **k: asked.append(off)
+                win._search_entry.set_text("needle")
+                win._on_search_changed(win._search_entry)
+
+                self.assertEqual(len(win._search_matches), 1)
+                buf = win._notes_view.get_buffer()
+                caret = buf.get_iter_at_mark(buf.get_insert()).get_offset()
+                self.assertEqual(asked, [caret])
+                # and it is the hit itself, well down the sheet
+                self.assertGreater(caret, 200)
+                self.assertEqual(self._cur(win), "needle")
+        self._run_in_window(body)
+
+    def test_a_hit_on_the_notes_sheet_is_rebased_onto_its_page(self):
+        """On the sheet the buffer is the WHOLE sidecar, markers and all, while
+        the hit offsets are into one page's stored notes — so they have to be
+        rebased through row 162's translation or the caret lands in whatever
+        page happens to sit that many characters from the top."""
+        def body(a):
+            win = PDFEditorWindow(a); win.present()
+            with tempfile.TemporaryDirectory() as d:
+                pdf = os.path.join(d, "t.pdf")
+                self._text_pdf(pdf, ["zzz", "zzz", "zzz"])
+                win._do_open_file(pdf)
+                win.notes_model.set(0, "nothing here")
+                win.notes_model.set(2, "a needle on the third page")
+                win._restore_note()
+                win._enter_full_notes_view()
+                self.assertTrue(win._full_notes_view())
+
+                win._search_entry.set_text("needle")
+                win._on_search_changed(win._search_entry)
+                self.assertEqual([m[0] for m in win._search_matches], ["note"])
+
+                self.assertEqual(self._cur(win), "needle")
+                buf = win._notes_view.get_buffer()
+                a_it = buf.get_iter_at_mark(buf.get_insert())
+                b_it = a_it.copy(); b_it.forward_chars(len("needle on the third"))
+                self.assertEqual(buf.get_text(a_it, b_it, True),
+                                 "needle on the third")
         self._run_in_window(body)
 
     def test_find_note_matches_offsets(self):
@@ -10643,7 +10836,7 @@ class TestNotesSearch(unittest.TestCase):
                 # starts on the current page's first match (the page-0 note)
                 self.assertEqual(win._search_current, 0)
                 self.assertEqual(win.canvas.current_page_idx, 0)
-                self.assertEqual(self._sel(win).lower(), "needle")
+                self.assertEqual(self._cur(win).lower(), "needle")
                 self.assertEqual(win._search_label.get_label(), "1 / 3")
 
                 # next → PDF hit on page 1, canvas highlights it
@@ -10654,7 +10847,7 @@ class TestNotesSearch(unittest.TestCase):
                 # next → note hit on page 2, notes selection lands on it
                 win._search_next()
                 self.assertEqual(win.canvas.current_page_idx, 2)
-                self.assertEqual(self._sel(win).lower(), "needle")
+                self.assertEqual(self._cur(win).lower(), "needle")
                 self.assertIsNone(win.canvas.search_current_rect)
 
                 # wraps back to the page-0 note

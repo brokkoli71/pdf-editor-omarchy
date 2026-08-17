@@ -51,6 +51,32 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     and no substitution can match a ligature's look — it spans both cells, so
     a one-glyph `→` comes out visibly shorter. If they break again, the
     question is about the font, not about `_MD_SYMBOLS`.
+  - **A task box is a ONE-FOR-ONE substitution** (`_boxify`, `_MD_TASK_RE`):
+    `- [ ]`'s state character becomes the glyph and the `- [` / `]` around it
+    are hidden with tags, so the construct is five columns of source and one
+    glyph on screen with the **index map left as the identity** — nothing else
+    on the line has to know boxes exist. Opened from anywhere on the line, like
+    a heading marker and for the same reason. Ticking (`toggle_task`) writes
+    the state character over the glyph and lets `_line_source` splice it back;
+    rewriting the source line by hand would freeze every other symbol on it.
+    The click target is the box glyph alone — one character — because a
+    checkbox is also a line you type in. **Enter reads the marker from the
+    SOURCE** (`_continue_list`), or it writes the glyph into the `.md`; it
+    opens an empty box, counts a number on, ends the list on an empty item, and
+    only fires at the END of a line (elsewhere Enter is a split, and the
+    caret's column there is a rendered one). *Not in the web port yet.*
+  - **Search highlights are the view's own tags, found by searching the
+    BUFFER** (`set_search_query` / `set_search_current`) — yellow for every
+    occurrence, orange for the current one, the page's palette. This is the one
+    surface whose text re-renders *under* the highlight, so a stored model
+    offset points at the wrong column the moment a line renders. Three
+    constraints: the tags live OUTSIDE `self._t` (`_rehighlight` clears that
+    table every pass, and a highlight outlives a render) and are created LAST
+    so they outrank `code`; `_rehighlight` re-applies them at the end of the
+    pass, because a line it rewrote dropped them; and the current match is a
+    MARK PAIR, so it rides `_buf_replace_line`. A hit is **never selected** —
+    the selection colour is grey beside the page's yellow, and row 141 would
+    un-render the line you were sent to read.
   - **Triple-click selects the whole LOGICAL line** (`line_bounds`) — one
     Return's worth of typing, however many rows it wraps onto. GtkTextView's
     own "line" is the DISPLAY line, a fragment of what looks like one. It is
@@ -891,6 +917,11 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     it parks when its tab goes to the back and `_activate_session` restarts it
     (`_scan_session` is the check). Without that, a background tab's scan
     writes its hits into the front document's table.
+  - **A notes hit is not scrolled to by `scroll_to_iter` on the sheet** — the
+    sheet holds no scroll of its own, so `_select_note_match` takes
+    `TextPageView.scroll_to_offset`; and on a PDF's full-notes sheet the hit's
+    offsets are into ONE page's notes while the buffer is the whole sidecar, so
+    they are rebased through `note_offset_for_page(run_start(page))`.
   - **Ctrl+F keeps the term and SELECTS it** rather than clearing: typing
     replaces it, Enter searches it again. `grab_focus` selects only when focus
     ARRIVES, so the explicit `select_region` is there for the case the feature

@@ -28,7 +28,7 @@ export const MD_SYMBOLS = {
   // where the root ends. A bar would have to be drawn; a glyph that shows you
   // a square root beats no glyph at all.
   "\\sqrt": "√",
-  "\\infty": "∞", "\\approx": "≈", "\\neq": "≠",
+  "\\infty": "∞", "\\approx": "≈", "\\neq": "≠", "\\propto": "∝",
   "\\leq": "≤", "\\geq": "≥", "\\le": "≤", "\\ge": "≥",
   "\\pm": "±", "\\times": "×",
   "\\div": "÷", "\\cdot": "·", "\\to": "→", "\\gets": "←", "\\mapsto": "↦",
