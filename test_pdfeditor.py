@@ -1230,9 +1230,30 @@ class TestStraightLineSnap(unittest.TestCase):
         c._on_drag_update(self._drag(100.0, 100.0), 80.0, 0.0)
         w1, h1, cx1, cy1 = self._span(c.current_stroke)
         self.assertAlmostEqual(w1 / w0, 2.0, places=5)
-        self.assertAlmostEqual(h1 / h0, 2.0, places=5)   # the oval keeps its aspect
         self.assertAlmostEqual(cx1, cx0, places=5)       # about the centre
         self.assertAlmostEqual(cy1, cy0, places=5)
+        # the pen went straight out along x, and it was ON the x axis when the
+        # dwell fired — so y has no lever and follows rather than flattening
+        self.assertAlmostEqual(h1 / h0, 2.0, places=5)
+
+    def test_a_snapped_ellipse_stretches_one_axis_at_a_time(self):
+        """The whole of the user's ask: the pen changes the RATIO, not just the
+        size, which is the box-handle verb every other shape already has."""
+        c = self._canvas()
+        # snap with the pen off BOTH axes, so it has a lever on each
+        c.current_stroke = self._loop(rx=40.0, ry=40.0)
+        c.current_stroke[-1] = (100.0 + 40.0 / math.sqrt(2),
+                                100.0 + 40.0 / math.sqrt(2))
+        c._snap_to_shape()
+        self.assertEqual(c._snap_kind, "ellipse")
+        w0, h0, _cx, _cy = self._span(c.current_stroke)
+        # pull sideways only: twice as far out in x, no further in y
+        c._on_drag_update(self._drag(100.0, 100.0),
+                          2 * 40.0 / math.sqrt(2), 40.0 / math.sqrt(2))
+        w1, h1, _cx, _cy = self._span(c.current_stroke)
+        self.assertAlmostEqual(w1 / w0, 2.0, places=5)
+        self.assertAlmostEqual(h1 / h0, 1.0, places=5)
+        self.assertGreater(w1, h1 * 1.5)   # it really is an oval now
 
     def test_the_pen_does_not_jump_the_ellipse_it_just_snapped(self):
         """The first motion event must scale by exactly 1: the shape settling

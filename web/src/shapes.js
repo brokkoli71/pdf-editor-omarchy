@@ -221,8 +221,14 @@ export function sampleEllipse(cx, cy, rx, ry, n) {
   return out;
 }
 
+/** How far out along one axis the pen must have been when the dwell fired for
+ * that axis to take a scale of its own, as a fraction of that semi-axis.
+ * Below it there is no LEVER: dividing by a near-zero offset turns a pixel of
+ * tremor into a large factor, so such an axis follows the other one. */
+export const ELLIPSE_LEVER_MIN = 0.25;
+
 /** What a just-recognised ellipse needs to stay resizable while the pen is
- * still down (row 179): centre, semi-axes, how far the pen was from that
+ * still down (row 179): centre, semi-axes, where the pen was relative to that
  * centre when the dwell fired, and the sample count to re-state it with. An
  * ellipse has no control point to keep hold of, so the whole shape scales
  * instead. Null when the pen rests ON the centre — no ray to pull along. */
@@ -231,21 +237,30 @@ export function ellipseResizeState(pts, at) {
   const minx = Math.min(...xs), maxx = Math.max(...xs);
   const miny = Math.min(...ys), maxy = Math.max(...ys);
   const cx = (minx + maxx) / 2, cy = (miny + maxy) / 2;
-  const r0 = Math.hypot(at[0] - cx, at[1] - cy);
+  const dx0 = Math.abs(at[0] - cx), dy0 = Math.abs(at[1] - cy);
+  const r0 = Math.hypot(dx0, dy0);
   if (r0 < ELLIPSE_MIN_R) return null;
   return { cx, cy, rx: (maxx - minx) / 2, ry: (maxy - miny) / 2,
-           r0, n: pts.length - 1 };
+           r0, dx0, dy0, n: pts.length - 1 };
 }
 
-/** The dwell's ellipse re-sampled for a pen now at (px, py): a UNIFORM scale
- * about the centre it was recognised at. Uniform because the dwell has already
- * answered what shape this is — a per-axis pull would let a circle turn back
- * into an oval while you were only making it bigger. */
+/** The dwell's ellipse re-sampled for a pen now at (px, py): a PER-AXIS scale
+ * about the centre it was recognised at, so the pen changes the RATIO and not
+ * merely the size — sideways widens, down heightens, the corner does both.
+ * An axis the pen has no lever on follows the other, so a stretch is never
+ * steered by tremor; the circle test still has the last word, which is what
+ * keeps a circle from dissolving under the hand. */
 export function resizedEllipse(s, px, py) {
-  const f = Math.max(Math.hypot(px - s.cx, py - s.cy), ELLIPSE_MIN_R) / s.r0;
-  let rx = Math.max(s.rx * f, ELLIPSE_MIN_R);
-  let ry = Math.max(s.ry * f, ELLIPSE_MIN_R);
-  // the circle test is a RATIO, so it cannot change the dwell's own answer
+  let fx = s.dx0 >= ELLIPSE_LEVER_MIN * s.rx ? Math.abs(px - s.cx) / s.dx0 : null;
+  let fy = s.dy0 >= ELLIPSE_LEVER_MIN * s.ry ? Math.abs(py - s.cy) / s.dy0 : null;
+  if (fx === null && fy === null) {
+    // deep inside the shape and off both axes: nothing there says anything
+    // about the ratio, so fall back to the plain radial pull
+    fx = fy = Math.max(Math.hypot(px - s.cx, py - s.cy), ELLIPSE_MIN_R) / s.r0;
+  } else if (fx === null) fx = fy;
+  else if (fy === null) fy = fx;
+  let rx = Math.max(s.rx * fx, ELLIPSE_MIN_R);
+  let ry = Math.max(s.ry * fy, ELLIPSE_MIN_R);
   if (Math.abs(rx - ry) <= CIRCLE_TOLERANCE * Math.max(rx, ry)) {
     rx = ry = (rx + ry) / 2;
   }

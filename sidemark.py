@@ -703,11 +703,23 @@ def zoom_factor_for_scroll(smooth, dy):
     return (1.0 / ZOOM_WHEEL_STEP) if dy > 0 else ZOOM_WHEEL_STEP
 
 
-GLIDE_TAU_MS = 325.0
+GLIDE_TAU_MS = 150.0
 """Time constant of the coast after a touchpad flick (row 175). Exponential,
-like every browser's: the total distance is velocity × TAU, so a flick at
-3 px/ms carries about a page, and the tail is long enough to read but short
-enough that a second flick is never fighting the first."""
+like every browser's, so the total distance is velocity × TAU and the whole of
+"how far a flick throws the page" is this one number.
+
+It is deliberately SHORTER than the references. GtkScrolledWindow decelerates
+at friction 4/s (τ = 250 ms) and multiplies the reported velocity by 2.5 on top
+(`MAGIC_SCROLL_FACTOR`); Firefox's fling friction of 0.002/ms is τ ≈ 500 ms.
+Both are tuned for a web page you skim. A sheet of A4 you are writing on is not
+that: the first shipped value of 325 read as far too fast in the hand, and a
+coast you have to catch is worse than none. Set `SIDEMARK_GLIDE_DEBUG=1` to
+have every flick's measured velocity and travel written to the session log —
+this is a number to re-measure, never to argue about."""
+
+GLIDE_DEBUG = bool(os.environ.get("SIDEMARK_GLIDE_DEBUG"))
+"""Log what each touchpad flick reports. The feel of a coast is one number
+against one hand, and the only way to settle it is to read the pad."""
 
 GLIDE_MIN_VEL = 0.02
 """px/ms below which the coast has arrived — under a pixel every three frames,
@@ -2149,37 +2161,70 @@ def snap_label_anchor(pts):
     return (max(p[0] for p in pts), min(p[1] for p in pts))
 
 
+ELLIPSE_LEVER_MIN = 0.25
+"""How far out along one axis the pen must have been when the dwell fired for
+that axis to take a scale of its own, as a fraction of that semi-axis.
+
+Below it the pen has no LEVER there: dividing by a near-zero offset turns a
+pixel of hand tremor into a large factor, so a pen that happened to snap its
+circle at the equator would flatten it the instant it moved. Such an axis
+follows the other one instead, which is the same shape the uniform scale gave
+and the only honest reading of a pull with no arm to pull on."""
+
+
 def ellipse_resize_state(pts, at):
     """What a just-recognised ellipse needs to stay resizable while the pen is
-    still down (row 179): its centre, its semi-axes, how far the pen was from
-    that centre when the dwell fired, and how many samples to re-state it with.
+    still down (row 179): its centre, its semi-axes, where the pen was relative
+    to that centre when the dwell fired, and how many samples to re-state it
+    with.
 
     An ellipse has no control points — it is a sampled curve, deliberately
     excluded from `shape_vertices` — so it cannot borrow the line/polygon verb
     of keeping hold of a vertex; the whole shape is scaled instead. Recording
-    the pen's own distance is what makes the first motion event scale by
-    exactly 1: the shape must not jump the instant the dwell fires. Returns
-    None when the pen rests ON the centre, where there is no ray to pull along.
-    """
+    the pen's own offset is what makes the first motion event scale by exactly
+    1 on BOTH axes: the shape must not jump the instant the dwell fires.
+    Returns None when the pen rests ON the centre, where there is no ray to
+    pull along at all."""
     xs = [p[0] for p in pts]
     ys = [p[1] for p in pts]
     cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
-    r0 = math.hypot(at[0] - cx, at[1] - cy)
+    dx0, dy0 = abs(at[0] - cx), abs(at[1] - cy)
+    r0 = math.hypot(dx0, dy0)
     if r0 < ELLIPSE_MIN_R:
         return None
     return (cx, cy, (max(xs) - min(xs)) / 2, (max(ys) - min(ys)) / 2,
-            r0, len(pts) - 1)
+            r0, dx0, dy0, len(pts) - 1)
 
 
 def resized_ellipse(state, px, py):
-    """The dwell's ellipse re-sampled for a pen now at (px, py): a UNIFORM
-    scale about the centre it was recognised at, by how much further out the
-    pen has travelled along its ray. Uniform because the dwell has already
-    answered what shape this is — a per-axis pull would let a circle turn back
-    into an oval while you were only trying to make it bigger."""
-    cx, cy, rx, ry, r0, n = state
-    f = max(math.hypot(px - cx, py - cy), ELLIPSE_MIN_R) / r0
-    rx, ry = circle_axes(max(rx * f, ELLIPSE_MIN_R), max(ry * f, ELLIPSE_MIN_R))
+    """The dwell's ellipse re-sampled for a pen now at (px, py): a PER-AXIS
+    scale about the centre it was recognised at, each axis by how much further
+    out the pen has travelled along it.
+
+    Per-axis, so the pen changes the RATIO and not merely the size — pulling
+    sideways widens, pulling down heightens, and the corner does both, which is
+    the box-handle verb every other selected shape already has. An axis the pen
+    has no lever on follows the other (`ELLIPSE_LEVER_MIN`), so a stretch is
+    never steered by tremor.
+
+    `circle_axes` still has the last word, which is what keeps the dwell's own
+    answer from dissolving under the hand: within its tolerance a circle stays
+    a circle, and past it you get the oval you were plainly asking for.
+    # ceiling: that tolerance is a 12% dead zone around square, so the very
+    # flattest ovals are unreachable from a circle — lift and draw one."""
+    cx, cy, rx, ry, r0, dx0, dy0, n = state
+    fx = abs(px - cx) / dx0 if dx0 >= ELLIPSE_LEVER_MIN * rx else None
+    fy = abs(py - cy) / dy0 if dy0 >= ELLIPSE_LEVER_MIN * ry else None
+    if fx is None and fy is None:
+        # the pen is deep inside the shape, off both axes: nothing there can
+        # say anything about the ratio, so fall back to the plain radial pull
+        fx = fy = max(math.hypot(px - cx, py - cy), ELLIPSE_MIN_R) / r0
+    elif fx is None:
+        fx = fy
+    elif fy is None:
+        fy = fx
+    rx, ry = circle_axes(max(rx * fx, ELLIPSE_MIN_R),
+                         max(ry * fy, ELLIPSE_MIN_R))
     return sample_ellipse(cx, cy, rx, ry, n)
 
 
@@ -13858,6 +13903,14 @@ class TextPageView(Gtk.Overlay):
         just resized the page must not then fling it."""
         if self._zooming_by_scroll or self._thumb_gesture is not None:
             return
+        if GLIDE_DEBUG:
+            # what a flick on THIS pad actually reports, against how far the
+            # curve will then carry the page. Logged at warning so the session
+            # log survives the app closing cleanly.
+            logger.warning("glide: vel=(%.3f, %.3f) px/ms -> travel=(%.0f, "
+                           "%.0f) px over tau=%.0f ms",
+                           vel_x, vel_y, vel_x * GLIDE_TAU_MS,
+                           vel_y * GLIDE_TAU_MS, GLIDE_TAU_MS)
         self._glide.start(vel_x, vel_y)
 
     def _apply_zoom(self):

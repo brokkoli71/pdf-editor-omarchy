@@ -1253,7 +1253,14 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     — GTK emits `::decelerate` only after a CONTINUOUS scroll, so a wheel notch
     keeps its instant `WHEEL_PAN_STEP` — and it hands over a velocity in px/ms
     and nothing else, so the curve is ours: `KineticGlide`, exponential with
-    `GLIDE_TAU_MS`, one class rather than a handler per surface. Two things it
+    `GLIDE_TAU_MS`, one class rather than a handler per surface. **That
+    constant is shorter than every reference, deliberately** — GtkScrolledWindow
+    decelerates at τ≈250 ms and multiplies the reported velocity by 2.5 on top,
+    Firefox's fling is τ≈500 ms, and both are tuned for a page you skim rather
+    than a sheet of A4 you are writing on; the first shipped value of 325 read
+    as far too fast in the hand. It is a number to RE-MEASURE, not to argue
+    about: `SIDEMARK_GLIDE_DEBUG=1` logs what each flick actually reports.
+    Two things it
     must get right. The frame step is the **integral** of the decaying velocity
     across the frame (`glide_frame`), never `v × dt` decayed afterwards, or a
     coast travels further at 30 fps than at 60 — and a dropped frame under a
@@ -1401,15 +1408,23 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     it needs its own verb because it has no control point to keep hold of — it
     is a sampled curve, deliberately excluded from `shape_vertices`. So the
     whole shape scales about the centre the dwell found, by how much further
-    out the pen has travelled along its ray (`ellipse_resize_state` /
-    `resized_ellipse`, shared by both surfaces and ported to the web). The
-    scale is UNIFORM: the dwell has already answered what shape this is, and a
-    per-axis pull would let a circle become an oval again while you were only
-    making it bigger — which is also why the circle test is a RATIO
-    (`circle_axes`) and so cannot change that answer mid-resize. Recording the
-    pen's OWN distance at the dwell is what makes the first motion event scale
-    by exactly 1; a shape settling under a hand that has not moved is the
-    defect. `sample_ellipse` rounds the sample count up to a **multiple of
+    out the pen has travelled (`ellipse_resize_state` / `resized_ellipse`,
+    shared by both surfaces and ported to the web). The scale is **PER-AXIS**:
+    the pen changes the RATIO and not merely the size, which is the box-handle
+    verb every other selected shape already has — sideways widens, down
+    heightens, the corner does both. It shipped UNIFORM first, on the argument
+    that the dwell had already answered what shape this is; the user's answer
+    was that stretching is the point, so that argument is dead. What survives
+    of it is `circle_axes` having the last word: within its tolerance a circle
+    stays a circle under a shaking hand, and past it you get the oval you were
+    plainly asking for (*ceiling: a 12% dead zone around square, so the very
+    flattest ovals are unreachable from a circle — lift and draw one*). An axis
+    the pen had no LEVER on when the dwell fired follows the other
+    (`ELLIPSE_LEVER_MIN`), because dividing by a near-zero offset turns a pixel
+    of tremor into a large factor — a circle snapped at its equator would
+    otherwise flatten the instant it moved. Recording the pen's OWN offset at
+    the dwell is what makes the first motion event scale by exactly 1 on BOTH
+    axes; a shape settling under a hand that has not moved is the defect. `sample_ellipse` rounds the sample count up to a **multiple of
     four** so the ring lands on all four extremes and its bounding box IS the
     ellipse's box — everything here re-derives geometry from the points rather
     than storing it (the `rect_bbox_of` pattern), and off a multiple of four

@@ -148,6 +148,15 @@ def main():
         ("oval, pulled in", oval(), (180.0, 100.0), (140.0, 100.0)),
         ("oval, off the ray", oval(), (180.0, 100.0), (150.0, 160.0)),
         ("circle, onto its centre", circle(), (150.0, 100.0), (100.0, 100.0)),
+        # off BOTH axes, so the pen has a lever on each and the scale really is
+        # per-axis — every case above rests on the x axis, where one axis can
+        # only follow the other and the branch that matters never runs
+        ("circle, stretched sideways only", circle(),
+         (135.35534, 135.35534), (170.71068, 135.35534)),
+        ("circle, pulled to a corner", circle(),
+         (135.35534, 135.35534), (170.71068, 170.71068)),
+        ("circle, squashed flat", circle(),
+         (135.35534, 135.35534), (135.35534, 110.0)),
     ):
         pts = [tuple(p) for p in r(pts)]
         _kind, shape = S.recognize_shape(pts)
