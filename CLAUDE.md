@@ -1739,14 +1739,27 @@ when something lands, fold its invariants upward and delete it from here rather
 than writing a line about having finished it. The chronology lives in
 `ideas.csv` and git.
 
-**START HERE (2026-08-14). There is an APPROVED, UNSTARTED plan waiting:
+**START HERE (2026-08-17): six ideas were triaged with the user and each one's
+open questions were ANSWERED by them — `ideas.csv` rows 175–180 hold the
+answers, and re-deriving them is wasted work.** In the user's own order of
+readiness: row 179 (a snapped ellipse stays resizable, small, the pattern
+exists), row 175 (smoother scrolling — **touchpad only, the user cut the wheel
+out**), then the two they asked to have PROTOTYPED IN THE WEB before anything
+ships (row 176, only what is right of the cursor falls back to source, cursor
+line only; row 177, four options for shapes that stretch when text is inserted
+through them — they especially want to feel the freehand one), then row 178
+(draw while scrolling, which they clarified as *scroll while the pen is down*),
+and row 180 (Nextcloud), which is blocked on ONE answer from them: their own
+instance, or anyone's?
+
+**Also unstarted: an APPROVED plan from 2026-08-14 —**
 `notes/text-objects-plan.md` (row 168) — type your own text on a page, stored
 like a drawing and written into the PDF as REAL selectable text. It was agreed
 with the user on 2026-08-14, its phase 0 is a standalone fix for a live bug
 (the notes export writes `α ∑ ℝ →` as `?????`, because base-14 `helv` cannot
 encode them), and it opens with the design decisions already made — read it
 before designing anything in that area. Editing the PDF's OWN text was analysed
-and REJECTED there with the user's agreement; don't reopen it.**
+and REJECTED there with the user's agreement; don't reopen it.
 
 Two smaller things are also queued and unstarted: **inserting an image from a
 FILE** (dropping a `.png` is still refused by `classify_import_paths`, and
