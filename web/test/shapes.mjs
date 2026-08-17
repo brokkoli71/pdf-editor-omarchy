@@ -10,6 +10,7 @@ import {
   recognizeShape, polylineIsClosed, polygonCorners, openPathCorners,
   rectBboxOf, simplifyPolyline, quadIsAxisAligned, evenDividerPositions,
   POLYGON_MAX_CORNERS, CIRCLE_TOLERANCE, LASSO_CLICK_SLOP_PX,
+  ellipseResizeState, resizedEllipse, ELLIPSE_MIN_R,
 } from "../src/shapes.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -54,6 +55,17 @@ for (const c of V.cases) {
     check(`${n}/quadIsAxisAligned`, quadIsAxisAligned(polygonCorners(c.pts)),
           c.axis_aligned);
   }
+}
+
+check("ELLIPSE_MIN_R", ELLIPSE_MIN_R, V.constants.ELLIPSE_MIN_R);
+
+// Row 179: the dwell's ellipse is still resizable while the pen is down, and
+// what it must agree on is not just the geometry but the STATE it is derived
+// from — a centre or a radius read a hair differently jumps the shape under
+// the hand on the first motion event.
+for (const c of V.ellipse_resize) {
+  const state = ellipseResizeState(c.shape, c.at);
+  check(`resize ${c.name}`, resizedEllipse(state, c.to[0], c.to[1]), c.resized);
 }
 
 for (const [label, want] of Object.entries(V.dividers)) {

@@ -2031,14 +2031,81 @@ def recognize_shape(pts):
                         (minx, maxy), (minx, miny)]
     if poly_err < ell_err:
         return "polygon", corners + [corners[0]]
-    # A hand-drawn circle lands as a faintly oval ellipse otherwise, which
-    # reads as sloppy recognition even though it is perfectly faithful.
+    rx, ry = circle_axes(rx, ry)
+    return "ellipse", sample_ellipse(cx, cy, rx, ry, max(24, len(pts)))
+
+
+ELLIPSE_MIN_R = 0.5
+"""Floor on a resized semi-axis, so a pen dragged onto the centre leaves a
+shape you can still see and pull back out instead of nothing at all."""
+
+
+def circle_axes(rx, ry):
+    """A hand-drawn circle lands as a faintly oval ellipse otherwise, which
+    reads as sloppy recognition even though it is perfectly faithful. The test
+    is a RATIO, so it is scale-invariant: a resize (row 179) cannot change the
+    answer the dwell already gave, which is exactly what must not happen under
+    the hand."""
     if abs(rx - ry) <= CIRCLE_TOLERANCE * max(rx, ry):
         rx = ry = (rx + ry) / 2.0
-    n = max(24, len(pts))
-    return "ellipse", [(cx + rx * math.cos(2 * math.pi * i / n),
-                        cy + ry * math.sin(2 * math.pi * i / n))
-                       for i in range(n + 1)]
+    return rx, ry
+
+
+def sample_ellipse(cx, cy, rx, ry, n):
+    """The closed ring an ellipse is stored as — one sampler, so a resize
+    re-states the dwell's own answer rather than a second geometry.
+
+    The sample count is rounded up to a multiple of FOUR so the ring lands on
+    all four extremes: that makes its bounding box the ellipse's own box, and
+    everything here re-derives geometry from the points rather than storing it
+    (the `rect_bbox_of` pattern). Off a multiple of four the box is a hair
+    small and its centre a hair off, so a resize would nudge the shape on the
+    very first motion event — a jump under a hand that has not moved."""
+    n = 4 * ((n + 3) // 4)
+    return [(cx + rx * math.cos(2 * math.pi * i / n),
+             cy + ry * math.sin(2 * math.pi * i / n))
+            for i in range(n + 1)]
+
+
+def snap_label_anchor(pts):
+    """Where the "ellipse"/"rectangle" glyph sits for a shape — its top-right
+    corner. One helper, because a resized shape has to carry its own label
+    along and a label left behind is the shape saying it is somewhere else."""
+    return (max(p[0] for p in pts), min(p[1] for p in pts))
+
+
+def ellipse_resize_state(pts, at):
+    """What a just-recognised ellipse needs to stay resizable while the pen is
+    still down (row 179): its centre, its semi-axes, how far the pen was from
+    that centre when the dwell fired, and how many samples to re-state it with.
+
+    An ellipse has no control points — it is a sampled curve, deliberately
+    excluded from `shape_vertices` — so it cannot borrow the line/polygon verb
+    of keeping hold of a vertex; the whole shape is scaled instead. Recording
+    the pen's own distance is what makes the first motion event scale by
+    exactly 1: the shape must not jump the instant the dwell fires. Returns
+    None when the pen rests ON the centre, where there is no ray to pull along.
+    """
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+    r0 = math.hypot(at[0] - cx, at[1] - cy)
+    if r0 < ELLIPSE_MIN_R:
+        return None
+    return (cx, cy, (max(xs) - min(xs)) / 2, (max(ys) - min(ys)) / 2,
+            r0, len(pts) - 1)
+
+
+def resized_ellipse(state, px, py):
+    """The dwell's ellipse re-sampled for a pen now at (px, py): a UNIFORM
+    scale about the centre it was recognised at, by how much further out the
+    pen has travelled along its ray. Uniform because the dwell has already
+    answered what shape this is — a per-axis pull would let a circle turn back
+    into an oval while you were only trying to make it bigger."""
+    cx, cy, rx, ry, r0, n = state
+    f = max(math.hypot(px - cx, py - cy), ELLIPSE_MIN_R) / r0
+    rx, ry = circle_axes(max(rx * f, ELLIPSE_MIN_R), max(ry * f, ELLIPSE_MIN_R))
+    return sample_ellipse(cx, cy, rx, ry, n)
 
 
 def rect_bbox_of(pts, tol_frac=0.10):
@@ -3415,6 +3482,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self._snap_kind = None
         self._snap_label = None
         self._snap_at = (0.0, 0.0)   # PDF-unit anchor for that glyph
+        # a recognised ellipse's centre/axes, so the pen can still resize it
+        # without lifting (row 179) — see ellipse_resize_state
+        self._snap_ellipse = None
         # highlighter mode: wide translucent strokes (PDF CA key via annot.set_opacity)
         self.hl_color = _pen_setting(_pen, "hl_color", (1.0, 0.85, 0.0))
         self.hl_width = _pen_setting(_pen, "hl_width", 12.0)
@@ -6020,9 +6090,15 @@ class PDFCanvas(Gtk.DrawingArea):
                            else len(self.current_stroke) - 1)
                     self.current_stroke = move_shape_vertex(
                         self.current_stroke, idx, pt[0], pt[1])
-                # a recognised rectangle/ellipse/divider is frozen — the dwell
-                # settled it, the pointer no longer edits it (lift and re-draw,
-                # or Ctrl+Z, to change your mind)
+                elif self._snap_kind == "ellipse" and self._snap_ellipse:
+                    # no control points to hold, so the pen scales the whole
+                    # shape about its centre instead (row 179)
+                    self.current_stroke = resized_ellipse(
+                        self._snap_ellipse, pt[0], pt[1])
+                    self._snap_at = snap_label_anchor(self.current_stroke)
+                # a recognised rectangle/divider is frozen — the dwell settled
+                # it, the pointer no longer edits it (lift and re-draw, or
+                # Ctrl+Z, to change your mind)
             else:
                 # samples arrive per PEN REPORT but events arrive per FRAME,
                 # so counting both is what lets a capture say which of the two
@@ -6322,9 +6398,12 @@ class PDFCanvas(Gtk.DrawingArea):
         self._live_snap_shapes = self._page_shapes_screen() if live else []
         self._curve_snap_cache = self._page_curves_screen() if live else []
         self._live_snap_at = None
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        self._snap_at = (max(xs), min(ys))
+        # an ellipse has no vertex to hold, so it keeps its geometry instead
+        # and the pen scales it (row 179); `raw[-1]` is where the pen actually
+        # is, which is what makes the first motion event a no-op
+        self._snap_ellipse = (ellipse_resize_state(pts, raw[-1])
+                              if kind == "ellipse" else None)
+        self._snap_at = snap_label_anchor(pts)
         self.current_stroke = pts
         self.queue_draw()
         if self.on_live_draw:
@@ -12826,6 +12905,7 @@ class TextPageView(Gtk.Overlay):
         self._snap_kind = None
         self._snap_label = None
         self._snap_at = (0.0, 0.0)   # overlay-space anchor for the glyph
+        self._snap_ellipse = None    # resizable while held (row 179)
         # lasso selection (PDF-canvas parity: select, move, resize, duplicate).
         # Selected strokes are ordinary strokes; a move/resize RE-ANCHORS them
         # — fresh GtkTextMark at the new spot, offsets recomputed — so they
@@ -14241,7 +14321,13 @@ class TextPageView(Gtk.Overlay):
                            else len(self.current_stroke) - 1)
                     self.current_stroke = move_shape_vertex(
                         self.current_stroke, idx, tx, ty)
-                # a recognised rectangle/ellipse/divider is frozen until release
+                elif self._snap_kind == "ellipse" and self._snap_ellipse:
+                    # the whole shape scales about its centre — PDF-canvas
+                    # parity (row 179)
+                    self.current_stroke = resized_ellipse(
+                        self._snap_ellipse, x, y)
+                    self._snap_at = snap_label_anchor(self.current_stroke)
+                # a recognised rectangle/divider is frozen until release
             else:
                 self._capture_events += 1
                 # the compressed-away trail first (PDF-canvas parity, row 147)
@@ -14410,9 +14496,10 @@ class TextPageView(Gtk.Overlay):
         self._live_snap_shapes = self._page_shapes_overlay() if live else []
         self._curve_snap_cache = self._page_curves_overlay() if live else []
         self._live_snap_at = None
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        self._snap_at = (max(xs), min(ys))
+        # PDF-canvas parity (row 179) — see PDFCanvas._snap_to_shape
+        self._snap_ellipse = (ellipse_resize_state(pts, raw[-1])
+                              if kind == "ellipse" else None)
+        self._snap_at = snap_label_anchor(pts)
         self.current_stroke = pts
         self.ink.queue_draw()
         return False   # one-shot

@@ -114,7 +114,8 @@ def r(v, n=12):
 def main():
     out = {"constants": {"POLYGON_MAX_CORNERS": S.POLYGON_MAX_CORNERS,
                          "CIRCLE_TOLERANCE": S.CIRCLE_TOLERANCE,
-                         "LASSO_CLICK_SLOP_PX": S.LASSO_CLICK_SLOP_PX},
+                         "LASSO_CLICK_SLOP_PX": S.LASSO_CLICK_SLOP_PX,
+                         "ELLIPSE_MIN_R": S.ELLIPSE_MIN_R},
            "cases": []}
     for name, pts in CASES.items():
         # Round FIRST, then compute: the vectors carry the rounded points, so
@@ -138,6 +139,24 @@ def main():
         entry["axis_aligned"] = (S.quad_is_axis_aligned(corners)
                                  if len(corners) == 4 else None)
         out["cases"].append(entry)
+    # Row 179: a recognised ellipse stays resizable while the pen is still
+    # down. The pen's own position at the dwell is what makes the first motion
+    # event a no-op, so each case carries the point it was resized FROM.
+    out["ellipse_resize"] = []
+    for name, pts, at, to in (
+        ("circle from the rim", circle(), (150.0, 100.0), (200.0, 100.0)),
+        ("oval, pulled in", oval(), (180.0, 100.0), (140.0, 100.0)),
+        ("oval, off the ray", oval(), (180.0, 100.0), (150.0, 160.0)),
+        ("circle, onto its centre", circle(), (150.0, 100.0), (100.0, 100.0)),
+    ):
+        pts = [tuple(p) for p in r(pts)]
+        _kind, shape = S.recognize_shape(pts)
+        at, to = tuple(r(at)), tuple(r(to))
+        state = S.ellipse_resize_state(shape, at)
+        out["ellipse_resize"].append({
+            "name": name, "shape": r(shape), "at": at, "to": to,
+            "resized": r(S.resized_ellipse(state, to[0], to[1])),
+        })
     out["dividers"] = {
         "3 across 0..100": r(S.even_divider_positions(0.0, 100.0, 3)),
         "1 across 10..20": r(S.even_divider_positions(10.0, 20.0, 1)),

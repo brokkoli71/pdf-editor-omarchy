@@ -10,7 +10,7 @@ import {
 import { drawInkStroke, strokeHit, rgbCss } from "./draw.js";
 import { BTN_FINGER, buttonForEvent, chordId } from "./bindings.js";
 import { recognizeShape, snapGridDivider, respaceDividers, polylineIsClosed,
-         SNAP_LABELS } from "./shapes.js";
+         ellipseResizeState, resizedEllipse, SNAP_LABELS } from "./shapes.js";
 import { pageWords, nearestWord, wordsBetween, wordsInRect,
          selectionText, selectionRects } from "./textlayer.js";
 import { copySelection, takeCopy, hasCopy, copyExtent } from "./clipboard.js";
@@ -763,6 +763,7 @@ export class Surface {
     this._snapTimer = null;
     const a = this.active;
     if (!a || a.pts.length < 2) return;
+    const rawEnd = a.pts[a.pts.length - 1];   // where the pen actually is
     let kind, pts;
     if (this.pen.shape_snap === "lines") {
       kind = "line";
@@ -784,7 +785,7 @@ export class Surface {
     this._snapAt = [Math.max(...xs), Math.min(...ys)];
     a.pts = pts;
     a.press = [];              // a settled shape has no pressure profile
-    this._armLiveVertex(a);
+    this._armLiveVertex(a, rawEnd);
     this.requestDraw();
   }
 
@@ -801,8 +802,13 @@ export class Surface {
    * motion event over a page of handwriting is tens of thousands of segments.
    * The live shape offers its OWN points and edges too — the held point and the
    * two edges meeting it are excluded by `snapPoint`, or it would pin itself. */
-  _armLiveVertex(a) {
+  _armLiveVertex(a, rawEnd) {
     a.liveHeld = null;
+    // ...except an ellipse, which has no vertex and so scales as a whole
+    // instead (row 179). `a.pts` before this call is where the pen actually
+    // is, which is what makes the first motion event a no-op.
+    a.liveEllipse = this._snapKind === "ellipse"
+      ? ellipseResizeState(a.pts, rawEnd) : null;
     if (!["line", "path", "polygon"].includes(this._snapKind)) return;
     if (!a.pts || a.pts.length < 2) return;
     const closed = polylineIsClosed(a.pts);
@@ -816,6 +822,13 @@ export class Surface {
    * held control point instead. This is also the classic straight snap: a
    * recognised LINE whose far end follows the nib is exactly a rubber band. */
   _dragLiveVertex(a, dx, dy) {
+    if (a.liveEllipse) {
+      a.pts = resizedEllipse(a.liveEllipse, dx, dy);
+      this._snapAt = [Math.max(...a.pts.map((p) => p[0])),
+                      Math.min(...a.pts.map((p) => p[1]))];
+      this.requestDraw();
+      return;
+    }
     if (a.liveHeld === null || a.liveHeld === undefined) return;
     const hit = vertexSnapRadius(this.cssW, this.cssH) / this.zoom;
     const curves = curveSnapShapes(a.liveCurves || [], dx, dy, hit);

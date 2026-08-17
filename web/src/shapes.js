@@ -200,13 +200,56 @@ export function recognizeShape(pts) {
   if (Math.abs(rx - ry) <= CIRCLE_TOLERANCE * Math.max(rx, ry)) {
     rx = ry = (rx + ry) / 2;
   }
-  const n = Math.max(24, pts.length);
+  // Rounded up to a multiple of FOUR so the ring lands on all four extremes:
+  // its bounding box is then the ellipse's own box, which is what lets the
+  // desktop re-derive centre and axes from the points to resize it (row 179).
+  const n = 4 * Math.ceil(Math.max(24, pts.length) / 4);
+  return { kind: "ellipse", pts: sampleEllipse(cx, cy, rx, ry, n) };
+}
+
+/** Floor on a resized semi-axis, so a pen dragged onto the centre leaves a
+ * shape you can still see and pull back out instead of nothing at all. */
+export const ELLIPSE_MIN_R = 0.5;
+
+export function sampleEllipse(cx, cy, rx, ry, n) {
   const out = [];
+  n = 4 * Math.ceil(n / 4);
   for (let i = 0; i <= n; i++) {
     const a = (2 * Math.PI * i) / n;
     out.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]);
   }
-  return { kind: "ellipse", pts: out };
+  return out;
+}
+
+/** What a just-recognised ellipse needs to stay resizable while the pen is
+ * still down (row 179): centre, semi-axes, how far the pen was from that
+ * centre when the dwell fired, and the sample count to re-state it with. An
+ * ellipse has no control point to keep hold of, so the whole shape scales
+ * instead. Null when the pen rests ON the centre — no ray to pull along. */
+export function ellipseResizeState(pts, at) {
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+  const minx = Math.min(...xs), maxx = Math.max(...xs);
+  const miny = Math.min(...ys), maxy = Math.max(...ys);
+  const cx = (minx + maxx) / 2, cy = (miny + maxy) / 2;
+  const r0 = Math.hypot(at[0] - cx, at[1] - cy);
+  if (r0 < ELLIPSE_MIN_R) return null;
+  return { cx, cy, rx: (maxx - minx) / 2, ry: (maxy - miny) / 2,
+           r0, n: pts.length - 1 };
+}
+
+/** The dwell's ellipse re-sampled for a pen now at (px, py): a UNIFORM scale
+ * about the centre it was recognised at. Uniform because the dwell has already
+ * answered what shape this is — a per-axis pull would let a circle turn back
+ * into an oval while you were only making it bigger. */
+export function resizedEllipse(s, px, py) {
+  const f = Math.max(Math.hypot(px - s.cx, py - s.cy), ELLIPSE_MIN_R) / s.r0;
+  let rx = Math.max(s.rx * f, ELLIPSE_MIN_R);
+  let ry = Math.max(s.ry * f, ELLIPSE_MIN_R);
+  // the circle test is a RATIO, so it cannot change the dwell's own answer
+  if (Math.abs(rx - ry) <= CIRCLE_TOLERANCE * Math.max(rx, ry)) {
+    rx = ry = (rx + ry) / 2;
+  }
+  return sampleEllipse(s.cx, s.cy, rx, ry, s.n);
 }
 
 /** The bbox if `pts` traces an axis-aligned rectangle perimeter, else null.

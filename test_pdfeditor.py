@@ -1120,6 +1120,94 @@ class TestStraightLineSnap(unittest.TestCase):
         self.assertEqual(tuple(c.current_stroke[0]), (0, 0))
         self.assertEqual(tuple(c.current_stroke[1]), (30, 5))
 
+    # ── row 179: a snapped ellipse is still resizable while the pen is down ──
+
+    @staticmethod
+    def _loop(cx=100.0, cy=100.0, rx=40.0, ry=25.0, n=24):
+        """A hand-drawn-ish oval, ending at its rightmost point — so the pen is
+        left where a resize pulls from."""
+        return [(cx + rx * math.cos(2 * math.pi * i / n),
+                 cy + ry * math.sin(2 * math.pi * i / n))
+                for i in range(n + 1)]
+
+    @staticmethod
+    def _span(pts):
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return (max(xs) - min(xs), max(ys) - min(ys),
+                (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
+
+    def _snapped_ellipse(self):
+        c = self._canvas()
+        c.current_stroke = self._loop()
+        c._snap_to_shape()
+        self.assertEqual(c._snap_kind, "ellipse")
+        return c
+
+    def test_a_snapped_ellipse_grows_as_the_pen_pulls_away(self):
+        """The verb the other kinds get by keeping hold of a control point —
+        an ellipse has none, so the whole shape scales instead."""
+        c = self._snapped_ellipse()
+        w0, h0, cx0, cy0 = self._span(c.current_stroke)
+        # the pen was at (140, 100), one semi-axis out; take it to twice that
+        c._on_drag_update(self._drag(100.0, 100.0), 80.0, 0.0)
+        w1, h1, cx1, cy1 = self._span(c.current_stroke)
+        self.assertAlmostEqual(w1 / w0, 2.0, places=5)
+        self.assertAlmostEqual(h1 / h0, 2.0, places=5)   # the oval keeps its aspect
+        self.assertAlmostEqual(cx1, cx0, places=5)       # about the centre
+        self.assertAlmostEqual(cy1, cy0, places=5)
+
+    def test_the_pen_does_not_jump_the_ellipse_it_just_snapped(self):
+        """The first motion event must scale by exactly 1: the shape settling
+        under a hand that has not moved is the dwell changing its own answer."""
+        c = self._snapped_ellipse()
+        before = list(c.current_stroke)
+        c._on_drag_update(self._drag(100.0, 100.0), 40.0, 0.0)   # still on the rim
+        for (ax, ay), (bx, by) in zip(before, c.current_stroke):
+            self.assertAlmostEqual(ax, bx, places=6)
+            self.assertAlmostEqual(ay, by, places=6)
+
+    def test_a_resized_circle_is_still_a_circle(self):
+        c = self._canvas()
+        c.current_stroke = self._loop(rx=30.0, ry=30.0)
+        c._snap_to_shape()
+        c._on_drag_update(self._drag(100.0, 100.0), 15.0, 0.0)
+        w, h, _cx, _cy = self._span(c.current_stroke)
+        self.assertLess(w, 40.0)          # it really did shrink (from 60)
+        # the ellipse is SAMPLED, so the spans match to within one sample step
+        self.assertAlmostEqual(w, h, delta=0.5)
+
+    def test_the_snap_label_travels_with_a_resized_ellipse(self):
+        """A label left behind says the shape is somewhere it is not."""
+        c = self._snapped_ellipse()
+        c._on_drag_update(self._drag(100.0, 100.0), 80.0, 0.0)
+        self.assertEqual(c._snap_at,
+                         sidemark.snap_label_anchor(c.current_stroke))
+
+    def test_a_snapped_rectangle_is_still_frozen(self):
+        """Only the ellipse gained a verb — a recognised box is settled."""
+        c = self._canvas()
+        c.current_stroke = [(0, 0), (50, 0), (100, 0), (100, 30), (100, 60),
+                            (50, 60), (0, 60), (0, 30), (0, 0)]
+        c._snap_to_shape()
+        self.assertEqual(c._snap_kind, "rect")
+        before = list(c.current_stroke)
+        c._on_drag_update(self._drag(0.0, 0.0), 200.0, 200.0)
+        self.assertEqual(c.current_stroke, before)
+
+    def test_a_pen_resting_on_the_centre_leaves_the_ellipse_alone(self):
+        """There is no ray to pull along from the middle, so there is nothing
+        to scale by — the shape must stay put rather than explode."""
+        pts = self._loop()
+        self.assertIsNone(sidemark.ellipse_resize_state(pts, (100.0, 100.0)))
+
+    def test_an_ellipse_dragged_onto_its_centre_stays_visible(self):
+        """Scaling to nothing leaves a shape you cannot pull back out."""
+        state = sidemark.ellipse_resize_state(self._loop(), (140.0, 100.0))
+        w, h, _cx, _cy = self._span(sidemark.resized_ellipse(state, 100.0, 100.0))
+        self.assertGreater(w, 0.0)
+        self.assertGreater(h, 0.0)
+
     def test_free_motion_appends_and_arms_timer(self):
         c = self._canvas()
         c.current_stroke = [(0, 0)]
@@ -16211,6 +16299,32 @@ class TestTextPageLasso(unittest.TestCase):
                 tp._on_press_end(g, 80.0, 20.0)
                 # committed exactly as the 2-point line, no smoothing applied
                 self.assertEqual(len(tp.strokes[0]["pts"]), 2)
+
+            self._run_in_window(body)
+
+    def test_a_snapped_ellipse_resizes_on_the_sheet_too(self):
+        """Row 179 on the other substrate — one shared helper, so what the
+        sheet must prove is that the pen reaches it at all."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                win._set_tool_mode("pen")
+                g = self._gesture(340.0, 100.0)
+                tp._on_press_begin(g, 340.0, 100.0)
+                # a round loop, ending back at its rightmost point
+                for i in range(1, 25):
+                    a = 2 * math.pi * i / 24
+                    tp._on_press_update(g, 40.0 * math.cos(a) - 40.0,
+                                        25.0 * math.sin(a))
+                tp._cancel_straight_timer()
+                tp._snap_to_shape()          # the rest timer firing
+                self.assertEqual(tp._snap_kind, "ellipse")
+                span = lambda p: (max(q[0] for q in p) - min(q[0] for q in p))
+                w0 = span(tp.current_stroke)
+                tp._on_press_update(g, 40.0, 0.0)   # twice as far from the centre
+                self.assertAlmostEqual(span(tp.current_stroke) / w0, 2.0,
+                                       places=5)
 
             self._run_in_window(body)
 

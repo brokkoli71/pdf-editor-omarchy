@@ -1379,6 +1379,24 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     re-arming per motion event lets a shaking hand restart the clock for ever
     and the dwell can never fire, whatever the tolerance. Both surfaces re-arm
     from their own motion handler, so a fix to one of them is invisible.
+  - **An ELLIPSE stays resizable while the pen is still down (row 179)**, and
+    it needs its own verb because it has no control point to keep hold of — it
+    is a sampled curve, deliberately excluded from `shape_vertices`. So the
+    whole shape scales about the centre the dwell found, by how much further
+    out the pen has travelled along its ray (`ellipse_resize_state` /
+    `resized_ellipse`, shared by both surfaces and ported to the web). The
+    scale is UNIFORM: the dwell has already answered what shape this is, and a
+    per-axis pull would let a circle become an oval again while you were only
+    making it bigger — which is also why the circle test is a RATIO
+    (`circle_axes`) and so cannot change that answer mid-resize. Recording the
+    pen's OWN distance at the dwell is what makes the first motion event scale
+    by exactly 1; a shape settling under a hand that has not moved is the
+    defect. `sample_ellipse` rounds the sample count up to a **multiple of
+    four** so the ring lands on all four extremes and its bounding box IS the
+    ellipse's box — everything here re-derives geometry from the points rather
+    than storing it (the `rect_bbox_of` pattern), and off a multiple of four
+    the re-read centre and axes are a hair out. A rectangle and a grid divider
+    are still frozen by the dwell.
 - **Geometry you STORE must not go through the int-truncating coord helpers.**
   `window_to_buffer_coords`/`buffer_to_window_coords` only take ints, so a
   per-point conversion rounds every point on the way in *and* out. Invisible
