@@ -1080,6 +1080,83 @@ class TestStrokes(unittest.TestCase):
         self.assertEqual(stroke["width"], 5.0)
 
 
+# ── the coast after a touchpad flick (row 175) ────────────────────────────────
+
+class TestKineticGlide(unittest.TestCase):
+    def _glide(self, moved=True):
+        """A glide over a fake widget, collecting what it asks for."""
+        steps = []
+
+        def move(dx, dy):
+            steps.append((dx, dy))
+            return moved
+
+        widget = mock.Mock()
+        widget.add_tick_callback.return_value = 7
+        return sidemark.KineticGlide(widget, move), steps
+
+    @staticmethod
+    def _run(g, frames, dt_ms):
+        """Drive `frames` frames of `dt_ms` each, past the real clock."""
+        for _ in range(frames):
+            g._last_us = sidemark.GLib.get_monotonic_time() - int(dt_ms * 1000)
+            if g._frame(None, None) == sidemark.GLib.SOURCE_REMOVE:
+                break
+
+    def test_a_flick_travels_velocity_times_the_time_constant(self):
+        """The whole of the feel: how far one flick carries. GTK reports px/ms,
+        so a coast settles at v x TAU — a fast flick is about a page."""
+        g, steps = self._glide()
+        g.start(0.0, 3.0)
+        self._run(g, 400, 8.0)
+        # short of the asymptote by whatever the coast still had left when it
+        # gave up, which is the stop threshold's own worth of distance
+        self.assertAlmostEqual(
+            sum(dy for _dx, dy in steps), 3.0 * sidemark.GLIDE_TAU_MS,
+            delta=sidemark.GLIDE_MIN_VEL * sidemark.GLIDE_TAU_MS + 1.0)
+
+    def test_the_distance_does_not_depend_on_the_frame_rate(self):
+        """A dropped frame under a heavy relayout is exactly when a coast
+        would jump — which it does if the velocity is decayed per frame
+        instead of integrated across it."""
+        totals = []
+        for dt in (4.0, 16.0, 100.0):
+            g, steps = self._glide()
+            g.start(0.0, 2.0)
+            self._run(g, int(4000 / dt) + 5, dt)
+            totals.append(sum(dy for _dx, dy in steps))
+        self.assertAlmostEqual(totals[0], totals[1], delta=1.0)
+        self.assertAlmostEqual(totals[0], totals[2], delta=1.0)
+
+    def test_it_slows_down(self):
+        g, steps = self._glide()
+        g.start(0.0, 3.0)
+        self._run(g, 30, 16.0)
+        self.assertGreater(steps[0][1], steps[-1][1] * 2)
+
+    def test_reaching_the_end_of_the_document_ends_the_coast(self):
+        """A clamped adjustment does not move, and a coast that cannot see
+        that keeps asking for another second."""
+        g, steps = self._glide(moved=False)
+        g.start(0.0, 3.0)
+        self._run(g, 30, 16.0)
+        self.assertEqual(len(steps), 1)
+        self.assertFalse(g.running)
+
+    def test_a_nudge_does_not_coast_at_all(self):
+        """Letting go having moved nothing must not fling the page."""
+        g, _steps = self._glide()
+        g.start(0.0, sidemark.GLIDE_MIN_VEL / 2)
+        self.assertFalse(g.running)
+
+    def test_stop_is_idempotent(self):
+        g, _steps = self._glide()
+        g.start(0.0, 3.0)
+        g.stop()
+        g.stop()
+        self.assertFalse(g.running)
+
+
 # ── straight-line snap (GoodNotes-style hold) ──────────────────────────────────
 
 class TestStraightLineSnap(unittest.TestCase):
@@ -16579,6 +16656,73 @@ class TestTextPageLasso(unittest.TestCase):
                           for c in tp.observe_controllers()
                           if isinstance(c, Gtk.EventControllerScroll)]
                 self.assertIn(Gtk.PropagationPhase.CAPTURE, phases)
+
+            self._run_in_window(body)
+
+    def test_a_touchpad_flick_coasts_and_a_hand_catches_it(self):
+        """Row 175: the sheet owns its own scrolling (a drawing tool cuts the
+        ScrolledWindow out of the event path), so GTK's kinetic scrolling
+        never runs here and the coast is ours to drive."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                va = tp.scroll.get_vadjustment()
+                va.configure(0.0, 0.0, 10000.0, 1.0, 10.0, 100.0)
+                va.set_value(0.0)
+                tp._on_sheet_scroll(_scroll_ctrl(smooth=True), 0.0, 12.0)
+                tp._on_sheet_decelerate(None, 0.0, 2.0)
+                self.assertTrue(tp._glide.running)
+                at = va.get_value()
+                tp._glide._last_us -= 20_000        # 20 ms of coasting
+                tp._glide._frame(None, None)
+                self.assertGreater(va.get_value(), at)
+                # a hand back on the page stops it dead
+                tp._on_press_begin(self._gesture(300.0, 100.0), 300.0, 100.0)
+                self.assertFalse(tp._glide.running)
+
+            self._run_in_window(body)
+
+    def test_zooming_the_sheet_never_flings_it(self):
+        """A Ctrl+scroll gesture ends like any other continuous scroll, so the
+        velocity arrives — but zooming is not scrolling."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                tp._mouse_xy = (100.0, 100.0)
+                tp._on_sheet_scroll(_scroll_ctrl(True, smooth=True), 0.0, -4.0)
+                tp._on_sheet_decelerate(None, 0.0, -2.0)
+                self.assertFalse(tp._glide.running)
+
+            self._run_in_window(body)
+
+    def test_a_fresh_scroll_takes_the_sheet_off_the_coast(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                tp._on_sheet_decelerate(None, 0.0, 2.0)
+                self.assertTrue(tp._glide.running)
+                tp._on_sheet_scroll(_scroll_ctrl(smooth=True), 0.0, 3.0)
+                self.assertFalse(tp._glide.running)
+
+            self._run_in_window(body)
+
+    def test_a_wheel_notch_keeps_its_instant_step(self):
+        """The scope the user cut: a wheel is not a touchpad, and GTK only
+        emits ::decelerate after a CONTINUOUS scroll — so the flag is the whole
+        of it, and a notch still moves WHEEL_PAN_STEP at once."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                va = tp.scroll.get_vadjustment()
+                va.configure(0.0, 0.0, 10000.0, 1.0, 10.0, 100.0)
+                va.set_value(0.0)
+                tp._on_sheet_scroll(_scroll_ctrl(), 0.0, 1.0)
+                self.assertEqual(va.get_value(), PDFCanvas.WHEEL_PAN_STEP)
+                self.assertFalse(tp._glide.running)
 
             self._run_in_window(body)
 

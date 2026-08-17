@@ -703,6 +703,81 @@ def zoom_factor_for_scroll(smooth, dy):
     return (1.0 / ZOOM_WHEEL_STEP) if dy > 0 else ZOOM_WHEEL_STEP
 
 
+GLIDE_TAU_MS = 325.0
+"""Time constant of the coast after a touchpad flick (row 175). Exponential,
+like every browser's: the total distance is velocity × TAU, so a flick at
+3 px/ms carries about a page, and the tail is long enough to read but short
+enough that a second flick is never fighting the first."""
+
+GLIDE_MIN_VEL = 0.02
+"""px/ms below which the coast has arrived — under a pixel every three frames,
+which nothing can see, and stopping there is what ends the tick callback."""
+
+
+def glide_frame(dt_ms):
+    """One frame of the coast: how far it travels per unit of velocity, and
+    what fraction of that velocity is left afterwards.
+
+    The distance is the exact INTEGRAL of the decaying velocity over the frame,
+    not `v × dt` with the decay applied after: a scroll has to travel the same
+    distance whatever the frame rate, and a dropped frame under a heavy
+    relayout is exactly when it would otherwise jump."""
+    decay = math.exp(-dt_ms / GLIDE_TAU_MS)
+    return GLIDE_TAU_MS * (1.0 - decay), decay
+
+
+class KineticGlide:
+    """The coast after a touchpad flick, driven ONCE PER FRAME.
+
+    GTK gives us the flick's velocity (`::decelerate`, px/ms) and nothing else:
+    the deceleration curve, and therefore how scrolling FEELS, is ours. It is
+    one class rather than a handler per surface for the "one table" reason —
+    two decay curves is two answers to how fast a page settles."""
+
+    def __init__(self, widget, move):
+        self._widget = widget
+        self._move = move          # (dx, dy) -> did it actually move?
+        self._tick = None
+        self._vel = (0.0, 0.0)
+        self._last_us = 0
+
+    @property
+    def running(self):
+        return self._tick is not None
+
+    def start(self, vel_x, vel_y):
+        self.stop()
+        if math.hypot(vel_x, vel_y) < GLIDE_MIN_VEL:
+            return
+        self._vel = (vel_x, vel_y)
+        self._last_us = GLib.get_monotonic_time()
+        self._tick = self._widget.add_tick_callback(self._frame)
+
+    def stop(self):
+        if self._tick is not None:
+            self._widget.remove_tick_callback(self._tick)
+            self._tick = None
+        self._vel = (0.0, 0.0)
+
+    def _frame(self, _widget, _clock):
+        now = GLib.get_monotonic_time()
+        dt = (now - self._last_us) / 1000.0
+        self._last_us = now
+        if dt <= 0:
+            return GLib.SOURCE_CONTINUE
+        vx, vy = self._vel
+        travelled, decay = glide_frame(dt)
+        moved = self._move(vx * travelled, vy * travelled)
+        self._vel = (vx * decay, vy * decay)
+        # A coast that has reached the end of the document is over: without
+        # this it keeps asking a clamped adjustment to move for another second.
+        if not moved or math.hypot(*self._vel) < GLIDE_MIN_VEL:
+            self._tick = None
+            self._vel = (0.0, 0.0)
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+
 def erase_radius(width):
     """How close to a stroke's CENTRELINE counts as touching it, for a stroke
     drawn `width` px wide on screen. Shared by both erasers.
@@ -13127,11 +13202,20 @@ class TextPageView(Gtk.Overlay):
         # Capture runs top-down, so this controller is the first to see scroll.
         # Attaching to the ScrolledWindow itself would NOT work: same widget +
         # same phase run in add order, and GTK's is added first.
+        # KINETIC is what makes the sheet coast after a touchpad flick (row
+        # 175): GTK only emits ::decelerate with it set, and only after a
+        # CONTINUOUS scroll — which is the touchpad and never the wheel, so the
+        # flag is the whole of the "touchpad only" scope. The curve is ours
+        # (KineticGlide); GTK hands over a velocity and nothing else.
         tscroll = Gtk.EventControllerScroll(
-            flags=Gtk.EventControllerScrollFlags.BOTH_AXES)
+            flags=(Gtk.EventControllerScrollFlags.BOTH_AXES
+                   | Gtk.EventControllerScrollFlags.KINETIC))
         tscroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         tscroll.connect("scroll", self._on_sheet_scroll)
+        tscroll.connect("decelerate", self._on_sheet_decelerate)
         self.add_controller(tscroll)
+        self._glide = KineticGlide(self, self._glide_scroll)
+        self._zooming_by_scroll = False
 
         # right-click aborts an in-progress zoom-region drag (same escape hatch
         # as the PDF canvas). Must live on the SAME widget that owns the zoom
@@ -13419,6 +13503,7 @@ class TextPageView(Gtk.Overlay):
         first finger of a pinch never meant to draw — and that includes what
         it already COMMITTED during this hand, which is taken back off the
         page here."""
+        self._glide.stop()   # a pinch is a hand on the glass (row 175)
         self._drop_touch_strokes()
         self.current_stroke = []
         self._ink_ignoring = True   # the rest of this drag means nothing now
@@ -13720,6 +13805,10 @@ class TextPageView(Gtk.Overlay):
 
         A thumb-pan rebases its origin to the post-zoom scroll so the next
         motion event doesn't jump."""
+        # a new scroll takes the sheet back off the coast — the hand is on the
+        # pad again, and a glide it is still fighting is the one thing a
+        # momentum scroll must never do (row 175)
+        self._glide.stop()
         if not dx and not dy:
             return False
         ev = ctrl.get_current_event()
@@ -13728,6 +13817,8 @@ class TextPageView(Gtk.Overlay):
         if not ctrl_held and self.get_held_mods is not None:
             ctrl_held = self.get_held_mods()[0]   # (ctrl, shift, alt)
         smooth = ctrl.get_unit() == Gdk.ScrollUnit.SURFACE
+        # which branch this scroll gesture took, for the coast that follows it
+        self._zooming_by_scroll = ctrl_held
         if ctrl_held or self._thumb_gesture is not None:
             new_scroll = self.zoom_by_at(zoom_factor_for_scroll(smooth, dy),
                                          *self._mouse_xy)
@@ -13740,10 +13831,34 @@ class TextPageView(Gtk.Overlay):
         # ±1 and needs the same step the PDF canvas pans by, so the two modes
         # scroll at one speed.
         step = 1.0 if smooth else PDFCanvas.WHEEL_PAN_STEP
-        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
-        ha.set_value(ha.get_value() + dx * step)
-        va.set_value(va.get_value() + dy * step)
+        self._glide_scroll(dx * step, dy * step)
         return True
+
+    def _glide_scroll(self, dx, dy):
+        """Move the sheet by a pixel delta, reporting whether it actually
+        moved: at the end of the document the adjustment clamps, and that is
+        what tells a coast it has arrived. One entry point, so a glided pixel
+        and a dragged one cannot travel differently."""
+        moved = False
+        for adj, d in ((self.scroll.get_hadjustment(), dx),
+                       (self.scroll.get_vadjustment(), dy)):
+            if not d:
+                continue
+            was = adj.get_value()
+            adj.set_value(was + d)
+            moved = moved or adj.get_value() != was
+        return moved
+
+    def _on_sheet_decelerate(self, ctrl, vel_x, vel_y):
+        """The fingers left the touchpad — coast on (row 175).
+
+        Only ever a touchpad: GTK emits this after a CONTINUOUS scroll, so a
+        wheel notch keeps its instant step, which is what a wheel does
+        everywhere else. Zooming is not scrolling, so a Ctrl+scroll that has
+        just resized the page must not then fling it."""
+        if self._zooming_by_scroll or self._thumb_gesture is not None:
+            return
+        self._glide.start(vel_x, vel_y)
 
     def _apply_zoom(self):
         """Width, margins and font all scale by the same factor, so the text
@@ -13805,6 +13920,7 @@ class TextPageView(Gtk.Overlay):
            width; the offset's y moves with each of those, and a GtkAdjustment
            does not carry its value along. So the scroll is re-applied while
            things move (`settle`), not computed once and trusted."""
+        self._glide.stop()   # a coast would drift off the place we just went to
         buf = self.view.get_buffer()
         it = buf.get_iter_at_offset(max(0, min(int(off), buf.get_char_count())))
         res = self.view.translate_coordinates(self.scroll, 0.0, 0.0)
@@ -14071,6 +14187,9 @@ class TextPageView(Gtk.Overlay):
         Capture phase above both the ink overlay and the TextView, which is
         what makes it the only path: with the caret in hand the overlay is not
         even targetable, so a handler down there would never see the press."""
+        # a hand on the page stops the coast (row 175) — the sheet must be
+        # still under a nib, and it is how you catch a long glide
+        self._glide.stop()
         if self._touch.multi:
             # a finger of a hand that is pinching — including the survivor of
             # a lift, which arrives here as a brand new press (row 148). Claim

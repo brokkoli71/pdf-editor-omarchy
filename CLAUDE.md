@@ -1247,6 +1247,24 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   - A drawing tool makes the ink overlay the event **target**
     (`ink.set_can_target`), which cuts the ScrolledWindow out of the path
     entirely — so `TextPageView` owns plain scrolling too, not just zoom.
+    **Which is why the sheet has to coast on its own (row 175)**: GTK's kinetic
+    scrolling belongs to the ScrolledWindow that never sees the event. The
+    `KINETIC` flag on our controller is the whole of the "touchpad only" scope
+    — GTK emits `::decelerate` only after a CONTINUOUS scroll, so a wheel notch
+    keeps its instant `WHEEL_PAN_STEP` — and it hands over a velocity in px/ms
+    and nothing else, so the curve is ours: `KineticGlide`, exponential with
+    `GLIDE_TAU_MS`, one class rather than a handler per surface. Two things it
+    must get right. The frame step is the **integral** of the decaying velocity
+    across the frame (`glide_frame`), never `v × dt` decayed afterwards, or a
+    coast travels further at 30 fps than at 60 — and a dropped frame under a
+    relayout is exactly when that shows. And it **stops on anything that is a
+    hand**: a fresh scroll, a press, a pinch, a programmatic
+    `scroll_to_offset`, plus the end of the document, which it learns from the
+    adjustment refusing to move (`_glide_scroll` reports that) rather than by
+    measuring the extent. PDF pages are deliberately not in this: a scroll
+    there flips the page at a boundary (`_handle_boundary_flip`), and a
+    momentum glide into one would fling you through slides — a different
+    feature needing its own judgement, not a parity gap to close quietly.
   - Window shortcuts that must beat a focused editor live in capture-phase
     controllers (`_on_global_key`, `_on_undo_key`, the sheet's own). `_on_key`
     is **bubble** and loses to whatever has focus — put a new app-level
