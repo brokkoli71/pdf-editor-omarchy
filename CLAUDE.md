@@ -55,8 +55,7 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     `- [ ]`'s state character becomes the glyph and the `- [` / `]` around it
     are hidden with tags, so the construct is five columns of source and one
     glyph on screen with the **index map left as the identity** — nothing else
-    on the line has to know boxes exist. Opened from anywhere on the line, like
-    a heading marker and for the same reason. Ticking (`toggle_task`) writes
+    on the line has to know boxes exist. Ticking (`toggle_task`) writes
     the state character over the glyph and lets `_line_source` splice it back;
     rewriting the source line by hand would freeze every other symbol on it.
     It is STYLED (`taskbox` / `taskdone`: 1.3×, grey, green when ticked, and an
@@ -70,6 +69,19 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
       aligns by construction — that is the argument. The only route to a real
       widget is a `GtkTextChildAnchor`, which is a real character in a buffer
       that IS the `.md`. Don't.
+    - **A box does NOT open under the caret** — the one construct that must
+      not. A heading marker reveals because `##` cannot be read off what it
+      renders; a box renders its whole state, and the way to change it is to
+      click it. Opening it grew the line by four columns the moment the caret
+      landed, sliding the words out from under a pointer that had not moved. A
+      SELECTION still shows source, and needs no special case: there the line
+      is source already, so the branch does not run.
+    - **The hit is resolved on the PRESS and acted on at the release**
+      (`_task_press`), and that outlives the rule above: by the time a release
+      arrives, ANY reveal on that line has re-rendered around the new caret, so
+      the words have moved under a pointer that never left. Only the layout as
+      it was when the finger came down can say where it came down; the release
+      just checks the press has not travelled (`CLICK_SLOP_PX`).
     - **The click target is a COLUMN RANGE, never a rectangle**
       (`_task_box_at`): `get_iter_at_location` answers the question the CARET
       asks — which boundary is nearest — so past the middle of the box it

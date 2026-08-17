@@ -2283,6 +2283,12 @@ CIRCLE_LASSO_HOLD_MS = 500     # the shape snap's dwell, so one hold time to lea
 # slow drag — the slow drag is the one case the press origin exists to reject.
 HOLD_SLOP_PX = 16.0
 
+# How far a press may travel and still be a CLICK rather than a drag. Small on
+# purpose, and nothing to do with HOLD_SLOP_PX: that one forgives a hand holding
+# a pen against glass for half a second, this one only has to survive the
+# twitch of a mouse button being released.
+CLICK_SLOP_PX = 5.0
+
 
 def circle_lasso_target(strokes, hits, inside=None):
     """Which stroke a press-and-hold converts into a lasso path — THE decision,
@@ -11211,6 +11217,9 @@ class MarkdownNotesView(GtkSource.View):
         }
         self._search_query = ""
         self._search_marks = None       # the current match, as a mark pair
+        # (line, x, y) of a press that landed on a task box — resolved there,
+        # because the release sees a re-rendered line (see _on_click_pressed)
+        self._task_press = None
 
         self._cursor_line = 0
         self._rehighlight_id = None
@@ -11450,7 +11459,7 @@ class MarkdownNotesView(GtkSource.View):
             end.forward_to_line_end()
         return start, end
 
-    def _on_click_pressed(self, _gesture, n_press, _x, _y):
+    def _on_click_pressed(self, _gesture, n_press, x, y):
         """Triple-click selects the whole LOGICAL line — up to the newline —
         not the display line GtkTextView takes, which on a wrapped sheet is a
         fragment of what looks like one line.
@@ -11461,6 +11470,14 @@ class MarkdownNotesView(GtkSource.View):
         makes its display-line selection on top of ours and the press ends
         with GTK's answer, not ours. Which controller wins is not ours to
         choose — running after the whole press is."""
+        # A TASK BOX IS HIT-TESTED HERE, ON THE PRESS, and acted on at release.
+        # By the time the release arrives the caret has landed and the line has
+        # re-rendered around it, so the words have MOVED under a pointer that
+        # never left: resolving there aimed at whatever slid into that column,
+        # which is how a click on the first letter of "sd" ticked the box in
+        # front of it. Only the layout as it was when the finger came down can
+        # answer where the finger came down.
+        self._task_press = (self._task_box_at(x, y), x, y) if n_press == 1 else None
         if n_press != 3:
             return
         GLib.idle_add(self._select_clicked_line)
@@ -11601,8 +11618,13 @@ class MarkdownNotesView(GtkSource.View):
         if not (mods & (Gdk.ModifierType.CONTROL_MASK
                         | Gdk.ModifierType.ALT_MASK
                         | Gdk.ModifierType.SHIFT_MASK)):
-            ln = self._task_box_at(x, y)
-            if ln is not None and self.toggle_task(ln):
+            hit, px, py = self._task_press or (None, 0, 0)
+            self._task_press = None
+            # the press decided WHICH box (see _on_click_pressed); the release
+            # only has to agree that this was a click and not the start of a
+            # drag across the text
+            if hit is not None and math.hypot(x - px, y - py) <= CLICK_SLOP_PX \
+                    and self.toggle_task(hit):
                 gesture.set_state(Gtk.EventSequenceState.CLAIMED)
             return
         # Ctrl+click follows the link; a plain click edits as usual
@@ -12616,13 +12638,26 @@ class MarkdownNotesView(GtkSource.View):
         # same reason: it is a property of the whole line, and revealing it
         # only pushes the line sideways — nothing on it re-renders.
         m = _MD_TASK_ANY_RE.match(text)
-        if m:
-            # the bullet and both brackets go, so the box stands ALONE against
+        if m and m.group(3) in ("☐", "☑"):
+            # The bullet and both brackets go, so the box stands ALONE against
             # the left margin — one glyph and a space, exactly where a plain
-            # bullet leaves a dash and a space
-            hide(m.start(2), m.start(3), within=(0, len(text)))
-            hide(m.end(3), m.end(3) + 1, within=(0, len(text)))
-            apply("taskdone" if m.group(3) in ("x", "X", "☑") else "taskbox",
+            # bullet leaves a dash and a space.
+            #
+            # A BOX DOES NOT OPEN UNDER THE CARET, and it is the one construct
+            # that should not. Row 161's heading marker reveals because you
+            # cannot read `##` off what it renders; a box renders its whole
+            # source — empty or ticked is the entire state, and the way to
+            # change it is to click it, not to type in the brackets. Opening it
+            # only cost: the line grew by four columns the moment the caret
+            # landed, which slid the words out from under the pointer, and a
+            # click aimed at the first letter came down on the box. `all_open`
+            # is still honoured, because a SELECTION is text you are about to
+            # cut and must show what it holds (and there the line is source
+            # again, so this branch does not run at all).
+            if not all_open:
+                apply("hide", m.start(2), m.start(3))
+                apply("hide", m.end(3), m.end(3) + 1)
+            apply("taskdone" if m.group(3) == "☑" else "taskbox",
                   m.start(3), m.end(3))
 
         # [[wiki links]] → styled + clickable; brackets hidden off cursor line.

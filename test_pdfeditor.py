@@ -4662,10 +4662,32 @@ class TestTaskLists(unittest.TestCase):
         # space — and nothing of the source's own punctuation left over
         self.assertEqual(shown, "☐ milk")
         self.assertTrue(at(3).has_tag(v._t["taskbox"]))
-        # …and under the caret it is source again, like a heading marker
-        buf.place_cursor(at(6))
+
+    def test_a_box_does_not_open_under_the_caret(self):
+        """The one construct that must NOT show its source there.
+
+        A heading marker reveals because `##` cannot be read off what it
+        renders; a box renders its whole state, and the way to change it is to
+        click it. Opening it grew the line by four columns the moment the caret
+        landed, sliding the words out from under a pointer that had not moved —
+        so a click aimed at the first letter came down on the box in front of
+        it."""
+        v = self._view()
+        buf = v.get_buffer()
+        self._render(v, "- [x] milk")
+        at = lambda c: buf.get_iter_at_line_offset(0, c)[1]
+        buf.place_cursor(at(8))            # caret in the word, on that line
         v._rehighlight()
-        self.assertFalse(any(at(c).has_tag(hide) for c in range(5)))
+        self.assertEqual(v._task_box_line(0)[0].group(3), "☑")
+        self.assertTrue(all(at(c).has_tag(v._t["hide"]) for c in (0, 1, 2, 4)))
+        # a SELECTION is different: it is text you are about to cut, so it
+        # shows what it holds
+        buf.select_range(at(0), at(9))
+        v._rehighlight()
+        line0 = v.get_source_text().split("\n")[0]
+        self.assertEqual(line0, "- [x] milk")
+        self.assertFalse(any(buf.get_iter_at_line_offset(0, c)[1]
+                             .has_tag(v._t["hide"]) for c in range(5)))
 
     def test_a_ticked_box_is_styled_apart_from_an_empty_one(self):
         # the two states have to be distinguishable at a glance without
@@ -4696,6 +4718,45 @@ class TestTaskLists(unittest.TestCase):
         v._rehighlight()
         self.assertEqual(v.get_source_text().split("\n")[0],
                          "- [x] \\alpha decay")
+
+    class _FakeClick:
+        """Enough of a GestureClick for the release handler: no event (so no
+        modifiers are held) and a place to record a claim."""
+        claimed = False
+
+        def get_current_event(self):
+            return None
+
+        def set_state(self, _state):
+            self.claimed = True
+
+    def test_the_press_decides_which_box_a_release_ticks(self):
+        """The release cannot re-resolve the hit: by then the caret has landed
+        and the line has re-rendered, so the words have moved under a pointer
+        that never left. Whatever the press recorded is what the release acts
+        on — and nothing at all if the press hit no box."""
+        v = self._view()
+        self._render(v, "- [ ] milk")
+        g = self._FakeClick()
+
+        v._task_press = None               # the press landed on the text
+        v._on_link_click(g, 1, 4.0, 4.0)   # …a release over the box changes nothing
+        self.assertFalse(g.claimed)
+        self.assertEqual(v.get_source_text().split("\n")[0], "- [ ] milk")
+
+        v._task_press = (0, 4.0, 4.0)      # the press landed on the box
+        v._on_link_click(g, 1, 5.0, 5.0)
+        self.assertTrue(g.claimed)
+        v._rehighlight()
+        self.assertEqual(v.get_source_text().split("\n")[0], "- [x] milk")
+
+        # and a press that TRAVELLED is a drag across the text, not a click
+        g2 = self._FakeClick()
+        v._task_press = (0, 4.0, 4.0)
+        v._on_link_click(g2, 1, 4.0 + 200, 4.0)
+        self.assertFalse(g2.claimed)
+        v._rehighlight()
+        self.assertEqual(v.get_source_text().split("\n")[0], "- [x] milk")
 
     def test_a_click_on_the_box_finds_it_and_one_past_it_does_not(self):
         """The whole visible box is the target, and the space behind it is not.
