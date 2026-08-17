@@ -4650,20 +4650,33 @@ class TestTaskLists(unittest.TestCase):
         for src in ("- [] b", "- [ ]b", "- [y] c", "1. one", "not - [ ] here"):
             self.assertEqual(_symbolize_map(src)[0], src)
 
-    def test_the_brackets_are_hidden_and_the_box_is_not(self):
+    def test_the_box_stands_alone_at_the_left_margin(self):
         v = self._view()
         self.assertEqual(self._render(v, "- [ ] milk"), "- [☐] milk")
         buf = v.get_buffer()
+        at = lambda c: buf.get_iter_at_line_offset(0, c)[1]
         hide = v._t["hide"]
-        shown = "".join(
-            buf.get_iter_at_line_offset(0, c)[1].get_char()
-            for c in range(len("- [☐] milk"))
-            if not buf.get_iter_at_line_offset(0, c)[1].has_tag(hide))
+        shown = "".join(at(c).get_char() for c in range(len("- [☐] milk"))
+                        if not at(c).has_tag(hide))
         # a box and a space, exactly where a plain bullet leaves a dash and a
-        # space — the source keeps its brackets
+        # space — and nothing of the source's own punctuation left over
         self.assertEqual(shown, "☐ milk")
+        self.assertTrue(at(3).has_tag(v._t["taskbox"]))
+        # …and under the caret it is source again, like a heading marker
+        buf.place_cursor(at(6))
+        v._rehighlight()
+        self.assertFalse(any(at(c).has_tag(hide) for c in range(5)))
 
-    def test_clicking_the_box_ticks_it_in_the_source(self):
+    def test_a_ticked_box_is_styled_apart_from_an_empty_one(self):
+        # the two states have to be distinguishable at a glance without
+        # reading the glyph, which is a thin outline in most fonts
+        v = self._view()
+        self._render(v, "- [x] milk")
+        at3 = v.get_buffer().get_iter_at_line_offset(0, 3)[1]
+        self.assertTrue(at3.has_tag(v._t["taskdone"]))
+        self.assertFalse(at3.has_tag(v._t["taskbox"]))
+
+    def test_ticking_writes_x_into_the_source(self):
         v = self._view()
         self._render(v, "- [ ] milk")
         self.assertTrue(v.toggle_task(0))
@@ -4683,6 +4696,53 @@ class TestTaskLists(unittest.TestCase):
         v._rehighlight()
         self.assertEqual(v.get_source_text().split("\n")[0],
                          "- [x] \\alpha decay")
+
+    def test_a_click_on_the_box_finds_it_and_one_past_it_does_not(self):
+        """The whole visible box is the target, and the space behind it is not.
+
+        Regression: hit-tested against the glyph's RECTANGLE, the right half of
+        every box did nothing — `get_iter_at_location` answers with the nearest
+        caret boundary, which past the middle of a glyph is the character after
+        it."""
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.taskclick")
+
+        def on_activate(a):
+            try:
+                from sidemark import MarkdownNotesView
+                win = Gtk.ApplicationWindow(application=a)
+                v = MarkdownNotesView()
+                sw = Gtk.ScrolledWindow(); sw.set_child(v)
+                win.set_default_size(600, 400); win.set_child(sw); win.present()
+                buf = v.get_buffer()
+                buf.set_text("- [ ] milk\n\n")
+                buf.place_cursor(buf.get_end_iter())
+                v._rehighlight()
+                for _ in range(60):
+                    GLib.MainContext.default().iteration(False)
+                box = buf.get_iter_at_line_offset(0, 3)[1]
+                r = v.get_iter_location(box)
+                if r.height <= 0:
+                    # no live frame clock in a full run: the view never laid
+                    # out, so there is no geometry to click on (see CLAUDE.md)
+                    self.skipTest("the view has no layout")
+                mid = v.buffer_to_window_coords(
+                    Gtk.TextWindowType.WIDGET, r.x, r.y + r.height // 2)
+                self.assertEqual(v._task_box_at(*mid), 0)
+                far = v.buffer_to_window_coords(
+                    Gtk.TextWindowType.WIDGET, r.x + 200, r.y + r.height // 2)
+                self.assertIsNone(v._task_box_at(*far))
+            except unittest.SkipTest:
+                pass
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
 
     def _enter(self, v, text, line, col):
         buf = v.get_buffer()
@@ -12021,42 +12081,73 @@ class TestSingleInstanceArgs(unittest.TestCase):
 
     def test_file_only(self):
         self.assertEqual(PDFEditorApp._parse_open_args(["a.pdf"]),
-                         ("a.pdf", 0, None, None))
+                         ("a.pdf", 0, None, None, False))
 
     def test_page_before_or_after_file(self):
         self.assertEqual(PDFEditorApp._parse_open_args(["--page", "3", "a.pdf"]),
-                         ("a.pdf", 3, None, None))
+                         ("a.pdf", 3, None, None, False))
         self.assertEqual(PDFEditorApp._parse_open_args(["a.pdf", "--page", "5"]),
-                         ("a.pdf", 5, None, None))
+                         ("a.pdf", 5, None, None, False))
 
     def test_verbose_and_unknown_flags_ignored(self):
         self.assertEqual(PDFEditorApp._parse_open_args(["-v", "a.pdf"]),
-                         ("a.pdf", 0, None, None))
+                         ("a.pdf", 0, None, None, False))
         self.assertEqual(PDFEditorApp._parse_open_args(["--frobnicate", "a.pdf"]),
-                         ("a.pdf", 0, None, None))
+                         ("a.pdf", 0, None, None, False))
 
     def test_bad_page_value_ignored(self):
         self.assertEqual(
             PDFEditorApp._parse_open_args(["--page", "nope", "a.pdf"]),
-            ("a.pdf", 0, None, None))
+            ("a.pdf", 0, None, None, False))
 
     def test_no_args(self):
-        self.assertEqual(PDFEditorApp._parse_open_args([]), (None, 0, None, None))
+        self.assertEqual(PDFEditorApp._parse_open_args([]), (None, 0, None, None, False))
 
     def test_new_asks_for_a_blank_document(self):
         self.assertEqual(PDFEditorApp._parse_open_args(["--new"]),
-                         (None, 0, "pdf", None))
+                         (None, 0, "pdf", None, False))
         self.assertEqual(PDFEditorApp._parse_open_args(["--new-text"]),
-                         (None, 0, "text", None))
+                         (None, 0, "text", None, False))
 
     def test_a_named_file_beats_new(self):
         """Naming a file AND asking for a blank one is contradictory; opening
         the file you named is the safe reading — the blank page is one click
         away in the ☰ menu, the file you meant might not be."""
         self.assertEqual(PDFEditorApp._parse_open_args(["--new", "a.pdf"]),
-                         ("a.pdf", 0, None, None))
+                         ("a.pdf", 0, None, None, False))
         self.assertEqual(PDFEditorApp._parse_open_args(["a.pdf", "--new-text"]),
-                         ("a.pdf", 0, None, None))
+                         ("a.pdf", 0, None, None, False))
+
+
+class TestThrowawayDocument(unittest.TestCase):
+    """`--tmp`: a blank scratch document that closes without asking to save."""
+
+    def test_tmp_implies_a_blank_page_and_composes_with_new_text(self):
+        # on its own there is nothing else it could mean; with --new-text it is
+        # paper. It is a MODIFIER, not a fourth kind of document.
+        self.assertEqual(PDFEditorApp._parse_open_args(["--tmp"]),
+                         (None, 0, "pdf", None, True))
+        self.assertEqual(PDFEditorApp._parse_open_args(["--tmp", "--new-text"]),
+                         (None, 0, "text", None, True))
+
+    def test_a_named_file_is_never_throwaway(self):
+        """Same reading as --new: a file you named is a file you care about."""
+        self.assertEqual(PDFEditorApp._parse_open_args(["--tmp", "a.pdf"]),
+                         ("a.pdf", 0, None, None, False))
+
+    def test_a_throwaway_tab_is_never_asked_about(self):
+        """ONE predicate for every close path — the tab close, the window close
+        and the autosave — or the window asks about a tab the tab close would
+        have let go."""
+        from sidemark import DocumentSession
+        asks = PDFEditorWindow._asks_to_save
+        s = DocumentSession()
+        self.assertFalse(asks(s))          # clean
+        s._dirty = True
+        self.assertTrue(asks(s))           # an ordinary dirty tab
+        s._throwaway = True
+        self.assertFalse(asks(s))          # …and the same tab, marked
+        self.assertFalse(asks(None))
 
 
 class TestReorderPages(unittest.TestCase):

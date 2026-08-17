@@ -102,6 +102,7 @@ sidemark [OPTIONS] [FILE]      # FILE: a .pdf, .pptx, .md, or text file
 sidemark --help                # full option list
 sidemark --page 5 lecture.pdf  # open at a given page
 sidemark --new                 # start on a blank page (--new-text for paper)
+sidemark --tmp                 # scratch page that closes without asking to save
 ```
 
 Tab-completion for the `sidemark` command's options and files is installed automatically (start a new shell to pick it up). To complete `./install.sh`'s own flags, `source extras/install.sh.bash` from the repo (both work in zsh after `autoload -U +X bashcompinit && bashcompinit`).

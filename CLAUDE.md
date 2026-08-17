@@ -59,8 +59,25 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     a heading marker and for the same reason. Ticking (`toggle_task`) writes
     the state character over the glyph and lets `_line_source` splice it back;
     rewriting the source line by hand would freeze every other symbol on it.
-    The click target is the box glyph alone — one character — because a
-    checkbox is also a line you type in. **Enter reads the marker from the
+    It is STYLED (`taskbox` / `taskdone`: 1.3×, grey, green when ticked, and an
+    explicit colour because GtkSource paints a list marker RED and an empty box
+    must not read as an error).
+    - **Drawing a real control instead was tried and reverted, and neither
+      reason will change.** A transparent foreground (`foreground-rgba` alpha
+      0) **still paints**, so the glyph cannot be hidden under a drawing; and
+      `get_iter_location` returns **the same x for adjacent characters** on a
+      line carrying hidden runs, so there is no cell to align one to. Text
+      aligns by construction — that is the argument. The only route to a real
+      widget is a `GtkTextChildAnchor`, which is a real character in a buffer
+      that IS the `.md`. Don't.
+    - **The click target is a COLUMN RANGE, never a rectangle**
+      (`_task_box_at`): `get_iter_at_location` answers the question the CARET
+      asks — which boundary is nearest — so past the middle of the box it
+      returns the character AFTER it, and an equality test left the right half
+      of every box dead. The range runs from the hidden bullet (zero width, so
+      nothing can land in it) to the far edge of the glyph, and stops at the
+      space behind it, because a checkbox is also a line you type in.
+    **Enter reads the marker from the
     SOURCE** (`_continue_list`), or it writes the glyph into the `.md`; it
     opens an empty box, counts a number on, ends the list on an empty item, and
     only fires at the END of a line (elsewhere Enter is a split, and the
@@ -1028,6 +1045,14 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   always launch standalone: `SIDEMARK_STANDALONE=1 /usr/bin/python3
   sidemark.py [FILE]` (the env var sets `NON_UNIQUE` so it bypasses the running
   instance — Ctrl+R reload uses the same trick to re-read the code).
+- **`--tmp` is a scratch document that closes without a word** — `--tmp` for a
+  blank page, `--tmp --new-text` for paper. It is a MODIFIER on `--new`, not a
+  third kind of document, and a named path beats it (a file you named is a file
+  you care about). `_asks_to_save()` is the ONE predicate behind the tab close,
+  the window close and the autosave skip — a throwaway leaves no recovery
+  snapshot either, or the next launch nags about a page you threw away.
+  `_new_blank_document` is the one place a launch flag makes a blank document,
+  so the mark lands on the session the ☰ actions just created.
 - **A COPY of the app is a different app.** `_copy_key()` is the one answer to
   "is this the installed script or a checkout?" — `""` for an installed path,
   else a hash of the source path (`SIDEMARK_INSTANCE=<name>` forces one). It

@@ -275,6 +275,8 @@ Options:
       --page N          Open FILE at page N (0-based page index).
       --new             Open a blank PDF page (ignored if FILE is given).
       --new-text        Open a blank text-first page instead.
+      --tmp             Blank scratch document that closes WITHOUT asking to
+                        save (add --new-text for paper). For trying things out.
       --list-recent     Print recent files as "name<TAB>path" and exit
                         (for launcher integrations); no window is shown.
 
@@ -282,6 +284,7 @@ Examples:
   sidemark lecture.pdf
   sidemark --page 5 lecture.pdf
   sidemark --new
+  sidemark --tmp --new-text
   sidemark notes.md
 """
 
@@ -11175,6 +11178,21 @@ class MarkdownNotesView(GtkSource.View):
             # thing to have in notes.
             "deadlink":    tag("deadlink",    underline=0, strikethrough=True,
                                foreground="#8b8b8b"),
+            # A task box is the GLYPH, enlarged, and green once it is ticked —
+            # the two states have to differ at a glance without reading a thin
+            # outline. Drawing a real control over the text instead was tried
+            # and reverted: the glyph cannot be hidden (a transparent
+            # foreground still paints, measured) and `get_iter_location`
+            # reports the same x for adjacent characters on these lines, so
+            # there is no cell to align a drawing to. TEXT aligns by
+            # construction, which is the whole argument.
+            # the colour is explicit because the GtkSource markdown language
+            # paints a list marker RED — an empty box is not an error, and it
+            # must not read as one
+            "taskbox":     tag("taskbox",     scale=1.3,
+                               foreground="#9a9996"),
+            "taskdone":    tag("taskdone",    scale=1.3,
+                               foreground="#26a269"),
         }
 
         # Search highlights live OUTSIDE `self._t`, and that is what makes them
@@ -11512,27 +11530,48 @@ class MarkdownNotesView(GtkSource.View):
         buf.end_user_action()
         return True
 
-    def _task_box_at(self, x, y):
-        """The line whose task box sits under this widget point, or None.
-
-        The target is the box GLYPH and nothing else — one character wide. A
-        checkbox you can tick is also a line you can type in, so the click that
-        means "put the caret here" must not be able to tick it by accident."""
-        bx, by = self.window_to_buffer_coords(Gtk.TextWindowType.WIDGET,
-                                              int(x), int(y))
-        over, it = self.get_iter_at_location(bx, by)
-        if not over:
-            return None
-        ln = it.get_line()
+    def _task_box_line(self, ln):
+        """(match, box iter) for the task box on line `ln`, or (None, None)."""
         buf = self.get_buffer()
         ok, ls = buf.get_iter_at_line(ln)
         if not ok:
-            return None
+            return None, None
         le = ls.copy()
         if not le.ends_line():
             le.forward_to_line_end()
         m = _MD_TASK_ANY_RE.match(buf.get_text(ls, le, True))
-        return ln if m and it.get_line_offset() == m.start(3) else None
+        if m is None:
+            return None, None
+        box = ls.copy()
+        box.forward_chars(m.start(3))
+        return m, box
+
+    def _task_box_at(self, x, y):
+        """The line whose task box sits under this widget point, or None.
+
+        The target is a COLUMN RANGE, running from the hidden bullet — which
+        costs no width, so nothing can land inside it — to the far edge of the
+        box glyph. `get_iter_at_location` answers the question the CARET asks,
+        which boundary is nearest, so past the middle of the box it returns the
+        character AFTER it: tested for equality with the box's own column, the
+        right half of every box did nothing at all.
+
+        It stops at the space behind the box. A checkbox you can tick is also a
+        line you can type in, so the click that means "put the caret here" must
+        not be able to tick by accident. (A rectangle would be the obvious
+        target and cannot be used: `get_iter_location` reports the same x for
+        adjacent characters on a line carrying hidden runs.)"""
+        bx, by = self.window_to_buffer_coords(Gtk.TextWindowType.WIDGET,
+                                              int(x), int(y))
+        ln = self.get_line_at_y(by)[0].get_line()
+        m, _box = self._task_box_line(ln)
+        if m is None:
+            return None
+        over, it = self.get_iter_at_location(bx, by)
+        if not over or it.get_line() != ln:
+            return None
+        col = it.get_line_offset()
+        return ln if m.start(2) <= col <= m.start(3) + 1 else None
 
     def toggle_task(self, ln):
         """Tick or untick the box on line `ln`, as an ordinary buffer edit.
@@ -11542,17 +11581,10 @@ class MarkdownNotesView(GtkSource.View):
         as typing over a rendered `α`. Rewriting the source line by hand would
         be a second way of doing the one thing `_line_source` exists for."""
         buf = self.get_buffer()
-        ok, ls = buf.get_iter_at_line(ln)
-        if not ok:
-            return False
-        le = ls.copy()
-        if not le.ends_line():
-            le.forward_to_line_end()
-        m = _MD_TASK_ANY_RE.match(buf.get_text(ls, le, True))
+        m, a = self._task_box_line(ln)
         if m is None:
             return False
-        a = ls.copy(); a.forward_chars(m.start(3))
-        b = a.copy();  b.forward_char()
+        b = a.copy(); b.forward_char()
         now = "x" if m.group(3) in (" ", "☐") else " "
         buf.begin_user_action()
         buf.delete(a, b)
@@ -12585,8 +12617,13 @@ class MarkdownNotesView(GtkSource.View):
         # only pushes the line sideways — nothing on it re-renders.
         m = _MD_TASK_ANY_RE.match(text)
         if m:
+            # the bullet and both brackets go, so the box stands ALONE against
+            # the left margin — one glyph and a space, exactly where a plain
+            # bullet leaves a dash and a space
             hide(m.start(2), m.start(3), within=(0, len(text)))
             hide(m.end(3), m.end(3) + 1, within=(0, len(text)))
+            apply("taskdone" if m.group(3) in ("x", "X", "☑") else "taskbox",
+                  m.start(3), m.end(3))
 
         # [[wiki links]] → styled + clickable; brackets hidden off cursor line.
         # The link tag covers the whole inner (so a click anywhere follows it),
@@ -15920,6 +15957,7 @@ class DocumentSession:
         "_has_toc", "_toc_thumbs", "_drop_indicator_row", "_text_mode",
         "_pane_settling", "_pane_watch_id", "_pane_settle_id",
         "_full_notes_from", "_full_notes_caret",
+        "_throwaway",
     )
     WIDGETS = (
         "canvas", "_notes_view", "_panel_notes_view", "_notes_box",
@@ -15969,6 +16007,10 @@ class DocumentSession:
         # it was opened AT (row 162) — the way back out asks both
         self._full_notes_from = None
         self._full_notes_caret = None
+        # `--tmp`: a scratch document that closes without a word. Nothing else
+        # in the app sets this — it is a launch-time decision about a blank
+        # page, never something a real file can become.
+        self._throwaway = False
         self._has_toc = False
         self._toc_thumbs = False
         self._drop_indicator_row = None
@@ -18565,7 +18607,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         """A tab's close button (or Ctrl+W) was used. Prompt for unsaved changes
         in that document, then confirm or veto the close asynchronously."""
         s = self._session_for_page(page)
-        if s is None or not s._dirty:
+        if not self._asks_to_save(s):
             self._remember_closed(s)
             tab_view.close_page_finish(page, True)
             return True
@@ -18819,7 +18861,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # _notes_path; an untitled page has no path to key a snapshot by yet,
         # so it stays uncovered until the first save-as names it.
         for s in self._sessions:
-            if not s._dirty:
+            if not s._dirty or s._throwaway:
                 continue
             try:
                 if s._path:
@@ -18984,8 +19026,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     # ── unsaved-changes dialog ────────────────────────────────────────────────
 
+    @staticmethod
+    def _asks_to_save(s):
+        """Would closing this tab put the unsaved-changes question up?
+
+        A `--tmp` document is a scratch surface for trying something out, so it
+        never asks and never leaves a recovery snapshot behind — being able to
+        shut it without a decision is the whole point. ONE predicate for every
+        close path, or the window asks about a tab the tab close would have let
+        go."""
+        return bool(s is not None and s._dirty and not s._throwaway)
+
     def _on_close_request(self, _win):
-        if not any(s._dirty for s in self._sessions):
+        if not any(self._asks_to_save(s) for s in self._sessions):
             self._destroy_all()
             return False   # allow close
         self._prompt_close_next_dirty()
@@ -18993,7 +19046,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _prompt_close_next_dirty(self):
         """Walk the dirty tabs one at a time on window close, then destroy."""
-        dirty = [s for s in self._sessions if s._dirty]
+        dirty = [s for s in self._sessions if self._asks_to_save(s)]
         if not dirty:
             self._destroy_all()
             return
@@ -23211,6 +23264,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._new_tab()
         self._create_blank()
 
+    def _new_blank_document(self, kind, tmp=False):
+        """The ONE way a launch flag makes a blank document — the same menu
+        actions, plus the `--tmp` mark on whatever session they made.
+
+        The mark goes on afterwards rather than being threaded through both
+        actions: it is a fact about the document, and the actions are shared
+        with the ☰ menu, which never wants it. It lands on the session that is
+        now active, which is the one they just made (both reuse a pristine tab
+        or add one, and select it)."""
+        if kind == "text":
+            self._on_new_text_page()
+        else:
+            self._on_new_pdf(None)
+        if tmp:
+            self._active_session._throwaway = True
+            self._set_file_title("Untitled (temporary)")
+        return True
+
     def _blank_pdf_file(self, background=None):
         """A one-page A4 PDF in a temp file — the blank page every entry point
         starts from (the menu, `--new`, row 130's edge pull). It is untitled
@@ -24922,11 +24993,17 @@ class PDFEditorApp(Adw.Application):
         """Pull a file path, --page N and --new/--new-text out of one launch's
         arguments (argv without the program name). Unknown flags are ignored.
 
-        Returns (path, page, new, restore), where `new` is None, "pdf" or
+        Returns (path, page, new, restore, tmp), where `new` is None, "pdf" or
         "text" and `restore` is the session file Ctrl+R left for us. A path
         wins over --new: naming a file and asking for a blank one is
-        contradictory, and opening the file you named is the safe reading."""
-        path, page, new, restore = None, 0, None, None
+        contradictory, and opening the file you named is the safe reading.
+
+        `--tmp` is a MODIFIER, not a fourth kind of document: it says "close
+        this without asking me anything". On its own it means a blank page —
+        there is nothing else it could mean — and it composes with --new-text.
+        A path wins over it for the same reason as --new: a file you named is a
+        file you care about."""
+        path, page, new, restore, tmp = None, 0, None, None, False
         i = 0
         while i < len(args):
             a = args[i]
@@ -24949,20 +25026,26 @@ class PDFEditorApp(Adw.Application):
                 new = "text"
                 i += 1
                 continue
+            if a == "--tmp":
+                tmp = True
+                i += 1
+                continue
             if a in ("-v", "--verbose"):
                 i += 1
                 continue
             if not a.startswith("-") and path is None:
                 path = a
             i += 1
-        return path, page, (None if path else new), restore
+        if tmp and new is None:
+            new = "pdf"
+        return path, page, (None if path else new), restore, (tmp and not path)
 
     def do_command_line(self, command_line):
         """Every launch (this process or a forwarded one from a second
         invocation) lands here in the single primary instance; open the file it
         names — as a tab in the window you were last using, or a new window."""
         args = command_line.get_arguments()
-        path, page, new, restore = self._parse_open_args(args[1:])
+        path, page, new, restore, tmp = self._parse_open_args(args[1:])
         if restore:
             self.restore_session_file(restore)
             return 0
@@ -24971,7 +25054,7 @@ class PDFEditorApp(Adw.Application):
             if cwd:
                 path = os.path.join(cwd, path)
         if new:
-            reused = self._open_blank(new)
+            reused = self._open_blank(new, tmp=tmp)
             if command_line.get_is_remote():
                 kind = "text page" if new == "text" else "page"
                 where = "the current window" if reused else "a new window"
@@ -25058,7 +25141,7 @@ class PDFEditorApp(Adw.Application):
                 return w
         return None
 
-    def _open_blank(self, kind):
+    def _open_blank(self, kind, tmp=False):
         """`--new` / `--new-text`: a blank document, following the SAME window
         policy as opening a file — a tab in the window you were last using,
         else a new window. Routed through the very actions the ☰ menu uses, so
@@ -25068,11 +25151,10 @@ class PDFEditorApp(Adw.Application):
         if win is None:
             # a fresh window opens ON the blank document instead of the
             # scratchpad — see open_new_window
-            self.open_new_window(blank=kind)
+            self.open_new_window(blank=kind, tmp=tmp)
             return False
         win.present()          # raise it so the new tab is in front
-        GLib.idle_add(lambda: (win._on_new_text_page() if kind == "text"
-                               else win._on_new_pdf(None)) and False)
+        GLib.idle_add(lambda: win._new_blank_document(kind, tmp=tmp) and False)
         return True
 
     def _open_target(self, path, page):
@@ -25091,7 +25173,7 @@ class PDFEditorApp(Adw.Application):
         self.open_new_window(path, page)
         return False
 
-    def open_new_window(self, path=None, page=0, blank=None):
+    def open_new_window(self, path=None, page=0, blank=None, tmp=False):
         logger.info("Opening new window: %s",
                     path or (f"(blank {blank})" if blank else "(last document)"))
         # the scratchpad has to be in the recents list before anyone goes
@@ -25107,8 +25189,8 @@ class PDFEditorApp(Adw.Application):
             # `--new` REPLACES what an empty launch would have opened rather
             # than joining it: a launch that asked for a blank page did not ask
             # for two documents.
-            GLib.idle_add(lambda: (win._on_new_text_page() if blank == "text"
-                                   else win._on_new_pdf(None)) and False)
+            GLib.idle_add(lambda: win._new_blank_document(blank, tmp=tmp)
+                          and False)
         else:
             if path:
                 logger.warning("File not found: %s", path)
@@ -25127,7 +25209,7 @@ def main():
     # Fail fast on a named file that doesn't exist, before we hand the launch
     # off to the (possibly already-running) primary instance. Checked here so
     # the error surfaces on the launching terminal with its own cwd.
-    path, _page, _new, _restore = PDFEditorApp._parse_open_args(args)
+    path, _page, _new, _restore, _tmp = PDFEditorApp._parse_open_args(args)
     if path and not os.path.isfile(path):
         print(f"File not found: {path}", file=sys.stderr)
         sys.exit(1)
