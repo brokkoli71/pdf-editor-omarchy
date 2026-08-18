@@ -1254,8 +1254,14 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     is deliberately not copied, since the sheet pans a surface delta
     one-for-one — **the invariant is that a flick carries on at the speed your
     fingers were moving the sheet**, not the number. `SIDEMARK_GLIDE_DEBUG=1`
-    logs what each flick actually reports. Two things it
-    must get right. The frame step is the **integral** of the decaying velocity
+    logs what each flick actually reports. **The sheet also applies GTK's
+    `MAGIC_SCROLL_FACTOR` itself** (`SURFACE_SCROLL_FACTOR`, 2.5) — a plain
+    ScrolledWindow does not pan a surface delta one-for-one, so without it the
+    sheet answered a finger differently from the notes panel beside it. It goes
+    on the drag AND the velocity, or letting go changes surfaces. The PDF
+    canvas is a stated exception: a scroll there flips the page past an edge
+    and `TOUCHPAD_FLIP_THRESHOLD` is tuned against raw 1-px deltas. Two more
+    things it must get right. The frame step is the **integral** of the decaying velocity
     across the frame (`glide_frame`), never `v × dt` decayed afterwards, or a
     coast travels further at 30 fps than at 60 — and a dropped frame under a
     relayout is exactly when that shows. And it **stops on anything that is a

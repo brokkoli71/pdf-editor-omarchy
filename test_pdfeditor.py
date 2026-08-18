@@ -16794,22 +16794,45 @@ class TestTextPageLasso(unittest.TestCase):
                     tp._glide._last_us -= 16_000
                     tp._glide._frame(None, None)
                 self.assertFalse(tp._glide.running)
-                # velocity(px/ms) × tau, less the tail below GLIDE_MIN_VEL
-                want = 2.0 * sidemark.GLIDE_TAU_MS
+                # velocity(px/ms) × the drag's own factor × tau, less the
+                # tail below GLIDE_MIN_VEL
+                want = (2.0 * sidemark.SURFACE_SCROLL_FACTOR
+                        * sidemark.GLIDE_TAU_MS)
                 self.assertAlmostEqual(
                     va.get_value(), want,
-                    delta=sidemark.GLIDE_MIN_VEL * sidemark.GLIDE_TAU_MS + 1.0)
+                    delta=(sidemark.GLIDE_MIN_VEL * sidemark.GLIDE_TAU_MS
+                           * sidemark.SURFACE_SCROLL_FACTOR + 1.0))
                 # and a flick is on the scale of the page, not of the document
                 self.assertLess(va.get_value(), 4000.0)
 
             self._run_in_window(body)
 
-    def test_the_sheet_coasts_at_the_rate_every_other_surface_does(self):
-        """The notes panel and the sidebar are plain ScrolledWindows coasting
-        on GTK's friction of 4/s; the sheet drives its own curve because a
-        drawing tool takes it off the ScrolledWindow's event path. One app
-        settles at one rate — this is what the user compared them by."""
+    def test_the_sheet_scrolls_exactly_like_every_other_surface(self):
+        """The notes panel and the sidebar are plain ScrolledWindows: they pan
+        2.5× a touchpad delta and coast on GTK's friction of 4/s. The sheet
+        drives its own scrolling because a drawing tool takes it off the
+        ScrolledWindow's event path, so it carries both numbers itself — one
+        app answers a finger one way. This is what the user compared them by,
+        and it pins the pair, since either alone is only half the feel."""
         self.assertAlmostEqual(sidemark.GLIDE_TAU_MS, 1000.0 / 4.0, places=6)
+        self.assertAlmostEqual(sidemark.SURFACE_SCROLL_FACTOR, 2.5, places=6)
+
+    def test_a_touchpad_drag_moves_the_sheet_2_5x_its_delta(self):
+        """The factor is on the DRAG as well as the coast: GTK puts it on both,
+        and a sheet that panned 1:1 but flicked at 2.5× would be two different
+        surfaces depending on whether you let go."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                va = tp.scroll.get_vadjustment()
+                va.configure(0.0, 0.0, 10000.0, 1.0, 10.0, 100.0)
+                va.set_value(0.0)
+                tp._on_sheet_scroll(_scroll_ctrl(smooth=True), 0.0, 10.0)
+                self.assertAlmostEqual(va.get_value(),
+                                       10.0 * sidemark.SURFACE_SCROLL_FACTOR)
+
+            self._run_in_window(body)
 
     def test_zooming_the_sheet_never_flings_it(self):
         """A Ctrl+scroll gesture ends like any other continuous scroll, so the

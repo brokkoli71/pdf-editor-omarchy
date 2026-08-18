@@ -723,6 +723,22 @@ written to the session log; this is a number to re-measure, never to argue
 about. Note that the earlier values (325, then 150) were judged against a
 1000×-too-long coast — see `GLIDE_VEL_PER_MS` — so they say nothing."""
 
+SURFACE_SCROLL_FACTOR = 2.5
+"""Pixels the sheet scrolls per pixel of touchpad delta — GtkScrolledWindow's
+own `MAGIC_SCROLL_FACTOR`.
+
+A SURFACE-unit delta arrives in pixels and GTK does NOT pan by it one-for-one:
+every plain ScrolledWindow in this app — the notes panel, the sidebar, the
+thumbnail strip — multiplies it by 2.5, on both the drag and the flick
+velocity. The sheet drives its own scrolling (a drawing tool takes it off the
+ScrolledWindow's event path), so it has to apply the same number itself or one
+surface answers a finger differently from the one beside it.
+
+The PDF canvas deliberately does NOT use it: a scroll there flips the page past
+an edge, and `TOUCHPAD_FLIP_THRESHOLD` is hand-tuned against raw 1-px deltas —
+scaling them would silently retune how hard you have to push to turn a slide.
+That is a different feature with its own judgement, not a parity gap."""
+
 GLIDE_VEL_PER_MS = 0.001
 """What one unit of `::decelerate`'s velocity is in px/ms — GTK reports px/SECOND.
 
@@ -13943,7 +13959,7 @@ class TextPageView(Gtk.Overlay):
         # plain scroll → pan. Touchpad deltas are ~1px each; a wheel notch is
         # ±1 and needs the same step the PDF canvas pans by, so the two modes
         # scroll at one speed.
-        step = 1.0 if smooth else PDFCanvas.WHEEL_PAN_STEP
+        step = SURFACE_SCROLL_FACTOR if smooth else PDFCanvas.WHEEL_PAN_STEP
         self._glide_scroll(dx * step, dy * step)
         return True
 
@@ -13972,9 +13988,12 @@ class TextPageView(Gtk.Overlay):
         if self._zooming_by_scroll or self._thumb_gesture is not None:
             return
         # GTK reports this in px/SECOND whatever its documentation claims
-        # (GLIDE_VEL_PER_MS), and KineticGlide's clock is in milliseconds.
-        vel_x *= GLIDE_VEL_PER_MS
-        vel_y *= GLIDE_VEL_PER_MS
+        # (GLIDE_VEL_PER_MS), and KineticGlide's clock is in milliseconds. The
+        # velocity is in the same units as the deltas, so it carries the same
+        # factor the drag does — that is what keeps a flick carrying on at the
+        # speed the fingers were moving the sheet.
+        vel_x *= GLIDE_VEL_PER_MS * SURFACE_SCROLL_FACTOR
+        vel_y *= GLIDE_VEL_PER_MS * SURFACE_SCROLL_FACTOR
         if GLIDE_DEBUG:
             # what a flick on THIS pad actually reports, against how far the
             # curve will then carry the page. Logged at warning so the session
