@@ -703,19 +703,39 @@ def zoom_factor_for_scroll(smooth, dy):
     return (1.0 / ZOOM_WHEEL_STEP) if dy > 0 else ZOOM_WHEEL_STEP
 
 
-GLIDE_TAU_MS = 150.0
+GLIDE_TAU_MS = 250.0
 """Time constant of the coast after a touchpad flick (row 175). Exponential,
 like every browser's, so the total distance is velocity × TAU and the whole of
 "how far a flick throws the page" is this one number.
 
-It is deliberately SHORTER than the references. GtkScrolledWindow decelerates
-at friction 4/s (τ = 250 ms) and multiplies the reported velocity by 2.5 on top
-(`MAGIC_SCROLL_FACTOR`); Firefox's fling friction of 0.002/ms is τ ≈ 500 ms.
-Both are tuned for a web page you skim. A sheet of A4 you are writing on is not
-that: the first shipped value of 325 read as far too fast in the hand, and a
-coast you have to catch is worse than none. Set `SIDEMARK_GLIDE_DEBUG=1` to
-have every flick's measured velocity and travel written to the session log —
-this is a number to re-measure, never to argue about."""
+It is GtkScrolledWindow's own friction of 4/s, i.e. τ = 250 ms, on purpose:
+every other scrollable surface in the app — the notes panel, the sidebar, the
+thumbnail strip — is a plain ScrolledWindow coasting on that curve, and one
+app must settle at one rate. What is NOT copied is the 2.5× the ScrolledWindow
+multiplies both its drag delta and its flick velocity by (`MAGIC_SCROLL_FACTOR`):
+the sheet pans a surface delta one-for-one, so the coast is scaled to match its
+own drag. A flick therefore carries on at exactly the speed your fingers were
+moving the sheet, which is the invariant to preserve if this is ever retuned —
+not the absolute number.
+
+Set `SIDEMARK_GLIDE_DEBUG=1` to have every flick's measured velocity and travel
+written to the session log; this is a number to re-measure, never to argue
+about. Note that the earlier values (325, then 150) were judged against a
+1000×-too-long coast — see `GLIDE_VEL_PER_MS` — so they say nothing."""
+
+GLIDE_VEL_PER_MS = 0.001
+"""What one unit of `::decelerate`'s velocity is in px/ms — GTK reports px/SECOND.
+
+The signal's documentation says pixels/ms and is WRONG: GTK computes it as
+`(accumulated delta × 1000) / (last − first event time)` over event times that
+are in milliseconds, which is per second. Its own consumer confirms it —
+GtkScrolledWindow hands the number straight to a kinetic solver whose clock is
+in seconds and whose friction is per second, and a px/ms reading there would
+fling every list a thousand screens.
+
+Trusting the doc is what made the sheet coast ~1000× too far while the sidebar
+beside it felt right. The two surfaces read the SAME signal, so whenever one of
+them scrolls unlike the other, suspect what is being read before the curve."""
 
 GLIDE_DEBUG = bool(os.environ.get("SIDEMARK_GLIDE_DEBUG"))
 """Log what each touchpad flick reports. The feel of a coast is one number
@@ -11614,13 +11634,61 @@ class MarkdownNotesView(GtkSource.View):
         (a bookmark, an outline entry, the document in front)."""
         self._link_live.clear()
 
+    def iter_at_buffer_xy(self, bx, by):
+        """(inside?, iter) for a point in BUFFER coords — GTK's
+        `get_iter_at_location` with the process abort taken out.
+
+        Hand GTK a y BELOW a line's text and its hit test gives up and answers
+        "the end of that line" — computed as the line's RAW byte count but
+        converted as a VISIBLE one. On a line carrying hidden characters the
+        index overshoots by exactly the bytes that are invisible, and
+        `gtk_text_iter_set_visible_line_index` replies with `g_error`: the
+        process is gone where it stands, no exception and nothing to catch. In
+        THIS buffer nearly every line has hidden characters — a page marker, a
+        `[[`, the source behind a rendered symbol — so it is our hit tests that
+        meet it, and a hover is enough (row 166's crash is `_link_target_at`).
+        Verified against GTK 4.22 in a bare GtkTextView: gtktextlayout.c,
+        `gtk_text_layout_get_iter_at_position`, the
+        `y > display->height - margins` branch. Nothing about Sidemark is
+        needed to reproduce it beyond an invisible tag and a y in the space
+        below the text.
+
+        So the y is clamped into the band the paragraph's text actually
+        occupies before GTK ever sees it, measured with `get_iter_location` —
+        which converts the other way (iter → index) and is safe — and in the
+        same stale-or-fresh layout GTK is about to use, so the two cannot
+        disagree. A point below the last row lands at the end of that row,
+        which is what the fallback was trying to say. `inside` still tells the
+        truth, so a caller that wants a hit ON the text is unaffected."""
+        bx, by = int(bx), int(by)
+        start = self.get_line_at_y(by)[0]     # the paragraph, via no byte index
+        # The band is measured from the paragraph's DISPLAY ROWS, walked
+        # forwards, and never from the end-of-line iter: that one sits on the
+        # newline and reports a 0×0 rect, which collapses the band to a point
+        # and rejects clicks that are plainly on the text (a task box, which is
+        # 1.3× tall, was the one that noticed).
+        ln = start.get_line()
+        row = start.copy()
+        first = last = self.get_iter_location(row)
+        while self.forward_display_line(row) and row.get_line() == ln:
+            r = self.get_iter_location(row)
+            if r.height > 0:
+                last = r
+        lo, hi = first.y, last.y + last.height - 1
+        if hi <= lo:                          # nothing laid out to measure
+            lo, yr = self.get_line_yrange(start)
+            hi = lo + yr - 1
+        clamped = min(max(by, lo), hi)
+        over, it = self.get_iter_at_location(bx, clamped)
+        return bool(over) and clamped == by, it
+
     def _link_target_at(self, wx, wy):
         """The _parse_note_link() dict for the [[link]] under widget coords
         (wx, wy), or None. Re-parses the line, so it works whether or not the
         brackets are hidden by the render pass."""
         bx, by = self.window_to_buffer_coords(
             Gtk.TextWindowType.WIDGET, int(wx), int(wy))
-        over, it = self.get_iter_at_location(bx, by)
+        over, it = self.iter_at_buffer_xy(bx, by)
         return self._link_at_iter(it) if over else None
 
     def _link_at_iter(self, it):
@@ -11783,7 +11851,7 @@ class MarkdownNotesView(GtkSource.View):
         m, _box = self._task_box_line(ln)
         if m is None:
             return None
-        over, it = self.get_iter_at_location(bx, by)
+        over, it = self.iter_at_buffer_xy(bx, by)
         if not over or it.get_line() != ln:
             return None
         col = it.get_line_offset()
@@ -13903,6 +13971,10 @@ class TextPageView(Gtk.Overlay):
         just resized the page must not then fling it."""
         if self._zooming_by_scroll or self._thumb_gesture is not None:
             return
+        # GTK reports this in px/SECOND whatever its documentation claims
+        # (GLIDE_VEL_PER_MS), and KineticGlide's clock is in milliseconds.
+        vel_x *= GLIDE_VEL_PER_MS
+        vel_y *= GLIDE_VEL_PER_MS
         if GLIDE_DEBUG:
             # what a flick on THIS pad actually reports, against how far the
             # curve will then carry the page. Logged at warning so the session
@@ -14145,7 +14217,7 @@ class TextPageView(Gtk.Overlay):
         w, h = iw * scale, ih * scale
         buf = self.view.get_buffer()
         bx, by = self._overlay_to_buffer(*(at or self.paste_point()))
-        _over, it = self.view.get_iter_at_location(int(bx), int(by))
+        _over, it = self.view.iter_at_buffer_xy(bx, by)
         r = self.view.get_iter_location(it)
         f = self.font_px / max(self._base_font_px, 1)
         im = {
@@ -14205,7 +14277,7 @@ class TextPageView(Gtk.Overlay):
             target = offs[-1] + page_px
             _bx, by = self.view.window_to_buffer_coords(
                 Gtk.TextWindowType.WIDGET, 0, int(target))
-            _ok, it = self.view.get_iter_at_location(0, by)
+            _ok, it = self.view.iter_at_buffer_xy(0, by)
             r = self.view.get_iter_location(it)   # r.y = display-line top
             _wx, top = self.view.buffer_to_window_coords(
                 Gtk.TextWindowType.WIDGET, 0, r.y)
@@ -14367,7 +14439,7 @@ class TextPageView(Gtk.Overlay):
         TextView would have opened its menu on. Mirror GTK's own behaviour —
         move the caret to the click point unless it landed in the selection."""
         bx, by = self._overlay_to_buffer(x, y)
-        _over, it = self.view.get_iter_at_location(bx, by)
+        _over, it = self.view.iter_at_buffer_xy(bx, by)
         buf = self.view.get_buffer()
         bounds = buf.get_selection_bounds()
         if not (bounds and it.in_range(bounds[0], bounds[1])):
@@ -15373,8 +15445,7 @@ class TextPageView(Gtk.Overlay):
         # to a whole pixel is what made a rotated stroke go lumpy
         buf_pts = [self._overlay_to_buffer_f(px, py) for px, py in overlay_pts]
         buf = self.view.get_buffer()
-        _over_text, it = self.view.get_iter_at_location(int(buf_pts[0][0]),
-                                                        int(buf_pts[0][1]))
+        _over_text, it = self.view.iter_at_buffer_xy(*buf_pts[0])
         mark = buf.create_mark(None, it, True)
         r = self.view.get_iter_location(it)
         return mark, [(bx - r.x, by - r.y) for bx, by in buf_pts]
@@ -15387,7 +15458,7 @@ class TextPageView(Gtk.Overlay):
         are already in the units _image_buffer_rect will read back."""
         bx, by = self._overlay_to_buffer_f(ox, oy)   # stored: keep the fraction
         buf = self.view.get_buffer()
-        _over, it = self.view.get_iter_at_location(int(bx), int(by))
+        _over, it = self.view.iter_at_buffer_xy(bx, by)
         mark = buf.create_mark(None, it, True)
         r = self.view.get_iter_location(it)
         return mark, (bx - r.x, by - r.y)
@@ -15678,7 +15749,7 @@ class TextPageView(Gtk.Overlay):
         the paste point — matching where a plain image paste goes."""
         buf = self.view.get_buffer()
         bx, by = self._overlay_to_buffer(*self.paste_point())
-        _over, it = self.view.get_iter_at_location(int(bx), int(by))
+        _over, it = self.view.iter_at_buffer_xy(bx, by)
         r = self.view.get_iter_location(it)
         ew, eh = pasted_extent(objects)
         # offset from the anchor's own position to where the copy's origin goes

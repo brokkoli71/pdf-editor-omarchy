@@ -739,25 +739,12 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   - **PREVIEWS ARE DEFERRED (row 166), and the row is worth reading before
     rebuilding them.** Hovering a link and `![[embeds]]` both shipped and were
     both pulled the same day after a GTK abort ("Byte index N is off the end of
-    the line") in the notes editor. The design that survives is in row 166,
-    including which parts were sound (the marker, not the caret; a tag's
-    `pixels-below-lines` rather than a paintable; a tooltip rather than a
-    popover) and the leading suspect for the crash.
-  - **The way BACK is part of following one**: `_link_return` remembers where
-    the click came from and where it landed, and the notes header shows
-    "↩ Back to p.N" only while you are still on the page the link put you on.
-    Asking "am I where the link left me?" is what retires the offer by itself
-    — no timer, and never a stale jump to somewhere you left ten pages ago.
-  - **The picker anchors to the LINE, not to a point** (`_position_link_popup`,
-    `halign=START`). Given a zero-height anchor GTK centres the popup on it and
-    flips it back over the very text you are reading — the `[[` you just typed.
-  - **PREVIEWS ARE DEFERRED (row 166), and the row is worth reading before
-    rebuilding them.** Hovering a link and `![[embeds]]` both shipped and were
-    both pulled the same day after a GTK abort ("Byte index N is off the end of
-    the line") in the notes editor. The design that survives is in row 166,
-    including which parts were sound (the marker, not the caret; a tag's
-    `pixels-below-lines` rather than a paintable; a tooltip rather than a
-    popover) and the leading suspect for the crash.
+    the line") in the notes editor. **That abort is now understood and fixed**
+    — it was `get_iter_at_location`, not the previews (see the crash note under
+    Logging) — so the precondition for rebuilding them is met. The design that
+    survives is in row 166, including which parts were sound: the marker, not
+    the caret; a tag's `pixels-below-lines` rather than a paintable; a tooltip
+    rather than a popover.
   - **`![[target]]` is an EMBED: the same link, showing the page it leads
     to**, under its line (`_MD_EMBED_RE`, `_sync_inline_preview`,
     `_snapshot_inline_preview`). Obsidian's syntax for exactly this, and
@@ -1251,16 +1238,23 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     scrolling belongs to the ScrolledWindow that never sees the event. The
     `KINETIC` flag on our controller is the whole of the "touchpad only" scope
     — GTK emits `::decelerate` only after a CONTINUOUS scroll, so a wheel notch
-    keeps its instant `WHEEL_PAN_STEP` — and it hands over a velocity in px/ms
-    and nothing else, so the curve is ours: `KineticGlide`, exponential with
+    keeps its instant `WHEEL_PAN_STEP` — and it hands over a velocity and
+    nothing else, so the curve is ours: `KineticGlide`, exponential with
     `GLIDE_TAU_MS`, one class rather than a handler per surface. **That
-    constant is shorter than every reference, deliberately** — GtkScrolledWindow
-    decelerates at τ≈250 ms and multiplies the reported velocity by 2.5 on top,
-    Firefox's fling is τ≈500 ms, and both are tuned for a page you skim rather
-    than a sheet of A4 you are writing on; the first shipped value of 325 read
-    as far too fast in the hand. It is a number to RE-MEASURE, not to argue
-    about: `SIDEMARK_GLIDE_DEBUG=1` logs what each flick actually reports.
-    Two things it
+    velocity is px/SECOND, whatever `::decelerate`'s documentation says**
+    (`GLIDE_VEL_PER_MS`): GTK computes it as delta×1000 over event times in ms,
+    and its own ScrolledWindow feeds it to a solver clocked in seconds. Reading
+    the doc instead of the code is how the sheet shipped coasting ~1000× too
+    far while the sidebar beside it felt right — and the two read the SAME
+    signal, so when one surface scrolls unlike the other, suspect what is being
+    READ before the curve. τ is now GtkScrolledWindow's own friction of 4/s
+    (250 ms), because every other scrollable surface here IS a plain
+    ScrolledWindow and one app settles at one rate; the 2.5×
+    `MAGIC_SCROLL_FACTOR` it puts on both its drag delta and its flick velocity
+    is deliberately not copied, since the sheet pans a surface delta
+    one-for-one — **the invariant is that a flick carries on at the speed your
+    fingers were moving the sheet**, not the number. `SIDEMARK_GLIDE_DEBUG=1`
+    logs what each flick actually reports. Two things it
     must get right. The frame step is the **integral** of the decaying velocity
     across the frame (`glide_frame`), never `v × dt` decayed afterwards, or a
     coast travels further at 30 fps than at 60 — and a dropped frame under a
@@ -1748,14 +1742,22 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     PyGObject hands the writer the raw `GLogField` array, so values are
     gpointers read with `ctypes` (`_glib_log_fields`); the structured path also
     carries `CODE_FILE`/`LINE`/`FUNC`, naming the GTK source line that gave up.
-  - **The row 166 crash is still LIVE, and it is not the previews' fault.** The
-    2026-08-14 abort was `gtk_text_iter_set_visible_line_index` reached from
-    `_on_link_motion` → `_link_target_at` — the hover hit-test, which survived
-    the pull of the previews and calls the same GTK path. It bit on an
-    805-page document's full-notes sheet, where `_rehighlight` walks the whole
-    sidecar; the size is the suspected trigger, not proven. The breadcrumbs on
-    that path (the switch logs the sheet's size, `REHIGHLIGHT_SLOW_MS` warns on
-    a slow render pass) are there so the next occurrence arrives diagnosed.
+  - **The row 166 crash is FIXED, and it was never the previews'** — it is
+    `get_iter_at_location` itself. Hand GTK a y BELOW a line's text and its hit
+    test answers "the end of that line", computed as the line's RAW byte count
+    but converted as a VISIBLE line index: on a line carrying invisible
+    characters the index overshoots by exactly the hidden bytes and
+    `gtk_text_iter_set_visible_line_index` calls `g_error` — the process is
+    gone where it stands, no exception, which is why the log simply stopped.
+    **In this buffer nearly every line has hidden characters**, so a hover was
+    enough. `MarkdownNotesView.iter_at_buffer_xy` clamps the y into the band
+    the paragraph's display ROWS occupy first, and **every pointer→iter hit
+    test in the notes view and the sheet goes through it — a bare
+    `get_iter_at_location` on this buffer is a bug.** Two traps: the band must
+    not be measured from the end-of-line iter (it sits on the newline and
+    reports a 0×0 rect, which rejects clicks that are plainly on the text), and
+    the regression test runs in a SUBPROCESS, because a regression there does
+    not fail an assertion, it takes the interpreter with it.
 
 ## The browser port (`web/`)
 

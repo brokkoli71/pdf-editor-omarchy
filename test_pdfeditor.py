@@ -15,6 +15,7 @@ import time
 import types
 import threading
 import logging
+import subprocess
 import unittest
 
 # Keep tests from writing the user's real recently-used.xbel — they run on the
@@ -5944,6 +5945,72 @@ class TestLatexFormatting(unittest.TestCase):
         for col in range(3):
             self.assertFalse(
                 buf.get_iter_at_line_offset(0, col)[1].has_tag(v._t["hide"]))
+
+
+class TestHoverBelowALineDoesNotAbort(unittest.TestCase):
+    """Row 166's crash: hovering a link killed the app outright.
+
+    GTK's `get_iter_at_location`, handed a y BELOW a line's text, answers with
+    the line's RAW byte count converted as a VISIBLE line index — so on a line
+    carrying hidden characters it overshoots and calls `g_error`. That is not
+    an exception: the process dies where it stands, which is why the session
+    log simply stopped. `MarkdownNotesView.iter_at_buffer_xy` clamps the y into
+    the text's own band first.
+
+    It runs in a SUBPROCESS on purpose. A regression here does not fail an
+    assertion, it takes the interpreter with it — inside the suite that reads
+    as every later test being broken, and names nothing."""
+
+    SCRIPT = r"""
+import sys
+sys.path.insert(0, %r)
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, GLib
+import sidemark
+
+def go(app):
+    win = Gtk.ApplicationWindow(application=app, default_width=400,
+                                default_height=300)
+    v = sidemark.MarkdownNotesView("Adwaita")
+    sw = Gtk.ScrolledWindow(); sw.set_child(v); win.set_child(sw)
+    buf = v.get_buffer()
+    buf.set_text("# Heading\n<!-- page:1 -->\n"
+                 "see [[Eigenvalues]] and [[l2.pdf#Two]] here\n"
+                 "tail line\n")
+    # ANY vertical space below a line's text reaches the branch; a tag is
+    # simply the shortest way to guarantee some in a test.
+    gap = buf.create_tag("gap", pixels_below_lines=60)
+    buf.apply_tag(gap, buf.get_iter_at_line(2)[1], buf.get_iter_at_line(3)[1])
+    win.present()
+    n = [0]
+    def sweep():
+        n[0] += 1
+        if n[0] < 3:
+            return True
+        for y in range(0, v.get_height() or 300, 2):
+            for x in range(0, v.get_width() or 400, 5):
+                v._link_target_at(x, y)
+        print("CLEAN")
+        app.quit()
+        return False
+    GLib.timeout_add(150, sweep)
+
+app = Gtk.Application(application_id="org.sidemark.test.hoverbelow")
+app.connect("activate", go)
+sys.exit(app.run([]))
+"""
+
+    def test_hovering_below_a_line_with_hidden_text_survives(self):
+        out = subprocess.run(
+            [sys.executable, "-c", self.SCRIPT % os.path.dirname(
+                os.path.abspath(sidemark.__file__))],
+            capture_output=True, text=True, timeout=120)
+        if "Gtk couldn't be initialized" in out.stderr:
+            self.skipTest("no compositor for a real window")
+        self.assertIn("CLEAN", out.stdout,
+                      "the hover hit-test aborted: %s" % out.stderr[-400:])
+        self.assertEqual(out.returncode, 0)
 
 
 class TestNoteLinkParse(unittest.TestCase):
@@ -16692,7 +16759,7 @@ class TestTextPageLasso(unittest.TestCase):
                 va.configure(0.0, 0.0, 10000.0, 1.0, 10.0, 100.0)
                 va.set_value(0.0)
                 tp._on_sheet_scroll(_scroll_ctrl(smooth=True), 0.0, 12.0)
-                tp._on_sheet_decelerate(None, 0.0, 2.0)
+                tp._on_sheet_decelerate(None, 0.0, 2000.0)
                 self.assertTrue(tp._glide.running)
                 at = va.get_value()
                 tp._glide._last_us -= 20_000        # 20 ms of coasting
@@ -16704,6 +16771,46 @@ class TestTextPageLasso(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_the_flick_velocity_is_read_as_px_per_second(self):
+        """GTK's ::decelerate is documented as px/ms and is really px/SECOND
+        (GLIDE_VEL_PER_MS). Read the doc instead of the code and the sheet
+        coasts a thousand times too far — which is exactly how it shipped, and
+        why this pins the TRAVEL against the velocity that was reported rather
+        than the conversion constant."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                va = tp.scroll.get_vadjustment()
+                va.configure(0.0, 0.0, 1e9, 1.0, 10.0, 100.0)
+                va.set_value(0.0)
+                # a brisk flick: 2000 px/s, i.e. 2 px/ms
+                tp._on_sheet_decelerate(None, 0.0, 2000.0)
+                self.assertTrue(tp._glide.running)
+                # run it to a standstill and measure how far the sheet went
+                for _ in range(2000):
+                    if not tp._glide.running:
+                        break
+                    tp._glide._last_us -= 16_000
+                    tp._glide._frame(None, None)
+                self.assertFalse(tp._glide.running)
+                # velocity(px/ms) × tau, less the tail below GLIDE_MIN_VEL
+                want = 2.0 * sidemark.GLIDE_TAU_MS
+                self.assertAlmostEqual(
+                    va.get_value(), want,
+                    delta=sidemark.GLIDE_MIN_VEL * sidemark.GLIDE_TAU_MS + 1.0)
+                # and a flick is on the scale of the page, not of the document
+                self.assertLess(va.get_value(), 4000.0)
+
+            self._run_in_window(body)
+
+    def test_the_sheet_coasts_at_the_rate_every_other_surface_does(self):
+        """The notes panel and the sidebar are plain ScrolledWindows coasting
+        on GTK's friction of 4/s; the sheet drives its own curve because a
+        drawing tool takes it off the ScrolledWindow's event path. One app
+        settles at one rate — this is what the user compared them by."""
+        self.assertAlmostEqual(sidemark.GLIDE_TAU_MS, 1000.0 / 4.0, places=6)
+
     def test_zooming_the_sheet_never_flings_it(self):
         """A Ctrl+scroll gesture ends like any other continuous scroll, so the
         velocity arrives — but zooming is not scrolling."""
@@ -16713,7 +16820,7 @@ class TestTextPageLasso(unittest.TestCase):
                 tp = win._active_session._text_page
                 tp._mouse_xy = (100.0, 100.0)
                 tp._on_sheet_scroll(_scroll_ctrl(True, smooth=True), 0.0, -4.0)
-                tp._on_sheet_decelerate(None, 0.0, -2.0)
+                tp._on_sheet_decelerate(None, 0.0, -2000.0)
                 self.assertFalse(tp._glide.running)
 
             self._run_in_window(body)
@@ -16723,7 +16830,7 @@ class TestTextPageLasso(unittest.TestCase):
             def body(win):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
-                tp._on_sheet_decelerate(None, 0.0, 2.0)
+                tp._on_sheet_decelerate(None, 0.0, 2000.0)
                 self.assertTrue(tp._glide.running)
                 tp._on_sheet_scroll(_scroll_ctrl(smooth=True), 0.0, 3.0)
                 self.assertFalse(tp._glide.running)
