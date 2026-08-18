@@ -14962,12 +14962,16 @@ class TestTextFirstMode(unittest.TestCase):
                 tp._on_press_end(g2, 0, 40)
 
                 # a plain left-drag is NOT a pan — with the caret on left the
-                # gesture denies itself so text selection keeps the sequence
+                # press is the CARET's. It is still CLAIMED: the router claims
+                # every press (row 181) and runs the caret itself, rather than
+                # denying and leaving the GtkTextView to guess.
                 self._caret(win)
                 g3 = _FakeDrag(50, 50, button=1)
                 tp._on_press_begin(g3, 50, 50)
                 self.assertFalse(tp._panning)
-                self.assertEqual(g3.claimed, Gtk.EventSequenceState.DENIED)
+                self.assertEqual(tp._press_tool, "text")
+                self.assertEqual(g3.claimed, Gtk.EventSequenceState.CLAIMED)
+                tp._on_press_end(g3, 0, 0)
 
                 # …but with the PAN TOOL active, a plain left-drag DOES pan
                 win._set_tool_mode("pan")
@@ -15109,11 +15113,14 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertEqual(tp.tool, "text")          # restored after release
                 self.assertEqual(len(tp.strokes), 1)
                 self.assertAlmostEqual(tp.strokes[0]["opacity"], hl_opacity, places=5)
-                # without Ctrl+Shift the gesture denies itself (no stroke)
+                # without Ctrl+Shift the press is the caret's, and no stroke
+                # is made — claimed, because the caret is a tool like any other
                 g2 = _FakeDrag(120, 120)
                 tp._on_press_begin(g2, 120, 120)
-                self.assertIsNone(tp._press_tool)   # the caret keeps the press
-                self.assertEqual(g2.claimed, Gtk.EventSequenceState.DENIED)
+                self.assertEqual(tp._press_tool, "text")
+                self.assertEqual(g2.claimed, Gtk.EventSequenceState.CLAIMED)
+                tp._on_press_end(g2, 0, 0)
+                self.assertEqual(len(tp.strokes), 1)   # still just the first
 
             self._run_in_window(body)
 
@@ -15187,20 +15194,25 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertTrue(tp._on_paper_edge(right, midy))
                 self.assertFalse(tp._on_paper_edge(px + pw / 2, midy))  # middle
                 w0 = tp.page_width
+                # driven through the ROUTER: the edge drag has no gesture of
+                # its own any more, because the router claims every press and
+                # a second gesture on this widget would never see one. It is a
+                # branch of the caret's tool.
                 g = _FakeDrag(right, midy)          # plain primary, no modifiers
-                tp._on_width_begin(g, right, midy)
+                tp._on_press_begin(g, right, midy)
                 self.assertTrue(tp._resizing_width)
                 self.assertEqual(g.claimed, Gtk.EventSequenceState.CLAIMED)
-                tp._on_width_update(g, 40, 0)       # pull the edge out 40px
+                tp._on_press_update(g, 40, 0)       # pull the edge out 40px
                 self.assertAlmostEqual(tp.page_width, w0 + 80, delta=3)
-                tp._on_width_end(g, 40, 0)
+                tp._on_press_end(g, 40, 0)
                 self.assertFalse(tp._resizing_width)
-                # a drawing tool keeps its drag (edge resize denies itself)
+                # a drawing tool keeps its drag: the edge belongs to the caret
                 win._set_tool_mode("pen")
                 g2 = _FakeDrag(right, midy)
-                tp._on_width_begin(g2, right, midy)
+                tp._on_press_begin(g2, right, midy)
                 self.assertFalse(tp._resizing_width)
-                self.assertEqual(g2.claimed, Gtk.EventSequenceState.DENIED)
+                self.assertEqual(tp._press_tool, "pen")
+                tp._on_press_end(g2, 0, 0)
 
             self._run_in_window(body)
 
@@ -16619,21 +16631,26 @@ class TestTextPageLasso(unittest.TestCase):
                 win.bindings.bind("ctrl+shift+alt+left", "lasso")
                 self.assertEqual(press(lasso_chord),
                                  Gtk.EventSequenceState.CLAIMED)
-                # plain left is the CARET on a text page (its own table), so
-                # the press goes to the TextView
+                # plain left is the CARET on a text page (its own table) — and
+                # it is CLAIMED like everything else: the caret is a tool the
+                # router runs, not a press it hands back (row 181)
                 self.assertEqual(press(Gdk.ModifierType(0)),
-                                 Gtk.EventSequenceState.DENIED)
+                                 Gtk.EventSequenceState.CLAIMED)
                 # …put an ink tool on left and the router claims it instead
                 tp.set_tool("pen")
                 self.assertEqual(press(Gdk.ModifierType(0)),
                                  Gtk.EventSequenceState.CLAIMED)
                 tp.set_tool("text")
-                # an unbound chord is nobody's: denied, never swallowed
-                # (Alt+left is NOT one — it ships as the caret, so the DENY it
-                # earns is the caret's, not an empty table's)
+                # An unbound chord does NOTHING, and the sheet claims it
+                # anyway. That is the row 181 rule and it is a real change: the
+                # press used to fall through to the GtkTextView, so an unbound
+                # chord moved the caret. It now behaves exactly as it does on a
+                # PDF page, which is what the empty stripe in the toolbar has
+                # always promised it would do.
                 self.assertEqual(
                     press(Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.ALT_MASK),
-                    Gtk.EventSequenceState.DENIED)
+                    Gtk.EventSequenceState.CLAIMED)
+                self.assertIsNone(tp._press_tool)
 
             self._run_in_window(body)
 
@@ -17704,7 +17721,10 @@ class TestTextPageImages(unittest.TestCase):
         x0, y0, _x1, _y1 = tp._selection_bbox()
         g = _FakeDrag(x0 - 200, y0 - 150)
         tp._on_press_begin(g, x0 - 200, y0 - 150)
-        self.assertEqual(g.claimed, Gtk.EventSequenceState.DENIED)
+        # claimed, but by the CARET — the grab claims only the selection, and
+        # a press elsewhere is an ordinary click in the text
+        self.assertEqual(g.claimed, Gtk.EventSequenceState.CLAIMED)
+        self.assertEqual(tp._press_tool, "text")
 
     def test_sidecar_round_trip_keeps_the_image(self):
         tp = self._sheet()
@@ -20358,6 +20378,36 @@ def _check_coasts_after_a_flick(t, win):
     t.assertIsInstance(surf._glide, sidemark.KineticGlide)
 
 
+def _check_the_caret_is_a_tool(t, win):
+    """The caret is an entry in the binding table, resolved by the same press
+    router as the pen — not a press the surface hands back to a widget below.
+
+    On a PDF page it always was: the canvas is the whole surface, so nothing
+    else wanted the press. On the sheet it is row 181's lever 3, and it is what
+    lets a press be LOOKED AT and still acted on — GTK gives no way to pass one
+    on after inspecting it, so a router that has to decide late can only decide
+    by never claiming, which was the seam.
+    """
+    surf = _surface(win)
+    mode = "text" if win._text_mode else "pdf"
+    was = win.bindings.tool_for(sidemark.BTN_LEFT, mode=mode)
+    win.bindings.bind("left", "text", mode=mode)
+    try:
+        g = _FakeDrag(60, 60, button=sidemark.BTN_LEFT)
+        if win._text_mode:
+            surf._on_press_begin(g, 60, 60)
+            t.assertEqual(g.claimed, Gtk.EventSequenceState.CLAIMED,
+                          "the sheet denied the caret's press instead of "
+                          "running it")
+            surf._on_press_end(g, 0, 0)
+        else:
+            surf._on_drag_begin(g, 60, 60)
+            t.assertEqual(surf._press_tool, "text")
+            surf._on_drag_end(g, 0, 0)
+    finally:
+        win.bindings.bind("left", was, mode=mode)
+
+
 # ── the table ─────────────────────────────────────────────────────────────────
 
 PARITY_MATRIX = {
@@ -20378,6 +20428,8 @@ PARITY_MATRIX = {
     "the surface owns its own scrolling": {
         "pdf": _check_scroll_is_the_surfaces_own,
         "text": _check_scroll_is_the_surfaces_own},
+    "the caret is a tool the router resolves": {
+        "pdf": _check_the_caret_is_a_tool, "text": _check_the_caret_is_a_tool},
     "a flick coasts": {
         "pdf": NotInMode(
             "a scroll at a page boundary FLIPS the page, and a momentum glide "
@@ -20459,6 +20511,178 @@ class TestModeParityMatrix(unittest.TestCase):
             self.assertTrue(
                 any(not isinstance(c, NotInMode) for c in row.values()),
                 f"{name!r} is checked in neither mode")
+
+
+
+class TestCaretAsATool(unittest.TestCase):
+    """Row 181 lever 3: the sheet claims every press and runs the caret itself.
+
+    The hit test (widget point → GtkTextIter) is `iter_at_buffer_xy`'s job and
+    is tested where it lives — including in a subprocess, because a regression
+    there aborts the interpreter rather than failing. Here it is stubbed, so
+    what is under test is the CARET's own rules: what one press selects, which
+    way a drag grows it, and what a release does. Those need no layout, which
+    matters — a full suite run has no live frame clock, so anything asserted in
+    pixels is stale (see CLAUDE.md).
+    """
+
+    def _view(self, text="alpha beta gamma\nsecond line here\nthird\n"):
+        v = sidemark.MarkdownNotesView()
+        v.get_buffer().set_text(text)
+        return v
+
+    def _at(self, v, offset):
+        """Make the caret's hit test answer with the iter at `offset`."""
+        buf = v.get_buffer()
+        it = buf.get_iter_at_offset(offset)
+        return mock.patch.object(v, "iter_at_buffer_xy",
+                                 return_value=(True, it))
+
+    def test_one_press_places_the_caret(self):
+        v = self._view()
+        with self._at(v, 7):
+            v.caret_press(0, 0, n_press=1)
+        buf = v.get_buffer()
+        self.assertEqual(buf.get_iter_at_mark(buf.get_insert()).get_offset(), 7)
+        self.assertFalse(buf.get_has_selection())
+
+    def test_two_presses_take_the_word(self):
+        v = self._view()
+        with self._at(v, 7):                 # inside "beta"
+            v.caret_press(0, 0, n_press=2)
+        buf = v.get_buffer()
+        s, e = buf.get_selection_bounds()
+        self.assertEqual(buf.get_text(s, e, True), "beta")
+
+    def test_two_presses_in_a_gap_take_the_word_they_touch_and_no_more(self):
+        """At a word BOUNDARY the word wins — that is what every editor does,
+        and Pango's own rules say which word it is. Strictly inside a run of
+        spaces there is no word to take, and nothing is selected rather than
+        the code reaching backwards for one: a double-click that quietly
+        selects something you did not point at is a replacement waiting to
+        happen."""
+        v = self._view("alpha    beta\n")
+        with self._at(v, 5):                 # touching the end of "alpha"
+            v.caret_press(0, 0, n_press=2)
+        buf = v.get_buffer()
+        s, e = buf.get_selection_bounds()
+        self.assertEqual(buf.get_text(s, e, True), "alpha")
+        with self._at(v, 7):                 # deep in the run of spaces
+            v.caret_press(0, 0, n_press=2)
+        self.assertFalse(buf.get_has_selection())
+
+    def test_three_presses_take_the_whole_logical_line(self):
+        """The line you typed before pressing Return, however many rows it
+        wraps onto — GtkTextView's own triple-click takes the DISPLAY line, a
+        fragment of what looks like one line on a wrapped sheet. This used to
+        need an idle that ran after the press and then DENIED the view's own
+        selection drag; the caret tool simply does it."""
+        v = self._view()
+        with self._at(v, 20):                # inside the second line
+            v.caret_press(0, 0, n_press=3)
+        buf = v.get_buffer()
+        s, e = buf.get_selection_bounds()
+        self.assertEqual(buf.get_text(s, e, True), "second line here")
+
+    def test_shift_extends_from_the_anchor(self):
+        v = self._view()
+        with self._at(v, 0):
+            v.caret_press(0, 0, n_press=1)
+        with self._at(v, 5):
+            v.caret_press(0, 0, n_press=1, shift=True)
+        buf = v.get_buffer()
+        s, e = buf.get_selection_bounds()
+        self.assertEqual(buf.get_text(s, e, True), "alpha")
+        # …and again, further out: the anchor has not moved
+        with self._at(v, 10):
+            v.caret_press(0, 0, n_press=1, shift=True)
+        s, e = buf.get_selection_bounds()
+        self.assertEqual(buf.get_text(s, e, True), "alpha beta")
+
+    def test_a_drag_selects_in_both_directions(self):
+        v = self._view()
+        buf = v.get_buffer()
+        with self._at(v, 6):
+            v.caret_press(0, 0, n_press=1)
+        with self._at(v, 10):
+            v.caret_motion(0, 0)
+        s, e = buf.get_selection_bounds()
+        self.assertEqual(buf.get_text(s, e, True), "beta")
+        # drag back past the press point: the anchor holds and the selection
+        # flips to the other side of it
+        with self._at(v, 0):
+            v.caret_motion(0, 0)
+        s, e = buf.get_selection_bounds()
+        self.assertEqual(buf.get_text(s, e, True), "alpha ")
+
+    def test_a_word_drag_grows_by_whole_words(self):
+        """A double-click drag that shrank back to single characters would make
+        the double-click pointless — the granularity is the press's, and it
+        lasts for the whole drag."""
+        v = self._view()
+        buf = v.get_buffer()
+        with self._at(v, 7):                 # inside "beta"
+            v.caret_press(0, 0, n_press=2)
+        with self._at(v, 13):                # inside "gamma"
+            v.caret_motion(0, 0)
+        s, e = buf.get_selection_bounds()
+        self.assertEqual(buf.get_text(s, e, True), "beta gamma")
+
+    def test_a_release_ticks_a_box_only_if_the_press_stayed_put(self):
+        """A click and the start of a drag are the same event until it moves,
+        so dragging a selection out of a checkbox must select text rather than
+        tick it."""
+        v = self._view("- [ ] a task\n")
+        with mock.patch.object(v, "toggle_task", return_value=True) as tick:
+            v._task_press = (0, 10.0, 10.0)
+            self.assertTrue(v.caret_release(11.0, 10.0))
+            tick.assert_called_once_with(0)
+        with mock.patch.object(v, "toggle_task", return_value=True) as tick:
+            v._task_press = (0, 10.0, 10.0)
+            self.assertFalse(v.caret_release(90.0, 10.0))
+            tick.assert_not_called()
+
+    def test_a_ctrl_release_follows_a_link_that_did_not_travel(self):
+        v = self._view("see [[other.pdf]] here\n")
+        seen = []
+        v.on_follow_link = seen.append
+        v._link_press = ({"path": "other.pdf"}, 10.0, 10.0)
+        self.assertTrue(v.caret_release(11.0, 10.0))
+        self.assertEqual(seen, [{"path": "other.pdf"}])
+
+    def test_the_click_count_uses_the_users_own_thresholds(self):
+        """GTK4 dropped the DOUBLE/TRIPLE_BUTTON_PRESS event types, so this is
+        summed by hand — and it must read GtkSettings rather than hardcode a
+        pair, or a double-click on the sheet takes a different length of time
+        from a double-click everywhere else on the desktop."""
+        tp = sidemark.TextPageView()
+        st = Gtk.Settings.get_default()
+        gap = st.get_property("gtk-double-click-time")
+
+        def press(t, x=10.0, y=10.0):
+            ev = types.SimpleNamespace(get_time=lambda: t)
+            return tp._click_count(ev, x, y)
+
+        self.assertEqual(press(1000), 1)
+        self.assertEqual(press(1000 + gap // 2), 2)
+        self.assertEqual(press(1000 + gap), 3)
+        # too slow, and too far, each start again
+        self.assertEqual(press(1000 + gap + 10 * gap), 1)
+        self.assertEqual(press(1000 + gap + 10 * gap + 5), 2)
+        self.assertEqual(press(1000 + gap + 10 * gap + 10, x=500.0), 1)
+
+    def test_the_sheet_has_no_second_gesture_left_to_starve(self):
+        """The structural half of lever 3, and the property the whole design
+        rests on: a claim STOPS propagation, so any other pointer gesture on
+        this widget is a correct handler that can never run. The router and the
+        pinch are the two that survive, and the pinch is for the TOUCHPAD,
+        which reports no touch sequences for the router to take."""
+        tp = sidemark.TextPageView()
+        drags = [c for c in tp.observe_controllers()
+                 if isinstance(c, Gtk.GestureDrag)]
+        self.assertEqual(len(drags), 1,
+                         "a second GestureDrag on the sheet cannot fire — the "
+                         "router claims every press before it")
 
 
 if __name__ == "__main__":

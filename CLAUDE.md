@@ -108,16 +108,36 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     un-render the line you were sent to read.
   - **Triple-click selects the whole LOGICAL line** (`line_bounds`) — one
     Return's worth of typing, however many rows it wraps onto. GtkTextView's
-    own "line" is the DISPLAY line, a fragment of what looks like one. It is
-    applied from an **idle, after the press** (`_select_clicked_line`), not in
-    the handler: controllers on one widget fire NEWEST FIRST, so the view's own
-    click gesture — installed before ours — runs *after* it and lays its
-    display-line selection on top. A press handler that "does nothing" here is
-    usually running and being overwritten. The idle also **denies the view's
-    internal selection drag**, which by then holds the sequence: that drag
-    re-derives the selection from the pointer at display-line granularity on
-    every motion event, so without the denial the first flicker of the hand
-    snaps the line back to one wrapped row.
+    own "line" is the DISPLAY line, a fragment of what looks like one. **Two
+    surfaces, two mechanisms, and the difference is who owns the press.** On
+    the notes PANEL nothing competes for a press, so GTK handles the caret and
+    ours is applied from an **idle, after the press** (`_select_clicked_line`):
+    controllers on one widget fire NEWEST FIRST, so the view's own click
+    gesture — installed before ours — runs *after* it and lays its display-line
+    selection on top. A press handler that "does nothing" here is usually
+    running and being overwritten. The idle also **denies the view's internal
+    selection drag**, which by then holds the sequence: that drag re-derives
+    the selection from the pointer at display-line granularity on every motion
+    event, so without the denial the first flicker of the hand snaps the line
+    back to one wrapped row. On the SHEET none of that runs — the router
+    claimed the press, so the view's gestures never see it, and the caret tool
+    simply selects the logical line (see "the caret is a tool" below).
+  - **THE CARET IS A TOOL, and on the sheet the router runs it** (row 181).
+    `caret_press` / `caret_motion` / `caret_release` on `MarkdownNotesView` are
+    the pointer half of a text editor written out — click places, drag selects,
+    double takes the word, triple takes the logical line, Shift extends from
+    the anchor, and the release ticks a task box or follows a Ctrl+link. They
+    exist because **GTK offers no way to hand a press on after looking at
+    it**: the only way the `GtkTextView` below gets one is if nobody ever
+    claimed it, so "inspect the press, then decide" and "let the TextView do
+    the caret" are mutually exclusive. The sheet needs the first, so it takes
+    the second's job. Deliberately the SAME verbs GTK implements — a caret that
+    behaves *nearly* like every other caret is worse than one that behaves
+    unlike them. The click count is summed by hand (`_click_count`) because
+    GTK4 dropped the DOUBLE/TRIPLE_BUTTON_PRESS event types and a second
+    gesture would be cancelled by the router's claim; it reads the user's own
+    `gtk-double-click-time`/`-distance` out of `GtkSettings`, never a
+    hardcoded pair. The panel keeps GTK's own handling and needs none of this.
   - **The maths grammar wins over Markdown's**: `_` is a SUBSCRIPT here, so the
     GtkSource language's `_emphasis_` is cancelled line by line with a
     `noitalic` tag and only `*italic*` puts the slant back. Its syntax tags sit
@@ -223,8 +243,17 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     generates both). A second mapping is how the bar comes to claim one thing
     while the mouse does another. Each canvas has ONE press router
     (`PDFCanvas._on_drag_begin` → `_begin_tool`, `TextPageView._on_press_begin`);
-    the sheet's router either claims the press for its tool or DENIES so the
-    caret keeps it.
+    the sheet's router **claims EVERY press** (row 181) — for a tool, for the
+    caret, or for nothing at all when the chord is unbound, which is exactly
+    what a PDF page does and what the toolbar's empty stripe promises. It never
+    denies. That is the whole of lever 3: a press that is negotiated with GTK
+    is a press whose outcome depends on which controller got there first, and
+    every text-mode input bug came through that seam. Consequences worth
+    knowing: the paper-edge width drag is a BRANCH of the caret's tool rather
+    than a gesture of its own (a second gesture on that widget can no longer
+    see a press at all), the right-button context menu is opened by hand
+    (`_reopen_context_menu`), and an unbound chord no longer falls through to
+    the editor to move the caret.
   - **`canvas.tool` is derived**: the tool of the button being pressed, else
     what LEFT would do. Assigning to it binds left. `highlighter` /
     `select_mode` are derived the same way — **never assign them alongside a
@@ -327,11 +356,11 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
         the touch count — a palm resting during a PEN stroke must arm nothing —
         and cleared when the glass empties or at any fresh press, so ink is
         revocable only for the hand that drew it.
-        *ceiling: with the finger unbound (or bound to `text`) the router
-        DENIES, so the `TextView` takes the first sequence and its own touch
-        text-selection popup can still appear under a pinch — the exit is to
-        give that selection UI to the finger only when the finger's tool IS
-        the caret (row 150).*
+        *Row 181's lever 3 removed the old hazard here: the router no longer
+        DENIES, so the `TextView` never takes the first sequence and its touch
+        text-selection popup can no longer appear under a pinch. New ceiling in
+        its place: our caret tool draws no touch selection handles, so a finger
+        selecting text on the sheet has nothing to grab afterwards.*
     - **No tilt** on this class of panel: the axes exist and are flat zero, so
       a presence check passes and the feature silently does nothing.
     - **A new DEFAULT binding reaches nobody who has customised their table**
@@ -1810,15 +1839,19 @@ when something lands, fold its invariants upward and delete it from here rather
 than writing a line about having finished it. The chronology lives in
 `ideas.csv` and git.
 
-**START HERE (2026-08-18): the next session is the TEXT-MODE PARITY session —
-all three levers of `notes/text-mode-parity-plan.md` (row 181), agreed with the
-user to be done together.** In order, each a safety net for the next: (1)
-finish and state the adapter rule over `GtkTextView`'s geometry APIs, (2) a
-parity matrix test driven at the WINDOW level, (3) one input front-end for the
-sheet, where the caret becomes a tool and every press is claimed. The plan
-holds the diagnosis — text mode's recurring bugs are a GTK SEAM, not a model
+**START HERE (2026-08-18): row 181's three levers all SHIPPED, and the only
+thing owed on them is a pass IN THE HAND — the checklist is at the end of
+`notes/text-mode-parity-plan.md`.** Lever 3 replaced GTK's pointer handling on
+the text sheet (the router claims every press; the caret is a tool), and none
+of it has been driven by a real pointer, pen or finger, because there is no
+key-injection tool on this machine. Start the session by handing the user that
+checklist. Two answers are wanted back rather than just pass/fail: whether a
+finger selecting text with no selection handles is worse than the bubble it
+replaced, and whether an unbound chord doing NOTHING on the sheet (it used to
+fall through and move the caret) reads as right. The plan file keeps the
+diagnosis — text mode's recurring bugs are a GTK SEAM, not a model
 disagreement, and a translation layer or a new text model was asked for and
-ruled out. Do not re-derive it. Lever 3 needs the panel in the user's hands.
+ruled out. Do not re-derive it.
 
 Rows 175 and 179 shipped; row 166's crash is fixed (`iter_at_buffer_xy`), which
 also lifts the precondition on rebuilding the link previews.
@@ -1957,12 +1990,15 @@ one validation session; `notes/validation-session.md` is its checklist.**
   process rules = put in tooling if they can be). **A test audit is a biased
   sample**, so "unused" means unobserved, not useless.
 
-- **Row 150's leftover — the touch text-selection popup.** The sheet pinches
-  now (see the stylus block), but with the finger unbound the `TextView` still
-  takes the first sequence and can raise its selection bubble under the pinch.
-  The user's proposal: that UI belongs to the finger only when the finger's
-  tool IS the caret. Needs the panel and a decision about what a lone finger
-  on a sheet should do at all (a PDF page pans).
+- **Row 150's leftover is CLOSED by lever 3, and it needs confirming in the
+  hand.** The sheet's router now claims every press, so the `TextView` never
+  takes the first sequence and its touch selection bubble cannot appear under
+  a pinch — the user's proposal ("that UI belongs to the finger only when the
+  finger's tool IS the caret") is satisfied by construction rather than by a
+  rule. *ceiling: our caret tool draws no touch selection handles at all, so
+  selecting text with a FINGER on the sheet is now a plain drag with nothing
+  to grab afterwards. Nobody has judged whether that is worse than the bubble
+  it replaces — it needs the panel.*
 - **Row 151 — a survivor finger should keep panning.** LOW priority, and the
   one piece of row 150's pinch that was never built: lift one finger of a
   two-finger gesture on a sheet and the gesture ENDS, because the survivor

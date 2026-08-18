@@ -2512,6 +2512,14 @@ HOLD_SLOP_PX = 16.0
 # twitch of a mouse button being released.
 CLICK_SLOP_PX = 5.0
 
+# Selection autoscroll on the text sheet: how often a held-outside-the-window
+# drag steps, and the most it moves in one step. The step is the overshoot
+# itself, so the further out you hold the pointer the faster it runs — GTK's
+# own behaviour, and the cap is what keeps a pointer flung to the far edge of
+# a large screen from jumping whole pages per tick.
+CARET_AUTOSCROLL_MS = 30
+CARET_AUTOSCROLL_MAX_PX = 40.0
+
 
 def circle_lasso_target(strokes, hits, inside=None):
     """Which stroke a press-and-hold converts into a lasso path — THE decision,
@@ -11460,6 +11468,8 @@ class MarkdownNotesView(GtkSource.View):
         # (line, x, y) of a press that landed on a task box — resolved there,
         # because the release sees a re-rendered line (see _on_click_pressed)
         self._task_press = None
+        self._link_press = None    # a Ctrl+press that may follow a link
+        self._caret_drag = None    # (granularity, anchor start, anchor end)
 
         self._cursor_line = 0
         self._rehighlight_id = None
@@ -11832,6 +11842,134 @@ class MarkdownNotesView(GtkSource.View):
             c = controllers.get_item(i)
             if isinstance(c, Gtk.GestureDrag):
                 c.set_state(Gtk.EventSequenceState.DENIED)
+        return False
+
+    # ── the caret as a TOOL ───────────────────────────────────────────────────
+    #
+    # Everything below is the pointer half of a text editor, written out, so a
+    # surface that has CLAIMED a press can still put the caret where the click
+    # was. The sheet does exactly that (row 181): it claims every press so
+    # that no press is ever negotiated with GTK, and the caret is then just
+    # another entry in the binding table beside the pen and the lasso.
+    #
+    # Why it has to be written out at all: GTK gives no way to hand a press to
+    # another widget after looking at it. The only way the GtkTextView below
+    # gets one is if nobody ever claimed it — so "look at the press, then
+    # decide" and "the TextView handles the caret" are mutually exclusive, and
+    # the sheet needs the first. The notes PANEL keeps GTK's own handling;
+    # nothing competes for a press there.
+    #
+    # It is deliberately the SAME set of verbs GtkTextView implements, because
+    # a caret that behaves nearly like every other caret is worse than one that
+    # behaves unlike them: click places, drag selects, double takes the word,
+    # triple takes the line, Shift extends. The one place it differs is the one
+    # place this widget already differed — triple-click takes the LOGICAL line
+    # (`line_bounds`), which is what `_select_clicked_line` had to fight GTK to
+    # do, and here is simply what the code does.
+
+    @staticmethod
+    def word_bounds(it):
+        """The word around `it`, as (start, end).
+
+        Pango's word rules, via the iterator — not a split on spaces, so it
+        agrees with what Ctrl+arrow does in the same buffer. On a space or at
+        the end of a line there is no word, and the answer is the empty range
+        at `it`: a double-click in the margin selects nothing rather than
+        reaching backwards for the previous word.
+        """
+        s = it.copy()
+        if not s.starts_word():
+            if s.inside_word() or s.ends_word():
+                s.backward_word_start()
+        e = s.copy()
+        if e.inside_word() or e.starts_word():
+            e.forward_word_end()
+        return (s, e) if not s.equal(e) else (it.copy(), it.copy())
+
+    def _range_at(self, it, granularity):
+        """The (start, end) one press of `granularity` selects at `it`."""
+        if granularity >= 3:
+            return self.line_bounds(self.get_buffer(), it.get_line())
+        if granularity == 2:
+            return self.word_bounds(it)
+        return it.copy(), it.copy()
+
+    def caret_press(self, x, y, n_press=1, shift=False, ctrl=False):
+        """Place the caret for a press at VIEW-widget coords, and arm the drag.
+
+        Returns the granularity in hand, so the caller knows a drag is live.
+
+        The press also takes FOCUS: a claimed press never reaches the view, and
+        without this the sheet would place a caret you then could not type at.
+        """
+        self.grab_focus()
+        bx, by = self.window_to_buffer_coords(
+            Gtk.TextWindowType.WIDGET, int(x), int(y))
+        _over, it = self.iter_at_buffer_xy(bx, by)
+        buf = self.get_buffer()
+        # A task box and a [[link]] are resolved on the PRESS and acted on at
+        # the RELEASE, for the reason in `_on_click_pressed`: by the time the
+        # release arrives the caret has landed and the line has re-rendered
+        # around it, so the words have moved under a pointer that never left.
+        self._task_press = ((self._task_box_at(x, y), x, y)
+                            if n_press == 1 and not (shift or ctrl) else None)
+        self._link_press = ((self._link_target_at(x, y), x, y)
+                            if n_press == 1 and ctrl else None)
+        gran = min(n_press, 3)
+        if shift and n_press == 1:
+            # Shift extends: the ANCHOR stays put and only `insert` moves,
+            # which is the one thing every text editor agrees about. With no
+            # selection the anchor sits on the caret, so this is also what a
+            # first Shift+click should do — no special case needed.
+            bound = buf.get_iter_at_mark(buf.get_selection_bound())
+            buf.select_range(it, bound)
+            self._caret_drag = (1, bound.get_offset(), bound.get_offset())
+            return 1
+        s, e = self._range_at(it, gran)
+        buf.select_range(e, s) if gran > 1 else buf.place_cursor(it)
+        self._caret_drag = (gran, s.get_offset(), e.get_offset())
+        return gran
+
+    def caret_motion(self, x, y):
+        """Extend the armed selection to VIEW-widget coords (x, y).
+
+        At word or line granularity the selection grows a whole word or line at
+        a time, in both directions — a double-click drag that shrank back to
+        single characters would make the double-click pointless.
+        """
+        if self._caret_drag is None:
+            return
+        gran, a_s, a_e = self._caret_drag
+        bx, by = self.window_to_buffer_coords(
+            Gtk.TextWindowType.WIDGET, int(x), int(y))
+        _over, it = self.iter_at_buffer_xy(bx, by)
+        buf = self.get_buffer()
+        s, e = self._range_at(it, gran)
+        if s.get_offset() < a_s:            # dragging backwards
+            buf.select_range(s, buf.get_iter_at_offset(a_e))
+        else:
+            buf.select_range(e, buf.get_iter_at_offset(a_s))
+
+    def caret_release(self, x, y):
+        """Finish the press: tick a box, follow a link, or nothing.
+
+        Both are checked against where the PRESS landed (`CLICK_SLOP_PX`), so
+        dragging a selection out of a checkbox selects text instead of ticking
+        it — a click and the start of a drag are the same event until it moves.
+        """
+        self._caret_drag = None
+        hit, px, py = self._task_press or (None, 0, 0)
+        self._task_press = None
+        if hit is not None and math.hypot(x - px, y - py) <= CLICK_SLOP_PX \
+                and self.toggle_task(hit):
+            self._link_press = None
+            return True
+        link, px, py = self._link_press or (None, 0, 0)
+        self._link_press = None
+        if link and self.on_follow_link \
+                and math.hypot(x - px, y - py) <= CLICK_SLOP_PX:
+            self.on_follow_link(link)
+            return True
         return False
 
     def _continue_list(self):
@@ -13313,6 +13451,10 @@ class TextPageView(Gtk.Overlay):
         self.add_controller(router)
         self._router = router
         self._press_tool = None      # the tool of the press in flight
+        self._caret_gran = 1         # 1/2/3: char, word or logical line
+        self._last_click = (0, 0.0, 0.0, 0)   # time, x, y, count
+        self._caret_last = None      # the pointer, while a selection drags
+        self._caret_scroll_id = None
         self._panning = False
         self._pan_start = (0.0, 0.0)
         self._rerase_press = None    # a right-press that may still be a click
@@ -13420,13 +13562,9 @@ class TextPageView(Gtk.Overlay):
         # typing, drawing, pan (Ctrl) and zoom (Shift) keep every other drag.
         self._resizing_width = False
         self._resize_center_x = 0.0
-        wresize = Gtk.GestureDrag()
-        wresize.set_button(Gdk.BUTTON_PRIMARY)
-        wresize.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        wresize.connect("drag-begin", self._on_width_begin)
-        wresize.connect("drag-update", self._on_width_update)
-        wresize.connect("drag-end", self._on_width_end)
-        self.add_controller(wresize)
+        # The width drag has NO gesture of its own any more: the router claims
+        # every press, so a second gesture on this widget would never see one.
+        # It is a branch of the caret's tool (`_on_press_begin`).
 
         # lasso keyboard verbs (Delete / Escape / Ctrl+D). Capture phase on the
         # overlay: the sheet's TextView usually keeps focus (the ink
@@ -13595,23 +13733,20 @@ class TextPageView(Gtk.Overlay):
         return (abs(x - px) <= self.EDGE_GRAB
                 or abs(x - (px + pw)) <= self.EDGE_GRAB)
 
-    def _on_width_begin(self, gesture, x, y):
-        state = self._chord_state(gesture)
-        mods = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
-                | Gdk.ModifierType.ALT_MASK)
-        if self.tool != "text" or state & mods or not self._on_paper_edge(x, y):
-            gesture.set_state(Gtk.EventSequenceState.DENIED)
-            return
-        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+    def _begin_width_resize(self, x, _y):
+        """Grab the paper's side edge to set the wrap column.
+
+        Driven by the router's caret branch, which has already established
+        that this is an unmodified left press on an edge — a gesture of its
+        own could not see the press at all now that the router claims
+        unconditionally."""
         self._resizing_width = True
         px, _py, pw, _ph = self._paper_bounds()
         self._resize_center_x = px + pw / 2
         self.set_cursor(Gdk.Cursor.new_from_name("ew-resize"))
 
-    def _on_width_update(self, gesture, dx, dy):
-        if not self._resizing_width:
-            return
-        ok, sx, sy = gesture.get_start_point()
+    def _width_resize_update(self, gesture, dx):
+        ok, sx, _sy = gesture.get_start_point()
         if not ok:
             return
         # the grabbed edge follows the cursor; the sheet stays centred, so its
@@ -13619,9 +13754,7 @@ class TextPageView(Gtk.Overlay):
         half = abs((sx + dx) - self._resize_center_x)
         self.set_page_width(round(2 * half / self.zoom))
 
-    def _on_width_end(self, gesture, dx, dy):
-        if not self._resizing_width:
-            return
+    def _end_width_resize(self):
         self._resizing_width = False
         self.set_cursor(None)
 
@@ -14433,15 +14566,43 @@ class TextPageView(Gtk.Overlay):
         log_press("text", chord_id(btn, ctrl, shift, alt), tool,
                   "grab" if grab else ("caret" if tool == "text" else
                                        ("unbound" if tool is None else "")))
+
+        # EVERY press is claimed from here down (row 181). The sheet is not a
+        # widget that sometimes handles a press and sometimes lets the
+        # GtkTextView have it: GTK offers no way to hand a press on after
+        # looking at it, so "deny and hope" was the seam that every text-mode
+        # input bug came through. The caret is a TOOL now, implemented on the
+        # notes view (`caret_press`), and an unbound button does nothing at all
+        # — which is what the empty stripe in the toolbar has always promised.
         if tool is None or tool == "text":
-            # The press belongs to the caret (click, text selection, the
-            # context menu). It also ends any live selection, exactly as a
-            # press elsewhere does on a PDF page — done here because this is
-            # the only handler that sees every press.
             if plain != "lasso":
+                # a press ends a live selection, exactly as it does on a PDF
+                # page; here because this is the only handler that sees them all
                 self.clear_lasso_selection()
                 self.ink.queue_draw()
-            gesture.set_state(Gtk.EventSequenceState.DENIED)
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            if tool is None:
+                return
+            self._press_tool = "text"
+            # dragging the paper's side edge sets the wrap column, and it lives
+            # INSIDE the caret's branch rather than in a gesture of its own:
+            # once the router claims unconditionally, a separate gesture on the
+            # same widget never sees the press again.
+            if btn == BTN_LEFT and not (ctrl or shift or alt) \
+                    and self._on_paper_edge(x, y):
+                self._begin_width_resize(x, y)
+                return
+            if btn == BTN_RIGHT:
+                # the context-menu press. The TextView opens its menu on the
+                # PRESS, and our claim swallowed it, so we place the caret and
+                # open the menu ourselves — GTK's own behaviour, by hand.
+                self._reopen_context_menu(x, y)
+                self._press_tool = None
+                return
+            vx, vy = self._overlay_to_view(x, y)
+            self._caret_gran = self.view.caret_press(
+                vx, vy, self._click_count(gesture.get_current_event(), x, y),
+                shift=shift, ctrl=ctrl)
             return
 
         if btn == BTN_RIGHT and tool == "eraser":
@@ -14473,6 +14634,14 @@ class TextPageView(Gtk.Overlay):
             return
         if self._panning:
             self._pan_update(dx, dy)
+            return
+        if self._resizing_width:
+            self._width_resize_update(gesture, dx)
+            return
+        if self._press_tool == "text":
+            ok, sx, sy = gesture.get_start_point()
+            if ok:
+                self._caret_drag_to(sx + dx, sy + dy)
             return
         if self._press_tool is not None:
             self._on_ink_update(gesture, dx, dy)
@@ -14506,6 +14675,13 @@ class TextPageView(Gtk.Overlay):
             return
         if self._panning:
             self._pan_end()
+        elif self._resizing_width:
+            self._end_width_resize()
+        elif self._press_tool == "text":
+            self._stop_caret_autoscroll()
+            ok, sx, sy = gesture.get_start_point()
+            if ok:
+                self.view.caret_release(*self._overlay_to_view(sx + dx, sy + dy))
         elif self._press_tool is not None:
             self._on_ink_end(gesture, dx, dy)
 
@@ -14521,6 +14697,88 @@ class TextPageView(Gtk.Overlay):
             buf.place_cursor(it)
         self.view.grab_focus()
         self.view.activate_action("menu.popup", None)
+
+    # ── the caret tool's own plumbing ─────────────────────────────────────────
+
+    def _overlay_to_view(self, x, y):
+        """Overlay coords → the text view's own widget coords.
+
+        The caret API on `MarkdownNotesView` speaks the view's coordinates,
+        because on the notes panel that is what a press arrives in. Here the
+        press lands on the Overlay, above a viewport that has scrolled.
+        """
+        res = self.ink.translate_coordinates(self.view, x, y)
+        return res if res else (x, y)
+
+    def _click_count(self, event, x, y):
+        """1, 2 or 3 for a press, counted the way GtkGestureClick counts.
+
+        Counted by hand because the sheet has no click gesture to ask: the
+        router claims every press, and a second gesture on this widget would
+        be cancelled by that claim before it ever reported anything. GTK4 also
+        offers no help from the event itself — it dropped the
+        DOUBLE/TRIPLE_BUTTON_PRESS event types GTK3 had, and GtkGestureClick
+        does exactly this sum internally.
+
+        It reads the user's OWN thresholds out of GtkSettings rather than
+        hardcoding a pair, so a double-click here takes as long as a
+        double-click anywhere else on their desktop.
+        """
+        now = event.get_time() if event is not None else 0
+        st = Gtk.Settings.get_default()
+        gap = st.get_property("gtk-double-click-time") if st else 400
+        near = st.get_property("gtk-double-click-distance") if st else 5
+        last_t, last_x, last_y, count = self._last_click
+        if now - last_t <= gap and math.hypot(x - last_x, y - last_y) <= near:
+            count = count % 3 + 1       # GTK cycles rather than climbing
+        else:
+            count = 1
+        self._last_click = (now, x, y, count)
+        return count
+
+    def _caret_drag_to(self, x, y):
+        """Extend the caret's selection to overlay point (x, y), autoscrolling
+        while the pointer is held outside the viewport.
+
+        Autoscroll is the one part of a selection drag that cannot be done at
+        the press: it is what lets a selection reach text that is not on
+        screen, and without it a drag simply stops at the edge of the window.
+        """
+        self._caret_last = (x, y)
+        self.view.caret_motion(*self._overlay_to_view(x, y))
+        vy = self.scroll.get_height()
+        over = (y - vy) if y > vy else (y if y < 0 else 0)
+        if over and self._caret_scroll_id is None:
+            self._caret_scroll_id = GLib.timeout_add(
+                CARET_AUTOSCROLL_MS, self._caret_autoscroll)
+        elif not over:
+            self._stop_caret_autoscroll()
+
+    def _caret_autoscroll(self):
+        """One step of the selection autoscroll: scroll, then re-extend to the
+        pointer where it still is. Re-extending is the point — the pointer has
+        not moved, so nothing else would grow the selection."""
+        if self._press_tool != "text" or self._caret_last is None:
+            self._caret_scroll_id = None
+            return False
+        x, y = self._caret_last
+        vy = self.scroll.get_height()
+        over = (y - vy) if y > vy else (y if y < 0 else 0)
+        if not over:
+            self._caret_scroll_id = None
+            return False
+        adj = self.scroll.get_vadjustment()
+        step = max(-CARET_AUTOSCROLL_MAX_PX,
+                   min(CARET_AUTOSCROLL_MAX_PX, over))
+        adj.set_value(adj.get_value() + step)
+        self.view.caret_motion(*self._overlay_to_view(x, y))
+        return True
+
+    def _stop_caret_autoscroll(self):
+        if self._caret_scroll_id is not None:
+            GLib.source_remove(self._caret_scroll_id)
+            self._caret_scroll_id = None
+        self._caret_last = None
 
     def _on_ink_begin(self, gesture, x, y):
         self._zoom_cancelled = False
