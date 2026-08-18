@@ -1798,13 +1798,24 @@ when something lands, fold its invariants upward and delete it from here rather
 than writing a line about having finished it. The chronology lives in
 `ideas.csv` and git.
 
-**START HERE (2026-08-17): six ideas were triaged with the user and each one's
+**START HERE (2026-08-18): the next session is the TEXT-MODE PARITY session —
+all three levers of `notes/text-mode-parity-plan.md` (row 181), agreed with the
+user to be done together.** In order, each a safety net for the next: (1)
+finish and state the adapter rule over `GtkTextView`'s geometry APIs, (2) a
+parity matrix test driven at the WINDOW level, (3) one input front-end for the
+sheet, where the caret becomes a tool and every press is claimed. The plan
+holds the diagnosis — text mode's recurring bugs are a GTK SEAM, not a model
+disagreement, and a translation layer or a new text model was asked for and
+ruled out. Do not re-derive it. Lever 3 needs the panel in the user's hands.
+
+Rows 175 and 179 shipped; row 166's crash is fixed (`iter_at_buffer_xy`), which
+also lifts the precondition on rebuilding the link previews.
+
+**Also open (2026-08-17): six ideas were triaged with the user and each one's
 open questions were ANSWERED by them — `ideas.csv` rows 175–180 hold the
 answers, and re-deriving them is wasted work.** In the user's own order of
-readiness: row 179 (a snapped ellipse stays resizable, small, the pattern
-exists), row 175 (smoother scrolling — **touchpad only, the user cut the wheel
-out**), then the two they asked to have PROTOTYPED IN THE WEB before anything
-ships (row 176, only what is right of the cursor falls back to source, cursor
+readiness, minus the two that have shipped: the two they asked to have
+PROTOTYPED IN THE WEB before anything ships (row 176, only what is right of the cursor falls back to source, cursor
 line only; row 177, four options for shapes that stretch when text is inserted
 through them — they especially want to feel the freehand one), then row 178
 (draw while scrolling, which they clarified as *scroll while the pen is down*),
