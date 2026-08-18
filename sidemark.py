@@ -3046,6 +3046,11 @@ def attach_touch_latch(widget, on_multi=None, on_move=None, on_end=None,
     ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
     ctrl.connect("event",
                  lambda c, ev: latch.handle(ev or c.get_current_event()))
+    # Marked so the "attach it FIRST" rule above can be ASSERTED rather than
+    # only written down: it is an ordering nobody can see by reading one
+    # widget's constructor, and it is how the latch shipped dead the second
+    # time. The parity matrix checks it on every surface that has one.
+    ctrl._touch_latch = latch
     widget.add_controller(ctrl)
     return latch
 
@@ -11650,6 +11655,51 @@ class MarkdownNotesView(GtkSource.View):
         (a bookmark, an outline entry, the document in front)."""
         self._link_live.clear()
 
+    # ── the adapter rule over GtkTextView ─────────────────────────────────
+    #
+    # THE RULE: this view and the sheet never call a raw GtkTextView
+    # geometry/iter API where that API has a trap. Each trapped one is wrapped
+    # exactly once, here or on TextPageView, and the wrapper's docstring holds
+    # the trap. A bare call to one of the wrapped names below is a bug.
+    #
+    # The reason it is a rule and not a habit: this buffer IS the .md source,
+    # rendered in place, so nearly every line carries invisible characters and
+    # every paragraph can wrap. Both are exactly what GtkTextView's geometry
+    # APIs are careless about, and all of them fail SILENTLY or fatally rather
+    # than raising — the 2026-08-14 process abort was one of them.
+    #
+    # The members, and what each one is protecting against:
+    #   iter_at_buffer_xy      get_iter_at_location aborts the process below a
+    #                          line carrying hidden characters
+    #   line_bounds            GtkTextView's "line" is the DISPLAY line
+    #   _buf_replace_line      an edit moves every mark on the line with no
+    #                          mark-set signal
+    #   _set_buffer_text       set_text drops every mark, i.e. every ink anchor
+    #   _overlay_to_buffer_f,  window_to_buffer_coords / buffer_to_window_coords
+    #   _buffer_to_overlay     take ints, so stored geometry degrades per edit
+    #                          (_overlay_to_buffer is the int one, hit-tests
+    #                          only)
+    #
+    # Swept 2026-08-18 and found NOT to need wrapping — do not re-investigate
+    # without a new symptom:
+    #   get_iter_location, get_line_at_y, get_line_yrange  convert iter→y or
+    #       y→paragraph, never through a byte index, so the abort above cannot
+    #       reach them; they are what iter_at_buffer_xy is built out of.
+    #   forward_display_line   returns False with no layout rather than lying.
+    #   get_iter_at_line       on a bad line returns ok=False with the iter at
+    #       the LAST line's start — a real position, so ignoring `ok` misplaces
+    #       rather than crashes. Callers that pass a line they computed check
+    #       it; the ones indexing [1] pass a line they already know is valid,
+    #       or want the clamp (get_iter_at_line(last + 1) is how a range asks
+    #       for the end of the buffer).
+    #
+    # buf.get_text(s, e, include_hidden_chars) is the same rule in another
+    # coat, and is TRUE everywhere on purpose: an iter counts the invisible
+    # characters, so text fetched without them is a shorter string and any
+    # offset into it points somewhere else — one place per hidden marker
+    # earlier on the line. It is never a crash, only a comparison that quietly
+    # stops matching on rendered lines, which is where the feature is used.
+
     def iter_at_buffer_xy(self, bx, by):
         """(inside?, iter) for a point in BUFFER coords — GTK's
         `get_iter_at_location` with the process abort taken out.
@@ -12274,7 +12324,10 @@ class MarkdownNotesView(GtkSource.View):
             if prev.get_char().isspace():
                 break
             start = prev
-        value = self._snippet_value(buf.get_text(start, ins, False))
+        # True, per the adapter rule: `start` was walked back with
+        # backward_char, which counts hidden characters, so the text has to
+        # be read the same way or the token loses a character per hidden one.
+        value = self._snippet_value(buf.get_text(start, ins, True))
         if value is None:
             return False
         buf.begin_user_action()
@@ -12424,22 +12477,25 @@ class MarkdownNotesView(GtkSource.View):
         pre_s = s.copy()
         if not pre_s.backward_chars(m):
             return s, e
-        if buf.get_text(pre_s, s, False) != marker:
+        # True throughout: every range here is built with backward_chars /
+        # forward_chars, which count hidden characters. Read without them a
+        # marker sitting next to one comes back short and never matches.
+        if buf.get_text(pre_s, s, True) != marker:
             return s, e
         # Single * must not be part of **: check char before the marker
         if m == 1:
             guard = pre_s.copy()
-            if guard.backward_chars(1) and buf.get_text(guard, pre_s, False) == marker:
+            if guard.backward_chars(1) and buf.get_text(guard, pre_s, True) == marker:
                 return s, e
         post_e = e.copy()
         post_e.forward_chars(m)
-        if buf.get_text(e, post_e, False) != marker:
+        if buf.get_text(e, post_e, True) != marker:
             return s, e
         # Single * must not be part of **: check char after the marker
         if m == 1:
             guard = post_e.copy()
             nxt = post_e.copy()
-            if nxt.forward_chars(1) and buf.get_text(guard, nxt, False) == marker:
+            if nxt.forward_chars(1) and buf.get_text(guard, nxt, True) == marker:
                 return s, e
         return pre_s, post_e
 

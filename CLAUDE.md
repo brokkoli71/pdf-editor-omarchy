@@ -1430,6 +1430,18 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     than storing it (the `rect_bbox_of` pattern), and off a multiple of four
     the re-read centre and axes are a hair out. A rectangle and a grid divider
     are still frozen by the dwell.
+- **The sheet and the notes view never call a TRAPPED `GtkTextView`
+  geometry/iter API raw** (row 181). Each one is wrapped exactly once and the
+  wrapper's docstring holds the trap; the full list, and the sweep of the APIs
+  found NOT to need one, is the rule comment above `iter_at_buffer_xy`. Today:
+  `iter_at_buffer_xy` (the process abort), `line_bounds` (display vs logical
+  line), `_buf_replace_line` (marks riding an edit), `_set_buffer_text` (marks
+  = ink anchors), `_overlay_to_buffer_f` / `_buffer_to_overlay` (int
+  truncation). The reason it is a rule: this buffer IS the `.md`, rendered in
+  place, so nearly every line carries invisible characters and every paragraph
+  wraps — precisely what those APIs are careless about, and they fail silently
+  or fatally rather than raising. Adding a wrapper is cheap; finding out you
+  needed one costs a session.
 - **Geometry you STORE must not go through the int-truncating coord helpers.**
   `window_to_buffer_coords`/`buffer_to_window_coords` only take ints, so a
   per-point conversion rounds every point on the way in *and* out. Invisible

@@ -20154,5 +20154,312 @@ class TestLoopWatchdog(unittest.TestCase):
             sidemark._log_had_error = was
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  The mode-parity matrix (ideas.csv row 181, lever 2)
+#
+#  Behaviours × {pdf, text}, driven at the WINDOW level, because the point is
+#  REACHABILITY and not logic. Every text-mode bug in row 181's table except
+#  the crash was a correct handler that could not be reached: the search
+#  revealer lived inside the column text mode hides, the touch latch was
+#  attached after the router that had already taken the touches, the drop
+#  target was matched after the GtkTextView's own. A unit test of any of those
+#  handlers passes while the feature is dead in the app.
+#
+#  So the assertions here are about paths and wiring — is the widget in a
+#  visible chain, is the controller first, is the press routed, does the
+#  surface answer the key the window asks it about — and they are deliberately
+#  property-level: a full run has no live frame clock, so anything measured in
+#  pixels is stale (see CLAUDE.md, "layout needs a live frame clock").
+#
+#  A behaviour present on one side and absent on the other must FAIL. A
+#  deliberate exception is `NotInMode(reason)` in the table, which is the only
+#  way to be absent and the reason is part of the entry.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class NotInMode:
+    """A behaviour deliberately absent from one mode, carrying its reason.
+
+    The whole value of the matrix is that a gap must be DECLARED. An entry
+    that simply had no check on one side would be indistinguishable from a
+    feature nobody had got round to, which is the state row 181 is about.
+    """
+
+    def __init__(self, reason):
+        self.reason = reason
+
+
+def _reachable(widget):
+    """Is `widget` inside a chain of visible ancestors, up to its root?
+
+    Reachability, not pixels. `get_visible()` is a plain property, so it
+    answers on a window that never laid out — which is what a full suite run
+    gives us. This is the exact shape of the Ctrl+F bug: the handler ran, the
+    revealer revealed itself, and it was all happening inside a column that
+    text mode sets invisible.
+    """
+    # ceiling: this catches a HIDDEN ancestor, not a zero-sized one — text
+    # mode collapses the page column to width 0 rather than hiding it, and a
+    # widget in there would pass. Measuring size instead needs a live frame
+    # clock, which a full run does not have; if a zero-width container ever
+    # swallows something, assert on the mode's own layout state instead.
+    w = widget
+    while w is not None:
+        if not w.get_visible():
+            return False
+        w = w.get_parent()
+    return True
+
+
+def _surface(win):
+    """The mode's drawing surface — the two things this whole file compares."""
+    return win._text_page if win._text_mode else win.canvas
+
+
+def _text_view(win):
+    """The mode's editable GtkTextView: the notes panel, or the sheet."""
+    return win._text_page.view if win._text_mode else win._notes_view
+
+
+def _fake_button_event(etype, button, mods=None):
+    return types.SimpleNamespace(
+        get_event_type=lambda: etype,
+        get_button=lambda: button,
+        get_modifier_state=lambda: mods or Gdk.ModifierType(0))
+
+
+# ── the checks ────────────────────────────────────────────────────────────────
+# Each takes (t, win) and asserts. A check shared by both columns of the table
+# is itself the statement that the behaviour has ONE implementation.
+
+def _check_search_reachable(t, win):
+    """Ctrl+F's revealer is revealed AND on screen in this mode."""
+    win._show_search()
+    t.assertTrue(win._search_revealer.get_reveal_child())
+    t.assertTrue(_reachable(win._search_revealer),
+                 "the search bar was revealed inside a hidden ancestor — the "
+                 "handler ran and nobody could see it (the Ctrl+F bug)")
+    t.assertTrue(_reachable(win._search_entry))
+    win._hide_search()
+
+
+def _check_thumb_routes(t, win):
+    """Button 10 reaches no GestureDrag, so each surface replays it through
+    its own press router — or the thumb can hold no tool at all."""
+    surf = _surface(win)
+    mode = "text" if win._text_mode else "pdf"
+    win.bindings.bind(sidemark.chord_id(sidemark.BTN_THUMB), "pen", mode=mode)
+    try:
+        if win._text_mode:
+            surf._mouse_xy = (100.0, 100.0)
+        else:
+            surf._mouse_x, surf._mouse_y = 100.0, 100.0
+        press = _fake_button_event(Gdk.EventType.BUTTON_PRESS,
+                                   sidemark.BTN_THUMB)
+        surf._on_thumb_event(None, press)
+        t.assertEqual(surf._press_tool, "pen",
+                      "the thumb press never reached the press router")
+        surf._on_thumb_event(None, _fake_button_event(
+            Gdk.EventType.BUTTON_RELEASE, sidemark.BTN_THUMB))
+        t.assertIsNone(surf._thumb_gesture)
+    finally:
+        win.bindings.bind(sidemark.chord_id(sidemark.BTN_THUMB), None,
+                          mode=mode)
+
+
+def _check_touch_latch_is_first(t, win):
+    """Two fingers are a fact about the HAND: the latch counts them off the raw
+    stream, and it only sees a touch nothing has claimed yet. Capture-phase
+    controllers of one widget run in the order they were ADDED, so it has to be
+    the first — an ordering no reader of one constructor can see, and how the
+    latch shipped dead the second time."""
+    surf = _surface(win)
+    t.assertIsNotNone(getattr(surf, "_touch", None),
+                      "this surface counts no fingers at all")
+    # observe_controllers() lists them in REVERSE of the order they were
+    # ADDED — GTK prepends — and "added first" is the whole property here, so
+    # reading the list as it comes tests the exact opposite of the invariant
+    # and fails against correct code.
+    capture = [c for c in reversed(list(surf.observe_controllers()))
+               if c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE]
+    t.assertTrue(capture, "no capture-phase controller to be first")
+    t.assertTrue(hasattr(capture[0], "_touch_latch"),
+                 "the touch latch is not the first capture-phase controller, "
+                 "so a gesture below it can claim a sequence before it counts")
+
+
+def _check_file_drop_target(t, win):
+    """A GtkTextView installs its OWN drop target for gchararray, and a file
+    manager offers text/plain beside the uris — so the editor matched first and
+    the file vanished. It must be REPLACED, not supplemented: two targets on
+    one widget are tried in the order they were added."""
+    view = _text_view(win)
+    ours = stale = 0
+    for c in view.observe_controllers():
+        if isinstance(c, Gtk.DropTargetAsync):
+            fmts = c.get_formats()
+            if fmts and fmts.contain_gtype(Gdk.FileList.__gtype__):
+                ours += 1
+        elif isinstance(c, Gtk.DropTarget):
+            stale += 1
+    t.assertEqual(ours, 1, "no file drop target on this mode's editor")
+    t.assertEqual(stale, 0,
+                  "the editor's own drop target is still there and is tried "
+                  "first, so a dropped file goes to it and disappears")
+
+
+def _check_answers_clipboard_keys(t, win):
+    """Ctrl+C / Ctrl+V / Delete live on the WINDOW's capture controller — a
+    key handler on a surface is off the path the moment you click a toolbar
+    button. So the window ASKS the surface, and a surface that cannot answer
+    silently loses all three."""
+    surf = _surface(win)
+    for name in ("wants_paste", "has_lasso_selection", "paste_point",
+                 "delete_selected_strokes", "clear_lasso_selection"):
+        t.assertTrue(callable(getattr(surf, name, None)),
+                     f"the window asks the surface {name}() and this one "
+                     f"cannot answer")
+    t.assertIsInstance(surf.wants_paste(), bool)
+    t.assertIsInstance(surf.has_lasso_selection(), bool)
+    x, y = surf.paste_point()
+    t.assertIsInstance(x, float)
+    t.assertIsInstance(y, float)
+
+
+def _check_bindings_mode(t, win):
+    """`bindings.mode` is what the CHROME acts on, and it follows the active
+    tab. Routing never reads it — a surface passes its own doc_mode — so this
+    is only about the toolbar, the badges and the popover naming the table the
+    user is actually looking at."""
+    expected = "text" if win._text_mode else "pdf"
+    t.assertEqual(win.bindings.mode, expected)
+    t.assertIn(win.bindings.tool_for(sidemark.BTN_LEFT, mode=expected),
+               sidemark.TOOL_MODES,
+               "the left button holds no tool this mode's bar can show")
+
+
+def _check_scroll_is_the_surfaces_own(t, win):
+    """A drawing tool makes the ink overlay the event TARGET, which cuts the
+    ScrolledWindow out of the path — so each surface owns plain scrolling as
+    well as zoom, and a scroll controller in the wrong place is a handler that
+    never runs."""
+    surf = _surface(win)
+    scrolls = [c for c in surf.observe_controllers()
+               if isinstance(c, Gtk.EventControllerScroll)]
+    t.assertTrue(scrolls, "this surface handles no scroll of its own")
+
+
+def _check_coasts_after_a_flick(t, win):
+    """A touchpad flick coasts, at the rate every other surface here coasts
+    at. The sheet has to do it itself: GTK's kinetic scrolling belongs to the
+    ScrolledWindow the events never reach."""
+    surf = _surface(win)
+    t.assertIsNotNone(getattr(surf, "_glide", None))
+    t.assertIsInstance(surf._glide, sidemark.KineticGlide)
+
+
+# ── the table ─────────────────────────────────────────────────────────────────
+
+PARITY_MATRIX = {
+    "the search bar is on screen": {
+        "pdf": _check_search_reachable, "text": _check_search_reachable},
+    "the thumb button routes through the press router": {
+        "pdf": _check_thumb_routes, "text": _check_thumb_routes},
+    "the touch latch counts fingers first": {
+        "pdf": _check_touch_latch_is_first,
+        "text": _check_touch_latch_is_first},
+    "a dropped file reaches the window": {
+        "pdf": _check_file_drop_target, "text": _check_file_drop_target},
+    "the surface answers the window's clipboard keys": {
+        "pdf": _check_answers_clipboard_keys,
+        "text": _check_answers_clipboard_keys},
+    "the binding table follows the mode": {
+        "pdf": _check_bindings_mode, "text": _check_bindings_mode},
+    "the surface owns its own scrolling": {
+        "pdf": _check_scroll_is_the_surfaces_own,
+        "text": _check_scroll_is_the_surfaces_own},
+    "a flick coasts": {
+        "pdf": NotInMode(
+            "a scroll at a page boundary FLIPS the page, and a momentum glide "
+            "into one would fling you through slides — a different feature "
+            "needing its own judgement, not a parity gap (row 175)"),
+        "text": _check_coasts_after_a_flick},
+}
+
+
+class TestModeParityMatrix(unittest.TestCase):
+    """Every behaviour, in both modes, driven at the window level.
+
+    Two tests do the whole matrix rather than one per cell, because the window
+    tier costs ~410 ms a test and building the window is nearly all of it. A
+    cell failing collects its failure and the rest still run — a matrix that
+    stops at the first red cell tells you about one mode when you asked about
+    two.
+    """
+
+    def _run_matrix(self, mode):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.parity")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "deck.pdf")
+                    make_pdf(pdf, n_pages=3)
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    if mode == "text":
+                        win._on_new_text_page()
+                    self.assertEqual(win._text_mode, mode == "text")
+                    self._check_all(win, mode, errors)
+            except Exception as e:                       # setup, not a cell
+                errors.append(("<harness>", e))
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            self.fail(f"{len(errors)} of {len(PARITY_MATRIX)} parity cells "
+                      f"failed in {mode} mode:\n" + "\n".join(
+                          f"  · {name}: {err}" for name, err in errors))
+
+    def _check_all(self, win, mode, errors):
+        for name, row in PARITY_MATRIX.items():
+            cell = row[mode]
+            if isinstance(cell, NotInMode):
+                continue
+            try:
+                cell(self, win)
+            except Exception as e:
+                errors.append((name, e))
+
+    def test_every_behaviour_holds_on_a_pdf_page(self):
+        self._run_matrix("pdf")
+
+    def test_every_behaviour_holds_on_a_text_page(self):
+        self._run_matrix("text")
+
+    def test_the_table_itself_is_complete(self):
+        """The matrix's own invariant, and the cheap half of its value: a
+        behaviour is either checked in BOTH modes or declared absent from one
+        with a reason. Silence is what row 181 is about — every gap it names
+        looked like nothing at all until a user found it."""
+        for name, row in PARITY_MATRIX.items():
+            self.assertEqual(set(row), {"pdf", "text"},
+                             f"{name!r} does not say what it does in each mode")
+            for mode, cell in row.items():
+                if isinstance(cell, NotInMode):
+                    self.assertTrue(cell.reason.strip(),
+                                    f"{name!r} is absent from {mode} with no "
+                                    f"reason given")
+                else:
+                    self.assertTrue(callable(cell))
+            self.assertTrue(
+                any(not isinstance(c, NotInMode) for c in row.values()),
+                f"{name!r} is checked in neither mode")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
