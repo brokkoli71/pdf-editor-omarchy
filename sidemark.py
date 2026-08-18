@@ -14054,7 +14054,7 @@ class TextPageView(Gtk.Overlay):
             self._on_press_update(self._thumb_gesture, x - sx, y - sy)
             return
         # hint that the paper edge is draggable (caret tool only, matching where
-        # _on_width_begin claims); leave other tools' cursors alone
+        # the caret's tool claims); leave other tools' cursors alone
         if not self._resizing_width and self.tool == "text":
             self.set_cursor(Gdk.Cursor.new_from_name("ew-resize")
                             if self._on_paper_edge(x, y) else None)
