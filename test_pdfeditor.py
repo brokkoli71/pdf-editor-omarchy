@@ -6467,6 +6467,86 @@ class TestShareToPhone(unittest.TestCase):
                                    return_value=_R(running)):
                 self.assertEqual(sidemark._tailscale_ip(), "100.70.12.127")
 
+    def test_funnel_start_parses_hostname_from_cli_stdout(self):
+        """Returns just the HOST, never the bare-root URL the CLI prints —
+        that root has none of our server's /token/ path on it, so handing it
+        straight to the phone is a link to nowhere (the bug this guards)."""
+        import sidemark
+
+        class _R:
+            def __init__(self, out, code=0):
+                self.stdout, self.returncode = out, code
+                self.stderr = ""
+
+        with mock.patch.object(sidemark.shutil, "which",
+                               return_value="/usr/bin/tailscale"), \
+             mock.patch.object(sidemark.subprocess, "run", return_value=_R(
+                 "Available on the internet:\nhttps://host.tailnet.ts.net/\n"
+                 "Press Ctrl+C to exit.\n")) as run:
+            host, hint = sidemark._tailscale_funnel_start(8123)
+            self.assertEqual(host, "host.tailnet.ts.net")
+            self.assertIsNone(hint)
+            run.assert_called_once_with(
+                ["tailscale", "funnel", "--bg", "--yes", "8123"],
+                capture_output=True, text=True, timeout=25,
+                stdin=sidemark.subprocess.DEVNULL)
+
+    def test_funnel_start_returns_hint_when_cli_fails(self):
+        import sidemark
+
+        class _R:
+            def __init__(self, out, code):
+                self.stdout, self.returncode = "", code
+                self.stderr = out
+
+        with mock.patch.object(sidemark.shutil, "which",
+                               return_value="/usr/bin/tailscale"), \
+             mock.patch.object(sidemark.subprocess, "run",
+                               return_value=_R("funnel: not permitted", 1)):
+            url, hint = sidemark._tailscale_funnel_start(8123)
+            self.assertIsNone(url)
+            self.assertIn("not permitted", hint)
+
+    def test_funnel_start_reports_a_timeout_instead_of_swallowing_it(self):
+        """A stuck confirmation prompt (or a genuinely wedged daemon) must
+        surface as its own hint, not fall silently into the generic
+        not-connected message — that's what made the real hang unreadable."""
+        import sidemark
+
+        def _raise(*_a, **_k):
+            raise sidemark.subprocess.TimeoutExpired(cmd="tailscale", timeout=10)
+
+        with mock.patch.object(sidemark.shutil, "which",
+                               return_value="/usr/bin/tailscale"), \
+             mock.patch.object(sidemark.subprocess, "run", side_effect=_raise):
+            url, hint = sidemark._tailscale_funnel_start(8123)
+            self.assertIsNone(url)
+            self.assertIn("timed out", hint)
+
+    def test_funnel_start_is_a_noop_without_the_tailscale_binary(self):
+        import sidemark
+        with mock.patch.object(sidemark.shutil, "which", return_value=None), \
+             mock.patch.object(sidemark.subprocess, "run") as run:
+            self.assertEqual(sidemark._tailscale_funnel_start(8123),
+                             (None, None))
+            run.assert_not_called()
+
+    def test_funnel_stop_turns_off_the_right_port(self):
+        import sidemark
+
+        class _R:
+            stdout = stderr = ""
+            returncode = 0
+
+        with mock.patch.object(sidemark.shutil, "which",
+                               return_value="/usr/bin/tailscale"), \
+             mock.patch.object(sidemark.subprocess, "run",
+                               return_value=_R()) as run:
+            sidemark._tailscale_funnel_stop(8123)
+            run.assert_called_once_with(
+                ["tailscale", "funnel", "8123", "off"],
+                capture_output=True, text=True, timeout=5)
+
     def test_qr_png_absent_tool_returns_false(self):
         from sidemark import _make_qr_png
         import shutil as _sh
@@ -6550,7 +6630,14 @@ class TestShareToPhone(unittest.TestCase):
 
         def on_activate(a):
             try:
-                with tempfile.TemporaryDirectory() as d:
+                import sidemark
+                with tempfile.TemporaryDirectory() as d, \
+                     mock.patch.object(sidemark, "_tailscale_ip",
+                                       return_value=None):
+                    # _tailscale_ip=None also skips the Funnel subprocess
+                    # call in _share_prepare — this test is about window
+                    # modality, not about actually shelling out to a real
+                    # `tailscale` on whatever machine runs the suite.
                     pdf = os.path.join(d, "deck.pdf"); make_pdf(pdf)
                     win = PDFEditorWindow(a); win.present()
                     win.open_file_in_tab(pdf)
@@ -6559,7 +6646,8 @@ class TestShareToPhone(unittest.TestCase):
                     out["is_window"] = isinstance(sw, Gtk.Window)
                     out["modal"] = sw.get_modal()
                     out["main_sensitive"] = win.get_sensitive()
-                    sw.close()        # stops the server + cleans up
+                    sw.close()          # no longer stops sharing (#180) —
+                    win._stop_sharing()  # tear the server down explicitly
             except Exception:
                 import traceback
                 errors.append(traceback.format_exc())
@@ -6627,7 +6715,10 @@ class TestShareToPhone(unittest.TestCase):
 
         def on_activate(a):
             try:
-                with tempfile.TemporaryDirectory() as d:
+                import sidemark
+                with tempfile.TemporaryDirectory() as d, \
+                     mock.patch.object(sidemark, "_tailscale_ip",
+                                       return_value=None):
                     pdf = os.path.join(d, "deck.pdf"); make_pdf(pdf)
                     win = PDFEditorWindow(a); win.present()
                     win.open_file_in_tab(pdf)
@@ -6642,6 +6733,7 @@ class TestShareToPhone(unittest.TestCase):
                     out["opened"] = win._share_window is not None
                     if win._share_window:
                         win._share_window.close()
+                    win._stop_sharing()  # tear down; close() no longer does
             except Exception:
                 import traceback
                 errors.append(traceback.format_exc())
@@ -6710,13 +6802,16 @@ class TestShareToPhone(unittest.TestCase):
         return sidemark.PDFEditorWindow._share_prepare(d, server, "doc.pdf")
 
     def test_prepare_always_offers_tailscale_with_hint_when_off(self):
+        """Entries come back in PRIORITY order — public link, tailnet,
+        Wi-Fi — not the order they're computed in, so Wi-Fi (always live) is
+        LAST even though it's the only one with a url here."""
         import sidemark
         with mock.patch.object(sidemark, "_tailscale_ip", return_value=None):
             with tempfile.TemporaryDirectory() as d:
                 server, entries = self._prepare(d)
                 try:
-                    self.assertEqual(entries[0]["caption"], "Same Wi-Fi")
-                    self.assertIn("url", entries[0])
+                    self.assertEqual(entries[-1]["caption"], "Same Wi-Fi")
+                    self.assertIn("url", entries[-1])
                     # the Tailscale column is always present...
                     ts = entries[1]
                     self.assertEqual(ts["caption"], "Over Tailscale")
@@ -6729,7 +6824,9 @@ class TestShareToPhone(unittest.TestCase):
     def test_prepare_offers_tailscale_link_when_connected(self):
         import sidemark
         with mock.patch.object(sidemark, "_tailscale_ip",
-                               return_value="100.70.12.127"):
+                               return_value="100.70.12.127"), \
+             mock.patch.object(sidemark, "_tailscale_funnel_start",
+                               return_value=(None, None)):
             with tempfile.TemporaryDirectory() as d:
                 server, entries = self._prepare(d)
                 try:
@@ -6738,6 +6835,178 @@ class TestShareToPhone(unittest.TestCase):
                     self.assertIn("100.70.12.127", ts["url"])
                 finally:
                     server.stop()
+
+    # ── public link via Tailscale Funnel (prototype, #180) ──────────────────
+
+    def test_prepare_offers_funnel_link_when_it_starts(self):
+        """When Tailscale is connected and Funnel starts cleanly, the third
+        column is a live public URL carrying our server's OWN /token/ path
+        (not the bare tailnet root the CLI prints — that was the bug: a QR
+        that rendered fine but pointed nowhere), and the server remembers the
+        port so stop() can tear the mapping back down."""
+        import sidemark
+        with mock.patch.object(sidemark, "_tailscale_ip",
+                               return_value="100.70.12.127"), \
+             mock.patch.object(sidemark, "_tailscale_funnel_start",
+                               return_value=("host.tailnet.ts.net",
+                                            None)) as start:
+            with tempfile.TemporaryDirectory() as d:
+                server, entries = self._prepare(d)
+                try:
+                    funnel = entries[0]
+                    self.assertEqual(funnel["caption"],
+                                     "Anyone with the link (public)")
+                    self.assertEqual(
+                        funnel["url"],
+                        f"https://host.tailnet.ts.net/{server.token}/")
+                    self.assertEqual(server.funnel_port, server.port)
+                    start.assert_called_once_with(server.port)
+                finally:
+                    server.stop()
+
+    def test_prepare_offers_funnel_hint_when_not_enabled(self):
+        """Funnel can fail even while connected (not enabled for the tailnet,
+        no admin grant yet) — that's a hint column, not a broken link, and the
+        CLI's own explanation is shown when there is one."""
+        import sidemark
+        with mock.patch.object(sidemark, "_tailscale_ip",
+                               return_value="100.70.12.127"), \
+             mock.patch.object(sidemark, "_tailscale_funnel_start",
+                               return_value=(None, "funnel: not permitted")):
+            with tempfile.TemporaryDirectory() as d:
+                server, entries = self._prepare(d)
+                try:
+                    funnel = entries[0]
+                    self.assertEqual(funnel["caption"],
+                                     "Anyone with the link (public)")
+                    self.assertNotIn("url", funnel)
+                    self.assertIn("not permitted", funnel["hint"])
+                    self.assertIsNone(server.funnel_port)
+                finally:
+                    server.stop()
+
+    def test_prepare_offers_funnel_hint_without_calling_it_when_offline(self):
+        """No point shelling out to `tailscale funnel` when Tailscale itself
+        isn't connected — same signal `_tailscale_ip` already gates on."""
+        import sidemark
+        with mock.patch.object(sidemark, "_tailscale_ip", return_value=None), \
+             mock.patch.object(sidemark, "_tailscale_funnel_start") as start:
+            with tempfile.TemporaryDirectory() as d:
+                server, entries = self._prepare(d)
+                try:
+                    funnel = entries[0]
+                    self.assertEqual(funnel["caption"],
+                                     "Anyone with the link (public)")
+                    self.assertIn("Tailscale", funnel["hint"])
+                    start.assert_not_called()
+                finally:
+                    server.stop()
+
+    def test_stop_turns_funnel_off_only_when_it_was_started(self):
+        import sidemark
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "doc.pdf"); make_pdf(p)
+            srv = sidemark._ShareServer(p)
+            with mock.patch.object(sidemark, "_tailscale_funnel_stop") as stop:
+                srv.stop()                     # never started Funnel
+                stop.assert_not_called()
+                srv.funnel_port = 4321
+                srv.stop()
+                stop.assert_called_once_with(4321)
+                self.assertIsNone(srv.funnel_port)
+
+    def test_url_for_public_link_has_no_port_and_https(self):
+        import sidemark
+        srv = sidemark._ShareServer(providers={
+            "title": "d.pdf", "state": lambda: (0, 0, 1),
+            "render": lambda p: None, "pdf": lambda p: None})
+        srv.port = 1234
+        self.assertEqual(srv.url_for("host.tailnet.ts.net", scheme="https",
+                                     port=None),
+                         f"https://host.tailnet.ts.net/{srv.token}/")
+        srv.stop()
+
+
+class TestShareStopUX(unittest.TestCase):
+    """Row/#180's UX change: closing the QR window no longer stops sharing —
+    only Stop sharing, the 10-minute safety net, or the app quitting does.
+    _stop_sharing / _on_share_window_close are plain state transitions with
+    no widget-drawing of their own, so these drive them with a duck-typed
+    stand-in for the window instead of a real GTK one (no weston needed)."""
+
+    @staticmethod
+    def _fake(**kw):
+        import types
+        base = dict(_share_server=None, _share_out_dir=None,
+                   _share_entries=None, _share_window=None, _share_gen=0,
+                   _update_share_indicator=mock.Mock())
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def test_stop_sharing_stops_the_server_and_clears_everything(self):
+        import sidemark
+        server, win = mock.Mock(), mock.Mock()
+        fake = self._fake(_share_server=server, _share_entries={"x": 1},
+                          _share_window=win)
+        sidemark.PDFEditorWindow._stop_sharing(fake)
+        server.stop.assert_called_once()
+        win.close.assert_called_once()
+        self.assertIsNone(fake._share_server)
+        self.assertIsNone(fake._share_entries)
+        self.assertIsNone(fake._share_window)
+        self.assertEqual(fake._share_gen, 1)
+        fake._update_share_indicator.assert_called_once_with(False)
+
+    def test_stop_sharing_removes_the_out_dir(self):
+        import sidemark
+        with tempfile.TemporaryDirectory() as d:
+            sub = os.path.join(d, "share")
+            os.makedirs(sub)
+            fake = self._fake(_share_out_dir=sub)
+            sidemark.PDFEditorWindow._stop_sharing(fake)
+            self.assertFalse(os.path.exists(sub))
+
+    def test_stop_sharing_is_a_harmless_noop_when_nothing_is_live(self):
+        import sidemark
+        fake = self._fake()
+        sidemark.PDFEditorWindow._stop_sharing(fake)   # must not raise
+        self.assertEqual(fake._share_gen, 1)
+
+    def test_closing_the_window_does_not_touch_the_server(self):
+        """The whole point of the UX change: Close != Stop."""
+        import sidemark
+        server, win = mock.Mock(), mock.Mock()
+        fake = self._fake(_share_server=server, _share_window=win)
+        result = sidemark.PDFEditorWindow._on_share_window_close(fake, win)
+        self.assertFalse(result)              # allow the close
+        self.assertIsNone(fake._share_window)
+        server.stop.assert_not_called()
+        self.assertEqual(fake._share_gen, 0)  # NOT bumped — a live share's
+                                              # window closing abandons
+                                              # nothing, there's nothing
+                                              # in flight to abandon
+
+    def test_closing_a_still_loading_window_abandons_the_attempt(self):
+        """No server has gone live yet, so there's nothing to "keep
+        running" — closing it bumps the generation, which is what tells the
+        in-flight worker (in _show_share_dialog) to tear its own
+        not-yet-published server back down instead of reviving a share
+        nobody is looking at anymore."""
+        import sidemark
+        win = mock.Mock()
+        fake = self._fake(_share_server=None, _share_window=win)
+        sidemark.PDFEditorWindow._on_share_window_close(fake, win)
+        self.assertEqual(fake._share_gen, 1)
+
+    def test_closing_a_stale_window_reference_is_ignored(self):
+        """_stop_sharing (or an abandon) already cleared the old window
+        before a NEWER one (from a later reopen) could exist — its
+        close-request must not clobber the newer reference."""
+        import sidemark
+        old_win, new_win = mock.Mock(), mock.Mock()
+        fake = self._fake(_share_window=new_win)
+        sidemark.PDFEditorWindow._on_share_window_close(fake, old_win)
+        self.assertIs(fake._share_window, new_win)
 
 
 # ── drag pages out of the thumbnail panel to export them (#57) ────────────────

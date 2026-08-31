@@ -10337,6 +10337,66 @@ def _tailscale_ip():
     return None
 
 
+def _tailscale_funnel_start(port, timeout=25):
+    """PROTOTYPE (#180): point Tailscale Funnel at our local share server, so
+    the phone needs no Tailscale app at all — a public HTTPS link, reachable
+    from anywhere, not just the tailnet. `--bg` writes the mapping into
+    tailscaled's own serve config and returns immediately instead of
+    streaming logs in the foreground; the CLI's own stdout carries the public
+    URL on success, so there is no separate query for the tailnet hostname.
+
+    `--yes` skips the one-time interactive "this exposes a service to the
+    public internet, continue?" confirmation the CLI shows the first time
+    Funnel is used on a node — without it the process just sits reading a
+    stdin nobody is offering it, `stdin=DEVNULL` closes that gap outright
+    (a prompt reading a closed stdin fails immediately instead of hanging),
+    and the `timeout` is only the fallback for a genuinely stuck daemon.
+
+    Returns (host, None) on success — just the tailnet hostname the CLI
+    printed, e.g. "foo.tailxxxx.ts.net", NEVER the full URL: Funnel fronts the
+    node's *root*, so the caller must still build the real link through
+    `server.url_for(host, scheme="https", port=None)` to get our server's own
+    `/<token>/` path onto it — the raw CLI text is the tailnet root with no
+    such path, so using it as-is is a link to nowhere.
+    Returns (None, hint) on failure, where hint is a human-readable reason to
+    show in the share dialog (Funnel not enabled for this tailnet, no
+    `tailscale` binary, a timed-out call, etc)."""
+    if not shutil.which("tailscale"):
+        return None, None
+    try:
+        out = subprocess.run(
+            ["tailscale", "funnel", "--bg", "--yes", str(port)],
+            capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return None, (f"tailscale funnel --bg {port} timed out — try it in a "
+                       "terminal to see what it's waiting on.")
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    text = out.stdout + out.stderr
+    m = re.search(r"https://\S+", text)
+    if out.returncode == 0 and m:
+        from urllib.parse import urlparse
+        host = urlparse(m.group(0)).netloc
+        if host:
+            return host, None
+    return None, text.strip() or None
+
+
+def _tailscale_funnel_stop(port):
+    """Undo _tailscale_funnel_start when the share window closes — best
+    effort. Leaving the mapping running would keep the document reachable
+    from the public internet after the dialog says sharing has stopped."""
+    if not shutil.which("tailscale"):
+        return
+    try:
+        subprocess.run(
+            ["tailscale", "funnel", str(port), "off"],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def _make_qr_png(url, out_path):
     """Render a QR PNG for url via the optional 'qrencode' tool. Returns True on
     success, False if qrencode isn't installed or fails (caller shows the URL)."""
@@ -10450,6 +10510,7 @@ class _ShareServer:
         self.ip = _lan_ip()
         self.port = 0
         self.served = False
+        self.funnel_port = None    # set by _share_prepare when Funnel is live
         self._httpd = None
         self.providers = providers
         self.file_path = file_path
@@ -10554,17 +10615,25 @@ class _ShareServer:
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
         return self
 
-    def url_for(self, host):
+    def url_for(self, host, *, scheme="http", port=...):
+        # port=... (not None) means "the port we're listening on"; pass
+        # port=None for a public Funnel URL, which fronts on the standard
+        # 443 and so carries no port at all.
         from urllib.parse import quote
+        port = self.port if port is ... else port
+        hostport = f"{host}:{port}" if port else host
         if self.providers is not None:
-            return f"http://{host}:{self.port}/{self.token}/"
-        return f"http://{host}:{self.port}/{self.token}/{quote(self.filename)}"
+            return f"{scheme}://{hostport}/{self.token}/"
+        return f"{scheme}://{hostport}/{self.token}/{quote(self.filename)}"
 
     @property
     def url(self):
         return self.url_for(self.ip)
 
     def stop(self):
+        if self.funnel_port:
+            _tailscale_funnel_stop(self.funnel_port)
+            self.funnel_port = None
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()
@@ -16732,6 +16801,20 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._sessions = [self._active_session]
         self._closed_tabs = []   # reopen stack for Ctrl+Shift+T (file paths)
         self._share_revision = 0  # bumps on every change; drives live phone share
+        self._share_window = None   # the QR/link window, or None — set by
+                                     # _show_share_dialog / _build_share_window_shell
+        self._share_server = None   # the live _ShareServer, or None — outlives
+                                     # the dialog window; closing the window no
+                                     # longer stops sharing (only Stop does)
+        self._share_entries = None  # cached (server, entries) from the last
+        self._share_out_dir = None  # _share_prepare, so reopening the window
+                                     # doesn't re-run tailscale/QR generation
+        self._share_gen = 0    # bumped when a share is abandoned before it
+                                # ever went live (closed/quit mid-spinner) —
+                                # lets the in-flight worker notice and tear
+                                # its own (unpublished) server back down
+                                # instead of reviving a share you already
+                                # walked away from
         self._notes_link_updating = False   # guards the row-129 checkbox
         self._bookmark_updating = False     # the same guard for the bookmark toggle
         self._bookmark_lists = []           # every live copy of the list widget
@@ -19788,6 +19871,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         for s in self._sessions:
             if s._presenter is not None:
                 s._presenter.close()
+        # Sharing now outlives its own window (row/#180), so it does NOT
+        # outlive the app — an orphaned server (and, worse, a live public
+        # Funnel mapping) must not survive the window that started it.
+        self._stop_sharing()
         self.destroy()
 
     def _ask_save_then(self, callback, title=None):
@@ -24566,6 +24653,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._toast("Open a PDF first to share it.")
             return
         self._commit_note()
+        # Sharing OUTLIVES the window now (closing it is not stopping it —
+        # see _stop_sharing), so a second Share click can land in three
+        # states: the window's still open (bring it forward), the window was
+        # closed but the share is still live (rebuild the chrome around it,
+        # no new server), or nothing is running at all (start fresh).
+        if self._share_window is not None:
+            self._share_window.present()
+            return
+        if self._share_server is not None:
+            self._reopen_share_window()
+            return
         # Show the dialog *immediately* with a spinner; the slow parts
         # (baking the PDF, starting the server, rendering QR codes) run in a
         # worker thread so the button feels responsive.
@@ -24576,21 +24674,27 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         """Worker-thread body: start the (already-built) server and render the QR
         PNGs. Returns (server, entries) or raises. Each entry is a dict with a
         caption and either a ready QR path + url, or a hint string. Nothing is
-        baked up front — the live server renders/bakes on demand."""
+        baked up front — the live server renders/bakes on demand.
+
+        Entries come back in PRIORITY order — public link, then tailnet, then
+        LAN — not the order they're computed in (funnel needs the tailnet IP
+        first). The dialog picks its default tab by walking this list for the
+        first entry that actually has a live url, so the order here IS the
+        preference the user asked for; reordering the return reorders the UI,
+        nothing downstream needs to know why."""
         server.start()
 
-        entries = []
         lan_url = server.url_for(server.ip)
         lan_qr = os.path.join(out_dir, "qr-lan.png")
-        entries.append({"caption": "Same Wi-Fi", "url": lan_url,
-                        "qr": lan_qr if _make_qr_png(lan_url, lan_qr) else None})
+        wifi_entry = {"caption": "Same Wi-Fi", "url": lan_url,
+                      "qr": lan_qr if _make_qr_png(lan_url, lan_qr) else None}
 
         ts = _tailscale_ip()
         if ts and ts != server.ip:
             ts_url = server.url_for(ts)
             ts_qr = os.path.join(out_dir, "qr-ts.png")
-            entries.append({"caption": "Over Tailscale", "url": ts_url,
-                            "qr": ts_qr if _make_qr_png(ts_url, ts_qr) else None})
+            ts_entry = {"caption": "Over Tailscale", "url": ts_url,
+                        "qr": ts_qr if _make_qr_png(ts_url, ts_qr) else None}
         else:
             if shutil.which("tailscale"):
                 hint = ("Tailscale is installed but not connected. Run "
@@ -24600,22 +24704,63 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 hint = ("Set up Tailscale on both devices to share securely "
                         "from anywhere — even when the Wi-Fi blocks the direct "
                         "link (repeaters, guest networks, AP isolation).")
-            entries.append({"caption": "Over Tailscale", "hint": hint})
-        return server, entries
+            ts_entry = {"caption": "Over Tailscale", "hint": hint}
 
-    def _share_entry(self, entry):
-        """One column of the share dialog: a QR (if available) plus the link as
-        selectable text, or an explanatory hint, under a caption."""
+        # PROTOTYPE (#180): a public link via Tailscale Funnel — the phone
+        # needs no Tailscale app at all, unlike the tailnet link above. Only
+        # attempted once we already know Tailscale is connected on this end;
+        # the tradeoff (anyone with the link, not just your own devices, for
+        # as long as sharing stays on) belongs in front of the user, not
+        # decided here — the dialog is the one place that says it.
+        if ts:
+            funnel_host, funnel_hint = _tailscale_funnel_start(server.port)
+            if funnel_host:
+                server.funnel_port = server.port   # stop() tears it down
+                # Funnel fronts the node's ROOT — the CLI told us only the
+                # hostname, so the actual link still has to carry our
+                # server's own /token/ path, or the phone hits a route that
+                # doesn't exist (this shipped broken once already: a QR that
+                # rendered fine but pointed at the bare tailnet root).
+                funnel_url = server.url_for(funnel_host, scheme="https",
+                                            port=None)
+                funnel_qr = os.path.join(out_dir, "qr-funnel.png")
+                funnel_entry = {"caption": "Anyone with the link (public)",
+                                "url": funnel_url,
+                                "qr": funnel_qr
+                                    if _make_qr_png(funnel_url, funnel_qr)
+                                    else None}
+            else:
+                funnel_entry = {"caption": "Anyone with the link (public)",
+                                "hint": funnel_hint or
+                                ("Enable Funnel for this tailnet in the "
+                                 "Tailscale admin console to get a public "
+                                 "link that needs no app on the phone.")}
+        else:
+            funnel_entry = {"caption": "Anyone with the link (public)",
+                            "hint": ("Connect this computer to Tailscale to "
+                                     "turn on a public link (Funnel) that "
+                                     "needs no app on the phone.")}
+        return server, [funnel_entry, ts_entry, wifi_entry]
+
+    def _share_entry(self, entry, show_caption=True):
+        """One page of the share dialog's mode switcher: a QR (if available)
+        plus the link as selectable text, or an explanatory hint. The caption
+        is the switcher's own tab label now (row/#180's 3-column layout became
+        a Gtk.Stack + Gtk.StackSwitcher), so show_caption=False drops the
+        redundant heading — kept togglable rather than removed outright since
+        nothing else here depended on a caption always being present."""
         col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         col.set_hexpand(True)
-        head = Gtk.Label(label=entry["caption"])
-        head.add_css_class("heading")
-        col.append(head)
+        col.set_halign(Gtk.Align.CENTER)
+        if show_caption:
+            head = Gtk.Label(label=entry["caption"])
+            head.add_css_class("heading")
+            col.append(head)
         if "url" in entry:
             if entry.get("qr"):
                 pic = Gtk.Picture.new_for_filename(entry["qr"])
                 pic.set_can_shrink(False)
-                pic.set_size_request(200, 200)
+                pic.set_size_request(160, 160)
                 col.append(pic)
             else:
                 hint = Gtk.Label(label="Install ‘qrencode’ for a scannable code.")
@@ -24631,7 +24776,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             col.append(link)
         else:
             spacer = Gtk.Box()
-            spacer.set_size_request(200, 200)
+            spacer.set_size_request(160, 160)
             icon = Gtk.Image.new_from_icon_name("network-vpn-symbolic")
             icon.set_pixel_size(48)
             icon.set_vexpand(True)
@@ -24667,7 +24812,195 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         finally:
             out.close()
 
+    def _update_share_indicator(self, active):
+        """The Share button IS the "currently sharing" indicator (#180) — no
+        separate banner row. `.success` is Adwaita's own green-tint class, so
+        this needs no new widget or header layout change (which would have
+        broken the test walking _header_end's direct children); the button's
+        CLICK BEHAVIOUR never changes — it always opens/reopens the panel,
+        active or not — so lighting up is purely a look, never a second
+        meaning for the same click, which is what made a plain toggle
+        ambiguous here (does clicking an active toggle stop it, or view it?).
+        Stop sharing lives inside the panel this always opens."""
+        self._share_btn.set_tooltip_text(
+            "Sharing to phone — click to view or stop" if active
+            else "Share to phone — live view + QR code")
+        if active:
+            self._share_btn.add_css_class("success")
+        else:
+            self._share_btn.remove_css_class("success")
+
+    def _on_share_window_close(self, win):
+        """Closing the QR window is NOT stopping the share (that changed —
+        see _stop_sharing): the server, and any Funnel mapping, keep running
+        so the phone keeps following along. This just drops the reference so
+        the next Share click (or _on_share_window_close itself, re-entered
+        from _stop_sharing's own win.close()) rebuilds a fresh window instead
+        of presenting a destroyed one.
+
+        The one exception is closing it WHILE STILL LOADING (no server has
+        gone live yet, so there is nothing meaningful to "keep running" —
+        the spinner never showed a link): that abandons the in-flight
+        attempt instead, via the generation bump _show_share_dialog's worker
+        checks before publishing itself."""
+        if self._share_window is win:
+            self._share_window = None
+            if self._share_server is None:
+                self._share_gen += 1
+        return False   # allow the window itself to close
+
+    def _stop_sharing(self):
+        """The ONE place a share actually ends. Idempotent by construction —
+        state is cleared before anything that could re-enter (server.stop()
+        synchronously, win.close() triggers _on_share_window_close) — so the
+        Stop button, the 10-minute safety net and app quit can all call this
+        without coordinating who got there first. Also bumps the generation
+        so a worker still preparing a share when this fires (app quit mid
+        spinner, say) tears its own result down instead of publishing it."""
+        self._share_gen += 1
+        server, out_dir = self._share_server, self._share_out_dir
+        self._share_server = None
+        self._share_out_dir = None
+        self._share_entries = None
+        if server is not None:
+            server.stop()   # safe even half-started; turns Funnel back off too
+        if out_dir:
+            shutil.rmtree(out_dir, ignore_errors=True)
+        self._update_share_indicator(False)
+        if self._share_window is not None:
+            win = self._share_window
+            self._share_window = None
+            win.close()
+
+    def _build_share_window_shell(self):
+        """The window chrome shared by a fresh share and a reopened one: a
+        *non-modal* companion window (not an AlertDialog) so you can keep
+        drawing on / flipping through the PDF while the phone follows along —
+        the whole point of the live view — plus the Stop sharing button.
+        Returns (win, body, stop_btn); the caller fills body and flips
+        stop_btn once something is actually live to stop."""
+        win = Adw.Window()
+        self._share_window = win
+        win.set_title("Sharing to phone")
+        win.set_transient_for(self)
+        win.set_modal(False)
+        win.set_default_size(320, 400)   # one mode at a time now (a switcher,
+                                          # not 3 columns), so portrait fits it
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        # The window's own close button (X) dismisses without stopping —
+        # _on_share_window_close is what makes that true, not a widget here.
+        # Stop sharing is the one button that actually ends it, so it's the
+        # only one worth adding explicitly.
+        stop_btn = Gtk.Button(label="Stop sharing")
+        stop_btn.set_tooltip_text("Stop the phone from being able to reach "
+                                  "this document")
+        stop_btn.add_css_class("destructive-action")
+        stop_btn.set_sensitive(False)   # nothing to stop until it's ready
+        stop_btn.connect("clicked", lambda _b: self._stop_sharing())
+        header.pack_end(stop_btn)
+        toolbar.add_top_bar(header)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        body.set_margin_top(12)
+        body.set_margin_bottom(18)
+        body.set_margin_start(18)
+        body.set_margin_end(18)
+        toolbar.set_content(body)
+        win.set_content(toolbar)
+        win.connect("close-request", self._on_share_window_close)
+        return win, body, stop_btn
+
+    @staticmethod
+    def _clear_box(box):
+        child = box.get_first_child()
+        while child is not None:
+            box.remove(child)
+            child = box.get_first_child()
+
+    def _show_share_loading(self, body):
+        self._clear_box(body)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_vexpand(True)
+        box.set_valign(Gtk.Align.CENTER)
+        box.set_halign(Gtk.Align.CENTER)
+        spinner = Gtk.Spinner()
+        spinner.set_size_request(48, 48)
+        spinner.start()
+        box.append(spinner)
+        msg = Gtk.Label(label="Preparing a link for your phone…")
+        msg.add_css_class("dim-label")
+        box.append(msg)
+        body.append(box)
+
+    def _show_share_ready(self, body, entries):
+        """Fill body with the intro + mode switcher + live indicator for a
+        (server, entries) pair that's already live — shared by a fresh
+        share's worker callback and by reopening the window on one that's
+        still running, so reopening never re-runs tailscale/funnel/QR work."""
+        self._clear_box(body)
+        intro = Gtk.Label(
+            label="Scan to open a <b>live view</b> on your phone — it follows "
+                  "along as you draw and flip pages. Tap <b>Download</b> there "
+                  "for the full annotated PDF. Sharing keeps running when "
+                  "you close this window — use <b>Stop sharing</b> to end it.")
+        intro.set_use_markup(True)
+        intro.set_wrap(True)
+        intro.set_xalign(0)
+        body.append(intro)
+
+        # A switcher instead of 3 side-by-side columns, defaulting to the
+        # best reachable option — "anyone with the link" beats a tailnet
+        # link beats plain LAN, in the order _share_prepare already returns
+        # them in, so the first entry with a live "url" wins.
+        stack = Gtk.Stack()
+        stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        stack.set_vexpand(True)
+        switcher = Gtk.StackSwitcher()
+        switcher.set_stack(stack)
+        switcher.set_halign(Gtk.Align.CENTER)
+        switcher.set_margin_top(6)
+        body.append(switcher)
+        body.append(stack)
+
+        default_name = None
+        for i, entry in enumerate(entries):
+            page_name = f"e{i}"
+            stack.add_titled(self._share_entry(entry, show_caption=False),
+                             page_name, entry["caption"])
+            if default_name is None and "url" in entry:
+                default_name = page_name
+        stack.set_visible_child_name(default_name or f"e{len(entries) - 1}")
+
+        live = Gtk.Label(label="●  Live — your phone mirrors this document")
+        live.add_css_class("dim-label")
+        live.add_css_class("caption")
+        live.set_margin_top(4)
+        body.append(live)
+
+    def _show_share_failed(self, body, message):
+        self._clear_box(body)
+        lbl = Gtk.Label(label=f"Could not prepare the share:\n{message}")
+        lbl.set_wrap(True)
+        lbl.set_xalign(0)
+        body.append(lbl)
+
+    def _reopen_share_window(self):
+        """The window was closed (Close, or its own X) while the share
+        stayed live — self._share_server and self._share_entries are still
+        good, so just rebuild the chrome around them. No worker thread, no
+        new _ShareServer, no re-running tailscale/funnel."""
+        win, body, stop_btn = self._build_share_window_shell()
+        stop_btn.set_sensitive(True)
+        self._show_share_ready(body, self._share_entries)
+        win.present()
+
     def _show_share_dialog(self):
+        """Start a share from scratch: a spinner first, then the worker
+        thread fills in the picker once _share_prepare returns. Only called
+        when nothing is live yet — _on_share_to_phone routes an already-live
+        share to _reopen_share_window instead. The window and the share it
+        shows are two different lifetimes now — see _on_share_window_close /
+        _stop_sharing."""
         out_dir = tempfile.mkdtemp(prefix="sidemark-share-")
         # Bind to the document that's active *now*, so the live view keeps
         # following it even if the user switches tabs while sharing.
@@ -24706,94 +25039,35 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "pdf": lambda p: _run_on_main(lambda: bake(p)),
         }
         server = _ShareServer(providers=providers)
+        my_gen = self._share_gen   # see _on_share_window_close / _stop_sharing
 
-        # A *non-modal* companion window (not an AlertDialog) so you can keep
-        # drawing on / flipping through the PDF while the phone follows along —
-        # the whole point of the live view. Set it aside and work behind it.
-        win = Adw.Window()
-        self._share_window = win   # kept for testing / single-instance reuse
-        win.set_title("Sharing to phone")
-        win.set_transient_for(self)
-        win.set_modal(False)
-        win.set_default_size(520, 420)
-        toolbar = Adw.ToolbarView()
-        toolbar.add_top_bar(Adw.HeaderBar())
-        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        body.set_margin_top(12)
-        body.set_margin_bottom(18)
-        body.set_margin_start(18)
-        body.set_margin_end(18)
-        toolbar.set_content(body)
-        win.set_content(toolbar)
-
-        def _clear(box):
-            child = box.get_first_child()
-            while child is not None:
-                box.remove(child)
-                child = box.get_first_child()
-
-        def _show_loading():
-            _clear(body)
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-            box.set_vexpand(True)
-            box.set_valign(Gtk.Align.CENTER)
-            box.set_halign(Gtk.Align.CENTER)
-            spinner = Gtk.Spinner()
-            spinner.set_size_request(48, 48)
-            spinner.start()
-            box.append(spinner)
-            msg = Gtk.Label(label="Preparing a link for your phone…")
-            msg.add_css_class("dim-label")
-            box.append(msg)
-            body.append(box)
-        _show_loading()
-
-        stopped = {"v": False}
-
-        def _cleanup(*_a):
-            if stopped["v"]:
-                return False
-            stopped["v"] = True
-            server.stop()      # safe even if it never started; also rmtree's tmp
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return False
-        win.connect("close-request", _cleanup)
+        win, body, stop_btn = self._build_share_window_shell()
+        self._show_share_loading(body)
         win.present()
 
         def _ready(srv, entries):
-            _clear(body)
-            intro = Gtk.Label(
-                label="Scan to open a <b>live view</b> on your phone — it follows "
-                      "along as you draw and flip pages. Tap <b>Download</b> there "
-                      "for the full annotated PDF. Keep this window open while you "
-                      "work; closing it stops sharing.")
-            intro.set_use_markup(True)
-            intro.set_wrap(True)
-            intro.set_xalign(0)
-            body.append(intro)
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
-            row.set_margin_top(6)
-            row.set_homogeneous(True)
-            for entry in entries:
-                row.append(self._share_entry(entry))
-            body.append(row)
-            live = Gtk.Label(label="●  Live — your phone mirrors this document")
-            live.add_css_class("dim-label")
-            live.add_css_class("caption")
-            live.set_margin_top(4)
-            body.append(live)
-            # safety net: stop serving after 10 minutes even if left open
+            if my_gen != self._share_gen:
+                # abandoned before it went live (window closed mid-spinner,
+                # Stop clicked, or the app quit) — tear this one back down
+                # instead of reviving a share nobody is looking at anymore
+                srv.stop()
+                shutil.rmtree(out_dir, ignore_errors=True)
+                return False
+            self._share_server = srv
+            self._share_out_dir = out_dir
+            self._share_entries = entries
+            self._update_share_indicator(True)
+            stop_btn.set_sensitive(True)
+            self._show_share_ready(body, entries)
+            # safety net: stop sharing after 10 minutes even if left running
             GLib.timeout_add_seconds(
-                600, lambda: (_cleanup(), win.close(), False)[2])
+                600, lambda: (self._stop_sharing(), False)[1])
             return False
 
         def _failed(message):
-            _clear(body)
             shutil.rmtree(out_dir, ignore_errors=True)
-            lbl = Gtk.Label(label=f"Could not prepare the share:\n{message}")
-            lbl.set_wrap(True)
-            lbl.set_xalign(0)
-            body.append(lbl)
+            if my_gen == self._share_gen:
+                self._show_share_failed(body, message)
             return False
 
         def _worker():
