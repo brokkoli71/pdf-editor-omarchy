@@ -7,6 +7,30 @@ on:
     branches: [master]
 
 jobs:
+  # CLAUDE.md has a LENGTH BUDGET, and this is what makes it real. It grew to
+  # 2254 lines once, at which point sessions stopped reading it to the end and
+  # started missing the rules near the bottom — which is how "never run the
+  # tests against the live session" came to be broken twice. Detail belongs in
+  # docs/<area>.md, a code comment, or ideas.csv; the starting point stays
+  # short enough to be read in full.
+  docs-budget:
+    name: CLAUDE.md stays readable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the length budget
+        run: |
+          BUDGET=400
+          N=$(wc -l < CLAUDE.md)
+          echo "CLAUDE.md is $N lines (budget $BUDGET)"
+          if [ "$N" -gt "$BUDGET" ]; then
+            echo "::error file=CLAUDE.md::CLAUDE.md is $N lines, over the $BUDGET-line budget."
+            echo "It is the file every session reads FULLY before doing anything."
+            echo "Move the detail to docs/<area>.md, to a comment at the code it"
+            echo "describes, or to ideas.csv — and never add a changelog entry."
+            exit 1
+          fi
+
   # Unit tests — GTK4 needs a real compositor even for headless widget
   # construction. Weston's headless backend provides a Wayland socket
   # with no screen/GPU required.

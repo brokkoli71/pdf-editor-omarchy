@@ -20,6 +20,31 @@ _WINDOW_RE = re.compile(r"PDFEditorWindow|PresenterWindow|Adw\.Application")
 _seen = {}
 
 
+def pytest_sessionstart(session):
+    """Refuse to run against the user's real desktop session.
+
+    A bare `pytest` inherits the live WAYLAND_DISPLAY, so the suite builds real
+    windows on top of whatever the user is doing and — because `Bindings.save()`
+    persists on every rebind — rewrites the button table of the app they
+    actually use. `run_tests.sh` starts an isolated headless Weston and is the
+    only thing that sets SIDEMARK_TEST_HARNESS.
+
+    A rule in a document is a rule that gets missed; this one is enforced.
+    Set SIDEMARK_ALLOW_BARE_PYTEST=1 to override deliberately."""
+    if os.environ.get("SIDEMARK_TEST_HARNESS") or \
+            os.environ.get("SIDEMARK_ALLOW_BARE_PYTEST"):
+        return
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+        return          # no session to damage (CI runs its own way)
+    raise pytest.UsageError(
+        "\n\nRefusing to run against your live desktop session.\n"
+        "  Use  ./run_tests.sh            (isolated headless Weston)\n"
+        "       ./run_tests.sh --full     (including the window tier)\n"
+        "       ./run_tests.sh -k Name    (one class)\n"
+        "A bare pytest would pop real windows over your work and rewrite the\n"
+        "settings of the Sidemark you actually use.\n")
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",

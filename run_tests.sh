@@ -93,6 +93,11 @@ fi
 CFG="$RT/config"
 mkdir -p "$CFG"
 
+# SIDEMARK_TEST_HARNESS is what conftest.py checks before letting the suite
+# run at all: without it, a bare `pytest` would drive the REAL desktop session
+# — popping windows over your work and rewriting the settings of the app you
+# actually use. Only this script may set it.
 exec env XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY="$SOCK" GDK_BACKEND=wayland \
   XDG_CONFIG_HOME="$CFG" \
-  SIDEMARK_TEST=1 /usr/bin/python3 -m pytest "${TIER[@]}" "${@:-test_pdfeditor.py}" -q
+  SIDEMARK_TEST=1 SIDEMARK_TEST_HARNESS=1 \
+  /usr/bin/python3 -m pytest "${TIER[@]}" "${@:-test_pdfeditor.py}" -q
