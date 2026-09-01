@@ -298,6 +298,30 @@ done
 install -m 755 "$SCRIPT_DIR/sidemark.py" "$INSTALL_DIR/sidemark.py"
 ok "sidemark.py  →  $INSTALL_DIR/"
 
+# Stamp what this copy IS. An installed copy has no .git, so `sidemark
+# --version` can only report its commit — and whether the tree it came from was
+# clean — if that is recorded now. It is also the only moment the dirtiness is
+# still knowable.
+_commit=""; _dirty=""
+if command -v git >/dev/null && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    _commit=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || true)
+    _dirty=$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null | grep -c . || true)
+fi
+# ${x:+..}${x:-..} is NOT an if/else — when x is set BOTH expand, which wrote
+# `"abc123"abc123` and made the file unparseable. Build the JSON values first.
+if [ -n "$_commit" ]; then _commit_json="\"$_commit\""; else _commit_json=null; fi
+if [ -n "$_dirty" ]; then _dirty_json="$_dirty"; else _dirty_json=null; fi
+cat > "$INSTALL_DIR/build.json" <<JSON
+{
+  "commit": $_commit_json,
+  "dirty": $_dirty_json,
+  "built": "$(date '+%Y-%m-%d %H:%M')",
+  "by": "install.sh"
+}
+JSON
+chmod 644 "$INSTALL_DIR/build.json"
+ok "build.json   →  $INSTALL_DIR/  (what \`sidemark --version\` reports)"
+
 # The browser port, served to a phone by Share to phone. Not optional any
 # more: scanning the QR lands on it, and without it a share falls back to the
 # small image viewer that cannot zoom. `test/` and package.json are

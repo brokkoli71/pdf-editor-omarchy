@@ -717,6 +717,7 @@ function liveConnect() {
     let s; try { s = JSON.parse(e.data); } catch { return; }
     if (s.t === "state") onLiveState(s);
     else if (s.t === "live") onLiveStroke(s);
+    else if (s.t === "camera") onLiveCamera(s);
   });
   const gone = () => {
     if (liveSock !== sock) return;         // a newer socket already took over
@@ -744,6 +745,38 @@ function onLiveStroke(s) {
         color: s.c || [0, 0, 0], opacity: s.o ?? 1 }
     : null;
   surface.requestDraw();
+}
+
+/** The desktop is pointing at something — go and look at it.
+ *
+ * A SUGGESTION, not a lock. Nothing here disables the phone's own pinch: the
+ * moment you move, `liveWatchView` reports the new viewport and the desktop's
+ * rectangle follows you again, exactly as it did before. That is the whole
+ * model — there is ONE box, it is where the phone is looking, and either end
+ * can move it.
+ *
+ * The region is fitted rather than matched exactly: the phone's aspect ratio
+ * is not the desktop's, so the drawn rectangle is CONTAINED (the smaller of
+ * the two scales) — showing everything that was pointed at and a little more
+ * beats cropping half of it away. */
+function onLiveCamera(s) {
+  if (!surface.doc || !s.rect || s.rect.length !== 4) return;
+  const [x0, y0, x1, y1] = s.rect;
+  const w = Math.max(x1 - x0, 1e-3), h = Math.max(y1 - y0, 1e-3);
+  const go = async () => {
+    if (s.page !== undefined && s.page !== surface.pageIndex) {
+      await surface.setPage(s.page);
+      livePage = s.page;
+    }
+    const zoom = Math.min(surface.cssW / w, surface.cssH / h);
+    surface.zoom = Math.max(0.05, Math.min(16, zoom));
+    // centre what was pointed at, which is not the same as putting its corner
+    // at the origin once the aspect ratios differ
+    surface.offX = surface.cssW / 2 - (x0 + w / 2) * surface.zoom;
+    surface.offY = surface.cssH / 2 - (y0 + h / 2) * surface.zoom;
+    surface.requestDraw();
+  };
+  go();
 }
 
 /** Tell the desktop where this phone is looking (row 182's indicator).

@@ -273,6 +273,8 @@ Arguments:
 Options:
   -h, --help            Show this help message and exit.
   -v, --verbose         Enable verbose (debug-level) logging.
+  -V, --version         Show the version, the commit it was built from, and
+                        WHICH copy is running (several can be installed).
       --page N          Open FILE at page N (0-based page index).
       --new             Open a blank PDF page (ignored if FILE is given).
       --new-text        Open a blank text-first page instead.
@@ -289,9 +291,107 @@ Examples:
   sidemark notes.md
 """
 
+SIDEMARK_VERSION = "0.6.0"
+
+
+def _build_info():
+    """What this copy of Sidemark actually is: version, commit, and whether
+    the tree it was built from was clean.
+
+    Two sources, in order. An INSTALLED copy has no `.git`, so `install.sh`
+    and the PKGBUILDs stamp a `build.json` beside the script at install time —
+    which is also the only way to record that the source was dirty when it was
+    installed, a fact that is unrecoverable afterwards. A CHECKOUT has no
+    stamp and is read live, because the answer changes with every commit and a
+    stale stamp would be worse than none."""
+    info = {"version": SIDEMARK_VERSION, "commit": None, "dirty": None,
+            "built": None, "by": None}
+    here = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+    try:
+        with open(os.path.join(here, "build.json")) as f:
+            info.update({k: v for k, v in json.load(f).items() if v is not None})
+        return info
+    except (OSError, ValueError):
+        pass
+    try:
+        run = lambda *a: subprocess.run(a, cwd=here, capture_output=True,
+                                        text=True, timeout=5)
+        r = run("git", "rev-parse", "--short", "HEAD")
+        if r.returncode == 0:
+            info["commit"] = r.stdout.strip()
+            info["by"] = "source checkout"
+            d = run("git", "status", "--porcelain")
+            if d.returncode == 0:
+                info["dirty"] = len([l for l in d.stdout.splitlines() if l.strip()])
+            t = run("git", "describe", "--tags", "--abbrev=0")
+            if t.returncode == 0 and t.stdout.strip():
+                info["version"] = t.stdout.strip().lstrip("v")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return info
+
+
+def _print_version():
+    """`--version`, and it answers "WHICH sidemark am I running?" as much as
+    "which version".
+
+    The path is not a detail: more than one copy can be installed at once (an
+    AUR package in /usr and install.sh's in ~/.local), PATH picks one, and the
+    symptom is edits that appear not to have landed. So the running file, and
+    any OTHER sidemark on PATH, are printed every time."""
+    info = _build_info()
+    bits = [f"Sidemark {info['version']}"]
+    tail = []
+    if info["commit"]:
+        tail.append(info["commit"])
+    if info["dirty"]:
+        tail.append(f"{info['dirty']} file{'s' if info['dirty'] != 1 else ''} "
+                    "modified since")
+    elif info["dirty"] == 0:
+        tail.append("clean")
+    if not info["commit"]:
+        tail.append("unknown commit")
+    print(bits[0] + (" (" + ", ".join(tail) + ")" if tail else ""))
+
+    script = os.path.realpath(os.path.abspath(__file__))
+    print(f"  running    {script}")
+    try:
+        mtime = datetime.datetime.fromtimestamp(os.path.getmtime(script))
+        print(f"  file date  {mtime:%Y-%m-%d %H:%M}")
+    except OSError:
+        pass
+    if info["built"]:
+        print(f"  installed  {info['built']}"
+              + (f" by {info['by']}" if info["by"] else ""))
+    elif info["by"]:
+        print(f"  source     {info['by']}")
+
+    # The actual trap, made visible: several sidemarks, one PATH.
+    found, seen = [], set()
+    for d in (os.environ.get("PATH") or "").split(os.pathsep):
+        cand = os.path.join(d, "sidemark")
+        real = os.path.realpath(cand)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK) and real not in seen:
+            seen.add(real)
+            found.append(cand)
+    if len(found) > 1:
+        print("\n  ⚠ more than one sidemark is on your PATH — `sidemark` runs "
+              "the first:")
+        for i, f in enumerate(found):
+            print(f"      {'→' if i == 0 else ' '} {f}")
+        print("    Edits to the others will look as though they never landed.")
+
+
 # Fast paths handled before any GTK import: print and exit straight away.
 if __name__ == "__main__" and ("-h" in sys.argv[1:] or "--help" in sys.argv[1:]):
     print(_USAGE, end="")
+    sys.exit(0)
+
+# --version is a fast path for the same reason the others are, and one more:
+# the question it answers ("which copy am I even running?") is at its most
+# useful when the app will not start, so it must not need GTK to answer.
+if __name__ == "__main__" and ("-V" in sys.argv[1:] or "--version" in sys.argv[1:]):
+    _print_version()
     sys.exit(0)
 
 # Launcher integrations (walker/elephant menus, rofi, …):
@@ -2573,7 +2673,7 @@ def _merge_selection(base, strokes, images):
 # old id, still accepted everywhere a tool is named (settings, saved chords).
 
 TOOL_BAR_ORDER = ("pen", "highlighter", "eraser", "lasso", "text",
-                  "pan", "zoom", "anchor")
+                  "pan", "zoom", "anchor", "phoneview")
 TOOL_MODES = {
     "pen":         ("pdf", "text"),
     "highlighter": ("pdf", "text"),
@@ -2586,17 +2686,25 @@ TOOL_MODES = {
     "pan":         ("pdf", "text"),
     "zoom":        ("pdf", "text"),
     "anchor":      ("pdf",),        # the one genuinely PDF-only tool
+    # Row 182: send the connected phone somewhere. PDF-only because the phone
+    # only has a camera of its own when it is running the browser port, and a
+    # text-first page falls back to the image viewer, which by construction
+    # shows the desktop's view and nothing else. It is also the one tool whose
+    # button comes and goes — see _sync_phone_tool_chrome.
+    "phoneview":   ("pdf",),
 }
 TOOL_WIDGET = {"pen": "_mode_pen", "highlighter": "_mode_hl",
                "eraser": "_mode_eraser", "lasso": "_mode_lasso",
                "text": "_mode_text", "pan": "_mode_pan",
-               "zoom": "_mode_zoom", "anchor": "_mode_anchor"}
+               "zoom": "_mode_zoom", "anchor": "_mode_anchor",
+               "phoneview": "_mode_phoneview"}
 TOOL_ALIASES = {"select": "text"}
 TOOL_INDEX = {t: i for i, t in enumerate(TOOL_BAR_ORDER)}
 TOOL_INDEX["select"] = TOOL_INDEX["text"]
 TOOL_LABELS = {"pen": "Pen", "highlighter": "Highlighter", "eraser": "Eraser",
                "lasso": "Lasso", "text": "Text cursor", "pan": "Pan",
-               "zoom": "Zoom to region", "anchor": "Anchor / callout"}
+               "zoom": "Zoom to region", "anchor": "Anchor / callout",
+               "phoneview": "Phone view"}
 
 
 def canonical_tool(tool):
@@ -2661,6 +2769,11 @@ DEFAULT_BINDINGS = {
     # touch runs, it must not be the pen. Rebind it to `pen` for a touch-only
     # tablet with no stylus (see ideas.csv row 135).
     "finger": "pan",
+    # Row 182: draw a region and the connected phone goes there; grab the
+    # rectangle showing where it is looking and drag it, and the phone
+    # follows. Bound to a chord nothing else wanted, and only reachable while
+    # a share is live — the button is not in the bar otherwise.
+    "ctrl+shift+left": "phoneview",
 }
 
 # The TEXT page's table. Same defaults unless there is a reason — the two modes
@@ -3572,6 +3685,15 @@ class PDFCanvas(Gtk.DrawingArea):
         # where a connected phone is looking, {"page": n, "rect": (…)} in PDF
         # units, or None when nothing is connected (row 182)
         self.remote_view = None
+        # the phone-view tool: a marquee being drawn, or the indicator being
+        # dragged. While either is true the rectangle on screen is OURS and
+        # the phone's own reports are ignored — otherwise the box fights the
+        # hand moving it, a frame behind.
+        self._phone_selecting = False
+        self._phone_start = self._phone_end = None
+        self._phone_drag = None          # (grab_dx, grab_dy) in PDF units
+        # set when a share is live: called with (page, rect) in PDF units
+        self.on_phone_view = None
         self.page = None
         self.page_width = 0
         self.page_height = 0
@@ -4749,6 +4871,14 @@ class PDFCanvas(Gtk.DrawingArea):
             rh = abs(self._zoom_end[1] - self._zoom_start[1])
             _draw_zoom_marquee(ctx, x1, y1, rw, rh, self.zoom_accent)
 
+        if self._phone_selecting and self._phone_start and self._phone_end:
+            x1 = min(self._phone_start[0], self._phone_end[0])
+            y1 = min(self._phone_start[1], self._phone_end[1])
+            _draw_zoom_marquee(ctx, x1, y1,
+                               abs(self._phone_end[0] - self._phone_start[0]),
+                               abs(self._phone_end[1] - self._phone_start[1]),
+                               self.zoom_accent)
+
         self._draw_remote_view(ctx)
 
     def _draw_remote_view(self, ctx):
@@ -4787,7 +4917,14 @@ class PDFCanvas(Gtk.DrawingArea):
         ctx.new_path()      # a shared painter must not leave a current point
 
     def set_remote_view(self, view):
-        """Called from the main thread when the phone reports its camera."""
+        """Called from the main thread when the phone reports its camera.
+
+        Ignored while the box is being dragged HERE: the phone is following us
+        and its reports are a round trip behind, so accepting them mid-drag
+        makes the rectangle stutter between where the hand is and where the
+        phone last was."""
+        if self._phone_drag is not None:
+            return
         if view == self.remote_view:
             return
         self.remote_view = view
@@ -5862,6 +5999,30 @@ class PDFCanvas(Gtk.DrawingArea):
             self._zoom_start = (start_x, start_y)
             self._zoom_end = (start_x, start_y)
             return
+        if tool == "phoneview":
+            # With no share live there is no phone to send anywhere, so the
+            # chord does NOTHING rather than something invisible. The binding
+            # itself stays in the table — the table is the truth, and a chord
+            # that disappeared when you stopped sharing would be a second
+            # mapping — but the verb is inert, which is exactly what the
+            # missing toolbar button already promises.
+            if self.on_phone_view is None:
+                return
+            # Inside the rectangle the phone is currently looking at? Then this
+            # press MOVES it. Otherwise it draws a new region to send it to.
+            # One box, two verbs — there is no second rectangle with a life of
+            # its own, because the box IS where the phone is.
+            px, py = self._screen_to_pdf(start_x, start_y)
+            rv = self.remote_view
+            if (rv and rv.get("page") == self.current_page_idx
+                    and _point_in_rect(px, py, rv["rect"])):
+                x0, y0, _x1, _y1 = rv["rect"]
+                self._phone_drag = (px - x0, py - y0)
+            else:
+                self._phone_selecting = True
+                self._phone_start = (start_x, start_y)
+                self._phone_end = (start_x, start_y)
+            return
         if tool == "anchor":
             # the anchor itself is dropped at press by _on_click_pressed;
             # dragging on places a callout box at the release point
@@ -6350,7 +6511,16 @@ class PDFCanvas(Gtk.DrawingArea):
                 self._selected_words = self._words_in_reading_range(px0, py0, px1, py1)
             self.queue_draw()
             return
-        if self._zoom_selecting:
+        if self._phone_selecting:
+            self._phone_end = (sx + offset_x, sy + offset_y)
+            self.queue_draw()
+        elif self._phone_drag is not None:
+            # LIVE, not on release: the box is a pointer at what you want them
+            # to look at, and pointing is a thing you do while talking.
+            px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
+            self._move_remote_view(px - self._phone_drag[0],
+                                   py - self._phone_drag[1])
+        elif self._zoom_selecting:
             # free-proportioned rectangle (matches the text sheet) — the zoom
             # fits whatever region you draw, no forced canvas aspect ratio
             self._zoom_end = (sx + offset_x, sy + offset_y)
@@ -6584,7 +6754,9 @@ class PDFCanvas(Gtk.DrawingArea):
             else:
                 self._finish_text_selection()
             return
-        if self._zoom_selecting:
+        if self._phone_selecting or self._phone_drag is not None:
+            self._finish_phone_view()
+        elif self._zoom_selecting:
             self._finish_zoom_region()
         else:
             if self.current_stroke and self._dismissed_selection:
@@ -7663,14 +7835,67 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.set_dash([])
 
     def _on_secondary_pressed(self, gesture, n_press, x, y):
-        if self._zoom_selecting:
-            # abort the zoom rectangle; _ignoring makes the rest of the still-
-            # held left drag (update + end) a no-op so nothing is drawn/zoomed
+        if self._zoom_selecting or self._phone_selecting:
+            # abort the rectangle; _ignoring makes the rest of the still-held
+            # left drag (update + end) a no-op so nothing is drawn/zoomed/sent
             self._zoom_selecting = False
             self._zoom_start = self._zoom_end = None
+            self._phone_selecting = False
+            self._phone_start = self._phone_end = None
             self._ignoring = True
             self.queue_draw()
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    def _move_remote_view(self, x0, y0):
+        """Put the phone's viewport at this top-left, keeping its size, and
+        tell the phone. Clamped to the page: a box you can drag off the paper
+        points at nothing, and the phone would clamp it back anyway — so the
+        rectangle would stop tracking the hand."""
+        rv = self.remote_view
+        if not rv:
+            return
+        ox0, oy0, ox1, oy1 = rv["rect"]
+        w, h = ox1 - ox0, oy1 - oy0
+        x0 = max(0.0, min(self.page_width - w, x0))
+        y0 = max(0.0, min(self.page_height - h, y0))
+        self.remote_view = {"page": self.current_page_idx,
+                            "rect": (x0, y0, x0 + w, y0 + h)}
+        self.queue_draw()
+        if self.on_phone_view:
+            self.on_phone_view(self.current_page_idx, self.remote_view["rect"])
+
+    def _finish_phone_view(self):
+        """Commit the phone-view gesture: send the phone to the region just
+        drawn, or leave it where the drag put it."""
+        selecting, start, end = (self._phone_selecting, self._phone_start,
+                                 self._phone_end)
+        self._phone_selecting = False
+        self._phone_start = self._phone_end = None
+        self._phone_drag = None
+        self.queue_draw()
+        if not selecting or not start or not end:
+            return          # a drag: every frame of it was already sent
+        if (abs(end[0] - start[0]) < ZOOM_RECT_MIN_PX
+                or abs(end[1] - start[1]) < ZOOM_RECT_MIN_PX):
+            # A click with no rectangle sends the phone back to the whole
+            # page — the same escape zoom-to-region gives you, and the same
+            # gesture, because this tool IS that one pointed at the phone.
+            rect = (0.0, 0.0, float(self.page_width), float(self.page_height))
+            self.remote_view = {"page": self.current_page_idx, "rect": rect}
+            self.queue_draw()
+            if self.on_phone_view:
+                self.on_phone_view(self.current_page_idx, rect)
+            return
+        x0, y0 = self._screen_to_pdf(min(start[0], end[0]), min(start[1], end[1]))
+        x1, y1 = self._screen_to_pdf(max(start[0], end[0]), max(start[1], end[1]))
+        rect = (x0, y0, x1, y1)
+        # Show it immediately rather than waiting for the phone to report back:
+        # the round trip is a render away, and a box that appears late reads as
+        # the gesture having missed.
+        self.remote_view = {"page": self.current_page_idx, "rect": rect}
+        self.queue_draw()
+        if self.on_phone_view:
+            self.on_phone_view(self.current_page_idx, rect)
 
     def _execute_zoom_to_rect(self, start, end):
         x1, y1 = min(start[0], end[0]), min(start[1], end[1])
@@ -10505,8 +10730,31 @@ def _tailscale_funnel_start(port, timeout=25):
         from urllib.parse import urlparse
         host = urlparse(m.group(0)).netloc
         if host:
+            # remember it: from here on the mapping exists in tailscaled and
+            # only we know to remove it (see _live_funnels)
+            _live_funnels.add(port)
             return host, None
     return None, text.strip() or None
+
+
+# Every Funnel mapping this process has made, so an exit that never reaches
+# _stop_sharing still takes them down. A mapping lives in TAILSCALED, not in
+# us: once we are gone nothing is left that knows to remove it, and what
+# remains is a public hostname pointing at a dead port until someone runs
+# `tailscale funnel <port> off` by hand. Belt and braces behind the signal
+# handlers — atexit does not run for SIGKILL, and nothing can.
+_live_funnels = set()
+
+
+def _drop_live_funnels():
+    for port in list(_live_funnels):
+        try:
+            _tailscale_funnel_stop(port)
+        except Exception:                                  # noqa: BLE001
+            pass
+
+
+atexit.register(_drop_live_funnels)
 
 
 def _tailscale_funnel_stop(port):
@@ -10521,6 +10769,10 @@ def _tailscale_funnel_stop(port):
             capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         pass
+    finally:
+        # dropped whatever the CLI said: a mapping we can no longer remove is
+        # not one to keep retrying at every exit
+        _live_funnels.discard(port)
 
 
 def _make_qr_png(url, out_path):
@@ -11013,6 +11265,11 @@ _WEB_COMPRESSIBLE = ("text/", "application/json", "image/svg+xml",
                      "application/wasm")
 
 
+def _point_in_rect(x, y, rect):
+    x0, y0, x1, y1 = rect
+    return x0 <= x <= x1 and y0 <= y <= y1
+
+
 def _stroke_to_wire(st):
     """One stroke in the shape the browser port already uses.
 
@@ -11062,7 +11319,13 @@ class _ShareServer:
         self.port = 0
         self.served = False
         self.funnel_port = None    # set by _share_prepare when Funnel is live
-        self.drawing_allowed = False   # the Sharing/Writing toggle
+        # The Read only / Writing toggle. WRITING by default (the user's call,
+        # 2026-09-01): the phone is overwhelmingly used here as a tablet for
+        # your own document, so making every session start read-only meant
+        # flipping the same switch every time. The consequence is stated in
+        # the dialog's ? and is the same one row 182 already accepted — the
+        # address in use, public link included, carries this permission.
+        self.drawing_allowed = True
         self._httpd = None
         self.providers = providers
         self.file_path = file_path
@@ -11180,6 +11443,22 @@ class _ShareServer:
                            skip=self.ink_origin, coalesce=True)
         except Exception:                          # noqa: BLE001
             logger.exception("share: failed to mirror the live stroke")
+
+    def send_camera(self, page, rect):
+        """Send the phone to a region (row 182's phone-view tool).
+
+        A SUGGESTION, never a lock: the phone moves there and then pinches
+        freely again, at which point its own reports drive the rectangle as
+        usual. Coalesced, because this is dragged live and only the newest
+        position matters."""
+        if not self._ws:
+            return
+        try:
+            self.broadcast({"t": "camera", "page": page,
+                            "rect": [round(v, 2) for v in rect]},
+                           coalesce=True)
+        except Exception:                          # noqa: BLE001
+            logger.exception("share: failed to send the camera")
 
     def notify_change(self):
         """The document changed on the desktop. Pushed, not polled — and the
@@ -11361,8 +11640,25 @@ class _ShareServer:
 
     def start(self):
         import http.server
+        import socketserver
         import json as _json
         from urllib.parse import unquote
+
+        class _Server(http.server.ThreadingHTTPServer):
+            """ThreadingHTTPServer, minus a five-second reverse DNS lookup.
+
+            `HTTPServer.server_bind` calls `socket.getfqdn(host)` to fill in
+            `server_name`, which for our 0.0.0.0 bind is a reverse lookup that
+            has nowhere to go — MEASURED at 5.00 s on this machine, every
+            single time the QR dialog was opened, and it was most of why that
+            dialog felt slow. `server_name` is only ever read to fill in CGI
+            variables this server does not emit, so there is nothing to lose.
+            """
+
+            def server_bind(self):
+                socketserver.TCPServer.server_bind(self)
+                self.server_name = "sidemark"
+                self.server_port = self.server_address[1]
         server = self
         token, fname = self.token, self.filename
 
@@ -11611,7 +11907,7 @@ class _ShareServer:
             def log_message(self, *_a):
                 pass   # don't spam stderr
 
-        self._httpd = http.server.ThreadingHTTPServer(("0.0.0.0", 0), _Handler)
+        self._httpd = _Server(("0.0.0.0", 0), _Handler)
         self.port = self._httpd.server_address[1]
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
         return self
@@ -17890,6 +18186,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._share_revision = 0  # bumps on every change; drives live phone share
         self._share_window = None   # the QR/link window, or None — set by
                                      # _show_share_dialog / _build_share_window_shell
+        self._share_body = None     # its content box, so a slow address can be
+                                     # slotted in after the window is up
+        self._share_selected = None  # the address caption on screen right now
         self._share_server = None   # the live _ShareServer, or None — outlives
                                      # the dialog window; closing the window no
                                      # longer stops sharing (only Stop does)
@@ -18451,6 +18750,34 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                         (h - ext.height) / 2 - ext.y_bearing)
             ctx.show_text("A")
 
+        def _draw_mode_phoneview(_a, ctx, w, h):
+            # A phone in portrait with a dashed viewport inside it — the same
+            # dashed rectangle this tool moves on the page, so the button and
+            # the thing it drags read as one idea. Same 16-unit grid and
+            # hairline weight as the pan/eraser/lasso glyphs.
+            s = min(w, h) / 16.0
+            ctx.translate((w - 16 * s) / 2, (h - 16 * s) / 2)
+            ctx.set_source_rgb(*fg)
+            ctx.set_line_width(1.2 * s)
+            ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+            # the handset
+            x, y, bw, bh, r = 4.2 * s, 1.6 * s, 7.6 * s, 12.8 * s, 1.4 * s
+            ctx.new_sub_path()
+            ctx.arc(x + bw - r, y + r, r, -math.pi / 2, 0)
+            ctx.arc(x + bw - r, y + bh - r, r, 0, math.pi / 2)
+            ctx.arc(x + r, y + bh - r, r, math.pi / 2, math.pi)
+            ctx.arc(x + r, y + r, r, math.pi, 1.5 * math.pi)
+            ctx.close_path()
+            ctx.stroke()
+            # the region it is looking at
+            ctx.save()
+            ctx.set_dash([1.6 * s, 1.2 * s])
+            ctx.set_line_width(1.0 * s)
+            ctx.rectangle(6.0 * s, 5.2 * s, 4.0 * s, 5.6 * s)
+            ctx.stroke()
+            ctx.restore()
+            ctx.new_path()      # a shared painter must not leave a point
+
         def _draw_mode_pan(_a, ctx, w, h):
             # the four-way arrow cross, the conventional "move/pan the surface"
             # glyph. GTK ships no such icon (Adwaita's pan-* are directional
@@ -18605,11 +18932,22 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._mode_anchor = Gtk.Button()
         self._mode_anchor.set_child(_glyph(_draw_mode_anchor))
         self._mode_anchor.set_tooltip_text("Anchor / callout (Ctrl+Alt+click/drag)")
+        self._mode_phoneview = Gtk.Button()
+        self._mode_phoneview.set_child(_glyph(_draw_mode_phoneview, 20))
+        self._mode_phoneview.set_tooltip_text(
+            "Phone view — draw a region to send the phone there, or drag the "
+            "dashed rectangle to move it (Ctrl+Shift+drag)")
+        # Hidden until a share is live (_sync_phone_tool_chrome). Set HERE as
+        # well as there because a GTK widget is visible by default and
+        # _update_header_for_mode does not necessarily run before the window is
+        # shown — so the button must start off and only ever be turned on.
+        self._mode_phoneview.set_visible(False)
         self._tools_box = tools_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         tools_box.add_css_class("linked")
         self._tool_btns = (self._mode_pen, self._mode_hl, self._mode_eraser,
                            self._mode_lasso, self._mode_text, self._mode_pan,
-                           self._mode_zoom, self._mode_anchor)
+                           self._mode_zoom, self._mode_anchor,
+                           self._mode_phoneview)
         for b, m in zip(self._tool_btns, self._TOOL_BAR_ORDER):
             b.connect("clicked", lambda _b, m=m: self._pick_tool(m))
             b.add_css_class("tool-btn")
@@ -18659,11 +18997,22 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._pmode_anchor = Gtk.Button()
         self._pmode_anchor.set_child(_glyph(_draw_mode_anchor))
         self._pmode_anchor.set_tooltip_text("Anchor / callout (Ctrl+Alt+click/drag)")
+        self._pmode_phoneview = Gtk.Button()
+        self._pmode_phoneview.set_child(_glyph(_draw_mode_phoneview, 20))
+        self._pmode_phoneview.set_tooltip_text(
+            "Phone view — draw a region to send the phone there, or drag the "
+            "dashed rectangle to move it (Ctrl+Shift+drag)")
+        # Hidden until a share is live (_sync_phone_tool_chrome). Set HERE as
+        # well as there because a GTK widget is visible by default and
+        # _update_header_for_mode does not necessarily run before the window is
+        # shown — so the button must start off and only ever be turned on.
+        self._pmode_phoneview.set_visible(False)
         pmode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         pmode_box.add_css_class("linked")
         self._ptool_btns = (self._pmode_pen, self._pmode_hl, self._pmode_eraser,
                             self._pmode_lasso, self._pmode_text, self._pmode_pan,
-                            self._pmode_zoom, self._pmode_anchor)
+                            self._pmode_zoom, self._pmode_anchor,
+                            self._pmode_phoneview)
         for b, m in zip(self._ptool_btns, self._TOOL_BAR_ORDER):
             b.connect("clicked", lambda _b, m=m: self._pick_tool(m))
             b.add_css_class("tool-btn")
@@ -19721,6 +20070,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if s is self._active_session:
             self._update_header_for_mode()
 
+    def _sync_phone_tool_chrome(self):
+        """The phone-view tool is in the bar only while a share is LIVE.
+
+        The one tool whose button comes and goes, and deliberately: it acts on
+        something that is not there the rest of the time, and a tool that does
+        nothing is worse than one you have to start a share to see. Its chord
+        stays in the table either way — the table is the truth, and a binding
+        that vanished when you stopped sharing would be a second mapping.
+        `_MODE_CHROME` cannot express this: it knows only the document mode."""
+        live = self._share_server is not None
+        mode = (self._active_session.doc_mode if self._active_session
+                else "pdf")
+        vis = live and tool_in_mode("phoneview", mode)
+        for name in ("_mode_phoneview", "_pmode_phoneview"):
+            w = getattr(self, name, None)
+            if w is not None:
+                w.set_visible(vis)
+
     def _update_header_for_mode(self):
         """Hide the PDF-only chrome while a text-first page is shown. Every
         tool the mode has stays, including the one caret button both modes
@@ -19746,6 +20113,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # the loop above only knows the MODE; the bookmark verb also depends on
         # whether the header still has room for its button
         self._sync_bookmark_chrome()
+        # ...and the phone-view tool on whether there is a phone at all
+        self._sync_phone_tool_chrome()
         # The pen / eraser tooltips carry the text-mode Alt-hold ink hint on the
         # tool itself (not on the caret), and drop it in PDF mode where Alt+drag
         # means text-select instead. Same pen either way — no "quick pen".
@@ -25848,31 +26217,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # the tradeoff (anyone with the link, not just your own devices, for
         # as long as sharing stays on) belongs in front of the user, not
         # decided here — the dialog is the one place that says it.
+        #
+        # DEFERRED, and that is the whole of why this dialog is quick.
+        # Everything above takes about 15 ms; `tailscale funnel` provisions a
+        # public hostname and a certificate and takes SECONDS, with a 25 s
+        # ceiling. Computing it here made the LAN QR — which was ready
+        # immediately, and is the one most sessions use — wait on a public
+        # link most sessions never open. It is filled in by
+        # _share_finish_funnel once the dialog is already on screen.
         if ts:
-            funnel_host, funnel_hint = _tailscale_funnel_start(server.port)
-            if funnel_host:
-                server.funnel_port = server.port   # stop() tears it down
-                # Funnel fronts the node's ROOT — the CLI told us only the
-                # hostname, so the actual link still has to carry our
-                # server's own /token/ path, or the phone hits a route that
-                # doesn't exist (this shipped broken once already: a QR that
-                # rendered fine but pointed at the bare tailnet root).
-                funnel_url = server.url_for(funnel_host, scheme="https",
-                                            port=None)
-                funnel_qr = os.path.join(out_dir, "qr-funnel.png")
-                funnel_entry = {"caption": "Public",
-                                "url": funnel_url,
-                                "qr": funnel_qr
-                                    if _make_qr_png(funnel_url, funnel_qr)
-                                    else None}
-            else:
-                funnel_entry = {"caption": "Public",
-                                "hint": funnel_hint or
-                                ("Enable Funnel for this tailnet in the "
-                                 "Tailscale admin console to get a public "
-                                 "link that needs no app on the phone.")}
+            funnel_entry = {"caption": "Public link", "pending": True,
+                            "hint": "Setting up the public link…"}
         else:
-            funnel_entry = {"caption": "Public",
+            funnel_entry = {"caption": "Public link",
                             "hint": ("Connect this computer to Tailscale to "
                                      "turn on a public link (Funnel) that "
                                      "needs no app on the phone.")}
@@ -26004,6 +26361,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         checks before publishing itself."""
         if self._share_window is win:
             self._share_window = None
+            self._share_body = None
             if self._share_server is None:
                 self._share_gen += 1
         return False   # allow the window itself to close
@@ -26025,6 +26383,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             cv = getattr(sess, "canvas", None)
             if cv is not None:
                 cv.on_live_stream = None
+                cv.on_phone_view = None
                 if getattr(cv, "remote_view", None) is not None:
                     cv.set_remote_view(None)
         self._share_out_dir = None
@@ -26034,6 +26393,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if out_dir:
             shutil.rmtree(out_dir, ignore_errors=True)
         self._update_share_indicator(False)
+        self._sync_phone_tool_chrome()
         if self._share_window is not None:
             win = self._share_window
             self._share_window = None
@@ -26078,6 +26438,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         toolbar.set_content(body)
         win.set_content(toolbar)
         win.connect("close-request", self._on_share_window_close)
+        self._share_body = body
         return win, body, stop_btn
 
     @staticmethod
@@ -26102,7 +26463,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         box.append(msg)
         body.append(box)
 
-    def _show_share_ready(self, body, server, entries):
+    def _show_share_ready(self, body, server, entries, select_caption=None):
         """Fill body for a (server, entries) pair that's already live —
         shared by a fresh share's worker callback and by reopening the
         window on one that's still running, so reopening never re-runs
@@ -26118,11 +26479,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         instruction paragraph shrank to one line — Download/Stop/etc. are
         discovered by using them once, not read every time the dialog opens."""
         self._clear_box(body)
-        intro = Gtk.Label(label="Scan with your phone's camera.")
+        # ONE line, not two: "Scan with your phone's camera" and "Live — your
+        # phone mirrors this document" sat at either end of the dialog saying
+        # the same thing, so the dot (the live part) and the instruction are
+        # now the same sentence, above the QR where the instruction belongs.
+        intro_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        intro_row.set_halign(Gtk.Align.CENTER)
+        intro = Gtk.Label(
+            label="●  Live — scan with your phone's camera to mirror this document")
         intro.add_css_class("dim-label")
-        intro.set_xalign(0.5)
-        intro.set_halign(Gtk.Align.CENTER)
-        body.append(intro)
+        intro.add_css_class("caption")
+        intro_row.append(intro)
+        help_btn = Gtk.MenuButton(icon_name="help-about-symbolic")
+        help_btn.add_css_class("flat")
+        help_btn.add_css_class("circular")
+        help_btn.set_tooltip_text("Which option should I use?")
+        help_btn.set_popover(self._build_share_help_popover())
+        intro_row.append(help_btn)
+        body.append(intro_row)
 
         # Row 182: Sharing (view-only) vs Writing (the phone can also draw/
         # erase, with the current pen, on whichever address is in use beside
@@ -26140,7 +26514,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         mode_row.add_css_class("linked")
-        share_toggle = Gtk.ToggleButton(label="Sharing")
+        share_toggle = Gtk.ToggleButton(label="Read only")
         write_toggle = Gtk.ToggleButton(label="Writing")
         write_toggle.set_group(share_toggle)
         share_toggle.set_active(not server.drawing_allowed)
@@ -26168,8 +26542,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         dropdown = Gtk.DropDown.new_from_strings([e["caption"] for e in entries])
         dropdown.add_css_class("flat")
         dropdown.set_tooltip_text("Which network the phone connects over")
-        default_idx = next((i for i, e in enumerate(entries) if "url" in e),
-                           len(entries) - 1)
+        # The address in use must not CHANGE under you. The public link is
+        # provisioned in the background and arrives seconds later; without
+        # this it would then be "the best entry with a url" and the dialog
+        # would swap the QR you were about to scan for a public one — which,
+        # now that Writing is the default, quietly widens who can draw on
+        # your document. So a re-render keeps what is selected, and the
+        # public link is something you choose rather than something you get.
+        if select_caption is not None:
+            default_idx = next((i for i, e in enumerate(entries)
+                                if e["caption"] == select_caption), 0)
+        else:
+            default_idx = next((i for i, e in enumerate(entries) if "url" in e),
+                               len(entries) - 1)
         dropdown.set_selected(default_idx)
         top_row.append(dropdown)
 
@@ -26179,18 +26564,73 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         content.set_margin_top(10)
         body.append(content)
 
+        self._share_selected = entries[default_idx]["caption"]
+
         def show_entry(*_a):
             self._clear_box(content)
-            content.append(self._share_entry(entries[dropdown.get_selected()],
-                                             show_caption=False))
+            chosen = entries[dropdown.get_selected()]
+            self._share_selected = chosen["caption"]
+            content.append(self._share_entry(chosen, show_caption=False))
         dropdown.connect("notify::selected", show_entry)
         show_entry()
 
-        live = Gtk.Label(label="●  Live — your phone mirrors this document")
-        live.add_css_class("dim-label")
-        live.add_css_class("caption")
-        live.set_margin_top(10)
-        body.append(live)
+
+    def _build_share_help_popover(self):
+        """The ? beside the QR: which address to use, and when each works.
+
+        Written because the three tiers fail for reasons that are invisible
+        from here — a guest network that blocks device-to-device traffic looks
+        exactly like a wrong QR code — and because Writing is now the default,
+        which is a thing the person sharing should be told rather than
+        discover."""
+        pop = Gtk.Popover()
+        pop.set_size_request(380, -1)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_start(14)
+        box.set_margin_end(14)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+
+        def section(title, text):
+            t = Gtk.Label(label=f"<b>{_html_escape(title)}</b>")
+            t.set_use_markup(True)
+            t.set_xalign(0)
+            box.append(t)
+            b = Gtk.Label(label=text)
+            b.set_wrap(True)
+            b.set_xalign(0)
+            b.set_max_width_chars(46)
+            b.add_css_class("dim-label")
+            b.add_css_class("caption")
+            box.append(b)
+
+        section("Same Wi-Fi",
+                "Works when the phone and this computer are on the same "
+                "network. Fastest, and nothing leaves your network. It fails "
+                "on guest Wi-Fi, eduroam and many hotel or campus networks, "
+                "which block devices from talking to each other directly — "
+                "the QR looks fine and the phone simply cannot connect.")
+        section("Over Tailscale",
+                "Works from any network, including mobile data, as long as "
+                "both devices are signed in to the same Tailscale account. "
+                "Install the Tailscale app on the phone, sign in, and this "
+                "option appears. Private: the link only resolves for your own "
+                "devices.")
+        section("Public link",
+                "Anyone with the link can open it, from anywhere, with no app "
+                "on the phone. Needs Tailscale connected on this computer and "
+                "Funnel enabled for your tailnet. Use it when the phone is not "
+                "yours — a colleague, a lecture room machine. The link stops "
+                "working when you stop sharing.")
+        section("Read only vs Writing",
+                "Writing is the default: a finger on the phone draws on this "
+                "page with your current pen, and an eraser toggle sits on the "
+                "phone. Read only lets the phone follow along without "
+                "changing anything — pick it when you are showing an audience. "
+                "Whichever address is in use carries the same permission, "
+                "including the public link.")
+        pop.set_child(box)
+        return pop
 
     def _show_share_failed(self, body, message):
         self._clear_box(body)
@@ -26330,11 +26770,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 canvas.on_live_stream = lambda pts, _c=canvas, _s=srv: (
                     _s.notify_live_stroke(_c.current_page_idx, pts,
                                           _c._pen_attrs()))
+                canvas.on_phone_view = lambda page, rect, _s=srv: (
+                    _s.send_camera(page, rect))
+            self._sync_phone_tool_chrome()
             self._share_out_dir = out_dir
             self._share_entries = entries
             self._update_share_indicator(True)
             stop_btn.set_sensitive(True)
             self._show_share_ready(body, srv, entries)
+            # ...and only now go and get the public link, with the QR already
+            # on screen and scannable
+            self._share_finish_funnel(srv, out_dir, my_gen)
             # safety net: stop sharing after 10 minutes even if left running
             GLib.timeout_add_seconds(
                 600, lambda: (self._stop_sharing(), False)[1])
@@ -26353,6 +26799,63 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 GLib.idle_add(_failed, str(e))
                 return
             GLib.idle_add(_ready, srv, entries)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _share_finish_funnel(self, server, out_dir, gen):
+        """Provision the public link in the background and slot it in.
+
+        Separate from _share_prepare because it is the only slow step: the
+        rest of the dialog is ~15 ms and this is seconds, so the QR you
+        actually scan must not wait for a link most sessions never open.
+
+        Everything here is best-effort. A share whose public link never
+        arrives is a working share with two addresses, so a failure leaves the
+        entry's hint in place and says nothing else."""
+        entry = next((e for e in (self._share_entries or [])
+                      if e.get("pending")), None)
+        if entry is None:
+            return
+
+        def _done(host, hint):
+            if gen != self._share_gen or self._share_server is not server:
+                # the share was stopped while we were provisioning; the mapping
+                # we may have just made is torn down with the server, but a
+                # stop that happened first would have missed it
+                if host:
+                    _tailscale_funnel_stop(server.port)
+                return False
+            entry.pop("pending", None)
+            if host:
+                server.funnel_port = server.port     # stop() tears it down
+                # Funnel fronts the node's ROOT, so the link still has to
+                # carry our own /token/ path or the phone hits a route that
+                # does not exist.
+                url = server.url_for(host, scheme="https", port=None)
+                qr = os.path.join(out_dir, "qr-funnel.png")
+                entry["url"] = url
+                entry["qr"] = qr if _make_qr_png(url, qr) else None
+                entry.pop("hint", None)
+            else:
+                entry["hint"] = hint or (
+                    "Enable Funnel for this tailnet in the Tailscale admin "
+                    "console to get a public link that needs no app on the "
+                    "phone.")
+            # Re-render only if the window is still open, and WITHOUT moving
+            # the dropdown: the address you are looking at must not change
+            # under you because a slower option finished.
+            if self._share_window is not None and self._share_body is not None:
+                self._show_share_ready(self._share_body, server,
+                                       self._share_entries,
+                                       select_caption=self._share_selected)
+            return False
+
+        def _worker():
+            try:
+                host, hint = _tailscale_funnel_start(server.port)
+            except Exception as e:                          # noqa: BLE001
+                host, hint = None, str(e)
+            GLib.idle_add(_done, host, hint)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -27266,6 +27769,13 @@ class PDFEditorApp(Adw.Application):
         # GLib.unix_signal_add on older PyGObject (Ubuntu/Fedora CI runners).
         _unix_signal_adder()(GLib.PRIORITY_DEFAULT, signal.SIGINT,
                              self._on_sigint)
+        # SIGTERM the same way: a logout, a session end or `systemctl` stop
+        # arrives as one, and it must tear a live share down for exactly the
+        # reason Ctrl+C must — a public Funnel mapping outliving the process
+        # is a hostname pointing at nothing, and nothing left running ever
+        # takes it back down.
+        _unix_signal_adder()(GLib.PRIORITY_DEFAULT, signal.SIGTERM,
+                             self._on_sigint)
         # The middle button is a BOUND button here (row 132) — pan by default,
         # anything the user puts there — so GTK's middle-click primary paste
         # must not fire behind it. A GtkTextView pastes the primary selection
@@ -27279,10 +27789,21 @@ class PDFEditorApp(Adw.Application):
 
     def _on_sigint(self):
         logger.info("Interrupted (Ctrl+C) — shutting down")
-        # destroy() tears windows down without firing close-request, so we don't
-        # block on a save prompt — the periodic autosave already covers the work.
+        # _destroy_all() rather than destroy(): destroy() skips close-request,
+        # which is what we want (no save prompt to block on — the periodic
+        # autosave covers the work), but close-request is also the ONLY path
+        # that reaches _stop_sharing. Going straight to destroy() therefore
+        # left a live share behind, and with it a public Tailscale Funnel
+        # mapping that nothing was left running to take down. _destroy_all
+        # does the teardown and then destroys, and prompts for nothing.
         for win in list(self.get_windows()):
-            win.destroy()
+            try:
+                win._destroy_all()
+            except Exception:                              # noqa: BLE001
+                # a window that cannot clean up must not stop the others, and
+                # must certainly not stop us exiting
+                logger.exception("shutdown: window teardown failed")
+                win.destroy()
         self.quit()
         return GLib.SOURCE_REMOVE
 

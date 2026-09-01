@@ -7233,6 +7233,220 @@ class TestPhoneEditor(unittest.TestCase):
             srv.stop()
 
 
+class TestPhoneViewTool(unittest.TestCase):
+    """Sending the phone somewhere, and dragging the box that says where it is.
+
+    There is ONE box: the rectangle showing where the phone is looking. The
+    tool writes to it, the phone writes to it, and neither owns it — so these
+    test the two verbs against the same piece of state."""
+
+    class _Canvas:
+        """Only what the gesture touches, so the REAL methods are under test."""
+        page_width, page_height = 595.0, 842.0
+        current_page_idx = 0
+        zoom_accent = (0.2, 0.5, 0.9)
+
+        def __init__(self):
+            self.scale, self.offset_x, self.offset_y = 1.0, 0.0, 0.0
+            self.remote_view = None
+            self._phone_selecting = False
+            self._phone_start = self._phone_end = None
+            self._phone_drag = None
+            self.sent = []
+            self.on_phone_view = lambda page, rect: self.sent.append((page, rect))
+
+        def queue_draw(self):
+            pass
+
+        _screen_to_pdf = sidemark.PDFCanvas._screen_to_pdf
+        _pdf_to_screen = sidemark.PDFCanvas._pdf_to_screen
+        _move_remote_view = sidemark.PDFCanvas._move_remote_view
+        _finish_phone_view = sidemark.PDFCanvas._finish_phone_view
+        set_remote_view = sidemark.PDFCanvas.set_remote_view
+        _draw_remote_view = sidemark.PDFCanvas._draw_remote_view
+
+    def test_the_tool_is_in_the_grammar_and_pdf_only(self):
+        """A tool in the bar and missing from the table is how routing and
+        chrome come to disagree. PDF-only because a text page's phone falls
+        back to the image viewer, which has no camera to send anywhere."""
+        self.assertIn("phoneview", sidemark.TOOL_BAR_ORDER)
+        self.assertEqual(sidemark.TOOL_MODES["phoneview"], ("pdf",))
+        self.assertFalse(sidemark.tool_in_mode("phoneview", "text"))
+        self.assertTrue(sidemark.tool_in_mode("phoneview", "pdf"))
+        self.assertIn("phoneview", sidemark.TOOL_LABELS)
+        self.assertIn("phoneview", sidemark.TOOL_WIDGET)
+
+    def test_the_chord_is_inert_with_no_share_live(self):
+        """The binding stays in the table — the table is the truth, and one
+        that vanished when you stopped sharing would be a second mapping — but
+        pressing it does nothing, which is what the missing toolbar button
+        already promises."""
+        class _C(TestPhoneViewTool._Canvas):
+            def selection_grab_at(self, *_a):
+                return False
+            _begin_tool = sidemark.PDFCanvas._begin_tool
+
+        idle = _C()
+        idle.on_phone_view = None
+        idle._begin_tool("phoneview", 100.0, 100.0, True)
+        self.assertFalse(idle._phone_selecting)
+        self.assertIsNone(idle._phone_drag)
+
+        live = _C()
+        live._begin_tool("phoneview", 100.0, 100.0, True)
+        self.assertTrue(live._phone_selecting)
+
+    def test_drawing_a_region_sends_the_phone_there(self):
+        c = self._Canvas()
+        c._phone_selecting = True
+        c._phone_start, c._phone_end = (100.0, 200.0), (300.0, 350.0)
+        c._finish_phone_view()
+        self.assertEqual(len(c.sent), 1)
+        self.assertEqual(c.sent[0], (0, (100.0, 200.0, 300.0, 350.0)))
+        # shown at once rather than waiting for the phone to report back: the
+        # round trip is a render away and a late box reads as a missed gesture
+        self.assertEqual(c.remote_view["rect"], (100.0, 200.0, 300.0, 350.0))
+
+    def test_a_click_sends_the_phone_back_to_the_whole_page(self):
+        """The same escape zoom-to-region gives you, because this tool is that
+        one pointed at the phone."""
+        c = self._Canvas()
+        c.remote_view = {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)}
+        c._phone_selecting = True
+        c._phone_start = c._phone_end = (220.0, 300.0)
+        c._finish_phone_view()
+        self.assertEqual(c.sent[-1][1],
+                         (0.0, 0.0, c.page_width, c.page_height))
+
+    def test_a_whole_page_view_paints_no_rectangle(self):
+        """A box around everything says nothing, and would sit on every share
+        where the phone never zoomed in."""
+        class _Ctx:
+            def __init__(self):
+                self.ops = 0
+
+            def __getattr__(self, _name):
+                def _f(*_a, **_k):
+                    self.ops += 1
+                return _f
+
+        c = self._Canvas()
+        c.remote_view = {"page": 0, "rect": (0.0, 0.0, 595.0, 842.0)}
+        full = _Ctx()
+        c._draw_remote_view(full)
+        c.remote_view = {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)}
+        part = _Ctx()
+        c._draw_remote_view(part)
+        self.assertEqual(full.ops, 0)
+        self.assertGreater(part.ops, 0)
+
+    def test_dragging_the_box_reports_every_frame_and_keeps_its_size(self):
+        """Live, not on release: the box is a pointer at what you want them to
+        look at, and pointing is something you do while talking."""
+        c = self._Canvas()
+        c.remote_view = {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)}
+        c._phone_drag = (0.0, 0.0)
+        for x, y in ((120.0, 220.0), (160.0, 270.0), (200.0, 310.0)):
+            c._move_remote_view(x, y)
+        self.assertEqual(len(c.sent), 3)
+        for _page, (x0, y0, x1, y1) in c.sent:
+            self.assertAlmostEqual(x1 - x0, 200.0)
+            self.assertAlmostEqual(y1 - y0, 150.0)
+
+    def test_the_box_is_clamped_to_the_page(self):
+        """The phone would clamp it back anyway, so a box that could leave the
+        paper is one that stops tracking the hand."""
+        c = self._Canvas()
+        c.remote_view = {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)}
+        c._phone_drag = (0.0, 0.0)
+        c._move_remote_view(9000.0, 9000.0)
+        x0, y0, x1, y1 = c.remote_view["rect"]
+        self.assertLessEqual(x1, c.page_width + 1e-6)
+        self.assertLessEqual(y1, c.page_height + 1e-6)
+        self.assertAlmostEqual(x1 - x0, 200.0)
+
+    def test_the_phone_cannot_fight_the_hand_dragging_the_box(self):
+        """Its reports are a round trip behind, so accepting one mid-drag
+        makes the rectangle stutter between the hand and the phone."""
+        c = self._Canvas()
+        c.remote_view = {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)}
+        c._phone_drag = (0.0, 0.0)
+        c.set_remote_view({"page": 0, "rect": (0.0, 0.0, 50.0, 50.0)})
+        self.assertEqual(c.remote_view["rect"], (100.0, 200.0, 300.0, 350.0))
+        c._phone_drag = None
+        c.set_remote_view({"page": 0, "rect": (0.0, 0.0, 50.0, 50.0)})
+        self.assertEqual(c.remote_view["rect"], (0.0, 0.0, 50.0, 50.0))
+
+
+class TestFunnelTeardown(unittest.TestCase):
+    """A public Funnel mapping lives in tailscaled, not in us — once this
+    process is gone nothing is left that knows to remove it, and what remains
+    is a public hostname pointing at a dead port. So every exit that CAN tear
+    it down must."""
+
+    def setUp(self):
+        self._real_stop = sidemark._tailscale_funnel_stop
+        self._live = set(sidemark._live_funnels)
+        sidemark._live_funnels.clear()
+        self.stopped = []
+        sidemark._tailscale_funnel_stop = self.stopped.append
+
+    def tearDown(self):
+        sidemark._tailscale_funnel_stop = self._real_stop
+        sidemark._live_funnels.clear()
+        sidemark._live_funnels.update(self._live)
+
+    def test_every_live_mapping_is_dropped_at_exit(self):
+        sidemark._live_funnels.update({4242, 4243})
+        sidemark._drop_live_funnels()
+        self.assertEqual(sorted(self.stopped), [4242, 4243])
+
+    def test_stopping_one_deregisters_it(self):
+        """Or every later exit retries a mapping that is already gone."""
+        sidemark._tailscale_funnel_stop = self._real_stop   # the real one
+        sidemark._live_funnels.add(4242)
+        with mock.patch.object(sidemark.shutil, "which", return_value=None):
+            sidemark._tailscale_funnel_stop(4242)
+        self.assertNotIn(4242, sidemark._live_funnels)
+
+    def test_an_interrupt_reaches_the_teardown(self):
+        """Ctrl+C called win.destroy() directly, which SKIPS close-request —
+        and close-request was the only path reaching _stop_sharing. That is
+        exactly how a Funnel came to outlive the app, so the chain from the
+        signal handler to the teardown is worth pinning."""
+        import inspect
+        self.assertIn("_destroy_all",
+                      inspect.getsource(sidemark.PDFEditorApp._on_sigint))
+        self.assertIn("_stop_sharing",
+                      inspect.getsource(sidemark.PDFEditorWindow._destroy_all))
+
+
+class TestVersionReport(unittest.TestCase):
+    """`--version` answers "WHICH copy am I running?" as much as "which
+    version" — the symptom it exists for is edits that appear not to have
+    landed, which is two installs and a PATH."""
+
+    def test_it_needs_no_gtk_and_names_the_running_file(self):
+        """A pre-GTK fast path on purpose: the question is at its most useful
+        when the app will not start."""
+        out = subprocess.run(
+            ["/usr/bin/python3", os.path.join(os.path.dirname(
+                os.path.abspath(__file__)), "sidemark.py"), "--version"],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Sidemark", out.stdout)
+        self.assertIn("running", out.stdout)
+        self.assertIn("sidemark.py", out.stdout)
+
+    def test_a_build_stamp_is_preferred_over_git(self):
+        """An installed copy has no .git, so install.sh and the PKGBUILDs
+        stamp build.json — the only moment the source's dirtiness is still
+        knowable."""
+        info = sidemark._build_info()
+        self.assertIn("version", info)
+        self.assertIn("commit", info)
+
+
 class TestShareIndicator(unittest.TestCase):
     """The header button's "● Live" content swap (row 182) — unified onto
     the SAME button that also starts a Share session, per the user's
