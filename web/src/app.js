@@ -5,7 +5,7 @@
 import {
   Bindings, TOOL_BAR_ORDER, TOOL_LABELS, TOOL_MODES, BUTTON_NAMES,
   BUTTON_LABELS, canonicalTool, toolInMode, chordId, chordLabel,
-  toolbarBindingFor, BTN_LEFT,
+  toolbarBindingFor, BTN_LEFT, BTN_FINGER,
 } from "./bindings.js";
 import { Surface, IMPLEMENTED_TOOLS } from "./surface.js";
 import { Doc, mergeDocuments, insertDocuments } from "./doc.js";
@@ -811,6 +811,9 @@ if (LIVE) {
 // notes/phone-web-port-sync-plan.md).
 let liveSock = null;
 let liveRev = null, livePage = null;
+// what a touch does right now with the desktop's modifiers held — display
+// only, so letting go needs no message
+let liveHeldTool = null;
 let liveRetry = 500;
 // often enough to feel attached to the hand, rare enough to be invisible
 // beside ink on the same socket
@@ -841,6 +844,7 @@ function liveConnect() {
     if (s.t === "state") onLiveState(s);
     else if (s.t === "live") onLiveStroke(s);
     else if (s.t === "camera") onLiveCamera(s);
+    else if (s.t === "tool") onLiveTool(s);
   });
   const gone = () => {
     if (liveSock !== sock) return;         // a newer socket already took over
@@ -854,6 +858,23 @@ function liveConnect() {
   };
   sock.addEventListener("close", gone);
   sock.addEventListener("error", gone);
+}
+
+/** The desktop's finger tool changed — because somebody picked one there, or
+ * because a modifier is being held on its keyboard.
+ *
+ * `tool` is what a touch does RIGHT NOW (modifiers included) and `base` is
+ * what the finger is bound to with nothing held. The BASE is what we store,
+ * so releasing the key returns to it without a second message; `tool` only
+ * moves what the bar shows, the same way the desktop's own stripes move under
+ * a held modifier. */
+function onLiveTool(s) {
+  if (!MOBILE) return;
+  if (s.base) {
+    bindings.bind(chordId(BTN_FINGER), s.base, bindings.mode);
+  }
+  liveHeldTool = s.tool || null;
+  refreshToolBindings();
 }
 
 /** The desktop is drawing right now — show it while their pen is down.
@@ -2044,9 +2065,16 @@ function buildToolbar(host) {
   }
 }
 
-/** The plain left-click path — put `tool` on the left button. */
+/** The plain left-click path — put `tool` on the left button.
+ *
+ * On a TOUCH device that button is the finger, and in LIVE mode the finger's
+ * tool is shared with the desktop: this is one system reached from two places,
+ * not two apps with their own pens. So picking here binds the finger and tells
+ * the desktop, and the desktop's own toolbar moves with it. */
 function pickTool(tool) {
-  bindChord(chordId(BTN_LEFT), tool);
+  const chord = chordId(MOBILE ? BTN_FINGER : BTN_LEFT);
+  bindChord(chord, tool);
+  if (LIVE && MOBILE) liveSend({ t: "settool", tool: canonicalTool(tool) });
 }
 
 function bindChord(chord, tool) {

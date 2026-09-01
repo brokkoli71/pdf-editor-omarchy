@@ -11793,8 +11793,18 @@ class _ShareServer:
 
     def _ws_message(self, conn, m, touch):
         kind = m.get("t")
+        if kind == "settool":
+            # The phone picked a tool. It binds the FINGER here — the phone is
+            # not a second app with its own pen, it is this one further away.
+            setter = self.providers.get("set_tool")
+            if setter is not None:
+                setter(m.get("tool"))
+            return
         if kind == "hello":
             conn.queue(json.dumps(self.state_payload()))
+            tool = self.providers.get("tool_now")
+            if tool is not None:
+                conn.queue(json.dumps({"t": "tool", **tool()}))
             return
         if kind == "view":
             # Where the phone is looking, for the dashed rectangle on the
@@ -24991,6 +25001,48 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         self._held_mods = (ctrl, shift, alt)
         self._repaint_binding_strips()
+        # A connected phone is part of the SAME system, so the modifiers you
+        # hold here change what its finger does too — and it has to be told,
+        # not merely obeyed, or the tool it shows and the tool it uses
+        # disagree.
+        self._push_share_tool()
+
+    def _finger_tool_now(self):
+        """The tool a finger runs RIGHT NOW — the `finger` binding under the
+        modifiers currently held. The same question `_live_buttons_for` asks
+        for the stripes, asked for one button."""
+        mode = (self._active_session.doc_mode if self._active_session else "pdf")
+        ctrl, shift, alt = self._held_mods
+        return self.bindings.tool_for(BTN_FINGER, ctrl, shift, alt, mode=mode)
+
+    def _push_share_tool(self):
+        """Tell a connected phone which tool its finger is holding.
+
+        The phone is not a separate app with its own idea of the pen: it is
+        this one, reached from further away. So the tool is SHARED state —
+        pick it here and it changes there, pick it there and it changes here
+        (`_ws_message`'s "settool") — and the modifiers held here reach it
+        too. One table, as row 132 requires; the phone never keeps a second
+        copy of the answer, only the answer.
+        """
+        srv = getattr(self, "_share_server", None)
+        if srv is None or not getattr(self, "_share_modifiers", False):
+            return
+        srv.broadcast({"t": "tool", "tool": self._finger_tool_now(),
+                       "base": self.bindings.tool_for_chord("finger")})
+
+    def _set_finger_tool(self, tool):
+        """The phone picked a tool: bind it to the FINGER, here.
+
+        Not a separate "phone tool" — binding the finger is what picking a
+        tool on a touchscreen already means in this app (row 132's toolbar is
+        a binding surface, and a finger is a button). So the desktop's own
+        bar shows the change, and the two cannot drift."""
+        if tool not in TOOL_BAR_ORDER:
+            return
+        self.bindings.bind("finger", tool)
+        self._refresh_tool_bindings()
+        self._push_share_tool()
 
     def _repaint_binding_strips(self):
         for strips in self._tool_strips.values():
@@ -26981,15 +27033,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         body.append(top_row)
 
-        mods = Gtk.CheckButton(label="Modifier keys here also change the phone")
+        mods = Gtk.CheckButton(label="Link the phone's tool to this computer")
         mods.set_halign(Gtk.Align.CENTER)
         mods.set_margin_top(4)
         mods.add_css_class("caption")
         mods.set_active(self._share_modifiers)
         mods.set_tooltip_text(
-            "Hold a modifier on this computer and the phone's finger follows "
-            "the same button bindings — so the chord that erases here erases "
-            "there. Off, a phone touch always draws with the current pen.")
+            "One system, two places to reach it: the tool follows the FINGER "
+            "binding, so picking one here changes the phone and picking one "
+            "there changes here — and a modifier held on this keyboard runs "
+            "that chord's tool when you touch the phone. Off, a phone touch "
+            "always draws with the current pen.")
 
         def _toggle_mods(btn):
             self._share_modifiers = btn.get_active()
@@ -27341,6 +27395,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "set_view": (None if tp is not None else
                          lambda cid, v: GLib.idle_add(
                              canvas.set_remote_view, cid, v)),
+            # the finger's tool, shared both ways — see _push_share_tool
+            "set_tool": lambda t: GLib.idle_add(self._set_finger_tool, t),
+            "tool_now": lambda: {"tool": self._finger_tool_now(),
+                                 "base": self.bindings.tool_for_chord("finger")},
         }
         # A ONE-TIME link is a fresh secret that is never saved: sharing with
         # someone else should not hand out the address your own phone has on
@@ -27374,6 +27432,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 canvas.on_phone_view = lambda page, rect, only=None, _s=srv: (
                     _s.send_camera(page, rect, only))
             self._sync_phone_tool_chrome()
+            self._push_share_tool()
             self._share_out_dir = out_dir
             self._share_entries = entries
             self._share_user_picked = False

@@ -7602,6 +7602,42 @@ class TestShareModifiers(unittest.TestCase):
         self.assertEqual(verb(True, False, False), "erase_begin")
         self.assertEqual(verb(False, False, False), "draw_begin")
 
+    def test_the_finger_tool_is_shared_state_both_ways(self):
+        """One system reached from two places: the phone is not a second app
+        with its own pen. Picking a tool there binds the FINGER here — which
+        is what picking a tool on a touchscreen already means (row 132's
+        toolbar is a binding surface and a finger is a button) — so the
+        desktop's own bar moves with it and the two cannot drift."""
+        b = sidemark.Bindings()
+        b.bind("finger", "pen")
+        self.assertEqual(b.tool_for(sidemark.BTN_FINGER, mode="pdf"), "pen")
+        # what _set_finger_tool does when the phone picks the eraser
+        b.bind("finger", "eraser")
+        self.assertEqual(b.tool_for_chord("finger"), "eraser")
+        draw = [("draw_begin", 1.0, 2.0, None)]
+        self.assertEqual(
+            sidemark.apply_modifier_tool(
+                draw, b.tool_for(sidemark.BTN_FINGER, mode="pdf"))[0][0],
+            "erase_begin")
+
+    def test_a_modifier_held_here_runs_that_chord_on_the_phone(self):
+        """The linkage is the TABLE, not a second mapping: the chord you
+        already know is the chord the phone obeys."""
+        b = sidemark.Bindings()
+        b.bind("finger", "pen")
+        b.bind("ctrl+shift+finger", "eraser")
+        draw = [("draw_begin", 1.0, 2.0, None)]
+
+        def verb(ctrl, shift, alt):
+            t = b.tool_for(sidemark.BTN_FINGER, ctrl, shift, alt, mode="pdf")
+            return sidemark.apply_modifier_tool(draw, t)[0][0]
+
+        self.assertEqual(verb(False, False, False), "draw_begin")
+        self.assertEqual(verb(True, True, False), "erase_begin")
+        # a chord bound to something with no remote verb leaves drawing alone
+        b.bind("shift+finger", "zoom")
+        self.assertEqual(verb(False, True, False), "draw_begin")
+
     def test_the_preference_is_remembered(self):
         """It is a preference about how you work, not a decision about one
         share, so it outlives the session."""

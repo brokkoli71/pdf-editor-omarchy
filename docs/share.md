@@ -203,12 +203,25 @@
     (`visible_remote_rects`): a phone on the whole page has a box covering it
     that is deliberately not drawn, and while the grab had its own hit test
     that invisible box swallowed every press.
-  - **Modifier keys can reach the phone** (opt-in, remembered): the phone's
-    finger follows the same binding table, resolved on the DESKTOP because a
-    copy of that table on the phone is what row 132 forbids. Only
-    pen/highlighter/eraser have remote verbs, so anything else is ignored
-    rather than half honoured — which also makes the default right, since
-    `finger` is bound to pan.
+  - **The phone's tool is SHARED STATE with the desktop** (opt-in, remembered
+    — "Link the phone's tool to this computer"). One system reached from two
+    places, not two apps with their own pens:
+    - It is the **FINGER binding**. Picking a tool on the phone binds the
+      finger here (`_set_finger_tool`), so the desktop's own bar moves with
+      it — which is what picking a tool on a touchscreen already means, since
+      the toolbar is a binding surface and a finger is a button (row 132).
+      Picking one here pushes it there (`_push_share_tool`).
+    - **A modifier held on this keyboard runs that chord's tool on the
+      phone.** Resolved on the DESKTOP, because a copy of the table on the
+      phone is the second mapping row 132 forbids; the phone is sent the
+      answer, never the table.
+    - The push carries `tool` (what a touch does right now, modifiers
+      included) and `base` (the finger's own binding). The phone STORES the
+      base and only displays `tool`, so releasing a key needs no message.
+    - *ceiling: only pen, highlighter and eraser have remote verbs. A chord
+      bound to lasso, pan or zoom is ignored rather than half honoured —
+      which is also what keeps a touch drawing when `finger` is bound to
+      something unreachable.*
   - **A browser that dies leaves a record.** The server logs every request
     with its user agent, independent of the phone's JS — a browser that dies
     before running a line of ours still made requests. Breadcrumbs go to
