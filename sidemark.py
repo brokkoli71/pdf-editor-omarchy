@@ -10758,21 +10758,40 @@ atexit.register(_drop_live_funnels)
 
 
 def _tailscale_funnel_stop(port):
-    """Undo _tailscale_funnel_start when the share window closes — best
-    effort. Leaving the mapping running would keep the document reachable
-    from the public internet after the dialog says sharing has stopped."""
+    """Undo _tailscale_funnel_start — best effort, and it must actually work.
+
+    Leaving the mapping up keeps the document reachable from the public
+    internet after the dialog says sharing has stopped.
+
+    TWO SPELLINGS, newest first, because this SILENTLY DID NOTHING for a
+    while: `tailscale funnel <port> off` is the old form, and Tailscale 1.102
+    answers it with "the CLI for serve and funnel has changed" — on stderr,
+    with exit status 0, so nothing here noticed and every share leaked a live
+    public hostname. The modern form addresses the FRONT of the mapping
+    (`--https=443`, which is what Funnel fronts on) rather than the local port
+    behind it. The old form is still tried second for older Tailscale, and the
+    result is checked rather than assumed.
+
+    `funnel reset` would also clear it, and is deliberately NOT used: it drops
+    the whole node's serve config, including mappings that are nothing to do
+    with us."""
     if not shutil.which("tailscale"):
-        return
-    try:
-        subprocess.run(
-            ["tailscale", "funnel", str(port), "off"],
-            capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        pass
-    finally:
-        # dropped whatever the CLI said: a mapping we can no longer remove is
-        # not one to keep retrying at every exit
         _live_funnels.discard(port)
+        return
+    for argv in (["tailscale", "funnel", "--https=443", "off"],
+                 ["tailscale", "funnel", str(port), "off"]):
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            break
+        # exit status alone is not the answer here: the rejected old form
+        # exits 0 and complains on stderr, which is exactly how this went
+        # unnoticed
+        if r.returncode == 0 and "has changed" not in (r.stderr or ""):
+            break
+    # dropped whatever the CLI said: a mapping we can no longer remove is not
+    # one to keep retrying at every exit
+    _live_funnels.discard(port)
 
 
 def _make_qr_png(url, out_path):
@@ -10875,6 +10894,34 @@ def _process_remote_touch(touch_state, points):
             if not active:
                 touch_state["blocked"] = False
     return actions
+
+
+def _dispatch_remote_ink(target, actions):
+    """Run one batch of _process_remote_touch's actions on a surface.
+
+    The other half of that function and module-level for the same reason:
+    it is pure dispatch over a list of tuples, it touches nothing but the
+    surface handed to it, and keeping it out of the window is what lets the
+    rule it encodes be tested without building one.
+
+    Straight to the bare remote_* primitives, never through the button
+    bindings: a phone touch means "draw" or "erase" by its own on-screen
+    toggle, whatever the desktop's left button is bound to right now."""
+    for verb, *rest in actions:
+        if verb == "draw_begin":
+            target.remote_stroke_begin(*rest)
+        elif verb == "draw_update":
+            target.remote_stroke_update(*rest)
+        elif verb == "draw_end":
+            target.remote_stroke_end()
+        elif verb == "erase_begin":
+            target.remote_erase_begin()
+        elif verb == "erase_at":
+            target.remote_erase_at(rest[0], rest[1])
+        elif verb == "erase_end":
+            target.remote_erase_end()
+        elif verb == "abort":
+            target.remote_abort()
 
 
 # The FALLBACK phone page, no longer the normal one: a current-page image that
@@ -18189,6 +18236,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._share_body = None     # its content box, so a slow address can be
                                      # slotted in after the window is up
         self._share_selected = None  # the address caption on screen right now
+        self._share_user_picked = False   # ...and whether YOU chose it
         self._share_server = None   # the live _ShareServer, or None — outlives
                                      # the dialog window; closing the window no
                                      # longer stops sharing (only Stop does)
@@ -24193,8 +24241,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         "_pen_btn":      ("pdf", "text"),
         # the tool buttons come from TOOL_MODES — one table for the bar, the
         # bindings and the chrome, so a tool cannot be in the bar and missing
-        # from the grammar
-        **{TOOL_WIDGET[_t]: TOOL_MODES[_t] for _t in TOOL_BAR_ORDER},
+        # from the grammar. `phoneview` is the ONE exception and is left out:
+        # its visibility depends on whether a share is live, which this table
+        # cannot express, so _sync_phone_tool_chrome owns it alone. Listing it
+        # here as a pdf tool would make the table say something false.
+        **{TOOL_WIDGET[_t]: TOOL_MODES[_t] for _t in TOOL_BAR_ORDER
+           if _t != "phoneview"},
     }
 
     _TOOL_BAR_ORDER = TOOL_BAR_ORDER
@@ -26393,7 +26445,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if out_dir:
             shutil.rmtree(out_dir, ignore_errors=True)
         self._update_share_indicator(False)
-        self._sync_phone_tool_chrome()
+        sync = getattr(self, "_sync_phone_tool_chrome", None)
+        if sync is not None:
+            sync()
         if self._share_window is not None:
             win = self._share_window
             self._share_window = None
@@ -26542,13 +26596,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         dropdown = Gtk.DropDown.new_from_strings([e["caption"] for e in entries])
         dropdown.add_css_class("flat")
         dropdown.set_tooltip_text("Which network the phone connects over")
-        # The address in use must not CHANGE under you. The public link is
-        # provisioned in the background and arrives seconds later; without
-        # this it would then be "the best entry with a url" and the dialog
-        # would swap the QR you were about to scan for a public one — which,
-        # now that Writing is the default, quietly widens who can draw on
-        # your document. So a re-render keeps what is selected, and the
-        # public link is something you choose rather than something you get.
+        # The PUBLIC LINK is the default (the user's call): it is the one that
+        # works from anywhere with no app on the phone, so it is what the QR
+        # should be unless you say otherwise. Entries are already in that
+        # priority order, so "the first entry with a live url" IS the rule —
+        # and because the public link is provisioned in the background, the
+        # dialog adopts it when it arrives.
+        #
+        # But only if you have not PICKED one yourself. A re-render that moved
+        # the dropdown off an address you deliberately chose would swap the QR
+        # you were about to scan, and with Writing also on by default the
+        # thing it swapped in can be drawn on by anyone holding the link.
+        # Defaulting to public is a choice; overriding your choice is not.
         if select_caption is not None:
             default_idx = next((i for i, e in enumerate(entries)
                                 if e["caption"] == select_caption), 0)
@@ -26565,10 +26624,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         body.append(content)
 
         self._share_selected = entries[default_idx]["caption"]
+        # `notify::selected` also fires for the set_selected above, so the
+        # first call is not a choice anybody made
+        settling = {"initial": True}
 
         def show_entry(*_a):
             self._clear_box(content)
             chosen = entries[dropdown.get_selected()]
+            if settling["initial"]:
+                settling["initial"] = False
+            elif chosen["caption"] != self._share_selected:
+                self._share_user_picked = True
             self._share_selected = chosen["caption"]
             content.append(self._share_entry(chosen, show_caption=False))
         dropdown.connect("notify::selected", show_entry)
@@ -26775,6 +26841,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._sync_phone_tool_chrome()
             self._share_out_dir = out_dir
             self._share_entries = entries
+            self._share_user_picked = False
             self._update_share_indicator(True)
             stop_btn.set_sensitive(True)
             self._show_share_ready(body, srv, entries)
@@ -26845,9 +26912,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # the dropdown: the address you are looking at must not change
             # under you because a slower option finished.
             if self._share_window is not None and self._share_body is not None:
-                self._show_share_ready(self._share_body, server,
-                                       self._share_entries,
-                                       select_caption=self._share_selected)
+                # adopt the public link if you have not picked an address
+                # yourself; keep yours if you have
+                self._show_share_ready(
+                    self._share_body, server, self._share_entries,
+                    select_caption=(self._share_selected
+                                    if self._share_user_picked else None))
             return False
 
         def _worker():
@@ -26882,32 +26952,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if (page is not None and canvas is not None and tp is None
                 and canvas.document and page != canvas.current_page_idx):
             canvas.go_to_page(page)
-        srv = self._share_server
+        srv = getattr(self, "_share_server", None)
         if srv is not None:
             srv.ink_origin = origin
         try:
-            self._dispatch_remote_ink(target, actions)
+            _dispatch_remote_ink(target, actions)
         finally:
             if srv is not None:
                 srv.ink_origin = None
 
-    @staticmethod
-    def _dispatch_remote_ink(target, actions):
-        for verb, *rest in actions:
-            if verb == "draw_begin":
-                target.remote_stroke_begin(*rest)
-            elif verb == "draw_update":
-                target.remote_stroke_update(*rest)
-            elif verb == "draw_end":
-                target.remote_stroke_end()
-            elif verb == "erase_begin":
-                target.remote_erase_begin()
-            elif verb == "erase_at":
-                target.remote_erase_at(rest[0], rest[1])
-            elif verb == "erase_end":
-                target.remote_erase_end()
-            elif verb == "abort":
-                target.remote_abort()
 
     def _current_dir_gfile(self):
         """The folder of the currently open file, so file dialogs start there."""

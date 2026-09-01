@@ -41,13 +41,15 @@ package() {
     # What this copy IS, for `sidemark --version`. A package has no .git once
     # installed, and a user with both an AUR package and install.sh's copy can
     # only tell which one PATH picked if each says so.
-    _commit=$(git -C "$srcdir/sidemark" rev-parse --short HEAD 2>/dev/null || echo "")
+    # No commit here, and that is correct rather than a gap: this package is
+    # built from a RELEASE TARBALL, which carries no git history, and the
+    # version tag is the identity anyway — `by` below records it. (The
+    # sidemark-git PKGBUILD in the repo root does have a clone, and records
+    # the commit.)
     install -dm755 "$pkgdir/usr/share/sidemark"
-    # ${x:+..}${x:-..} is NOT an if/else — when x is set BOTH expand.
-    if [ -n "$_commit" ]; then _commit_json="\"$_commit\""; else _commit_json=null; fi
     cat > "$pkgdir/usr/share/sidemark/build.json" <<JSON
 {
-  "commit": $_commit_json,
+  "commit": null,
   "dirty": 0,
   "built": "$(date '+%Y-%m-%d %H:%M')",
   "by": "$pkgname $pkgver-$pkgrel"

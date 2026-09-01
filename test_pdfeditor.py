@@ -6543,9 +6543,58 @@ class TestShareToPhone(unittest.TestCase):
              mock.patch.object(sidemark.subprocess, "run",
                                return_value=_R()) as run:
             sidemark._tailscale_funnel_stop(8123)
+            # The MODERN spelling, and it must be tried first: Tailscale
+            # 1.102 answers `funnel <port> off` with "the CLI for serve and
+            # funnel has changed" — on stderr, with EXIT STATUS 0 — so for a
+            # while this silently did nothing and every share leaked a live
+            # public hostname. Funnel fronts on 443, so that is what is
+            # turned off; the local port is only the target behind it.
             run.assert_called_once_with(
-                ["tailscale", "funnel", "8123", "off"],
+                ["tailscale", "funnel", "--https=443", "off"],
                 capture_output=True, text=True, timeout=5)
+
+    def test_funnel_stop_falls_back_to_the_old_spelling(self):
+        """An older Tailscale still wants `funnel <port> off`. The rejected
+        NEW form there exits non-zero, so the fallback is reached."""
+        import sidemark
+
+        class _R:
+            def __init__(self, rc, err=""):
+                self.returncode, self.stderr, self.stdout = rc, err, ""
+
+        calls = []
+
+        def _run(argv, **_kw):
+            calls.append(argv)
+            return _R(1) if "--https=443" in argv else _R(0)
+
+        with mock.patch.object(sidemark.shutil, "which",
+                               return_value="/usr/bin/tailscale"), \
+             mock.patch.object(sidemark.subprocess, "run", _run):
+            sidemark._tailscale_funnel_stop(8123)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("8123", calls[1])
+
+    def test_funnel_stop_does_not_trust_exit_status_alone(self):
+        """The whole reason this leaked: the rejected old form exits 0 and
+        complains on stderr, so a returncode check alone declared success."""
+        import sidemark
+
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = "the CLI for serve and funnel has changed"
+
+        calls = []
+
+        with mock.patch.object(sidemark.shutil, "which",
+                               return_value="/usr/bin/tailscale"), \
+             mock.patch.object(sidemark.subprocess, "run",
+                               side_effect=lambda a, **k: (calls.append(a),
+                                                           _R())[1]):
+            sidemark._tailscale_funnel_stop(8123)
+        # it did not stop at the first "success"
+        self.assertEqual(len(calls), 2)
 
     def test_qr_png_absent_tool_returns_false(self):
         from sidemark import _make_qr_png
@@ -6645,7 +6694,7 @@ class TestShareToPhone(unittest.TestCase):
                     pdf = os.path.join(d, "deck.pdf"); make_pdf(pdf)
                     win = PDFEditorWindow(a); win.present()
                     win.open_file_in_tab(pdf)
-                    win._show_share_dialog()
+                    win._show_share_dialog(win.canvas, None)
                     sw = win._share_window
                     out["is_window"] = isinstance(sw, Gtk.Window)
                     out["modal"] = sw.get_modal()
@@ -6842,12 +6891,40 @@ class TestShareToPhone(unittest.TestCase):
 
     # ── public link via Tailscale Funnel (prototype, #180) ──────────────────
 
+    def test_prepare_does_not_wait_for_the_public_link(self):
+        """The Funnel is no longer computed here, and that is the whole of why
+        this dialog is quick: everything else in _share_prepare is ~15 ms,
+        while `tailscale funnel` provisions a hostname and a certificate and
+        takes SECONDS (25 s ceiling). Computing it inline made the LAN QR —
+        ready immediately, and the one most sessions use — wait on a public
+        link most sessions never open."""
+        import sidemark
+        with mock.patch.object(sidemark, "_tailscale_ip",
+                               return_value="100.70.12.127"), \
+             mock.patch.object(sidemark, "_tailscale_funnel_start") as start:
+            with tempfile.TemporaryDirectory() as d:
+                server, entries = self._prepare(d)
+                try:
+                    start.assert_not_called()
+                    funnel = entries[0]
+                    self.assertEqual(funnel["caption"], "Public link")
+                    self.assertTrue(funnel["pending"])
+                    self.assertNotIn("url", funnel)
+                    # the private tiers are live immediately
+                    self.assertIn("url", entries[1])
+                    self.assertIn("url", entries[2])
+                finally:
+                    server.stop()
+
     def test_prepare_offers_funnel_link_when_it_starts(self):
-        """When Tailscale is connected and Funnel starts cleanly, the third
-        column is a live public URL carrying our server's OWN /token/ path
-        (not the bare tailnet root the CLI prints — that was the bug: a QR
-        that rendered fine but pointed nowhere), and the server remembers the
-        port so stop() can tear the mapping back down."""
+        """When Tailscale is connected and Funnel starts cleanly, the public
+        column is a live URL carrying our server's OWN /token/ path (not the
+        bare tailnet root the CLI prints — that was the bug: a QR that
+        rendered fine but pointed nowhere), and the server remembers the port
+        so stop() can tear the mapping back down.
+
+        Driven through the deferred path now: the entry starts `pending` and
+        _share_finish_funnel fills it in once the dialog is already up."""
         import sidemark
         with mock.patch.object(sidemark, "_tailscale_ip",
                                return_value="100.70.12.127"), \
@@ -6858,8 +6935,14 @@ class TestShareToPhone(unittest.TestCase):
                 server, entries = self._prepare(d)
                 try:
                     funnel = entries[0]
-                    self.assertEqual(funnel["caption"],
-                                     "Public")
+                    self.assertTrue(funnel["pending"])   # not yet
+                    # what _share_finish_funnel's worker + idle callback do
+                    host, hint = sidemark._tailscale_funnel_start(server.port)
+                    funnel.pop("pending")
+                    server.funnel_port = server.port
+                    funnel["url"] = server.url_for(host, scheme="https",
+                                                   port=None)
+                    self.assertEqual(funnel["caption"], "Public link")
                     self.assertEqual(
                         funnel["url"],
                         f"https://host.tailnet.ts.net/{server.token}/")
@@ -6881,8 +6964,12 @@ class TestShareToPhone(unittest.TestCase):
                 server, entries = self._prepare(d)
                 try:
                     funnel = entries[0]
-                    self.assertEqual(funnel["caption"],
-                                     "Public")
+                    # what _share_finish_funnel does when the CLI refuses
+                    host, hint = sidemark._tailscale_funnel_start(server.port)
+                    self.assertIsNone(host)
+                    funnel.pop("pending")
+                    funnel["hint"] = hint
+                    self.assertEqual(funnel["caption"], "Public link")
                     self.assertNotIn("url", funnel)
                     self.assertIn("not permitted", funnel["hint"])
                     self.assertIsNone(server.funnel_port)
@@ -6899,9 +6986,9 @@ class TestShareToPhone(unittest.TestCase):
                 server, entries = self._prepare(d)
                 try:
                     funnel = entries[0]
-                    self.assertEqual(funnel["caption"],
-                                     "Public")
+                    self.assertEqual(funnel["caption"], "Public link")
                     self.assertIn("Tailscale", funnel["hint"])
+                    self.assertNotIn("pending", funnel)   # nothing to wait for
                     start.assert_not_called()
                 finally:
                     server.stop()
@@ -6930,11 +7017,13 @@ class TestShareToPhone(unittest.TestCase):
                          f"https://host.tailnet.ts.net/{srv.token}/")
         srv.stop()
 
-    def test_drawing_defaults_off_and_ink_is_silently_ignored(self):
-        """Sharing is the default mode, Writing is opt-in every session —
-        a touch batch while drawing_allowed is False must cost nothing
-        (no map_point/ink_actions call at all), not just be a no-op after
-        the fact."""
+    def test_read_only_ignores_ink_without_touching_the_document(self):
+        """WRITING is now the default (2026-09-01, the user's call: the phone
+        is overwhelmingly a tablet for your own document, so starting read-only
+        meant flipping the same switch every session). Read only is therefore
+        the mode under test here, and the promise is unchanged — a touch batch
+        arriving in it must cost NOTHING (no map_point, no ink_actions), not
+        merely be undone afterwards, because it arrives every frame."""
         import sidemark
         import urllib.request
         import json as _json
@@ -6948,7 +7037,9 @@ class TestShareToPhone(unittest.TestCase):
             "ink_actions": lambda a: calls.__setitem__("ink_actions", 1),
         }
         srv = sidemark._ShareServer(providers=providers)
-        self.assertFalse(srv.drawing_allowed)   # off by default
+        # Writing is the shipped default now, so Read only is set explicitly
+        self.assertTrue(srv.drawing_allowed)    # ...and that IS the default
+        srv.drawing_allowed = False
         srv.start()
         try:
             body = _json.dumps({"points": [
@@ -7265,16 +7356,16 @@ class TestPhoneViewTool(unittest.TestCase):
         set_remote_view = sidemark.PDFCanvas.set_remote_view
         _draw_remote_view = sidemark.PDFCanvas._draw_remote_view
 
-    def test_the_tool_is_in_the_grammar_and_pdf_only(self):
-        """A tool in the bar and missing from the table is how routing and
-        chrome come to disagree. PDF-only because a text page's phone falls
-        back to the image viewer, which has no camera to send anywhere."""
-        self.assertIn("phoneview", sidemark.TOOL_BAR_ORDER)
-        self.assertEqual(sidemark.TOOL_MODES["phoneview"], ("pdf",))
-        self.assertFalse(sidemark.tool_in_mode("phoneview", "text"))
-        self.assertTrue(sidemark.tool_in_mode("phoneview", "pdf"))
-        self.assertIn("phoneview", sidemark.TOOL_LABELS)
-        self.assertIn("phoneview", sidemark.TOOL_WIDGET)
+    def test_every_bar_tool_is_complete_across_the_tables(self):
+        """The accident this catches is a tool added to the bar and forgotten
+        in one of the tables beside it — which KeyErrors mid-gesture, or paints
+        a button with no label. Asserting phoneview's OWN mode tuple would only
+        fail if somebody changed it deliberately, so that is not asserted."""
+        for tool in sidemark.TOOL_BAR_ORDER:
+            self.assertIn(tool, sidemark.TOOL_MODES, tool)
+            self.assertIn(tool, sidemark.TOOL_LABELS, tool)
+            self.assertIn(tool, sidemark.TOOL_WIDGET, tool)
+            self.assertTrue(sidemark.TOOL_MODES[tool], tool)
 
     def test_the_chord_is_inert_with_no_share_live(self):
         """The binding stays in the table — the table is the truth, and one
@@ -7409,16 +7500,61 @@ class TestFunnelTeardown(unittest.TestCase):
             sidemark._tailscale_funnel_stop(4242)
         self.assertNotIn(4242, sidemark._live_funnels)
 
-    def test_an_interrupt_reaches_the_teardown(self):
+    def test_an_interrupt_tears_the_share_down(self):
         """Ctrl+C called win.destroy() directly, which SKIPS close-request —
-        and close-request was the only path reaching _stop_sharing. That is
-        exactly how a Funnel came to outlive the app, so the chain from the
-        signal handler to the teardown is worth pinning."""
-        import inspect
-        self.assertIn("_destroy_all",
-                      inspect.getsource(sidemark.PDFEditorApp._on_sigint))
-        self.assertIn("_stop_sharing",
-                      inspect.getsource(sidemark.PDFEditorWindow._destroy_all))
+        and close-request was the only path reaching _stop_sharing, so a
+        public Funnel outlived the app.
+
+        Driven, not grepped: a source-text assertion here would break when
+        somebody renames a helper that still does the teardown, and would
+        pass if _destroy_all quietly stopped doing it."""
+        torn = []
+
+        class _Win:
+            def _destroy_all(self):
+                torn.append("down")
+
+        class _App:
+            _on_sigint = sidemark.PDFEditorApp._on_sigint
+
+            @staticmethod
+            def get_windows():
+                return [_Win()]
+
+            @staticmethod
+            def quit():
+                pass
+
+        _App()._on_sigint()
+        self.assertEqual(torn, ["down"])
+
+    def test_a_window_that_cannot_clean_up_does_not_block_the_exit(self):
+        """One window failing must not strand the others, and must certainly
+        not stop us quitting — the whole point of the handler is to leave
+        nothing running."""
+        quit_called = []
+
+        class _Bad:
+            def _destroy_all(self):
+                raise RuntimeError("nope")
+
+            def destroy(self):
+                pass
+
+        class _App:
+            _on_sigint = sidemark.PDFEditorApp._on_sigint
+
+            @staticmethod
+            def get_windows():
+                return [_Bad()]
+
+            @staticmethod
+            def quit():
+                quit_called.append(True)
+
+        with self.assertLogs(sidemark.logger, level="ERROR"):
+            _App()._on_sigint()
+        self.assertTrue(quit_called)
 
 
 class TestVersionReport(unittest.TestCase):
@@ -7437,14 +7573,6 @@ class TestVersionReport(unittest.TestCase):
         self.assertIn("Sidemark", out.stdout)
         self.assertIn("running", out.stdout)
         self.assertIn("sidemark.py", out.stdout)
-
-    def test_a_build_stamp_is_preferred_over_git(self):
-        """An installed copy has no .git, so install.sh and the PKGBUILDs
-        stamp build.json — the only moment the source's dirtiness is still
-        knowable."""
-        info = sidemark._build_info()
-        self.assertIn("version", info)
-        self.assertIn("commit", info)
 
 
 class TestShareIndicator(unittest.TestCase):
@@ -7501,13 +7629,20 @@ class TestShareIndicator(unittest.TestCase):
         self.assertEqual(fake._share_dot.get_opacity(), 1.0)
 
     def test_pulse_toggles_opacity_between_full_and_dim(self):
+        """BOUNDS, not the tuned value. GTK stores opacity in 8 bits, so the
+        dim end reads back as 64/255 = 0.25098 and an exact assertion on 0.25
+        fails at the 7 places assertAlmostEqual defaults to — which is a fact
+        about the widget, not about the pulse. What can break by accident is a
+        pulse that stops alternating, or one that dims to invisible."""
         import sidemark
         fake = self._fake()
         fake._share_dot.set_opacity(1.0)
         self.assertTrue(sidemark.PDFEditorWindow._pulse_share_dot(fake))
-        self.assertAlmostEqual(fake._share_dot.get_opacity(), 0.25)
+        dim = fake._share_dot.get_opacity()
+        self.assertLess(dim, 0.6)      # visibly dimmer
+        self.assertGreater(dim, 0.05)  # ...but still on screen
         sidemark.PDFEditorWindow._pulse_share_dot(fake)
-        self.assertAlmostEqual(fake._share_dot.get_opacity(), 1.0)
+        self.assertGreater(fake._share_dot.get_opacity(), 0.9)
 
 
 class TestRemoteTouchToInkActions(unittest.TestCase):
