@@ -1081,6 +1081,15 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   snapshot either, or the next launch nags about a page you threw away.
   `_new_blank_document` is the one place a launch flag makes a blank document,
   so the mark lands on the session the ☰ actions just created.
+- **`sidemark --version` answers "WHICH copy is running?"** (row 188), and
+  that is what it is for: two installs and a PATH is why edits appear not to
+  land — an AUR `sidemark-git` in `/usr` and `install.sh`'s in `~/.local`,
+  with `/usr/bin` first. It prints the running FILE, its date, the commit,
+  how many files changed since it, and every other `sidemark` on PATH with an
+  arrow at the winner. An installed copy has no `.git`, so `install.sh` and
+  both PKGBUILDs stamp a `build.json` — the only moment the source's
+  dirtiness is still knowable. A **pre-GTK fast path** like `--help`, because
+  the question matters most when the app will not start.
 - **A COPY of the app is a different app.** `_copy_key()` is the one answer to
   "is this the installed script or a checkout?" — `""` for an installed path,
   else a hash of the source path (`SIDEMARK_INSTANCE=<name>` forces one). It
@@ -1208,7 +1217,7 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     header (the ☰ popover, the rail itself) measures from it — the bug that
     taught this was the menu opening 50px low, anchored to a two-row header
     that no longer existed.
-  - **Write-and-advance** (☰ *Advance while writing*, row 186, off by
+  - **Write-and-advance** (☰ *Advance while writing*, row 187, off by
     default): finish a stroke near the right edge, pause, and the view moves
     along; at the page edge it wraps to the next line, spaced by the size of
     what you have actually been writing. A new press cancels it — you had not
@@ -1216,6 +1225,42 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     or desync a session. Deliberately **no character segmentation**: "have
     you run out of room?" is answered exactly by where a stroke ended, while
     "was that a letter?" is not answered by a pen lift at all (row 184).
+  - **The phone-view tool points the phone at something** (Ctrl+Shift+left,
+    PDF only). Draw a region and it goes there; grab the dashed rectangle and
+    drag it and the phone follows LIVE. **There is ONE box** — the indicator
+    that already says where the phone is — so the tool writes to the same
+    state the phone does and neither owns it: after a move the box is where
+    the phone is *because that is where it went*, and the phone stays free to
+    pinch away, at which point its own reports drive the box again. No
+    separate lifetime, no lock, no second rectangle. A CLICK sends it back to
+    the whole page (zoom-to-region's escape), and a whole-page box paints
+    nothing. Three things it must keep doing: the button is in the bar only
+    while a share is live (`_sync_phone_tool_chrome`, **and hidden at
+    construction** — a GTK widget is visible by default and
+    `_update_header_for_mode` may not run before the window is shown); the
+    chord is INERT with no share, but stays in the table, because a binding
+    that vanished when you stopped sharing is the second mapping row 132
+    forbids; and the phone's reports are ignored *while the box is dragged
+    here*, since they are a round trip behind and the box would stutter
+    between the hand and the phone.
+  - **The share dialog was slow for two reasons and the big one was not the
+    obvious one** (row 186). `HTTPServer.server_bind` calls `socket.getfqdn()`
+    to fill in `server_name` — on a `0.0.0.0` bind that is a reverse lookup
+    with nowhere to go, **measured at 5004 ms every time the dialog opened**,
+    for a value this server never emits. Overridden away. The Funnel was the
+    other half (seconds, 25 s ceiling) and is now provisioned in the
+    background with the QR already scannable — `_share_prepare` went 5059 ms →
+    24 ms. **The arriving public link must not take the dropdown**: it would
+    be "the best entry with a url" and swap the QR under you mid-scan, which
+    with Writing as the default widens who can draw on your document.
+  - **A share must be torn down on EVERY exit that can be.** A Funnel mapping
+    lives in `tailscaled`, not in us, so once the process is gone nothing
+    knows to remove it and a public hostname points at a dead port. Ctrl+C
+    leaked one for a long time: `_on_sigint` called `win.destroy()`, which
+    deliberately skips close-request (no save prompt to block on) — and
+    close-request was the ONLY path reaching `_stop_sharing`. It goes through
+    `_destroy_all` now, SIGTERM is wired to the same handler, and
+    `_live_funnels` + `atexit` are the last resort. Nothing covers SIGKILL.
   DEFERRED, tracked in ideas.csv row 182: multiple phones drawing at once, a
   long-press tool picker beyond the plain Pen/Eraser toggle, and a
   character-by-character "typewriter" input mode (row 184).
