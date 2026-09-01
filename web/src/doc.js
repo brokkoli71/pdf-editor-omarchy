@@ -8,6 +8,12 @@ import * as pdfjs from "../vendor/pdf.min.mjs";
 import { PDFDocument } from "../vendor/pdf-lib.esm.js";
 import { NotesModel } from "./notes-model.js";
 import { readInk, readImages } from "./inkpdf.js";
+
+// How many lazily fetched pages stay resident (LIVE mode). Each is a whole
+// pdf.js document held in the worker, so this is a memory ceiling, not a
+// speed knob: big enough that paging back and forth costs no re-fetch, small
+// enough that a 400-page deck cannot accumulate into a killed tab.
+const LAZY_PAGE_CACHE = 8;
 import { makeImage } from "./images.js";
 
 // The single-file build has no URLs to fetch from, so it hands us a Worker it
@@ -85,10 +91,17 @@ export class Doc {
 
   /** One page fetched on its own (LIVE mode). Returns the pdf.js page and the
    * ink adopted off it, which the caller files under its REAL index — the
-   * fetched PDF is one page long, so everything in it says page 0. */
+   * fetched PDF is one page long, so everything in it says page 0.
+   *
+   * The DOCUMENT rides along so it can be destroyed later. Each fetched page
+   * is a whole PDFDocumentProxy, and pdf.js holds its data in the WORKER —
+   * which is why a leak here does not show up in the main thread's heap at
+   * all, and why a phone browsing a long deck could run out of memory with
+   * every JS measurement looking healthy. */
   static async openLoosePage(bytes) {
     const got = await Doc._adopt(bytes);
-    return { page: await got.pdf.getPage(1), ink: got.ink.get(0) || [] };
+    return { page: await got.pdf.getPage(1), ink: got.ink.get(0) || [],
+             pdf: got.pdf };
   }
 
   /** An empty document — the blank A4 sheet `blank_pdf_file()` makes. */
@@ -128,6 +141,7 @@ export class Doc {
   }
 
   async page(index) {
+    this._lastPage = index;
     if (this._pageCache.has(index)) return this._pageCache.get(index);
     // LIVE mode fetches pages one at a time (see attachLazyPages): `this.pdf`
     // then holds ONE page, not the document, so asking it for page index+1
@@ -136,6 +150,8 @@ export class Doc {
     if (this._lazy && index !== this._lazy.have) {
       const got = await this._lazy.fetch(index);
       p = got.page;
+      this._lazy.docs.set(index, got.pdf);
+      this._evictLazyPages();
       // Ink adopted off a page fetched alone is filed under its REAL index.
       // Tested for EMPTY, not for absence: `strokesFor` creates the key the
       // moment anything asks for the page's strokes, and the renderer does
@@ -163,8 +179,36 @@ export class Doc {
    * say: it is a one-page PDF.
    */
   attachLazyPages(count, fetch) {
-    this._lazy = { have: this.pageIndexLoaded ?? 0, fetch };
+    this._lazy = { have: this.pageIndexLoaded ?? 0, fetch, docs: new Map() };
     this.pageCount = count;
+  }
+
+  /** Keep only a window of fetched pages alive.
+   *
+   * Every lazily fetched page is its own pdf.js DOCUMENT, and pdf.js keeps
+   * the bytes and the parsed objects in its worker. Holding all of them means
+   * a phone that pages through a lecture accumulates the whole deck a page at
+   * a time — invisible in `performance.memory`, since none of it is on the
+   * main thread, and on a phone that ends as a killed tab rather than an
+   * error anyone can read.
+   *
+   * Evicts the FURTHEST page from where you are, not the oldest: paging back
+   * and forth around one spot should keep its neighbours, which is what
+   * paging actually looks like. */
+  _evictLazyPages(keep = LAZY_PAGE_CACHE) {
+    if (!this._lazy || this._lazy.docs.size <= keep) return;
+    const here = this._lastPage ?? this._lazy.have;
+    const far = [...this._lazy.docs.keys()]
+      .sort((a, b) => Math.abs(b - here) - Math.abs(a - here));
+    for (const idx of far.slice(0, this._lazy.docs.size - keep)) {
+      const pdf = this._lazy.docs.get(idx);
+      this._lazy.docs.delete(idx);
+      this._pageCache.delete(idx);
+      this._sizeCache.delete(idx);
+      // the ink stays: it is OURS now, filed under the real page index, and
+      // re-fetching the page would adopt it a second time
+      try { pdf.destroy(); } catch { /* already gone */ }
+    }
   }
 
   /** The page's size in PDF points — which ARE the document units the ink

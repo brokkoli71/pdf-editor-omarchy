@@ -7309,6 +7309,58 @@ class TestPhoneEditor(unittest.TestCase):
         finally:
             srv.stop()
 
+    def test_only_one_phone_draws_at_a_time(self):
+        """Several phones can connect and follow along, but the canvas has a
+        single `current_stroke`, so two drawing at once used to interleave
+        into ONE corrupted line: A's begin, B's begin resetting it, A's next
+        point landing on B's stroke, one commit for both. Dropping the second
+        phone's stroke is a bad outcome; a stroke that is neither phone's and
+        cannot be told apart afterwards is a worse one."""
+        import sidemark
+        got = []
+        srv, _ = self._server()
+        srv.providers["ink_actions"] = lambda a, page=None, origin=None: got.extend(a)
+        srv.drawing_allowed = True
+
+        class _Conn:
+            def __init__(self, cid):
+                self.cid = cid
+
+        a, b = _Conn(1), _Conn(2)
+        ta, tb = {"active": {}}, {"active": {}}
+        pt = lambda x: [[x, x]]
+        srv._ws_message(a, {"t": "ink", "id": 1, "pts": pt(10)}, ta)
+        srv._ws_message(b, {"t": "ink", "id": 9, "pts": pt(900)}, tb)   # refused
+        srv._ws_message(a, {"t": "ink", "id": 1, "pts": pt(20)}, ta)
+        srv._ws_message(a, {"t": "ink", "id": 1, "pts": [], "end": True}, ta)
+
+        verbs = [v[0] for v in got]
+        self.assertEqual(verbs, ["draw_begin", "draw_update", "draw_end"])
+        # nothing from B reached the page while A held the pen
+        self.assertNotIn(900, [v[1] for v in got if len(v) > 1])
+        # ...and the pen is free again once A commits
+        self.assertIsNone(srv._ink_holder)
+        srv._ws_message(b, {"t": "ink", "id": 9, "pts": pt(900)}, tb)
+        self.assertEqual(got[-1][0], "draw_begin")
+
+    def test_a_phone_that_vanishes_mid_stroke_releases_the_pen(self):
+        """Nothing else will ever send the `end` that releases it, so a phone
+        walking out of range would lock every other phone out for good."""
+        srv, _ = self._server()
+        srv.drawing_allowed = True
+        srv._ink_holder = 7
+        srv.providers["ink_actions"] = lambda *a, **k: None
+
+        class _Conn:
+            cid = 7
+
+            @staticmethod
+            def recv():
+                raise ConnectionError("gone")
+
+        srv.ws_serve(_Conn())
+        self.assertIsNone(srv._ink_holder)
+
     def test_state_names_the_document_and_says_if_an_editor_exists(self):
         import json
         srv, _ = self._server()
@@ -7339,12 +7391,13 @@ class TestPhoneViewTool(unittest.TestCase):
 
         def __init__(self):
             self.scale, self.offset_x, self.offset_y = 1.0, 0.0, 0.0
-            self.remote_view = None
+            self.remote_views = {}
             self._phone_selecting = False
             self._phone_start = self._phone_end = None
             self._phone_drag = None
             self.sent = []
-            self.on_phone_view = lambda page, rect: self.sent.append((page, rect))
+            self.on_phone_view = (
+                lambda page, rect, only=None: self.sent.append((page, rect, only)))
 
         def queue_draw(self):
             pass
@@ -7355,6 +7408,8 @@ class TestPhoneViewTool(unittest.TestCase):
         _finish_phone_view = sidemark.PDFCanvas._finish_phone_view
         set_remote_view = sidemark.PDFCanvas.set_remote_view
         _draw_remote_view = sidemark.PDFCanvas._draw_remote_view
+        _point_every_phone_at = sidemark.PDFCanvas._point_every_phone_at
+        visible_remote_rects = sidemark.PDFCanvas.visible_remote_rects
 
     def test_every_bar_tool_is_complete_across_the_tables(self):
         """The accident this catches is a tool added to the bar and forgotten
@@ -7389,20 +7444,24 @@ class TestPhoneViewTool(unittest.TestCase):
 
     def test_drawing_a_region_sends_the_phone_there(self):
         c = self._Canvas()
+        c.remote_views = {1: {"page": 0, "rect": (0.0, 0.0, 10.0, 10.0)},
+                          2: {"page": 0, "rect": (0.0, 0.0, 10.0, 10.0)}}
         c._phone_selecting = True
         c._phone_start, c._phone_end = (100.0, 200.0), (300.0, 350.0)
         c._finish_phone_view()
         self.assertEqual(len(c.sent), 1)
-        self.assertEqual(c.sent[0], (0, (100.0, 200.0, 300.0, 350.0)))
-        # shown at once rather than waiting for the phone to report back: the
+        # `only=None` — a drawn region is "all of you look at this"
+        self.assertEqual(c.sent[0], (0, (100.0, 200.0, 300.0, 350.0), None))
+        # shown at once rather than waiting for the phones to report back: the
         # round trip is a render away and a late box reads as a missed gesture
-        self.assertEqual(c.remote_view["rect"], (100.0, 200.0, 300.0, 350.0))
+        for rv in c.remote_views.values():
+            self.assertEqual(rv["rect"], (100.0, 200.0, 300.0, 350.0))
 
     def test_a_click_sends_the_phone_back_to_the_whole_page(self):
         """The same escape zoom-to-region gives you, because this tool is that
         one pointed at the phone."""
         c = self._Canvas()
-        c.remote_view = {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)}
+        c.remote_views = {1: {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)}}
         c._phone_selecting = True
         c._phone_start = c._phone_end = (220.0, 300.0)
         c._finish_phone_view()
@@ -7422,36 +7481,64 @@ class TestPhoneViewTool(unittest.TestCase):
                 return _f
 
         c = self._Canvas()
-        c.remote_view = {"page": 0, "rect": (0.0, 0.0, 595.0, 842.0)}
-        full = _Ctx()
-        c._draw_remote_view(full)
-        c.remote_view = {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)}
-        part = _Ctx()
-        c._draw_remote_view(part)
-        self.assertEqual(full.ops, 0)
-        self.assertGreater(part.ops, 0)
+        c.remote_views = {1: {"page": 0, "rect": (0.0, 0.0, 595.0, 842.0)}}
+        self.assertEqual(c.visible_remote_rects(), [])
+        c.remote_views = {1: {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)}}
+        self.assertEqual(len(c.visible_remote_rects()), 1)
+        self.assertEqual(c.visible_remote_rects()[0][0], 1)   # carries the cid
+        # ...and a box on ANOTHER page is not drawn on this one
+        c.remote_views = {1: {"page": 4, "rect": (100.0, 200.0, 300.0, 350.0)}}
+        self.assertEqual(c.visible_remote_rects(), [])
+
+    def test_an_undrawn_box_cannot_be_grabbed(self):
+        """A phone looking at the WHOLE page has a rect covering it, which is
+        deliberately not drawn. While the grab had its own hit test, that
+        invisible box swallowed every press and no region could be drawn at
+        all until every phone happened to be zoomed in — reported from the
+        hand. The painter and the grab read ONE list now."""
+        class _C(TestPhoneViewTool._Canvas):
+            def selection_grab_at(self, *_a):
+                return False
+            _begin_tool = sidemark.PDFCanvas._begin_tool
+
+        c = _C()
+        c.remote_views = {1: {"page": 0, "rect": (0.0, 0.0, 595.0, 842.0)}}
+        c._begin_tool("phoneview", 300.0, 400.0, True)
+        self.assertIsNone(c._phone_drag)       # nothing invisible was caught
+        self.assertTrue(c._phone_selecting)    # ...so a region can be drawn
+
+        # a box that IS drawn still grabs
+        c2 = _C()
+        c2.remote_views = {1: {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)}}
+        c2._begin_tool("phoneview", 200.0, 300.0, True)
+        self.assertEqual(c2._phone_drag[0], 1)
+        self.assertFalse(c2._phone_selecting)
 
     def test_dragging_the_box_reports_every_frame_and_keeps_its_size(self):
         """Live, not on release: the box is a pointer at what you want them to
         look at, and pointing is something you do while talking."""
         c = self._Canvas()
-        c.remote_view = {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)}
-        c._phone_drag = (0.0, 0.0)
+        c.remote_views = {7: {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)},
+                          8: {"page": 0, "rect": (10.0, 10.0, 60.0, 60.0)}}
+        c._phone_drag = (7, 0.0, 0.0)
         for x, y in ((120.0, 220.0), (160.0, 270.0), (200.0, 310.0)):
             c._move_remote_view(x, y)
         self.assertEqual(len(c.sent), 3)
-        for _page, (x0, y0, x1, y1) in c.sent:
+        for _page, (x0, y0, x1, y1), only in c.sent:
             self.assertAlmostEqual(x1 - x0, 200.0)
             self.assertAlmostEqual(y1 - y0, 150.0)
+            self.assertEqual(only, 7)      # ...and only that phone was moved
+        # the OTHER phone stayed where it was reading
+        self.assertEqual(c.remote_views[8]["rect"], (10.0, 10.0, 60.0, 60.0))
 
     def test_the_box_is_clamped_to_the_page(self):
         """The phone would clamp it back anyway, so a box that could leave the
         paper is one that stops tracking the hand."""
         c = self._Canvas()
-        c.remote_view = {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)}
-        c._phone_drag = (0.0, 0.0)
+        c.remote_views = {1: {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)}}
+        c._phone_drag = (1, 0.0, 0.0)
         c._move_remote_view(9000.0, 9000.0)
-        x0, y0, x1, y1 = c.remote_view["rect"]
+        x0, y0, x1, y1 = c.remote_views[1]["rect"]
         self.assertLessEqual(x1, c.page_width + 1e-6)
         self.assertLessEqual(y1, c.page_height + 1e-6)
         self.assertAlmostEqual(x1 - x0, 200.0)
@@ -7460,13 +7547,171 @@ class TestPhoneViewTool(unittest.TestCase):
         """Its reports are a round trip behind, so accepting one mid-drag
         makes the rectangle stutter between the hand and the phone."""
         c = self._Canvas()
-        c.remote_view = {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)}
-        c._phone_drag = (0.0, 0.0)
-        c.set_remote_view({"page": 0, "rect": (0.0, 0.0, 50.0, 50.0)})
-        self.assertEqual(c.remote_view["rect"], (100.0, 200.0, 300.0, 350.0))
+        c.remote_views = {1: {"page": 0, "rect": (100.0, 200.0, 300.0, 350.0)},
+                          2: {"page": 0, "rect": (5.0, 5.0, 15.0, 15.0)}}
+        c._phone_drag = (1, 0.0, 0.0)
+        c.set_remote_view(1, {"page": 0, "rect": (0.0, 0.0, 50.0, 50.0)})
+        self.assertEqual(c.remote_views[1]["rect"], (100.0, 200.0, 300.0, 350.0))
+        # ...but only the phone being dragged is deaf; the others keep moving
+        c.set_remote_view(2, {"page": 0, "rect": (9.0, 9.0, 19.0, 19.0)})
+        self.assertEqual(c.remote_views[2]["rect"], (9.0, 9.0, 19.0, 19.0))
         c._phone_drag = None
-        c.set_remote_view({"page": 0, "rect": (0.0, 0.0, 50.0, 50.0)})
-        self.assertEqual(c.remote_view["rect"], (0.0, 0.0, 50.0, 50.0))
+        c.set_remote_view(1, {"page": 0, "rect": (0.0, 0.0, 50.0, 50.0)})
+        self.assertEqual(c.remote_views[1]["rect"], (0.0, 0.0, 50.0, 50.0))
+        # a phone that disconnects takes its box with it
+        c.set_remote_view(2, None)
+        self.assertNotIn(2, c.remote_views)
+
+
+class TestShareModifiers(unittest.TestCase):
+    """The laptop's held modifiers re-pointing the phone's finger — opt-in,
+    because row 182's shipped rule is that a phone touch always draws with the
+    current pen whatever the desktop's buttons are bound to."""
+
+    def test_a_modifier_swaps_the_verb_not_the_route(self):
+        draw = [("draw_begin", 1.0, 2.0, None), ("draw_update", 3.0, 4.0, None),
+                ("draw_end", 0, 0, None)]
+        erased = sidemark.apply_modifier_tool(draw, "eraser")
+        self.assertEqual([v[0] for v in erased],
+                         ["erase_begin", "erase_at", "erase_end"])
+        # the POINTS are untouched — only which verb they become changes
+        self.assertEqual(erased[1][1:3], (3.0, 4.0))
+        back = sidemark.apply_modifier_tool(erased, "pen")
+        self.assertEqual([v[0] for v in back], [v[0] for v in draw])
+
+    def test_a_tool_with_no_remote_verb_is_ignored_not_half_honoured(self):
+        """`finger` is bound to pan by default, so with the toggle ON and
+        nothing held this is the ordinary case — it must leave drawing alone
+        rather than silently disable it."""
+        draw = [("draw_begin", 1.0, 2.0, None)]
+        for tool in ("pan", "lasso", "zoom", "text", "anchor", None):
+            self.assertEqual(sidemark.apply_modifier_tool(draw, tool), draw,
+                             tool)
+
+    def test_the_binding_table_is_what_decides(self):
+        """Resolved from the SAME table the laptop's own buttons read — a
+        second copy of it on the phone is the one thing row 132 forbids."""
+        b = sidemark.Bindings()
+        b.bind("ctrl+finger", "eraser")
+        draw = [("draw_begin", 1.0, 2.0, None)]
+
+        def verb(ctrl, shift, alt):
+            tool = b.tool_for(sidemark.BTN_FINGER, ctrl, shift, alt, mode="pdf")
+            return sidemark.apply_modifier_tool(draw, tool)[0][0]
+
+        self.assertEqual(verb(True, False, False), "erase_begin")
+        self.assertEqual(verb(False, False, False), "draw_begin")
+
+    def test_the_preference_is_remembered(self):
+        """It is a preference about how you work, not a decision about one
+        share, so it outlives the session."""
+        before = sidemark._load_settings().get("share_modifiers")
+        try:
+            sidemark._save_setting("share_modifiers", True)
+            self.assertTrue(sidemark._load_settings().get("share_modifiers"))
+            sidemark._save_setting("share_modifiers", False)
+            self.assertFalse(sidemark._load_settings().get("share_modifiers"))
+        finally:
+            if before is not None:
+                sidemark._save_setting("share_modifiers", before)
+
+
+class TestShareLinkIdentity(unittest.TestCase):
+    """The share ADDRESS: permanent by default, nameable, revocable, and
+    one-time when the link is going to somebody else."""
+
+    def setUp(self):
+        self._saved = sidemark._load_settings().get("share_token")
+
+    def tearDown(self):
+        if self._saved is not None:
+            sidemark._save_setting("share_token", self._saved)
+
+    def test_it_is_the_same_address_every_session(self):
+        """A fresh token per session made the link unbookmarkable: a QR
+        scanned yesterday, or a home screen shortcut, 404s today — which is
+        exactly what a stale token looks like from the phone."""
+        providers = {"title": "d.pdf", "state": lambda: (0, 0, 1),
+                     "render": lambda p: None, "pdf": lambda p: None}
+        a = sidemark._ShareServer(providers=providers)
+        b = sidemark._ShareServer(providers=providers)
+        self.assertEqual(a.token, b.token)
+        self.assertGreaterEqual(len(a.token), 4)
+
+    def test_a_one_time_link_is_used_but_never_saved(self):
+        """Sharing with someone else must not hand out the address your own
+        phone has on its home screen."""
+        providers = {"title": "d.pdf", "state": lambda: (0, 0, 1),
+                     "render": lambda p: None, "pdf": lambda p: None}
+        permanent = sidemark._share_token()
+        one = sidemark._ShareServer(providers=providers, token="throwaway1")
+        self.assertEqual(one.token, "throwaway1")
+        self.assertEqual(sidemark._share_token(), permanent)
+
+    def test_a_name_cannot_break_the_url_it_lives_in(self):
+        """It IS the path, so anything that would need escaping — or worse,
+        split the path in two — must not survive."""
+        self.assertEqual(sidemark._clean_share_token("my laptop!"), "mylaptop")
+        self.assertNotIn("/", sidemark._clean_share_token("a/b/cd") or "")
+        self.assertIsNone(sidemark._clean_share_token("ab"))      # too short
+        self.assertIsNone(sidemark._clean_share_token("   "))
+        self.assertEqual(sidemark._clean_share_token("hannes-laptop_2"),
+                         "hannes-laptop_2")
+
+    def test_the_public_link_never_carries_the_permanent_secret(self):
+        """The flaw the permanent link introduced, and the reason it is two
+        secrets rather than one.
+
+        A permanent secret is what makes the address bookmarkable — and
+        exactly what must not travel over the public tier, where it leaks in
+        ways a per-session one cannot (browser history, a photo of the QR, a
+        screen share) and stays valid until somebody thinks to rotate it. So
+        the private tiers keep the address your own devices know and anyone
+        outside gets one that dies with this share."""
+        providers = {"title": "d.pdf", "state": lambda: (0, 0, 1),
+                     "render": lambda p: None, "pdf": lambda p: None}
+        a = sidemark._ShareServer(providers=providers)
+        b = sidemark._ShareServer(providers=providers)
+        lan = a.url_for("192.168.1.5")
+        public = a.url_for("h.ts.net", scheme="https", port=None, public=True)
+        self.assertNotIn(a.token, public)
+        self.assertIn(a.token, lan)
+        # the private address is stable, the public one is not
+        self.assertEqual(a.token, b.token)
+        self.assertNotEqual(a.public_token, b.public_token)
+
+    def test_both_secrets_open_the_same_share(self):
+        """Two doors, one room: a visitor on the public link gets the same
+        document, or the tier would be decorative."""
+        import urllib.request, urllib.error
+        srv = sidemark._ShareServer(providers={
+            "title": "d.pdf", "state": lambda: (0, 0, 1),
+            "render": lambda p: open(p, "wb").write(b"\x89PNG"),
+            "pdf": lambda p: open(p, "wb").write(b"%PDF-1.4")})
+        srv.start()
+        try:
+            for tok in (srv.token, srv.public_token):
+                r = urllib.request.urlopen(
+                    f"http://127.0.0.1:{srv.port}/{tok}/state", timeout=5)
+                self.assertEqual(r.status, 200)
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{srv.port}/wrong/state", timeout=5)
+            self.assertEqual(cm.exception.code, 404)
+        finally:
+            srv.stop()
+
+    def test_rotating_revokes_the_old_address(self):
+        before = sidemark._share_token()
+        after = sidemark._share_token(rotate=True)
+        self.assertNotEqual(before, after)
+        self.assertEqual(sidemark._share_token(), after)
+
+    def test_a_one_shot_file_handout_is_never_the_permanent_link(self):
+        """The static mode serves one file to whoever was handed it; giving it
+        the bookmarkable address would outlive the handout."""
+        srv = sidemark._ShareServer("/tmp/whatever.pdf")
+        self.assertNotEqual(srv.token, sidemark._share_token())
 
 
 class TestFunnelTeardown(unittest.TestCase):

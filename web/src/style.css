@@ -80,6 +80,15 @@
 
 html, body {
   height: 100%;
+  /* The DYNAMIC viewport, and on a phone this is not cosmetic. With
+     `overflow: hidden` and no scrolling, `height: 100%` resolves against the
+     initial containing block — which on mobile is the LARGE viewport, the one
+     with the URL bar hidden. So while the URL bar is showing, the bottom of
+     the page sits below the visible area and simply cannot be reached: the
+     page canvas is taller than the screen and the last strip of it is lost.
+     `dvh` tracks the bar as it comes and goes. The 100% above stays as the
+     fallback for anything without dvh. */
+  height: 100dvh;
   margin: 0;
   overflow: hidden;
   overscroll-behavior: none;
@@ -827,4 +836,12 @@ body.mobile .hb-start .title { max-width: 32vw; }
 /* Portrait phone: nothing moves, it just gets tighter. */
 @media (orientation: portrait) {
   body.mobile .hb-center { gap: 0.2rem; }
+}
+
+/* The fullscreen button lives in the header on a phone — see addFullscreenEntry.
+   Landscape only: in portrait the browser's chrome costs a bar you can live
+   with, and the header has less room to spare than the page does. */
+.fullscreen-btn { display: none; }
+@media (orientation: landscape) and (max-height: 560px) {
+  body.mobile .fullscreen-btn { display: inline-flex; }
 }

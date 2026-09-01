@@ -268,6 +268,21 @@ Numbers in `../notes/phone-web-port-sync-plan.md`.
   second pointer. In landscape the toolbar becomes a rail and `--header-h` is
   overridden; everything floating under the header measures from that
   variable, so change it there and nowhere else.
+- **`html, body` must be `100dvh`, not `100%`.** With `overflow: hidden`,
+  `100%` resolves against the LARGE viewport — the one with the URL bar
+  hidden — so on a phone the bottom strip of the page sat below the visible
+  area and could not be reached at all.
+- **Fullscreen is Android-only.** Safari implements `requestFullscreen` for
+  video and nothing else, so the entry is offered only where the API exists;
+  Add to Home Screen (the `*-web-app-capable` meta) is the iOS route.
+- **Lazily fetched pages are EVICTED** to a window of 8. Each is a whole
+  pdf.js document whose memory lives in the WORKER, so holding them all is
+  invisible in `performance.memory` and ends as a killed tab on a phone.
+- **Breadcrumbs use a keepalive FETCH, never `sendBeacon`.** Brave
+  neutralises sendBeacon by returning TRUE and discarding, so an
+  `if (!sendBeacon(...))` fallback never fires and the record vanishes
+  silently — which is exactly how a browser crash was investigated twice with
+  nothing to show for it.
 
 ## Browser differences (measured, not assumed)
 

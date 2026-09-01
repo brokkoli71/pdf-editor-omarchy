@@ -349,6 +349,8 @@ function applyMobileLayout() {
   // screen is not a thing you do from a phone often enough to spend a button.
   moveToMenu("present-btn", "Presenter mode");
 
+  addFullscreenEntry();
+
   // Writing on a phone runs out of room in a few words; this moves the page
   // for you when you stop. Off by default — a view that moves on its own is
   // the last thing you want when you are not writing prose.
@@ -364,6 +366,74 @@ function applyMobileLayout() {
   // starting another stroke means you had not finished after all
   const page = document.getElementById("page");
   if (page) page.addEventListener("pointerdown", cancelAdvance, { capture: true });
+}
+
+/** Fullscreen, which on a phone is worth more than any layout tweak: the
+ * browser's own chrome is the single biggest consumer of height, and in
+ * landscape it is most of what is left after the page.
+ *
+ * Offered only where it EXISTS. Safari implements `requestFullscreen` for
+ * video and nothing else, so on iOS this entry would be a button that does
+ * nothing — there the answer is Add to Home Screen, which runs without chrome
+ * (see the apple-mobile-web-app-capable meta in index.html) and is the only
+ * route Apple gives.
+ *
+ * The state is the BROWSER's, not ours: you can leave fullscreen with a
+ * gesture or the Escape key without touching this, so the label follows
+ * `fullscreenchange` rather than what we last asked for. */
+function addFullscreenEntry() {
+  const root = document.documentElement;
+  const request = root.requestFullscreen || root.webkitRequestFullscreen;
+  if (!request) return;                 // iOS Safari: nothing to offer
+  const menu = document.getElementById("more-popover");
+  if (!menu) return;
+
+  const item = document.createElement("button");
+  item.className = "flat menu-item";
+
+  // ...and a BUTTON IN THE HEADER as well, beside the ☰. In landscape the
+  // browser's own chrome is most of what is left after the page, so this is
+  // the control you reach for first — a menu entry for it is two taps for
+  // the thing that gives you back the room to work in. Same handler, so the
+  // two cannot disagree.
+  const hdr = document.createElement("button");
+  hdr.className = "flat icon-btn fullscreen-btn";
+  hdr.setAttribute("aria-label", "Fullscreen");
+  hdr.innerHTML =
+    '<svg viewBox="0 0 16 16" aria-hidden="true">'
+    + '<path d="M2 6V2.5h3.5M14 6V2.5h-3.5M2 10v3.5h3.5M14 10v3.5h-3.5"'
+    + ' fill="none" stroke="currentColor" stroke-width="1.5"'
+    + ' stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  const more = document.getElementById("more-btn");
+  if (more && more.parentNode) more.parentNode.insertBefore(hdr, more);
+
+  const paint = () => {
+    const on = !!(document.fullscreenElement || document.webkitFullscreenElement);
+    item.textContent = on ? "Leave fullscreen" : "Fullscreen";
+    item.setAttribute("aria-pressed", String(on));
+    hdr.setAttribute("aria-pressed", String(on));
+    hdr.title = on ? "Leave fullscreen" : "Fullscreen";
+    hdr.classList.toggle("on", on);
+  };
+  paint();
+  hdr.addEventListener("click", () => item.click());
+  item.addEventListener("click", () => {
+    // the click IS the user gesture the API requires; a rejected promise just
+    // means the browser said no, which is not worth an error on screen
+    if (document.fullscreenElement || document.webkitFullscreenElement) {
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    } else {
+      request.call(root);
+    }
+  });
+  for (const ev of ["fullscreenchange", "webkitfullscreenchange"]) {
+    document.addEventListener(ev, () => {
+      paint();
+      // the viewport just changed size by the height of the browser's chrome
+      surface.requestDraw();
+    });
+  }
+  (menu.querySelector(".popover-body") || menu).appendChild(item);
 }
 
 /** A menu row that remembers an on/off state. */
@@ -601,17 +671,21 @@ function watchForStalledStart() {
  * The desktop's Download button serves a different, flattened export; this is
  * deliberately not that one. */
 async function openLiveDocument() {
+  diag("open-start");
   const state = await fetch("../state", { cache: "no-store" })
     .then((r) => r.json()).catch(() => ({}));
   const first = state.page || 0;
+  diag("state", `pages=${state.pages} page=${first}`);
   // ONE page, not the document. A lecture deck is tens of megabytes and the
   // phone is about to look at a single slide of it; the rest arrives as it is
   // reached (attachLazyPages). Ink rides along on each page, so a page is
   // never briefly blank waiting for a delta.
   const r = await fetch(`../page.pdf?n=${first}`, { cache: "no-store" });
   if (!r.ok) throw new Error(`page.pdf answered ${r.status}`);
-  const doc = await Doc.open(new Uint8Array(await r.arrayBuffer()),
-                             state.title || "Shared document");
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  diag("page-pdf", `${(bytes.length / 1024).toFixed(0)}KB`);
+  const doc = await Doc.open(bytes, state.title || "Shared document");
+  diag("doc-open");
   doc.pageIndexLoaded = first;
   if (state.pages > 1) {
     doc.attachLazyPages(state.pages, async (n) => {
@@ -623,6 +697,7 @@ async function openLiveDocument() {
     });
   }
   await setDoc(doc, doc.name);
+  diag("set-doc");
   if (first) await surface.setPage(first);
   liveRev = state.rev ?? null;
   livePage = state.page ?? null;
@@ -630,6 +705,9 @@ async function openLiveDocument() {
   liveBanner();
   liveConnect();
   liveWatchView();
+  // the first frame is the expensive one: pdf.js rasterises the page and the
+  // ink layer is allocated. If the phone dies here, that is the answer.
+  requestAnimationFrame(() => requestAnimationFrame(() => diag("first-frame")));
   return true;
 }
 
@@ -678,6 +756,50 @@ function liveStatus(connected) {
   liveBannerEl.title = long;
 }
 
+// ── breadcrumbs, for a browser that dies without saying why ─────────────────
+// A renderer crash takes the console with it, so nothing the page could show
+// or log survives. What DOES survive is what has already left the device:
+// `sendBeacon` hands the payload to the browser's own queue, which outlives
+// the page. So the desktop's log ends with the last stage the phone reached,
+// and the crash is bisected without ever attaching a debugger.
+//
+// LIVE mode only, and cheap: a short string per milestone.
+let diagSeq = 0;
+
+function diag(stage, detail) {
+  if (!LIVE) return;
+  try {
+    const mem = performance.memory
+      ? ` heap=${(performance.memory.usedJSHeapSize / 1048576).toFixed(1)}MB`
+      : "";
+    const line = `#${++diagSeq} ${stage}${detail ? " " + detail : ""}`
+               + `${mem} dpr=${devicePixelRatio} ${innerWidth}x${innerHeight}`;
+    const url = new URL("../diag", location.href).toString();
+    // A keepalive FETCH first, not sendBeacon. Brave — the browser this was
+    // built to diagnose — neutralises `sendBeacon` as an anti-tracking
+    // measure, and it does so by returning TRUE and discarding the payload,
+    // so a `if (!sendBeacon(...))` fallback never fires and the breadcrumbs
+    // vanish silently. A keepalive fetch is an ordinary same-origin request
+    // and makes the same promise: the browser keeps it alive past the page.
+    fetch(url, { method: "POST", body: line, keepalive: true }).catch(() => {
+      try { navigator.sendBeacon && navigator.sendBeacon(url, line); } catch {}
+    });
+  } catch { /* a breadcrumb must never be the thing that breaks the page */ }
+}
+
+if (LIVE) {
+  diag("boot", navigator.userAgent.slice(0, 90));
+  window.addEventListener("error", (e) =>
+    diag("ERROR", `${e.message} @ ${(e.filename || "").split("/").pop()}:${e.lineno}`));
+  window.addEventListener("unhandledrejection", (e) =>
+    diag("REJECT", String(e.reason && e.reason.message || e.reason).slice(0, 140)));
+  // A crash usually follows memory climbing, and the last heartbeat before
+  // the silence is the reading that matters — but a trend needs a handful of
+  // readings, not a hundred, and every one of them is a request. Every 30 s
+  // still shows memory climbing over a session and costs two lines a minute.
+  setInterval(() => diag("alive"), 30000);
+}
+
 // ── the live connection ──────────────────────────────────────────────────────
 // A socket, not a poll, and that is the whole feature. Ink has to reach the
 // desktop while the finger is still down, and a change made on the desktop has
@@ -710,6 +832,7 @@ function liveConnect() {
   liveSock = sock;
   sock.addEventListener("open", () => {
     liveRetry = 500;                       // a good connection resets the backoff
+    diag("ws-open");
     liveStatus(true);
     sock.send(JSON.stringify({ t: "hello" }));
   });

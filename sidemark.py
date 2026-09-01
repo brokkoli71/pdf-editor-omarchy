@@ -3682,9 +3682,12 @@ class PDFCanvas(Gtk.DrawingArea):
         self.document = None
         self.n_pages = 0
         self.current_page_idx = 0
-        # where a connected phone is looking, {"page": n, "rect": (…)} in PDF
-        # units, or None when nothing is connected (row 182)
-        self.remote_view = None
+        # Where each connected phone is looking: {connection id: {"page": n,
+        # "rect": (…)}} in PDF units, empty when nobody is connected (row 182).
+        # A DICT because several phones can watch at once and each has a camera
+        # of its own — one shared slot meant two phones overwrote each other
+        # and the rectangle flickered between them, describing neither.
+        self.remote_views = {}
         # the phone-view tool: a marquee being drawn, or the indicator being
         # dragged. While either is true the rectangle on screen is OURS and
         # the phone's own reports are ignored — otherwise the box fights the
@@ -4893,41 +4896,64 @@ class PDFCanvas(Gtk.DrawingArea):
         Not drawn when it covers essentially the whole page: a rectangle
         around everything says nothing, and it would sit on every share
         where the phone never zoomed in."""
-        rv = self.remote_view
-        if not rv or rv.get("page") != self.current_page_idx:
-            return
-        x0, y0, x1, y1 = rv["rect"]
-        pw, ph = self.page_width, self.page_height
-        if (x1 - x0) >= pw * 0.92 and (y1 - y0) >= ph * 0.92:
-            return
-        sx0, sy0 = self._pdf_to_screen(x0, y0)
-        sx1, sy1 = self._pdf_to_screen(x1, y1)
-        ctx.save()
         r, g, b = self.zoom_accent
-        # a soft wash first so the region reads at a glance, then the outline
-        ctx.set_source_rgba(r, g, b, 0.07)
-        ctx.rectangle(sx0, sy0, sx1 - sx0, sy1 - sy0)
-        ctx.fill()
-        ctx.set_source_rgba(r, g, b, 0.85)
-        ctx.set_line_width(2.0)
-        ctx.set_dash([8.0, 5.0])
-        ctx.rectangle(sx0, sy0, sx1 - sx0, sy1 - sy0)
-        ctx.stroke()
-        ctx.restore()
+        for _cid, rect in self.visible_remote_rects():
+            x0, y0, x1, y1 = rect
+            sx0, sy0 = self._pdf_to_screen(x0, y0)
+            sx1, sy1 = self._pdf_to_screen(x1, y1)
+            ctx.save()
+            # a soft wash first so the region reads at a glance, then the
+            # outline. Two phones on the same spot deepen the wash, which is
+            # the honest thing for it to do.
+            ctx.set_source_rgba(r, g, b, 0.07)
+            ctx.rectangle(sx0, sy0, sx1 - sx0, sy1 - sy0)
+            ctx.fill()
+            ctx.set_source_rgba(r, g, b, 0.85)
+            ctx.set_line_width(2.0)
+            ctx.set_dash([8.0, 5.0])
+            ctx.rectangle(sx0, sy0, sx1 - sx0, sy1 - sy0)
+            ctx.stroke()
+            ctx.restore()
         ctx.new_path()      # a shared painter must not leave a current point
 
-    def set_remote_view(self, view):
-        """Called from the main thread when the phone reports its camera.
+    def visible_remote_rects(self):
+        """`(connection id, rect)` for every phone viewport worth drawing on
+        THIS page — and THE hit region for grabbing one.
 
-        Ignored while the box is being dragged HERE: the phone is following us
-        and its reports are a round trip behind, so accepting them mid-drag
-        makes the rectangle stutter between where the hand is and where the
-        phone last was."""
-        if self._phone_drag is not None:
+        One list for the painter and the grab, because a box you cannot see is
+        a box you must not be able to catch. A phone looking at the whole page
+        has a rect covering it, which is deliberately not drawn (a rectangle
+        around everything says nothing) — and while the grab had its own test,
+        that invisible box swallowed every press, so a region could not be
+        drawn at all until every phone had zoomed in. That is the same
+        painter/hit-test drift the lasso frame documents, in a new place."""
+        pw, ph = self.page_width, self.page_height
+        out = []
+        for cid, rv in self.remote_views.items():
+            if not rv or rv.get("page") != self.current_page_idx:
+                continue
+            x0, y0, x1, y1 = rv["rect"]
+            if (x1 - x0) >= pw * 0.92 and (y1 - y0) >= ph * 0.92:
+                continue
+            out.append((cid, rv["rect"]))
+        return out
+
+    def set_remote_view(self, cid, view):
+        """One phone reported its camera (or disconnected: `view` is None).
+
+        Ignored for the phone whose box is being dragged HERE: its reports are
+        a round trip behind, so accepting one mid-drag makes the rectangle
+        stutter between where the hand is and where the phone last was. Other
+        phones keep updating — only the one being pushed around is deaf."""
+        if self._phone_drag is not None and self._phone_drag[0] == cid:
             return
-        if view == self.remote_view:
+        if view is None:
+            if self.remote_views.pop(cid, None) is None:
+                return
+        elif self.remote_views.get(cid) == view:
             return
-        self.remote_view = view
+        else:
+            self.remote_views[cid] = view
         self.queue_draw()
 
     # ── pasted images ────────────────────────────────────────────────────────
@@ -6013,11 +6039,22 @@ class PDFCanvas(Gtk.DrawingArea):
             # One box, two verbs — there is no second rectangle with a life of
             # its own, because the box IS where the phone is.
             px, py = self._screen_to_pdf(start_x, start_y)
-            rv = self.remote_view
-            if (rv and rv.get("page") == self.current_page_idx
-                    and _point_in_rect(px, py, rv["rect"])):
-                x0, y0, _x1, _y1 = rv["rect"]
-                self._phone_drag = (px - x0, py - y0)
+            # WHICH phone's box did you grab? With several connected there are
+            # several boxes, and dragging one must move that phone and leave
+            # the others where they are — otherwise pointing one person at
+            # something drags everybody else off what they were reading.
+            # ...and only a box that is actually DRAWN can be grabbed — see
+            # visible_remote_rects. Hit-testing the undrawn whole-page box
+            # meant every press landed "inside" it and no region could be
+            # drawn at all.
+            grabbed = None
+            for cid, rect in self.visible_remote_rects():
+                if _point_in_rect(px, py, rect):
+                    grabbed = cid
+                    break
+            if grabbed is not None:
+                x0, y0, _x1, _y1 = self.remote_views[grabbed]["rect"]
+                self._phone_drag = (grabbed, px - x0, py - y0)
             else:
                 self._phone_selecting = True
                 self._phone_start = (start_x, start_y)
@@ -6518,8 +6555,8 @@ class PDFCanvas(Gtk.DrawingArea):
             # LIVE, not on release: the box is a pointer at what you want them
             # to look at, and pointing is a thing you do while talking.
             px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
-            self._move_remote_view(px - self._phone_drag[0],
-                                   py - self._phone_drag[1])
+            self._move_remote_view(px - self._phone_drag[1],
+                                   py - self._phone_drag[2])
         elif self._zoom_selecting:
             # free-proportioned rectangle (matches the text sheet) — the zoom
             # fits whatever region you draw, no forced canvas aspect ratio
@@ -7847,22 +7884,41 @@ class PDFCanvas(Gtk.DrawingArea):
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
 
     def _move_remote_view(self, x0, y0):
-        """Put the phone's viewport at this top-left, keeping its size, and
-        tell the phone. Clamped to the page: a box you can drag off the paper
-        points at nothing, and the phone would clamp it back anyway — so the
-        rectangle would stop tracking the hand."""
-        rv = self.remote_view
+        """Put the GRABBED phone's viewport at this top-left, keeping its size,
+        and tell that phone. Clamped to the page: a box you can drag off the
+        paper points at nothing, and the phone would clamp it back anyway — so
+        the rectangle would stop tracking the hand."""
+        if self._phone_drag is None:
+            return
+        cid = self._phone_drag[0]
+        rv = self.remote_views.get(cid)
         if not rv:
             return
         ox0, oy0, ox1, oy1 = rv["rect"]
         w, h = ox1 - ox0, oy1 - oy0
         x0 = max(0.0, min(self.page_width - w, x0))
         y0 = max(0.0, min(self.page_height - h, y0))
-        self.remote_view = {"page": self.current_page_idx,
-                            "rect": (x0, y0, x0 + w, y0 + h)}
+        rect = (x0, y0, x0 + w, y0 + h)
+        self.remote_views[cid] = {"page": self.current_page_idx, "rect": rect}
         self.queue_draw()
         if self.on_phone_view:
-            self.on_phone_view(self.current_page_idx, self.remote_view["rect"])
+            self.on_phone_view(self.current_page_idx, rect, cid)
+
+    def _point_every_phone_at(self, rect):
+        """Send EVERY connected phone to this region.
+
+        Drawing a region is "all of you look at this", where dragging one box
+        is "you, specifically". The boxes are set here rather than waiting for
+        the phones to report back: the round trip is a render away, and a box
+        that appears late reads as the gesture having missed.
+        """
+        for cid in list(self.remote_views) or [None]:
+            if cid is not None:
+                self.remote_views[cid] = {"page": self.current_page_idx,
+                                          "rect": rect}
+        self.queue_draw()
+        if self.on_phone_view:
+            self.on_phone_view(self.current_page_idx, rect, None)
 
     def _finish_phone_view(self):
         """Commit the phone-view gesture: send the phone to the region just
@@ -7880,22 +7936,13 @@ class PDFCanvas(Gtk.DrawingArea):
             # A click with no rectangle sends the phone back to the whole
             # page — the same escape zoom-to-region gives you, and the same
             # gesture, because this tool IS that one pointed at the phone.
-            rect = (0.0, 0.0, float(self.page_width), float(self.page_height))
-            self.remote_view = {"page": self.current_page_idx, "rect": rect}
-            self.queue_draw()
-            if self.on_phone_view:
-                self.on_phone_view(self.current_page_idx, rect)
+            self._point_every_phone_at(
+                (0.0, 0.0, float(self.page_width), float(self.page_height)))
             return
         x0, y0 = self._screen_to_pdf(min(start[0], end[0]), min(start[1], end[1]))
         x1, y1 = self._screen_to_pdf(max(start[0], end[0]), max(start[1], end[1]))
         rect = (x0, y0, x1, y1)
-        # Show it immediately rather than waiting for the phone to report back:
-        # the round trip is a render away, and a box that appears late reads as
-        # the gesture having missed.
-        self.remote_view = {"page": self.current_page_idx, "rect": rect}
-        self.queue_draw()
-        if self.on_phone_view:
-            self.on_phone_view(self.current_page_idx, rect)
+        self._point_every_phone_at(rect)
 
     def _execute_zoom_to_rect(self, start, end):
         x1, y1 = min(start[0], end[0]), min(start[1], end[1])
@@ -10778,6 +10825,13 @@ def _tailscale_funnel_stop(port):
     if not shutil.which("tailscale"):
         _live_funnels.discard(port)
         return
+    # LOGGED, with a stack, because this is node-wide: `--https=443 off` turns
+    # off whatever funnel is running, not merely the one this port started.
+    # A public link that dies for no visible reason is the hardest failure
+    # this feature has, and the start already says why it succeeds — the stop
+    # has to say who asked.
+    logger.info("share: turning the public link off (port %s), asked by:\n%s",
+                port, "".join(traceback.format_stack(limit=6)[:-1]).rstrip())
     for argv in (["tailscale", "funnel", "--https=443", "off"],
                  ["tailscale", "funnel", str(port), "off"]):
         try:
@@ -10894,6 +10948,35 @@ def _process_remote_touch(touch_state, points):
             if not active:
                 touch_state["blocked"] = False
     return actions
+
+
+def apply_modifier_tool(actions, tool):
+    """Re-point one batch of phone actions at the tool a MODIFIER selected.
+
+    Row 182 shipped the rule that a phone touch always draws with the current
+    pen whatever the desktop's own buttons are bound to, and that stays the
+    default. This is the opt-in: hold a modifier on the laptop and the phone
+    follows the same binding table the laptop does, so the eraser chord you
+    already know erases on the phone too.
+
+    Pure, and a REWRITE of verbs rather than a second route into the surface —
+    the phone still decides where the finger is and _process_remote_touch
+    still decides what a second finger means; only which verb those points
+    become changes. `None` (an unbound chord) leaves the phone's own Pen/
+    Eraser toggle alone: a modifier that means nothing must not silently
+    disable drawing.
+
+    ceiling: only the tools the remote primitives have — pen, highlighter and
+    eraser. A modifier bound to lasso or pan is ignored rather than half
+    honoured, because there is no remote verb for either."""
+    if tool is None or tool not in ("pen", "highlighter", "eraser"):
+        return actions
+    want_erase = tool == "eraser"
+    swap = ({"draw_begin": "erase_begin", "draw_update": "erase_at",
+             "draw_end": "erase_end"} if want_erase else
+            {"erase_begin": "draw_begin", "erase_at": "draw_update",
+             "erase_end": "draw_end"})
+    return [(swap.get(verb, verb), *rest) for verb, *rest in actions]
 
 
 def _dispatch_remote_ink(target, actions):
@@ -11109,6 +11192,103 @@ _SHARE_VIEWER_HTML = """<!doctype html>
  });
 </script>
 </body></html>"""
+
+
+# The share server's PREFERRED port. It used to bind port 0 — a fresh random
+# high port every session — which is fine until a firewall is in the way: you
+# cannot allow a port that changes every time you press the button. A stable
+# one means a single `ufw allow` (or equivalent) holds for good. Falls back to
+# a random port if this one is taken, so nothing breaks when two copies share.
+SHARE_PREFERRED_PORT = 8756
+
+
+def _clean_share_token(text):
+    """A user-chosen link name, or None if it cannot be one.
+
+    Kept to the URL-safe set so the address needs no escaping and reads the
+    same everywhere it is written down — a name with a space or a slash would
+    survive here and then arrive somewhere else percent-encoded, or split the
+    path in two."""
+    text = re.sub(r"[^A-Za-z0-9_-]", "", (text or "").strip())
+    return text if len(text) >= 4 else None
+
+
+def _share_token(rotate=False, set_to=None):
+    """The share path's secret, and it PERSISTS.
+
+    It used to be fresh every session, which made the link unbookmarkable: a
+    QR scanned yesterday, or a shortcut on a phone's home screen, 404s today
+    — and that is exactly what a stale token looks like from the phone. With
+    a stable port and a stable token the whole address is stable, so a home
+    screen shortcut keeps working.
+
+    Still a SECRET, and that is the difference from simply serving at the
+    root: the path stays unguessable, so reaching the port is not the same as
+    reaching the document. `rotate=True` throws the old one away, which is
+    the answer when a link has gone somewhere it should not have — every
+    previous QR, bookmark and shortcut stops working at once."""
+    import secrets
+    if set_to:
+        _save_setting("share_token", set_to)
+        return set_to
+    tok = None if rotate else _load_settings().get("share_token")
+    if not isinstance(tok, str) or len(tok) < 4:
+        tok = secrets.token_urlsafe(8)
+        _save_setting("share_token", tok)
+    return tok
+
+
+def _firewall_note(port):
+    """A warning for the Same Wi-Fi option when a firewall is running here.
+
+    This is the failure the LAN link actually has, and it is SILENT: the QR
+    scans, the browser opens it, and the page simply never loads, because the
+    packets are dropped before anything of ours sees them. Nothing in the app
+    can detect it from the inside — the connection never arrives — so the only
+    honest thing is to say a firewall is running and name the port to allow.
+
+    Deliberately not a claim that it IS blocked: the rule may already be
+    there. It says what is running and what to do if the phone cannot connect.
+    Tailscale and the public link are unaffected either way, since both
+    connect OUTWARD from this machine."""
+    try:
+        for name, tool, cmd in (
+                ("ufw", "ufw", ["systemctl", "is-active", "ufw"]),
+                ("firewalld", "firewalld",
+                 ["systemctl", "is-active", "firewalld"])):
+            if not shutil.which(tool) and not shutil.which("systemctl"):
+                continue
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+            if r.stdout.strip() == "active":
+                how = (f"sudo ufw allow {port}/tcp" if name == "ufw"
+                       else f"sudo firewall-cmd --add-port={port}/tcp")
+                return (f"A firewall ({name}) is running on this computer. If "
+                        f"the phone cannot open this link, allow the port:  "
+                        f"{how}")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+# Shown for a link whose token no longer matches — an old QR, or the phone's
+# own history. Deliberately says nothing about the document: whoever is holding
+# a stale link was not necessarily meant to have this one.
+_SHARE_STALE_HTML = """<!doctype html>
+<html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Link expired</title>
+<style>
+ :root{color-scheme:light dark}
+ body{margin:0;min-height:100dvh;display:flex;align-items:center;
+   justify-content:center;font-family:system-ui,sans-serif;padding:2rem;
+   text-align:center;line-height:1.5}
+ h1{font-size:1.15rem;margin:0 0 .6rem}
+ p{margin:0;opacity:.75;font-size:.92rem;max-width:24rem}
+</style></head><body><div>
+<h1>This share link has expired</h1>
+<p>Sharing was restarted, so the address changed. Open <b>Share to phone</b>
+on the computer again and scan the new QR code.</p>
+</div></body></html>"""
 
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -11359,9 +11539,24 @@ class _ShareServer:
     all — also carries write access whenever Writing is on. There is no
     drawing-only address tier that stays private while viewing goes public."""
 
-    def __init__(self, file_path=None, *, providers=None):
+    def __init__(self, file_path=None, *, providers=None, token=None):
         import secrets
-        self.token = secrets.token_urlsafe(8)
+        # The LIVE share keeps its token across sessions so the address can be
+        # bookmarked (see _share_token) — unless the caller hands over a
+        # one-off one, which is what "One-time link" does. The static
+        # single-file mode is a handout and always gets a throwaway.
+        self.token = token or (_share_token() if providers is not None
+                               else secrets.token_urlsafe(8))
+        # THE PUBLIC LINK GETS ITS OWN SECRET, fresh every session and never
+        # saved. The permanent token is what makes the address bookmarkable
+        # (see _share_token) and that is exactly why it must not travel over
+        # the public tier: a permanent secret in a public URL leaks in ways a
+        # per-session one cannot — browser history, a photograph of the QR, a
+        # screen share — and stays valid until somebody thinks to rotate it.
+        # So the private tiers keep the address your own devices know, and
+        # anyone outside gets one that dies with this share.
+        self.public_token = (secrets.token_urlsafe(12)
+                             if providers is not None else None)
         self.ip = _lan_ip()
         self.port = 0
         self.served = False
@@ -11396,10 +11591,16 @@ class _ShareServer:
         # run on the main thread inside one idle callback, so this needs no
         # lock and cannot interleave.
         self.ink_origin = None
+        # Which connection is mid-stroke. The canvas has ONE current_stroke, so
+        # a second phone's `begin` would reset the first's and the two would
+        # commit as one tangled line — see _ws_message.
+        self._ink_holder = None
         # resolved once: the answer cannot change while we run, and every
         # request would otherwise stat the disk
         self.app_dir = _web_app_dir()
         self._touch_state = {"active": {}}
+        # user agents seen, so each browser announces itself once (see _trace)
+        self._seen_clients = set()
         self._tmp = (tempfile.mkdtemp(prefix="sidemark-live-")
                      if providers is not None else None)
 
@@ -11491,8 +11692,13 @@ class _ShareServer:
         except Exception:                          # noqa: BLE001
             logger.exception("share: failed to mirror the live stroke")
 
-    def send_camera(self, page, rect):
-        """Send the phone to a region (row 182's phone-view tool).
+    def send_camera(self, page, rect, only=None):
+        """Send a phone to a region (row 182's phone-view tool).
+
+        `only` is a connection id: dragging one phone's box moves THAT phone,
+        while drawing a region points every one of them at it. Pointing one
+        person at something must not drag everyone else off what they were
+        reading.
 
         A SUGGESTION, never a lock: the phone moves there and then pinches
         freely again, at which point its own reports drive the rectangle as
@@ -11500,10 +11706,16 @@ class _ShareServer:
         position matters."""
         if not self._ws:
             return
+        body = {"t": "camera", "page": page,
+                "rect": [round(v, 2) for v in rect]}
         try:
-            self.broadcast({"t": "camera", "page": page,
-                            "rect": [round(v, 2) for v in rect]},
-                           coalesce=True)
+            if only is None:
+                self.broadcast(body, coalesce=True)
+                return
+            with self._ws_lock:
+                conns = [c for c in self._ws if c.cid == only]
+            for c in conns:
+                c.queue(json.dumps(body), coalesce=True)
         except Exception:                          # noqa: BLE001
             logger.exception("share: failed to send the camera")
 
@@ -11562,12 +11774,20 @@ class _ShareServer:
                     # one bad message must not drop a live drawing session
                     logger.exception("share: bad message from the phone")
         finally:
+            # a phone that vanished mid-stroke must not hold the pen for ever —
+            # nothing else will ever send the `end` that releases it
+            if self._ink_holder == conn.cid:
+                self._ink_holder = None
+                try:
+                    self.providers["ink_actions"]([("abort",)], None, conn.cid)
+                except Exception:                  # noqa: BLE001
+                    pass
             # a phone that has gone is not looking anywhere, and a rectangle
             # left behind would claim it still is
             setter = self.providers.get("set_view")
             if setter is not None:
                 try:
-                    setter(None)
+                    setter(conn.cid, None)
                 except Exception:                  # noqa: BLE001
                     pass
 
@@ -11584,7 +11804,8 @@ class _ShareServer:
             setter = self.providers.get("set_view")
             if setter is not None:
                 rect = m.get("rect")
-                setter({"page": m.get("page"), "rect": tuple(rect)}
+                setter(conn.cid,
+                       {"page": m.get("page"), "rect": tuple(rect)}
                        if rect and len(rect) == 4 else None)
             return
         if kind != "ink":
@@ -11599,6 +11820,17 @@ class _ShareServer:
         # and there must not be: it holds the real page geometry, which is
         # exactly what lets it draw under a zoom the desktop knows nothing
         # about. The small viewer sends image pixels and is mapped instead.
+        # ONE PHONE DRAWS AT A TIME, and this is a guard rather than a
+        # feature. Several phones can connect and follow along; the canvas
+        # underneath has a single `current_stroke`, so two of them drawing at
+        # once interleaved into one corrupted line — A's begin, B's begin
+        # (which reset A's), A's next point landing on B's stroke, one commit
+        # for both. Dropping the second phone's stroke is a bad outcome; a
+        # stroke that is neither phone's and cannot be told apart afterwards
+        # is a worse one. Real multi-phone drawing needs a stroke per
+        # connection on the canvas and is deferred (row 182).
+        if self._ink_holder is not None and self._ink_holder != conn.cid:
+            return
         pts, first = m.get("pts") or [], pid not in touch["active"]
         if first and touch["active"]:
             # A NEW gesture means the previous one is over, whatever the phone
@@ -11631,7 +11863,13 @@ class _ShareServer:
                            "pid": pid, "tool": tool})
         actions = _process_remote_touch(touch, points)
         if actions:
+            # hold the pen for as long as this gesture runs, and hand it back
+            # the moment it commits or is abandoned
+            if any(a[0].endswith("_begin") for a in actions):
+                self._ink_holder = conn.cid
             self.providers["ink_actions"](actions, m.get("page"), conn.cid)
+            if any(a[0].endswith("_end") or a[0] == "abort" for a in actions):
+                self._ink_holder = None
 
     def _live_page(self, n):
         """ONE page of the document, as its own small PDF.
@@ -11720,7 +11958,7 @@ class _ShareServer:
             timeout = 60
 
             def _send(self, data, ctype, disposition=None, *,
-                      cache="no-store", etag=None):
+                      cache="no-store", etag=None, status=200):
                 # gzip is not a nicety here: the browser port is ~4 MB of
                 # vendored libraries and the client is a phone. The stdlib
                 # handler does none of this for us.
@@ -11729,7 +11967,7 @@ class _ShareServer:
                         and ctype.startswith(_WEB_COMPRESSIBLE)
                         and "gzip" in self.headers.get("Accept-Encoding", "")):
                     data, enc = gzip.compress(data, 6), "gzip"
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", ctype)
                 if disposition:
                     self.send_header("Content-Disposition", disposition)
@@ -11784,10 +12022,27 @@ class _ShareServer:
                            cache="max-age=60", etag=tag)
 
             def do_GET(self):
+                self._trace()
                 path = unquote(self.path.split("?", 1)[0])
-                base = f"/{token}/"
-                if not path.startswith(base):
-                    self.send_error(404)
+                # Either secret opens the same share: the permanent one your
+                # own devices have bookmarked, or this session's public one.
+                base = next((f"/{t}/" for t in
+                             (token, server.public_token)
+                             if t and path.startswith(f"/{t}/")), None)
+                if base is None:
+                    # A LINK FROM AN EARLIER SHARE. The token is new every
+                    # time sharing starts, so an old QR — or the URL sitting
+                    # in the phone's history, which is the easy way to hit
+                    # this — no longer matches, and the bare 404 the server
+                    # used to return says nothing about why. Only for a
+                    # NAVIGATION: an asset fetch keeps the plain status, since
+                    # a stray HTML body in place of a script is worse than an
+                    # honest error. Says nothing about the document.
+                    if "text/html" in (self.headers.get("Accept") or ""):
+                        self._send(_SHARE_STALE_HTML.encode("utf-8"),
+                                   "text/html; charset=utf-8", status=404)
+                    else:
+                        self.send_error(404)
                     return
                 sub = path[len(base):]
 
@@ -11923,8 +12178,34 @@ class _ShareServer:
                 self.close_connection = True
 
             def do_POST(self):
+                # BREADCRUMBS from the phone (`/diag`). A browser that dies
+                # takes its console with it, so the only record of how far it
+                # got is the one already sent somewhere else. Sent with
+                # sendBeacon, which is queued by the browser and survives the
+                # page going away — a fetch in flight does not.
+                if server.providers is not None and self.path in (
+                        f"/{token}/diag", f"/{server.public_token}/diag"):
+                    try:
+                        n = int(self.headers.get("Content-Length", 0))
+                        note = self.rfile.read(n).decode("utf-8", "replace")
+                        # WARNING is for something having gone wrong, and a
+                        # heartbeat has not: logging every breadcrumb at that
+                        # level buried the two lines that matter under two
+                        # hundred that did not. The phone's own error reports
+                        # keep it; the rest is INFO, and the log is retained
+                        # anyway by _trace's "a phone connected".
+                        bad = ("ERROR" in note[:40]) or ("REJECT" in note[:40])
+                        logger.log(logging.WARNING if bad else logging.INFO,
+                                   "phone: %s", note[:400])
+                    except Exception:                      # noqa: BLE001
+                        pass
+                    self.send_response(204)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 # Ink only exists in live mode, on the one /ink route.
-                if server.providers is None or self.path != f"/{token}/ink":
+                if server.providers is None or self.path not in (
+                        f"/{token}/ink", f"/{server.public_token}/ink"):
                     self.send_error(404)
                     return
                 if not server.drawing_allowed:
@@ -11954,12 +12235,50 @@ class _ShareServer:
             def log_message(self, *_a):
                 pass   # don't spam stderr
 
-        self._httpd = _Server(("0.0.0.0", 0), _Handler)
+            def _trace(self):
+                """A server-side record of what the phone actually asked for.
+
+                Kept, not debugging scaffolding, because it is the ONLY record
+                a phone session leaves behind. A phone is a device you cannot
+                attach a debugger to, whose console you cannot read, and which
+                may die before running a line of our JavaScript — and this
+                survives all three, because the requests it managed to make
+                are already here. The trail says how far it got: the page
+                only, or the modules, or the worker, or the document.
+
+                The first request from each browser is logged at WARNING, and
+                that is deliberate rather than a level mistake: a log is
+                DELETED on a clean exit unless something warns (see the
+                logging note in CLAUDE.md), so at INFO the trail would be
+                thrown away by exactly the sessions worth reading. It carries
+                the full user agent, which is what tells two browsers on one
+                phone apart. Everything after it is INFO."""
+                try:
+                    ua = (self.headers.get("User-Agent") or "?")
+                    who = f"{self.client_address[0]} {ua}"
+                    if who not in server._seen_clients:
+                        server._seen_clients.add(who)
+                        logger.warning("share: a phone connected — %s",
+                                       who[:200])
+                    logger.info("share: %s %s  [%s]", self.command,
+                                self.path[:120], ua.split(") ")[0][-40:])
+                except Exception:                          # noqa: BLE001
+                    pass
+
+        # A STABLE port, so a firewall rule allowing it keeps working. Port 0
+        # (a fresh random port each session) is unfirewallable by
+        # construction: there is nothing to allow.
+        try:
+            self._httpd = _Server(("0.0.0.0", SHARE_PREFERRED_PORT), _Handler)
+        except OSError:
+            # taken — by another Sidemark, or anything else. A working share on
+            # a random port beats no share on the tidy one.
+            self._httpd = _Server(("0.0.0.0", 0), _Handler)
         self.port = self._httpd.server_address[1]
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
         return self
 
-    def url_for(self, host, *, scheme="http", port=...):
+    def url_for(self, host, *, scheme="http", port=..., public=False):
         # port=... (not None) means "the port we're listening on"; pass
         # port=None for a public Funnel URL, which fronts on the standard
         # 443 and so carries no port at all.
@@ -11967,7 +12286,8 @@ class _ShareServer:
         port = self.port if port is ... else port
         hostport = f"{host}:{port}" if port else host
         if self.providers is not None:
-            return f"{scheme}://{hostport}/{self.token}/"
+            tok = (self.public_token if public else self.token)
+            return f"{scheme}://{hostport}/{tok}/"
         return f"{scheme}://{hostport}/{self.token}/{quote(self.filename)}"
 
     @property
@@ -11986,9 +12306,18 @@ class _ShareServer:
             _tailscale_funnel_stop(self.funnel_port)
             self.funnel_port = None
         if self._httpd is not None:
-            self._httpd.shutdown()
-            self._httpd.server_close()
-            self._httpd = None
+            httpd, self._httpd = self._httpd, None
+            # OFF THE MAIN THREAD. `shutdown()` waits for the serve_forever
+            # loop to notice, and that loop polls on a 0.5 s interval — so
+            # stopping a share froze the UI for up to half a second, which
+            # row 169's watchdog duly caught and reported ("main loop stalled
+            # 302 ms ... in stop"). Nothing here needs the main thread and
+            # nothing waits for the result: the server is already unreachable
+            # (we dropped the reference and closed every socket above), so
+            # the only thing left is letting its threads retire.
+            threading.Thread(
+                target=lambda: (httpd.shutdown(), httpd.server_close()),
+                daemon=True).start()
         if self._tmp:
             shutil.rmtree(self._tmp, ignore_errors=True)
 
@@ -18236,6 +18565,16 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._share_body = None     # its content box, so a slow address can be
                                      # slotted in after the window is up
         self._share_selected = None  # the address caption on screen right now
+        # One-time link: a fresh secret for this share only, never saved. Not
+        # persisted itself — the safe default is the one you can bookmark, and
+        # a session that silently became unbookmarkable would be worse than
+        # ticking a box when you actually mean to hand a link to someone.
+        self._share_one_time = False
+        # Do the laptop's held modifiers re-point the phone's finger? Row
+        # 182's default is NO (a phone touch always draws), so this is opt-in
+        # — and REMEMBERED, because it is a preference about how you work
+        # rather than a decision about one share.
+        self._share_modifiers = bool(_load_settings().get("share_modifiers"))
         self._share_user_picked = False   # ...and whether YOU chose it
         self._share_server = None   # the live _ShareServer, or None — outlives
                                      # the dialog window; closing the window no
@@ -26244,7 +26583,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         lan_url = server.url_for(server.ip)
         lan_qr = os.path.join(out_dir, "qr-lan.png")
         wifi_entry = {"caption": "Same Wi-Fi", "url": lan_url,
-                      "qr": lan_qr if _make_qr_png(lan_url, lan_qr) else None}
+                      "qr": lan_qr if _make_qr_png(lan_url, lan_qr) else None,
+                      "note": _firewall_note(server.port)}
 
         ts = _tailscale_ip()
         if ts and ts != server.ip:
@@ -26319,6 +26659,16 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             link.add_css_class("monospace")
             link.add_css_class("caption")
             col.append(link)
+            if entry.get("note"):
+                note = Gtk.Label(label=entry["note"])
+                note.add_css_class("dim-label")
+                note.add_css_class("caption")
+                note.set_wrap(True)
+                note.set_max_width_chars(34)
+                note.set_justify(Gtk.Justification.CENTER)
+                note.set_selectable(True)   # so the command can be copied
+                note.set_margin_top(4)
+                col.append(note)
         else:
             spacer = Gtk.Box()
             spacer.set_size_request(220, 220)
@@ -26436,8 +26786,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             if cv is not None:
                 cv.on_live_stream = None
                 cv.on_phone_view = None
-                if getattr(cv, "remote_view", None) is not None:
-                    cv.set_remote_view(None)
+                if getattr(cv, "remote_views", None):
+                    cv.remote_views.clear()
+                    cv.queue_draw()
         self._share_out_dir = None
         self._share_entries = None
         if server is not None:
@@ -26617,7 +26968,34 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         dropdown.set_selected(default_idx)
         top_row.append(dropdown)
 
+        # Revoking is the other half of a permanent link: an address that
+        # never changes is one you can lose control of, so there has to be a
+        # way to change it on purpose. Every existing QR, bookmark and home
+        # screen shortcut stops working — which is the point, and why it asks.
+        link_btn = Gtk.MenuButton(icon_name="insert-link-symbolic")
+        link_btn.add_css_class("flat")
+        link_btn.set_tooltip_text("The address itself — permanent, one-time, "
+                                  "or a name of your own")
+        link_btn.set_popover(self._build_share_link_popover(server))
+        top_row.append(link_btn)
+
         body.append(top_row)
+
+        mods = Gtk.CheckButton(label="Modifier keys here also change the phone")
+        mods.set_halign(Gtk.Align.CENTER)
+        mods.set_margin_top(4)
+        mods.add_css_class("caption")
+        mods.set_active(self._share_modifiers)
+        mods.set_tooltip_text(
+            "Hold a modifier on this computer and the phone's finger follows "
+            "the same button bindings — so the chord that erases here erases "
+            "there. Off, a phone touch always draws with the current pen.")
+
+        def _toggle_mods(btn):
+            self._share_modifiers = btn.get_active()
+            _save_setting("share_modifiers", self._share_modifiers)
+        mods.connect("toggled", _toggle_mods)
+        body.append(mods)
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         content.set_margin_top(10)
@@ -26640,6 +27018,142 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         dropdown.connect("notify::selected", show_entry)
         show_entry()
 
+
+    def _build_share_link_popover(self, server):
+        """The address itself: permanent (the default), one-time, or a name.
+
+        Behind a button rather than in the row, because it is the control you
+        touch once and then never again — unlike Read only/Writing, which is a
+        decision most sessions. Everything here RESTARTS the share, since the
+        address a phone is holding is exactly the thing being changed."""
+        pop = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_margin_start(14)
+        box.set_margin_end(14)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_size_request(320, -1)
+
+        kind = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        kind.add_css_class("linked")
+        perm = Gtk.ToggleButton(label="Permanent")
+        once = Gtk.ToggleButton(label="One-time")
+        once.set_group(perm)
+        perm.set_active(not self._share_one_time)
+        once.set_active(self._share_one_time)
+        perm.set_tooltip_text(
+            "The same address every session — add it to a phone's home screen "
+            "and it keeps working")
+        once.set_tooltip_text(
+            "A fresh address for this share only, never saved. For handing a "
+            "link to somebody else")
+        kind.append(perm)
+        kind.append(once)
+        kind.set_halign(Gtk.Align.CENTER)
+        box.append(kind)
+
+        why = Gtk.Label(
+            label="A one-time link stops working when you stop sharing, and "
+                  "does not give away the address your own devices use.")
+        why.set_wrap(True)
+        why.set_max_width_chars(38)
+        why.add_css_class("dim-label")
+        why.add_css_class("caption")
+        box.append(why)
+
+        name_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        entry = Gtk.Entry()
+        entry.set_text(_share_token())
+        entry.set_hexpand(True)
+        entry.set_tooltip_text(
+            "The end of the address. Letters, digits, - and _; at least 4 "
+            "characters. A guessable one is a guessable link.")
+        apply_btn = Gtk.Button(label="Rename")
+        roll = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
+        roll.set_tooltip_text("A new random one")
+        name_row.append(entry)
+        name_row.append(apply_btn)
+        name_row.append(roll)
+        box.append(name_row)
+        # the name only applies to the permanent link; a one-time one is
+        # generated per share and there is nothing to name
+        for w in (entry, apply_btn, roll):
+            w.set_sensitive(not self._share_one_time)
+
+        def _restart():
+            canvas, tp = self._share_surfaces()
+            self._stop_sharing()
+            self._show_share_dialog(canvas, tp)
+
+        def _pick_once(btn):
+            if not btn.get_active():
+                return
+            self._share_one_time = btn is once
+            pop.popdown()
+            _restart()
+        perm.connect("toggled", _pick_once)
+        once.connect("toggled", _pick_once)
+
+        def _rename(_b):
+            cleaned = _clean_share_token(entry.get_text())
+            if cleaned is None:
+                entry.add_css_class("error")
+                return
+            entry.remove_css_class("error")
+            if cleaned == _share_token():
+                pop.popdown()
+                return
+            _share_token(set_to=cleaned)
+            pop.popdown()
+            self._confirm_new_share_link(already_changed=True)
+        apply_btn.connect("clicked", _rename)
+        roll.connect("clicked", lambda _b: (pop.popdown(),
+                                            self._confirm_new_share_link())[1])
+        pop.set_child(box)
+        return pop
+
+    def _confirm_new_share_link(self, already_changed=False):
+        """Rotate the share secret, after asking.
+
+        Destructive in a way that is invisible until somebody tries the old
+        link, so it asks rather than just doing it — and it restarts the
+        share, because the address the phone is holding is the one that just
+        stopped working."""
+        if already_changed:
+            # the name is already saved; there is nothing left to ask, only a
+            # share to bring back up on the new address
+            canvas, tp = self._share_surfaces()
+            self._stop_sharing()
+            self._show_share_dialog(canvas, tp)
+            return
+        dlg = Adw.AlertDialog.new(
+            "Make a new link?",
+            "The current address stops working everywhere it has been saved "
+            "or scanned — bookmarks, home screen shortcuts and any QR code "
+            "still on a screen. Sharing restarts with the new one.")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("new", "New link")
+        dlg.set_response_appearance("new", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+
+        def _answer(_d, resp):
+            if resp != "new":
+                return
+            _share_token(rotate=True)
+            # the live server is still answering on the OLD path, so the
+            # share has to come back up before the new address means anything
+            canvas, tp = self._share_surfaces()
+            self._stop_sharing()
+            self._show_share_dialog(canvas, tp)
+
+        dlg.connect("response", _answer)
+        dlg.present(self._share_window or self)
+
+    def _share_surfaces(self):
+        """(canvas, tp) for the surface a share should bind to — exactly one
+        is non-None, the same contract _show_share_dialog documents."""
+        tp = self._full_notes_view()
+        return (None, tp) if tp is not None else (self.canvas, None)
 
     def _build_share_help_popover(self):
         """The ? beside the QR: which address to use, and when each works.
@@ -26684,10 +27198,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 "devices.")
         section("Public link",
                 "Anyone with the link can open it, from anywhere, with no app "
-                "on the phone. Needs Tailscale connected on this computer and "
-                "Funnel enabled for your tailnet. Use it when the phone is not "
-                "yours — a colleague, a lecture room machine. The link stops "
-                "working when you stop sharing.")
+                "on their phone — only THIS computer needs Tailscale. Use it "
+                "when the device is not yours: a colleague, a lecture room "
+                "machine. It carries its own one-time address rather than the "
+                "permanent one your own devices use, so a link that ends up "
+                "somewhere unexpected — a photo of the QR, a screen share — "
+                "dies when this share does and cannot be used to reach you "
+                "again.")
+        section("The link is permanent",
+                "The address stays the same every session, so you can add it "
+                "to a phone's home screen and it keeps working. It only "
+                "answers while you are sharing, and the path is a secret — "
+                "being able to reach this computer is not the same as being "
+                "able to open the document. The link button beside the "
+                "address lets you rename it to something you will recognise, "
+                "roll a new random one (which revokes every saved copy at "
+                "once), or switch to a ONE-TIME link — a fresh address for "
+                "this share only, for when you are handing a link to somebody "
+                "else rather than to your own phone.")
         section("Read only vs Writing",
                 "Writing is the default: a finger on the phone draws on this "
                 "page with your current pen, and an eraser toggle sits on the "
@@ -26811,9 +27339,16 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # arrives on the server thread, so it hops like everything else
             # that touches a widget
             "set_view": (None if tp is not None else
-                         lambda v: GLib.idle_add(canvas.set_remote_view, v)),
+                         lambda cid, v: GLib.idle_add(
+                             canvas.set_remote_view, cid, v)),
         }
-        server = _ShareServer(providers=providers)
+        # A ONE-TIME link is a fresh secret that is never saved: sharing with
+        # someone else should not hand out the address your own phone has on
+        # its home screen, and should stop working when this share does.
+        import secrets as _secrets
+        server = _ShareServer(
+            providers=providers,
+            token=(_secrets.token_urlsafe(8) if self._share_one_time else None))
         my_gen = self._share_gen   # see _on_share_window_close / _stop_sharing
 
         win, body, stop_btn = self._build_share_window_shell()
@@ -26836,8 +27371,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 canvas.on_live_stream = lambda pts, _c=canvas, _s=srv: (
                     _s.notify_live_stroke(_c.current_page_idx, pts,
                                           _c._pen_attrs()))
-                canvas.on_phone_view = lambda page, rect, _s=srv: (
-                    _s.send_camera(page, rect))
+                canvas.on_phone_view = lambda page, rect, only=None, _s=srv: (
+                    _s.send_camera(page, rect, only))
             self._sync_phone_tool_chrome()
             self._share_out_dir = out_dir
             self._share_entries = entries
@@ -26886,19 +27421,35 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         def _done(host, hint):
             if gen != self._share_gen or self._share_server is not server:
-                # the share was stopped while we were provisioning; the mapping
-                # we may have just made is torn down with the server, but a
-                # stop that happened first would have missed it
-                if host:
+                # The share was stopped or restarted while we were
+                # provisioning. Tear the mapping down ONLY if nothing has
+                # taken our place: the stop is NODE-WIDE (`--https=443 off`,
+                # the only spelling the current CLI accepts), so a late
+                # teardown from an abandoned share would turn off the funnel
+                # a NEWER share had just brought up — and, because the port
+                # is stable now, both are :8756 and nothing distinguishes
+                # them. That is a silent failure: the log says "public link
+                # live" and the link is dead, which is exactly what was
+                # reported.
+                if host and self._share_server is None:
+                    logger.info("share: dropping the public link — the share "
+                                "it belonged to is gone")
                     _tailscale_funnel_stop(server.port)
+                elif host:
+                    logger.info("share: a newer share is live; leaving the "
+                                "public link to it")
                 return False
             entry.pop("pending", None)
             if host:
+                logger.info("share: public link LIVE at %s", host)
                 server.funnel_port = server.port     # stop() tears it down
                 # Funnel fronts the node's ROOT, so the link still has to
                 # carry our own /token/ path or the phone hits a route that
                 # does not exist.
-                url = server.url_for(host, scheme="https", port=None)
+                # public=True: this session's own secret, not the one your
+                # phone has on its home screen
+                url = server.url_for(host, scheme="https", port=None,
+                                     public=True)
                 qr = os.path.join(out_dir, "qr-funnel.png")
                 entry["url"] = url
                 entry["qr"] = qr if _make_qr_png(url, qr) else None
@@ -26921,10 +27472,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return False
 
         def _worker():
+            # LOGGED both ways. This is the one step of a share that takes
+            # seconds and can fail for reasons outside the app (Funnel not
+            # granted for the tailnet, a CLI whose syntax has moved under us —
+            # which has happened once already), and it used to say nothing at
+            # all: the entry quietly became a hint and the public link simply
+            # was not public. A share that silently is not what the dialog
+            # says it is deserves a line.
+            logger.info("share: starting the public link (funnel -> :%d)…",
+                        server.port)
             try:
                 host, hint = _tailscale_funnel_start(server.port)
             except Exception as e:                          # noqa: BLE001
                 host, hint = None, str(e)
+            if host:
+                logger.info("share: funnel provisioned at %s", host)
+            else:
+                logger.warning("share: NO public link — %s",
+                               hint or "tailscale gave no reason")
             GLib.idle_add(_done, host, hint)
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -26955,9 +27520,30 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         srv = getattr(self, "_share_server", None)
         if srv is not None:
             srv.ink_origin = origin
+        # The laptop's HELD MODIFIERS can re-point the phone's finger, if you
+        # asked for that (row 182's default is that they cannot). Resolved
+        # here rather than on the phone because the binding table lives here:
+        # the phone would otherwise need a copy of it, and two copies of a
+        # table is the one thing row 132 forbids.
+        temp_hl = False
+        # getattr for the same reason _share_server above uses it: this is
+        # reached from a worker hop and must not require a built window.
+        if getattr(self, "_share_modifiers", False) and canvas is not None:
+            held = canvas.get_held_mods() if canvas.get_held_mods else (0, 0, 0)
+            tool = self.bindings.tool_for(BTN_FINGER, bool(held[0]),
+                                          bool(held[1]), bool(held[2]),
+                                          mode="pdf")
+            actions = apply_modifier_tool(actions, tool)
+            # the highlighter is the pen with other attributes, and
+            # _temp_highlighter is exactly the transient flag _pen_attrs reads
+            temp_hl = tool == "highlighter" and tp is None
         try:
+            if temp_hl:
+                canvas._temp_highlighter = True
             _dispatch_remote_ink(target, actions)
         finally:
+            if temp_hl:
+                canvas._temp_highlighter = False
             if srv is not None:
                 srv.ink_origin = None
 

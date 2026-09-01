@@ -1261,6 +1261,51 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     close-request was the ONLY path reaching `_stop_sharing`. It goes through
     `_destroy_all` now, SIGTERM is wired to the same handler, and
     `_live_funnels` + `atexit` are the last resort. Nothing covers SIGKILL.
+  - **The ADDRESS is stable and bookmarkable, and the public one is not**
+    (row 189). A preferred port (`SHARE_PREFERRED_PORT`, 8756, falling back to
+    a random one) plus a token persisted in settings.json, so a home-screen
+    shortcut keeps working; renameable, and rollable to revoke every saved
+    copy. **Two secrets, not one**: the permanent token is what makes the
+    address bookmarkable and exactly what must not travel over the PUBLIC
+    tier, where it leaks in ways a per-session one cannot (history, a photo of
+    the QR, a screen share) and stays valid until someone rotates it. The
+    private tiers keep the bookmarkable one; the public link gets its own,
+    fresh each session and never saved. A stale link says so instead of a bare
+    404 — for a NAVIGATION only, since a stray HTML body in place of a script
+    is worse than an honest error.
+  - **A random port is unfirewallable BY CONSTRUCTION**, and that was the real
+    cause of "the phone never loads": ufw with a DROP default has nothing to
+    allow when the port changes every session. Hence the stable port, and the
+    Same Wi-Fi entry naming the exact `ufw allow` when a firewall is running —
+    the failure is otherwise silent from inside the app, because the
+    connection never arrives.
+  - **ONE PHONE DRAWS AT A TIME**, and a viewport box PER phone. The canvas
+    has a single `current_stroke`, so two phones interleaved into one
+    corrupted line. Dragging one box moves that phone; drawing a region points
+    them all. **The grab and the painter read ONE list**
+    (`visible_remote_rects`): a phone on the whole page has a box covering it
+    that is deliberately not drawn, and while the grab had its own hit test
+    that invisible box swallowed every press.
+  - **Modifier keys can reach the phone** (opt-in, remembered): the phone's
+    finger follows the same binding table, resolved on the DESKTOP because a
+    copy of that table on the phone is what row 132 forbids. Only
+    pen/highlighter/eraser have remote verbs, so anything else is ignored
+    rather than half honoured — which also makes the default right, since
+    `finger` is bound to pan.
+  - **A browser that dies leaves a record.** The server logs every request
+    with its user agent, independent of the phone's JS — a browser that dies
+    before running a line of ours still made requests. Breadcrumbs go to
+    `/diag` by keepalive FETCH, never `sendBeacon`, which Brave neutralises by
+    returning true and discarding. Routine ones are INFO; only errors warn.
+  - **The Funnel teardown is NODE-WIDE** (`--https=443 off` is the only
+    spelling the current CLI takes), so a late teardown from an abandoned
+    share used to kill a newer share's funnel — same port, nothing to tell
+    them apart. It only stops when nothing has replaced it, and every stop
+    logs its caller. *ceiling: Tailscale's public ingress currently accepts
+    the TCP connection and closes during TLS, with nothing reaching
+    tailscaled, while the tailnet path works — verified against all three
+    ingress IPs with the funnel confirmed on. That is theirs, not ours (row
+    186); don't look for it here.*
   DEFERRED, tracked in ideas.csv row 182: multiple phones drawing at once, a
   long-press tool picker beyond the plain Pen/Eraser toggle, and a
   character-by-character "typewriter" input mode (row 184).
