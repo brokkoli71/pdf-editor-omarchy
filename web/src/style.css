@@ -718,3 +718,113 @@ hr { border: none; border-top: 1px solid var(--separator); margin: 10px 0 2px; w
   padding: 1px 5px;
   border-radius: 4px;
 }
+
+/* LIVE mode (the phone attached to a desktop Sidemark, see app.js's LIVE).
+   Fixed and on top of everything: it is a statement about what this session
+   IS, and it must not be lost by scrolling the page away from it. Tap to
+   dismiss — it has been read by then. */
+.live-banner {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  z-index: 60;
+  padding: 0.5rem 0.9rem;
+  font-size: 0.78rem;
+  text-align: center;
+  color: #10233b;
+  background: #cfe3ff;
+  border-top: 1px solid #9dbde8;
+}
+/* The three states are colour-coded because the difference between them is
+   whether your writing is being kept, and that has to be readable at a
+   glance from arm's length. */
+.live-banner[data-state="writing"] { background: #cdebd6; border-top-color: #8fc7a3; }
+.live-banner[data-state="viewing"] { background: #f6e6bf; border-top-color: #d8bd77; }
+.live-banner[data-state="off"]     { background: #f3d2d2; border-top-color: #d79b9b; }
+
+/* ── the mobile layout (a phone or tablet: `pointer: coarse`, `hover: none`) ──
+   Driven by a class on <body> rather than a media query alone, because two of
+   the decisions are about the SESSION and not the screen: a shared document
+   is not this phone's to save, and a device with one finger has nothing to
+   say about which button holds which tool. */
+
+/* (1) The binding stripes are a readout of which POINTER BUTTON runs a tool.
+   With one finger there is exactly one answer, so the bar becomes a row of
+   identical colours that only costs height. */
+body.mobile .strip { display: none; }
+
+body.mobile .headerbar { padding: 0.25rem 0.4rem; gap: 0.25rem; }
+body.mobile .hb-start .title { max-width: 32vw; }
+
+/* The live indicator as a chip beside the document name (see liveBanner). */
+.live-chip {
+  flex: none;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  color: #10233b;
+  background: #cfe3ff;
+  border: 1px solid #9dbde8;
+}
+.live-chip[data-state="writing"] { background: #cdebd6; border-color: #8fc7a3; }
+.live-chip[data-state="viewing"] { background: #f6e6bf; border-color: #d8bd77; }
+.live-chip[data-state="off"]     { background: #f3d2d2; border-color: #d79b9b; }
+
+/* ── landscape phone: vertical space is the scarce one ──────────────────────
+   A phone held sideways has plenty of width and almost no height, so the
+   toolbar stops being a row above the page and becomes a rail beside it. The
+   page then gets the whole remaining height, which is the only measurement
+   that matters when you are drawing on it. */
+@media (orientation: landscape) and (max-height: 560px) {
+  /* The header is ONE row again here — the tools have left it for the rail —
+     so the two-row height the narrow layout assumes (84px, tools included) is
+     wrong for everything that floats under the header. It is a variable
+     precisely so this is one line: the ☰ menu, the pen popover and the rail
+     all measure from it, and a hardcoded offset anywhere would drift. */
+  body.mobile { --header-h: 36px; }
+  body.mobile .headerbar {
+    padding: 0.1rem 0.35rem;
+    /* an exact height, not a minimum: the rail below starts at --header-h, so
+       a header that grows past it slides under its own toolbar */
+    height: var(--header-h);
+    min-height: 0;
+    box-sizing: border-box;
+  }
+  body.mobile .headerbar .icon-btn { padding: 0.2rem; }
+
+  /* the tools leave the header and stack down the left of the page */
+  body.mobile .hb-center {
+    position: fixed;
+    left: 0;
+    top: var(--header-h);
+    bottom: 0;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.2rem;
+    padding: 0.25rem 0.2rem;
+    overflow-y: auto;
+    /* the header's own colours — the rail IS the header, stood on its side,
+       and a hardcoded white read as a different surface in both themes */
+    background: var(--headerbar-bg);
+    border-right: 1px solid var(--headerbar-border);
+  }
+  body.mobile .hb-center #toolbar {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+  }
+  /* the page column starts clear of the rail */
+  body.mobile #body { margin-left: 2.6rem; }
+
+  /* the pager is a row again, at the foot of the rail */
+  body.mobile .hb-center .pager { flex-direction: column; }
+}
+
+/* Portrait phone: nothing moves, it just gets tighter. */
+@media (orientation: portrait) {
+  body.mobile .hb-center { gap: 0.2rem; }
+}

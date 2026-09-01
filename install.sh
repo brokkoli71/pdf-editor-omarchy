@@ -298,6 +298,19 @@ done
 install -m 755 "$SCRIPT_DIR/sidemark.py" "$INSTALL_DIR/sidemark.py"
 ok "sidemark.py  →  $INSTALL_DIR/"
 
+# The browser port, served to a phone by Share to phone. Not optional any
+# more: scanning the QR lands on it, and without it a share falls back to the
+# small image viewer that cannot zoom. `test/` and package.json are
+# development-only, exactly as the Pages workflow leaves them out.
+if [ -d "$SCRIPT_DIR/web" ]; then
+    rm -rf "$INSTALL_DIR/web"
+    mkdir -p "$INSTALL_DIR/web"
+    (cd "$SCRIPT_DIR/web" && tar --exclude=test --exclude=node_modules \
+        --exclude=dist --exclude=package.json --exclude=package-lock.json \
+        -cf - .) | (cd "$INSTALL_DIR/web" && tar -xf -)
+    ok "web/        →  $INSTALL_DIR/web/  (phone editor)"
+fi
+
 # Wrapper so 'sidemark' works from any shell / Exec line
 cat > "$BIN_DIR/sidemark" <<EOF
 #!/bin/sh

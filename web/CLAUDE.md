@@ -223,6 +223,52 @@ is over the whole sidecar and typing must not pay for it per character.
 document change — so every path that swaps the model calls `syncFullNotes()` to
 re-enter the sheet. Without it the panel is full width, showing one page.
 
+## LIVE MODE — this port as a phone attached to a desktop Sidemark
+
+`?live=1`, served BY a running `sidemark.py` out of its own share server (root
+`CLAUDE.md` has the desktop half). The document arrives over the wire, ink goes
+both ways while the pen is down, and nothing is persisted here — it is somebody
+else's file, open only as long as the connection is.
+
+**Same origin is the only thing that works, and it was measured.** The copy on
+GitHub Pages cannot reach a desktop on your LAN or your tailnet: mixed content
+blocks it, Chrome's Local Network Access blocks it independently (and counts
+the tailnet as local), and **TLS does not lift LNA**. A LAN address can never
+satisfy mixed content at all — no CA issues a cert for `192.168.x.x`. So the
+desktop serves these files itself. Don't try to make the hosted copy do it.
+Numbers in `../notes/phone-web-port-sync-plan.md`.
+
+- **`LIVE` is a URL flag like `SANDBOX`**, and suppresses the same things for
+  a different reason: the session, the recents list and the leave-confirmation
+  are all about a document that is not this browser's.
+- **Pages arrive one at a time** (`Doc.attachLazyPages`, `../page.pdf?n=N`) —
+  535.8 KB → 9.2 KB to first paint on a 60-page deck. The trap:
+  `strokesFor()` CREATES a page's array on first access, so "has this page got
+  its ink yet" must test for EMPTY, not for a missing key. That silently
+  dropped every lazily fetched page's ink.
+- **`Doc._adopt` is shared by `open` and `openLoosePage`** so a page fetched
+  alone is adopted and stripped exactly like one that came with the document.
+  Skip the strip and the ink is painted twice — once by pdf.js as an
+  annotation appearance, once by us — and pdf.js's copy cannot be erased.
+- **`Surface.onInkStream` mirrors raw samples in DOCUMENT coordinates.** That
+  is what lets the phone hold its own zoom: a screen coordinate would only
+  mean something against the desktop's view. The desktop runs its own pipeline
+  over them, so both sides commit the same stroke from the same samples —
+  which is what the conformance vectors are for.
+- **A gesture that never closes wedges the desktop's ink for ever.** `active`
+  is nulled in several places OUTSIDE `_onUp` (a circle becoming a lasso, a
+  second finger starting a pinch), so `_closeStream` is called from a
+  catch-all at the top of `_onUp` as well as from the tool branches. The
+  server guards against a missing close too; do not remove either half.
+- **An ink delta REPLACES a page's strokes**, filled in place rather than
+  swapped, so the renderer's layer and any live selection keep looking at the
+  same array.
+- **`MOBILE` is `pointer: coarse` and `hover: none`** — a laptop with a
+  touchscreen is not mobile, and the binding stripes are meaningless without a
+  second pointer. In landscape the toolbar becomes a rail and `--header-h` is
+  overridden; everything floating under the header measures from that
+  variable, so change it there and nowhere else.
+
 ## Browser differences (measured, not assumed)
 
 Taken with `input-probe.html` on the Goodix GXTP7380 panel, Linux/Wayland:
@@ -300,8 +346,13 @@ shortcut is called done.
 ## Deliberately not here
 
 Scope limits, not oversights: no image crop, no tabs, no wiki links, no
-text-first mode, no notes export, no OCR, no PowerPoint import, no
-share-to-phone (a browser tab cannot listen on a socket).
+text-first mode, no notes export, no OCR, no PowerPoint import.
+
+**Share-to-phone is no longer on this list, and the reason it was is worth
+knowing.** "A browser tab cannot listen on a socket" was true and was never
+the obstacle: in LIVE mode the tab still does not listen. The desktop serves
+this port and the tab connects OUT to it, which is what it was always able to
+do — see LIVE MODE below.
 
 **No prediction, and it is settled.** It was graded against 133 Hz captured ink
 and recovers ~10% of the lag error at best, negative past 40 ms.

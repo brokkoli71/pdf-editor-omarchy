@@ -37,6 +37,38 @@ import { putHandoff, takeHandoff } from "./db.js";
  * `Bindings.save()` persists on every rebind. */
 export const SANDBOX = new URLSearchParams(location.search).has("sandbox");
 
+/** LIVE MODE — this port running as a phone attached to a desktop Sidemark.
+ * The desktop's `_ShareServer` serves these files under its own token path and
+ * points the phone at `?live=1`; the document then arrives over the wire from
+ * `../live.pdf` instead of from a file somebody picked, and the DESKTOP stays
+ * the truth — every change there re-delivers it (`../state`'s `rev`).
+ *
+ * It exists because the phone needs a camera of its own. The small viewer the
+ * desktop also serves is an image of the desktop's view, so it can only ever
+ * show what the desktop shows — which is why zoom had to be deferred there.
+ * Here the phone holds the real document and its own zoom, and ink drawn on it
+ * is in DOCUMENT coordinates, which is what a stroke has to be to survive
+ * being drawn under a camera the desktop knows nothing about.
+ *
+ * Nothing is persisted in this mode: the document belongs to another machine
+ * and is open only as long as the connection is, so writing it into this
+ * browser's session or recents would strand a stale copy of somebody else's
+ * file here. */
+export const LIVE = new URLSearchParams(location.search).has("live");
+
+/** A touch-only device — a phone or a tablet, not a laptop with a touchscreen.
+ *
+ * `hover: none` is what separates them: a laptop reports `hover: hover` for
+ * its mouse even when it also has a digitiser, and the whole point of the
+ * mobile layout is that there is no second pointer and no hovering. It also
+ * means the binding stripes have nothing to say — every press comes from one
+ * finger, so a readout of which BUTTON holds which tool is a column of
+ * identical colours taking up the bar.
+ *
+ * Read once: a device does not grow a mouse mid-session, and re-deciding the
+ * layout underneath somebody is worse than getting a rare case wrong. */
+export const MOBILE = matchMedia("(pointer: coarse) and (hover: none)").matches;
+
 const STORE_KEY = "sidemark.web.settings";
 const store = {
   _data: null,
@@ -153,6 +185,10 @@ const heldMods = { ctrl: false, shift: false, alt: false };
 
 const surface = new Surface(document.getElementById("page"), pen, bindings, {
   onChange: () => { refreshUndo(); markDirty(true); rememberSession(); },
+  // LIVE mode: mirror raw samples to the desktop as they are drawn. Null in
+  // every other mode, which is what keeps the stream out of the normal app.
+  onInkStream: LIVE ? (msg) => liveSend(msg) : null,
+  onStrokeDone: (stroke) => onStrokeDoneForAdvance(stroke),
   onLiveDraw: () => presenter.request(),
   // an anchor edits the NOTES, so the panel has to be told to re-read them
   onNotesChanged: () => { notes.showPage(surface.pageIndex); markDirty(true); },
@@ -273,6 +309,212 @@ window.__sidemark = {
   setSplit(frac) { wireDivider.setSplit(frac, { remember: false }); },
 };
 
+/** The mobile layout. Everything it can do with a class it does with a class —
+ * the CSS is where "less vertical space" actually lives — and it only reaches
+ * into the DOM for the three things that are a MOVE rather than a hide.
+ *
+ * The rule behind all of it: a phone has one finger, a small screen and, in a
+ * shared session, no business saving somebody else's document. */
+function applyMobileLayout() {
+  document.body.classList.toggle("mobile", MOBILE);
+  document.body.classList.toggle("live", LIVE);
+
+  // A shared session is a window onto somebody ELSE'S live document, whatever
+  // it is opened on — Open would replace it and Save would write a copy of it
+  // onto this device, and neither is anything the person who scanned the code
+  // means by them. Download stays, in the menu, because wanting a copy is
+  // legitimate. Not gated on MOBILE: a laptop that scans the link is just as
+  // much a guest.
+  if (LIVE) {
+    for (const id of ["open-btn", "save-btn"]) {
+      const el = document.getElementById(id);
+      if (el) el.hidden = true;
+    }
+    addMenuLink("Download this document", "../doc.pdf");
+  }
+
+  if (!MOBILE) return;
+
+  // The sidebar AND the notes start collapsed. They are the two biggest space
+  // costs on a phone and both are one tap away. The notes go through
+  // toggleNotes rather than the divider directly, so the button's own state
+  // cannot disagree with where the split actually sits.
+  const bar = document.getElementById("sidebar");
+  if (bar) bar.hidden = true;
+  // after the divider has been wired and the first layout has happened, or
+  // the split is applied to a pane that has not been measured yet
+  requestAnimationFrame(() => toggleNotes(false));
+
+  // Presenter mode leaves the header for the menu: mirroring to a second
+  // screen is not a thing you do from a phone often enough to spend a button.
+  moveToMenu("present-btn", "Presenter mode");
+
+  // Writing on a phone runs out of room in a few words; this moves the page
+  // for you when you stop. Off by default — a view that moves on its own is
+  // the last thing you want when you are not writing prose.
+  advanceOn = !!store.get("write_advance");
+  const item = addMenuToggle("Advance while writing", advanceOn, (on) => {
+    advanceOn = on;
+    store.set("write_advance", on);
+    resetAdvanceRun();
+    if (!on) cancelAdvance();
+  });
+  if (item) item.title = "When you write to the edge of the screen and pause, "
+                       + "the page moves along so you can carry on.";
+  // starting another stroke means you had not finished after all
+  const page = document.getElementById("page");
+  if (page) page.addEventListener("pointerdown", cancelAdvance, { capture: true });
+}
+
+/** A menu row that remembers an on/off state. */
+function addMenuToggle(label, initial, onChange) {
+  const menu = document.getElementById("more-popover");
+  if (!menu) return null;
+  const item = document.createElement("button");
+  item.className = "flat menu-item";
+  item.setAttribute("aria-pressed", String(initial));
+  const paint = (on) => { item.textContent = (on ? "✓ " : "") + label; };
+  paint(initial);
+  item.addEventListener("click", () => {
+    const on = item.getAttribute("aria-pressed") !== "true";
+    item.setAttribute("aria-pressed", String(on));
+    paint(on);
+    onChange(on);
+  });
+  (menu.querySelector(".popover-body") || menu).appendChild(item);
+  return item;
+}
+
+// ── write and advance ────────────────────────────────────────────────────────
+// Writing on a phone runs out of room in about four words. The page then has
+// to move, and the only moment it can move WITHOUT interrupting you is the one
+// after you have finished a stroke near the edge and not started another.
+//
+// Deliberately no character segmentation and no recognition. The question here
+// is "have you run out of room?", which a stroke's own end position answers
+// exactly; asking "was that a letter?" needs to know where one character stops
+// and the next begins, and a pen lift does not tell you that (i, t, x and every
+// capital are several strokes). That is a different feature — see the note in
+// ideas.csv row 182.
+//
+// Purely a camera move: the phone already holds its own view (row 182's
+// independent camera), ink is committed in DOCUMENT coordinates, and the
+// desktop is not consulted. So this cannot displace a stroke or desync a
+// shared session — the worst it can do is scroll at a moment you did not want.
+const ADVANCE_EDGE = 0.72;      // "near the edge": a fraction of the viewport
+const ADVANCE_REST = 0.15;      // where the writing's right edge lands after
+const ADVANCE_WAIT_MS = 450;    // the pause that means "I have finished"
+const ADVANCE_MS = 260;         // how long the move itself takes
+const ADVANCE_LINE = 1.7;       // line spacing, in multiples of what you wrote
+const ADVANCE_MARGIN = 0.04;    // where the page's left edge sits on a new line
+
+let advanceOn = false;
+let advanceTimer = null;
+let advanceAnim = null;
+// The extent of what has been written since the last move, in document units.
+// Tracked across STROKES, not per stroke, because "have I reached the edge?"
+// is a question about the writing and not about the last mark: the stroke that
+// happens to finish a word is often a short one going backwards — the dot of
+// an i, the bar of a t — and judging by it alone means the page refuses to
+// move at exactly the moment you have run out of room.
+let advanceRight = -Infinity;
+
+function cancelAdvance() {
+  clearTimeout(advanceTimer);
+  advanceTimer = null;
+  if (advanceAnim) cancelAnimationFrame(advanceAnim);
+  advanceAnim = null;
+}
+
+/** Forget the run's extent — after a move, and whenever the view is no longer
+ * the one the extent was measured against. */
+function resetAdvanceRun() {
+  advanceRight = -Infinity;
+}
+
+/** Glide the view by (dx, dy) view pixels. Animated because a page that
+ * teleports leaves you hunting for where you had got to. */
+function advanceGlide(dx, dy) {
+  const t0 = performance.now();
+  // panBy is INCREMENTAL, so each frame moves by the difference from the last
+  // one rather than the total — accumulating the eased total instead would
+  // apply the whole distance again on every frame.
+  let sx = 0, sy = 0;
+  const step = (now) => {
+    const k = Math.min(1, (now - t0) / ADVANCE_MS);
+    const e = 1 - Math.pow(1 - k, 3);        // ease-out: moves, then settles
+    const wx = dx * e, wy = dy * e;
+    surface.panBy(wx - sx, wy - sy);
+    sx = wx; sy = wy;
+    advanceAnim = k < 1 ? requestAnimationFrame(step) : null;
+  };
+  advanceAnim = requestAnimationFrame(step);
+}
+
+function onStrokeDoneForAdvance(stroke) {
+  if (!advanceOn || !stroke || !stroke.pts || !stroke.pts.length) return;
+  cancelAdvance();
+  let minY = Infinity, maxY = -Infinity;
+  for (const [x, y] of stroke.pts) {
+    if (x > advanceRight) advanceRight = x;
+    if (y > maxY) maxY = y; if (y < minY) minY = y;
+  }
+  // The RIGHTMOST point written in this run, not where the pen was lifted —
+  // a letter that curls back (a, o, e) and a trailing i-dot both finish well
+  // left of where the writing actually reaches.
+  const reach = advanceRight * surface.zoom + surface.offX;
+  if (reach < surface.cssW * ADVANCE_EDGE) return;     // still room to write
+  const height = Math.max((maxY - minY) * surface.zoom, 12);
+  advanceTimer = setTimeout(() => {
+    advanceTimer = null;
+    // How far right of the page is left? If the writing has reached the page
+    // edge there is nowhere to advance TO, so it wraps to the next line
+    // instead — back to where this line started, and down by the size of what
+    // you have actually been writing, which needs no configured line height.
+    const pageRightView = surface.pageW * surface.zoom + surface.offX;
+    const dx = surface.cssW * ADVANCE_REST - reach;
+    if (pageRightView + dx < surface.cssW * 0.9) {
+      // Back to the PAGE's left margin, not to where this run happened to
+      // start: the run has been advancing along the line, so its own leftmost
+      // point is wherever the last move left it, not where you began writing.
+      const pageLeftView = surface.offX;
+      advanceGlide(surface.cssW * ADVANCE_MARGIN - pageLeftView,
+                   -height * ADVANCE_LINE);
+    } else {
+      advanceGlide(dx, 0);
+    }
+    resetAdvanceRun();
+  }, ADVANCE_WAIT_MS);
+}
+
+/** Move a header button into the ☰ menu, keeping its handler. */
+function moveToMenu(id, label) {
+  const btn = document.getElementById(id);
+  const menu = document.getElementById("more-popover");
+  if (!btn || !menu) return;
+  btn.hidden = true;
+  const item = document.createElement("button");
+  item.className = "flat menu-item";
+  item.textContent = label;
+  // click the original rather than re-binding its handler, so this cannot
+  // drift from what the button does
+  item.addEventListener("click", () => btn.click());
+  (menu.querySelector(".popover-body") || menu).appendChild(item);
+}
+
+function addMenuLink(label, href) {
+  const menu = document.getElementById("more-popover");
+  if (!menu) return;
+  const a = document.createElement("a");
+  a.className = "flat menu-item";
+  a.href = href;
+  a.setAttribute("download", "");
+  a.textContent = label;
+  (menu.querySelector(".popover-body") || menu).appendChild(a);
+}
+
+applyMobileLayout();
+
 // The view follows its container through a ResizeObserver inside the Surface,
 // which fires AFTER layout and knows whether you had chosen a zoom. Re-fitting
 // from here as well would run before the canvas had its new size — fitting the
@@ -285,7 +527,7 @@ surface.requestDraw();
 // to the blank page rather than stopping here.
 watchForStalledStart();
 noteSavingSupport();
-restoreSession()
+(LIVE ? openLiveDocument() : restoreSession())
   .catch(async (err) => {
     // A session that cannot be restored would fail again on every load, so it
     // is thrown away rather than kept. A stale document is not worth an app
@@ -351,6 +593,245 @@ function watchForStalledStart() {
   }, 6000);
 }
 
+/** Take the document from the desktop that served this page (LIVE mode).
+ *
+ * `../live.pdf` is the desktop's real document with our ink still as
+ * annotations, so `Doc.open` adopts it into editable strokes exactly as it
+ * does for a file you picked — the phone gets the ink, not a picture of it.
+ * The desktop's Download button serves a different, flattened export; this is
+ * deliberately not that one. */
+async function openLiveDocument() {
+  const state = await fetch("../state", { cache: "no-store" })
+    .then((r) => r.json()).catch(() => ({}));
+  const first = state.page || 0;
+  // ONE page, not the document. A lecture deck is tens of megabytes and the
+  // phone is about to look at a single slide of it; the rest arrives as it is
+  // reached (attachLazyPages). Ink rides along on each page, so a page is
+  // never briefly blank waiting for a delta.
+  const r = await fetch(`../page.pdf?n=${first}`, { cache: "no-store" });
+  if (!r.ok) throw new Error(`page.pdf answered ${r.status}`);
+  const doc = await Doc.open(new Uint8Array(await r.arrayBuffer()),
+                             state.title || "Shared document");
+  doc.pageIndexLoaded = first;
+  if (state.pages > 1) {
+    doc.attachLazyPages(state.pages, async (n) => {
+      const res = await fetch(`../page.pdf?n=${n}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`page ${n} answered ${res.status}`);
+      // adopted and stripped by the same code a whole document goes through,
+      // so a page fetched alone behaves like one that arrived with the file
+      return Doc.openLoosePage(new Uint8Array(await res.arrayBuffer()));
+    });
+  }
+  await setDoc(doc, doc.name);
+  if (first) await surface.setPage(first);
+  liveRev = state.rev ?? null;
+  livePage = state.page ?? null;
+  liveWriting = !!state.writing;
+  liveBanner();
+  liveConnect();
+  liveWatchView();
+  return true;
+}
+
+/** Say plainly whether ink is reaching the desktop.
+ *
+ * Not decoration: the two ways this can quietly fail are the connection
+ * dropping (the phone locks, the wifi goes) and the desktop being set to
+ * Sharing rather than Writing — and in BOTH the phone still draws perfectly,
+ * on its own copy. Ink you believe is on the lecture and is not is the worst
+ * outcome this feature has, and it is silent unless something says so. */
+let liveWriting = false;
+let liveBannerEl = null;
+
+function liveBanner() {
+  liveBannerEl = document.createElement("div");
+  if (MOBILE) {
+    // On a phone a full-width bar costs a line of the page for a sentence you
+    // read once. It becomes a CHIP beside the document name — same three
+    // states, same colours, no vertical space — which is the only place on a
+    // landscape phone that has room to spare.
+    liveBannerEl.className = "live-chip";
+    const title = document.getElementById("doc-title");
+    if (title && title.parentNode) title.parentNode.insertBefore(
+      liveBannerEl, title.nextSibling);
+    else document.body.appendChild(liveBannerEl);
+  } else {
+    liveBannerEl.className = "live-banner";
+    document.body.appendChild(liveBannerEl);
+  }
+  liveStatus(false);
+}
+
+function liveStatus(connected) {
+  if (!liveBannerEl) return;
+  const state = !connected ? "off"
+              : liveWriting ? "writing" : "viewing";
+  liveBannerEl.dataset.state = state;
+  const long = state === "off" ? "Reconnecting to the desktop…"
+             : state === "writing" ? "Live — your ink goes to the desktop"
+             : "Live — viewing only. Switch the desktop to Writing to draw.";
+  // The chip still says which of the three it is — "Live" alone cannot tell
+  // you your ink is going nowhere — and carries the sentence as its tooltip.
+  liveBannerEl.textContent = MOBILE
+    ? (state === "off" ? "offline" : state === "writing" ? "Live" : "Live · read-only")
+    : long;
+  liveBannerEl.title = long;
+}
+
+// ── the live connection ──────────────────────────────────────────────────────
+// A socket, not a poll, and that is the whole feature. Ink has to reach the
+// desktop while the finger is still down, and a change made on the desktop has
+// to arrive when it happens rather than up to a poll interval later. The page
+// is served BY the desktop, so this is same-origin — which is the only reason
+// it is allowed at all: the copy hosted on GitHub Pages cannot open a socket
+// to a machine on your LAN or your tailnet (mixed content, and Chrome's Local
+// Network Access, which TLS does not lift — measured, see
+// notes/phone-web-port-sync-plan.md).
+let liveSock = null;
+let liveRev = null, livePage = null;
+let liveRetry = 500;
+// often enough to feel attached to the hand, rare enough to be invisible
+// beside ink on the same socket
+const LIVE_VIEW_MS = 120;
+
+function liveSend(msg) {
+  if (liveSock && liveSock.readyState === WebSocket.OPEN) {
+    liveSock.send(JSON.stringify(msg));
+    return true;
+  }
+  return false;
+}
+
+function liveConnect() {
+  const url = new URL("../ws", location.href);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  let sock;
+  try { sock = new WebSocket(url); } catch { return void setTimeout(liveConnect, 2000); }
+  liveSock = sock;
+  sock.addEventListener("open", () => {
+    liveRetry = 500;                       // a good connection resets the backoff
+    liveStatus(true);
+    sock.send(JSON.stringify({ t: "hello" }));
+  });
+  sock.addEventListener("message", (e) => {
+    let s; try { s = JSON.parse(e.data); } catch { return; }
+    if (s.t === "state") onLiveState(s);
+    else if (s.t === "live") onLiveStroke(s);
+  });
+  const gone = () => {
+    if (liveSock !== sock) return;         // a newer socket already took over
+    liveSock = null;
+    liveStatus(false);
+    // The phone locks its screen, the wifi drops, the desktop stops sharing.
+    // Backoff so a desktop that has genuinely gone is not hammered, capped so
+    // picking the phone back up reconnects in seconds rather than minutes.
+    setTimeout(liveConnect, liveRetry);
+    liveRetry = Math.min(liveRetry * 2, 10000);
+  };
+  sock.addEventListener("close", gone);
+  sock.addEventListener("error", gone);
+}
+
+/** The desktop is drawing right now — show it while their pen is down.
+ *
+ * Transient by construction: it is never put in the page's stroke list, so
+ * nothing here can be erased, lassoed or undone, and there is no state to
+ * reconcile when the real ink lands. `pts: null` is the lift, and the commit
+ * follows immediately as an ordinary ink delta. */
+function onLiveStroke(s) {
+  surface.remoteLive = s.pts
+    ? { page: s.page, pts: s.pts, width: s.w,
+        color: s.c || [0, 0, 0], opacity: s.o ?? 1 }
+    : null;
+  surface.requestDraw();
+}
+
+/** Tell the desktop where this phone is looking (row 182's indicator).
+ *
+ * The whole point of the editor is that the phone has a camera of its own, so
+ * the person at the laptop cannot otherwise tell which corner of the page the
+ * ink is about to land in. Polled rather than hooked into the view: zoom and
+ * pan change from a pinch, a scroll, a page turn and a re-fit, and one cheap
+ * comparison catches all of them where four hooks would eventually miss one.
+ *
+ * Sent only when it CHANGED, and it is a hint rather than state — a dropped
+ * update costs nothing, so it must never compete with ink for the socket. */
+function liveWatchView() {
+  let last = "";
+  setInterval(() => {
+    if (!surface.doc || !liveSock || liveSock.readyState !== WebSocket.OPEN) return;
+    const [x0, y0] = surface.toDoc(0, 0);
+    const [x1, y1] = surface.toDoc(surface.cssW, surface.cssH);
+    const page = surface.pageIndex;
+    const sig = `${page}|${x0.toFixed(1)},${y0.toFixed(1)},${x1.toFixed(1)},${y1.toFixed(1)}`;
+    if (sig === last) return;
+    last = sig;
+    liveSend({ t: "view", page, rect: [x0, y0, x1, y1] });
+  }, LIVE_VIEW_MS);
+}
+
+/** Take one page's ink from the desktop, wholesale.
+ *
+ * REPLACES rather than merges, and that is what makes it correct as well as
+ * quick: the desktop's list for a page is the entire truth for it — ink this
+ * phone drew is in there too, because it was committed on the desktop — so
+ * there is no pair of edits that can disagree and nothing to reconcile.
+ *
+ * The array is emptied and refilled rather than swapped out, so anything
+ * already holding the page's stroke list (the renderer's layer, a live
+ * selection) is looking at the same array afterwards. */
+function applyInkDelta(ink) {
+  if (!surface.doc || !ink) return;
+  // the committed ink is here, so the transient it replaces must go with it
+  // or the stroke is briefly drawn twice
+  surface.remoteLive = null;
+  const list = surface.doc.strokesFor(ink.page);
+  list.length = 0;
+  for (const w of ink.strokes) {
+    list.push({
+      pts: w.pts, width: w.w, color: w.c, opacity: w.o,
+      profile: w.p || null, flat: w.o < 1,
+    });
+  }
+  if (ink.page === surface.pageIndex) {
+    surface.invalidateLayer();
+    surface.requestDraw();
+  }
+}
+
+/** The desktop says something changed. */
+async function onLiveState(s) {
+  const structural = s.pages !== undefined && surface.doc
+                     && s.pages !== surface.doc.pageCount;
+  if (structural) {
+    // A page was added, deleted or reordered — a per-page stroke list would
+    // now describe the wrong page, so this is the one case still worth a
+    // whole document.
+    try {
+      const r = await fetch("../live.pdf", { cache: "no-store" });
+      if (r.ok) {
+        const keep = surface.pageIndex;
+        const doc = await Doc.open(new Uint8Array(await r.arrayBuffer()),
+                                   s.title || "Shared document");
+        await setDoc(doc, doc.name);
+        await surface.setPage(Math.min(keep, doc.pageCount - 1));
+      }
+    } catch { /* keep what we have; the next change will try again */ }
+  } else if (s.ink) {
+    // the ordinary case: somebody drew or erased on the desktop
+    applyInkDelta(s.ink);
+  }
+  if (livePage !== null && s.page !== livePage) {
+    // Follow the presenter's page only when THEY turn it. Setting it on every
+    // message would yank back a phone that had navigated on its own, which is
+    // most of the point of having a camera of your own.
+    await surface.setPage(s.page);
+  }
+  liveRev = s.rev; livePage = s.page;
+  liveWriting = !!s.writing;
+  liveStatus(true);
+}
+
 async function restoreSession() {
   if (SANDBOX) return false;
   const rec = await loadSession();
@@ -372,7 +853,7 @@ async function restoreSession() {
  * that a reload loses nothing, rarely enough that it costs nothing. */
 let sessionTimer = null;
 function rememberSession() {
-  if (SANDBOX) return;
+  if (SANDBOX || LIVE) return;   // LIVE: the document is another machine's
   clearTimeout(sessionTimer);
   sessionTimer = setTimeout(() => saveSession(surface.doc, surface.pageIndex), 800);
 }
@@ -397,7 +878,9 @@ async function setDoc(doc, title) {
   markDirty(false);
   rememberSession();
   // an untitled blank is not a document anyone wants to come back to
-  if (!SANDBOX && doc.name && doc.name !== "Untitled") {
+  // LIVE is excluded for the same reason as SANDBOX: a live document is not a
+  // file this browser opened, and it will not be there to reopen.
+  if (!SANDBOX && !LIVE && doc.name && doc.name !== "Untitled") {
     rememberRecent({ name: doc.name, bytes: doc.bytes,
                      handle: doc.handles?.pdf || null, page: 0 });
   }
@@ -1292,7 +1775,7 @@ function wireDocument() {
     // nothing is written until you say so, so leaving with unsaved work has to
     // be a deliberate act — but a SANDBOX has nothing of yours in it, and a
     // tour that will not let you leave is a tour nobody finishes
-    if (dirty && !SANDBOX) { e.preventDefault(); e.returnValue = ""; }
+    if (dirty && !SANDBOX && !LIVE) { e.preventDefault(); e.returnValue = ""; }
   });
 
   const atCentre = (f) => {

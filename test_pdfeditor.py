@@ -6581,7 +6581,11 @@ class TestShareToPhone(unittest.TestCase):
             self.assertIn("page.png", html)               # live image viewer
             import json
             st = json.loads(urllib.request.urlopen(base + "state", timeout=5).read())
-            self.assertEqual(st, {"rev": 0, "page": 0, "pages": 3})
+            # the three the small viewer reads; `title` and `editor` ride along
+            # for the full editor and are asserted where they mean something,
+            # so this is a subset rather than an equality that every added
+            # key would have to be threaded through
+            self.assertEqual((st["rev"], st["page"], st["pages"]), (0, 0, 3))
             img = urllib.request.urlopen(base + "page.png", timeout=5).read()
             self.assertTrue(img.startswith(b"\x89PNG"))
             pdf = urllib.request.urlopen(base + "doc.pdf", timeout=5).read()
@@ -6855,7 +6859,7 @@ class TestShareToPhone(unittest.TestCase):
                 try:
                     funnel = entries[0]
                     self.assertEqual(funnel["caption"],
-                                     "Anyone with the link (public)")
+                                     "Public")
                     self.assertEqual(
                         funnel["url"],
                         f"https://host.tailnet.ts.net/{server.token}/")
@@ -6878,7 +6882,7 @@ class TestShareToPhone(unittest.TestCase):
                 try:
                     funnel = entries[0]
                     self.assertEqual(funnel["caption"],
-                                     "Anyone with the link (public)")
+                                     "Public")
                     self.assertNotIn("url", funnel)
                     self.assertIn("not permitted", funnel["hint"])
                     self.assertIsNone(server.funnel_port)
@@ -6896,7 +6900,7 @@ class TestShareToPhone(unittest.TestCase):
                 try:
                     funnel = entries[0]
                     self.assertEqual(funnel["caption"],
-                                     "Anyone with the link (public)")
+                                     "Public")
                     self.assertIn("Tailscale", funnel["hint"])
                     start.assert_not_called()
                 finally:
@@ -6925,6 +6929,587 @@ class TestShareToPhone(unittest.TestCase):
                                      port=None),
                          f"https://host.tailnet.ts.net/{srv.token}/")
         srv.stop()
+
+    def test_drawing_defaults_off_and_ink_is_silently_ignored(self):
+        """Sharing is the default mode, Writing is opt-in every session —
+        a touch batch while drawing_allowed is False must cost nothing
+        (no map_point/ink_actions call at all), not just be a no-op after
+        the fact."""
+        import sidemark
+        import urllib.request
+        import json as _json
+
+        calls = {"map_point": 0, "ink_actions": 0}
+        providers = {
+            "title": "d.pdf", "state": lambda: (0, 0, 1),
+            "render": lambda p: None, "pdf": lambda p: None,
+            "map_point": lambda x, y: (calls.__setitem__(
+                "map_point", calls["map_point"] + 1), (x, y))[1],
+            "ink_actions": lambda a: calls.__setitem__("ink_actions", 1),
+        }
+        srv = sidemark._ShareServer(providers=providers)
+        self.assertFalse(srv.drawing_allowed)   # off by default
+        srv.start()
+        try:
+            body = _json.dumps({"points": [
+                {"x": 1.0, "y": 2.0, "p": 0.5, "ph": "down", "pid": 1,
+                 "tool": "pen"},
+            ]}).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{srv.port}/{srv.token}/ink",
+                data=body, method="POST")
+            resp = urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(resp.status, 204)
+            self.assertEqual(calls, {"map_point": 0, "ink_actions": 0})
+        finally:
+            srv.stop()
+
+    def test_writing_mode_maps_points_and_forwards_ink_actions(self):
+        import sidemark
+        import urllib.request
+        import json as _json
+
+        calls = {}
+        providers = {
+            "title": "d.pdf", "state": lambda: (0, 0, 1),
+            "render": lambda p: None, "pdf": lambda p: None,
+            "map_point": lambda x, y: (x * 2, y * 3),
+            "ink_actions": lambda actions: calls.setdefault("actions", actions),
+        }
+        srv = sidemark._ShareServer(providers=providers)
+        srv.drawing_allowed = True
+        srv.start()
+        try:
+            body = _json.dumps({"points": [
+                {"x": 1.0, "y": 2.0, "p": 0.5, "ph": "down", "pid": 1,
+                 "tool": "pen"},
+            ]}).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{srv.port}/{srv.token}/ink",
+                data=body, method="POST")
+            resp = urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(resp.status, 204)
+            self.assertEqual(calls["actions"], [("draw_begin", 2.0, 6.0, 0.5)])
+        finally:
+            srv.stop()
+
+    def test_ink_route_404s_in_static_mode(self):
+        """The single-file (legacy) mode has no providers at all — /ink must
+        not exist there, whatever drawing_allowed happens to be."""
+        import sidemark
+        import urllib.request
+        import urllib.error
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "doc.pdf"); make_pdf(p)
+            srv = sidemark._ShareServer(p)
+            srv.start()
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{srv.port}/{srv.token}/ink",
+                        data=b"{}", timeout=5)
+                self.assertEqual(cm.exception.code, 404)
+            finally:
+                srv.stop()
+
+
+class TestPhoneEditor(unittest.TestCase):
+    """The phone running the real browser port instead of the small viewer.
+
+    The port is a checkout-only asset, so every test here skips when `web/`
+    is not beside sidemark.py — an installed copy legitimately has none, and
+    that is the behaviour, not a broken fixture."""
+
+    def setUp(self):
+        import sidemark
+        if not sidemark._web_app_dir():
+            self.skipTest("web/ is not beside sidemark.py (installed copy)")
+
+    def _server(self, *, with_editor=True, doc_bytes=b"%PDF-1.4 real"):
+        import sidemark
+        state = {"rev": 0, "page": 0, "pages": 3}
+        providers = {
+            "title": "deck.pdf",
+            "state": lambda: (state["rev"], state["page"], state["pages"]),
+            "render": lambda p: open(p, "wb").write(b"\x89PNG"),
+            # deliberately DIFFERENT bytes from live_doc: the two routes are
+            # two different documents (a baked export vs the real one), and a
+            # test that used the same bytes could not tell them apart
+            "pdf": lambda p: open(p, "wb").write(b"%PDF-1.4 baked export"),
+            "live_doc": ((lambda p: open(p, "wb").write(doc_bytes))
+                         if with_editor else None),
+        }
+        return sidemark._ShareServer(providers=providers), state
+
+    @staticmethod
+    def _get(url, **headers):
+        import urllib.request
+        req = urllib.request.Request(url)
+        for k, v in headers.items():
+            req.add_header(k.replace("_", "-"), v)
+        r = urllib.request.urlopen(req, timeout=5)
+        return r.status, dict(r.headers), r.read()
+
+    def test_the_share_url_lands_on_the_editor(self):
+        """Scanning the QR opens the real editor, with nothing in between.
+
+        A redirect rather than the app served at the token root: the port is
+        a tree of RELATIVE urls, and one level up from /<token>/ is outside
+        the token path, so `../live.pdf` would 404."""
+        srv, _ = self._server()
+        self.assertTrue(srv.editor_available)
+        srv.start()
+        try:
+            base = f"http://127.0.0.1:{srv.port}/{srv.token}/"
+            # urllib follows it, so assert where it LANDS as well as that the
+            # landing page is the app and not the old image viewer
+            body = self._get(base)[2].lower()
+            self.assertIn(b"<!doctype html", body[:200])
+            self.assertNotIn(b"page.png", body)
+        finally:
+            srv.stop()
+
+    def test_a_share_with_no_editor_keeps_the_small_viewer(self):
+        """The fallback is not dead code — it is what a TEXT-FIRST page gets
+        (the browser port has no text mode yet) and what an installed copy
+        with no web/ beside it gets. Both are real, so the viewer stays until
+        neither is."""
+        srv, _ = self._server(with_editor=False)
+        self.assertFalse(srv.editor_available)
+        srv.start()
+        try:
+            base = f"http://127.0.0.1:{srv.port}/{srv.token}/"
+            html = self._get(base)[2].decode()
+            self.assertIn("page.png", html)          # the image viewer
+            self.assertIn("deck.pdf", html)
+            self.assertNotIn("__TITLE__", html)      # placeholder substituted
+        finally:
+            srv.stop()
+
+    def test_live_pdf_is_the_real_document_not_the_baked_export(self):
+        """The editor needs our ink as ANNOTATIONS so the port can adopt it
+        back into editable strokes; the Download button's export has the
+        notes flattened onto the pages. Serving the wrong one gives a phone
+        a picture of ink that nothing can erase or undo."""
+        import urllib.error
+        srv, _ = self._server(doc_bytes=b"%PDF-1.4 real")
+        srv.start()
+        try:
+            base = f"http://127.0.0.1:{srv.port}/{srv.token}/"
+            self.assertIn(b"real", self._get(base + "live.pdf")[2])
+            self.assertIn(b"baked", self._get(base + "doc.pdf")[2])
+        finally:
+            srv.stop()
+
+        srv2, _ = self._server(with_editor=False)
+        srv2.start()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self._get(f"http://127.0.0.1:{srv2.port}/{srv2.token}/live.pdf")
+            self.assertEqual(cm.exception.code, 404)
+        finally:
+            srv2.stop()
+
+    def test_live_doc_is_recached_only_when_the_revision_changes(self):
+        """Same contract as the page image: the document is re-baked on a
+        change and not on every request. A phone polls."""
+        import sidemark
+        bakes = {"n": 0}
+        state = {"rev": 0}
+
+        def _bake(p):
+            bakes["n"] += 1
+            open(p, "wb").write(b"%PDF-" + bytes([state["rev"]]))
+        srv = sidemark._ShareServer(providers={
+            "title": "d.pdf", "state": lambda: (state["rev"], 0, 1),
+            "render": lambda p: open(p, "wb").write(b"\x89PNG"),
+            "pdf": _bake, "live_doc": _bake,
+        })
+        srv.start()
+        try:
+            url = f"http://127.0.0.1:{srv.port}/{srv.token}/live.pdf"
+            self._get(url); self._get(url)
+            self.assertEqual(bakes["n"], 1)
+            state["rev"] = 1
+            self._get(url)
+            self.assertEqual(bakes["n"], 2)
+        finally:
+            srv.stop()
+
+    def test_the_port_is_served_under_the_token_path(self):
+        srv, _ = self._server()
+        srv.start()
+        try:
+            base = f"http://127.0.0.1:{srv.port}/{srv.token}/"
+            st, hdr, body = self._get(base + "app/index.html")
+            self.assertEqual(st, 200)
+            self.assertIn(b"<!doctype html", body.lower()[:200])
+            # a bare /app would leave every relative URL one level too high
+            self.assertIn(b"<!doctype html",
+                          self._get(base + "app")[2].lower()[:200])
+        finally:
+            srv.stop()
+
+    def test_module_scripts_are_served_as_javascript(self):
+        """A module served under the wrong type is REFUSED by the browser
+        with nothing drawn, and Python's mimetypes does not know .mjs at
+        all — which is pdf.js's worker, i.e. the whole PDF engine."""
+        srv, _ = self._server()
+        srv.start()
+        try:
+            base = f"http://127.0.0.1:{srv.port}/{srv.token}/app/"
+            for rel in ("src/app.js", "vendor/pdf.worker.min.mjs"):
+                ctype = self._get(base + rel)[1].get("Content-Type", "")
+                self.assertTrue(ctype.startswith("text/javascript"),
+                                f"{rel} served as {ctype!r}")
+        finally:
+            srv.stop()
+
+    def test_big_assets_are_compressed_and_revalidate(self):
+        """The port is ~4 MB raw against ~1.2 MB gzipped and the client is a
+        phone; the stdlib handler does neither of these for us."""
+        srv, _ = self._server()
+        srv.start()
+        try:
+            base = f"http://127.0.0.1:{srv.port}/{srv.token}/app/"
+            st, hdr, body = self._get(base + "vendor/pdf.worker.min.mjs",
+                                      Accept_Encoding="gzip")
+            self.assertEqual(hdr.get("Content-Encoding"), "gzip")
+            self.assertEqual(hdr.get("Vary"), "Accept-Encoding")
+            tag = hdr.get("ETag")
+            self.assertTrue(tag)
+            # a second load of a 1.2 MB app should cost a 304, not the bytes
+            import urllib.request, urllib.error
+            req = urllib.request.Request(base + "vendor/pdf.worker.min.mjs")
+            req.add_header("If-None-Match", tag)
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(cm.exception.code, 304)
+        finally:
+            srv.stop()
+
+    def test_an_already_compressed_body_is_not_gzipped_again(self):
+        srv, _ = self._server()
+        srv.start()
+        try:
+            base = f"http://127.0.0.1:{srv.port}/{srv.token}/"
+            for route in ("live.pdf", "page.png"):
+                hdr = self._get(base + route, Accept_Encoding="gzip")[1]
+                self.assertIsNone(hdr.get("Content-Encoding"), route)
+        finally:
+            srv.stop()
+
+    def test_the_static_route_cannot_walk_out_of_the_port(self):
+        """This route is reachable from a PUBLIC Funnel link and serves files
+        straight off the sharer's disk, so `..` must not reach their home
+        directory."""
+        import urllib.error
+        srv, _ = self._server()
+        srv.start()
+        try:
+            base = f"http://127.0.0.1:{srv.port}/{srv.token}/"
+            for bad in ("app/../../sidemark.py",
+                        "app/../../../../etc/passwd",
+                        "app/%2e%2e/%2e%2e/sidemark.py",
+                        "app/./../../sidemark.py"):
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    self._get(base + bad)
+                self.assertEqual(cm.exception.code, 404, bad)
+        finally:
+            srv.stop()
+
+    def test_state_names_the_document_and_says_if_an_editor_exists(self):
+        import json
+        srv, _ = self._server()
+        srv.start()
+        try:
+            base = f"http://127.0.0.1:{srv.port}/{srv.token}/"
+            st = json.loads(self._get(base + "state")[2])
+            self.assertEqual(st["title"], "deck.pdf")
+            self.assertTrue(st["editor"])
+            # the three the small viewer has always read must survive
+            self.assertEqual((st["rev"], st["page"], st["pages"]), (0, 0, 3))
+        finally:
+            srv.stop()
+
+
+class TestShareIndicator(unittest.TestCase):
+    """The header button's "● Live" content swap (row 182) — unified onto
+    the SAME button that also starts a Share session, per the user's
+    explicit call that a colour-tinted icon wasn't what they wanted told
+    apart from the drawing feature's own indicator. Real but UNPARENTED GTK
+    widgets: plain child add/remove needs no window or weston to exercise."""
+
+    @staticmethod
+    def _children(box):
+        kids = []
+        c = box.get_first_child()
+        while c is not None:
+            kids.append(c)
+            c = c.get_next_sibling()
+        return kids
+
+    def _fake(self):
+        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        content.append(Gtk.Image())
+        return types.SimpleNamespace(
+            _share_content=content, _share_dot=Gtk.Label(label="●"),
+            _share_live_label=Gtk.Label(label="Live"), _share_btn=Gtk.Button(),
+            _share_pulse_id=None, _pulse_share_dot=lambda: True)
+
+    def test_going_live_appends_the_dot_and_label_exactly_once(self):
+        import sidemark
+        fake = self._fake()
+        try:
+            sidemark.PDFEditorWindow._update_share_indicator(fake, True)
+            self.assertIn(fake._share_dot, self._children(fake._share_content))
+            self.assertIn(fake._share_live_label,
+                          self._children(fake._share_content))
+            self.assertIsNotNone(fake._share_pulse_id)
+            first_pulse_id = fake._share_pulse_id
+            sidemark.PDFEditorWindow._update_share_indicator(fake, True)
+            self.assertEqual(
+                self._children(fake._share_content).count(fake._share_dot), 1)
+            self.assertEqual(fake._share_pulse_id, first_pulse_id)
+        finally:
+            if fake._share_pulse_id is not None:
+                GLib.source_remove(fake._share_pulse_id)
+
+    def test_going_idle_removes_the_dot_and_label_and_stops_the_pulse(self):
+        import sidemark
+        fake = self._fake()
+        sidemark.PDFEditorWindow._update_share_indicator(fake, True)
+        sidemark.PDFEditorWindow._update_share_indicator(fake, False)
+        self.assertNotIn(fake._share_dot, self._children(fake._share_content))
+        self.assertNotIn(fake._share_live_label,
+                         self._children(fake._share_content))
+        self.assertIsNone(fake._share_pulse_id)
+        self.assertEqual(fake._share_dot.get_opacity(), 1.0)
+
+    def test_pulse_toggles_opacity_between_full_and_dim(self):
+        import sidemark
+        fake = self._fake()
+        fake._share_dot.set_opacity(1.0)
+        self.assertTrue(sidemark.PDFEditorWindow._pulse_share_dot(fake))
+        self.assertAlmostEqual(fake._share_dot.get_opacity(), 0.25)
+        sidemark.PDFEditorWindow._pulse_share_dot(fake)
+        self.assertAlmostEqual(fake._share_dot.get_opacity(), 1.0)
+
+
+class TestRemoteTouchToInkActions(unittest.TestCase):
+    """_process_remote_touch (row 182): pure, GTK-free, the one place the
+    "how many fingers, what do they mean" rule lives."""
+
+    def test_single_finger_draw_sequence(self):
+        from sidemark import _process_remote_touch
+        state = {"active": {}}
+        actions = _process_remote_touch(state, [
+            {"pid": 1, "ph": "down", "tool": "pen", "x": 1.0, "y": 1.0, "p": 0.4},
+            {"pid": 1, "ph": "move", "tool": "pen", "x": 2.0, "y": 2.0, "p": 0.5},
+            {"pid": 1, "ph": "up", "tool": "pen", "x": 3.0, "y": 3.0, "p": 0.0},
+        ])
+        self.assertEqual(actions, [
+            ("draw_begin", 1.0, 1.0, 0.4),
+            ("draw_update", 2.0, 2.0, 0.5),
+            ("draw_end", 3.0, 3.0, 0.0),
+        ])
+        self.assertEqual(state["active"], {})
+
+    def test_eraser_tool_uses_erase_verbs(self):
+        from sidemark import _process_remote_touch
+        state = {"active": {}}
+        actions = _process_remote_touch(state, [
+            {"pid": 1, "ph": "down", "tool": "eraser", "x": 0, "y": 0, "p": None},
+            {"pid": 1, "ph": "move", "tool": "eraser", "x": 1, "y": 1, "p": None},
+            {"pid": 1, "ph": "up", "tool": "eraser", "x": 2, "y": 2, "p": None},
+        ])
+        self.assertEqual([a[0] for a in actions],
+                         ["erase_begin", "erase_at", "erase_end"])
+
+    def test_second_finger_aborts_and_blocks_until_every_finger_lifts(self):
+        """Matches this app's own local-touch rule: a second finger reclaims
+        the gesture (abort), and the survivor after a lift is a brand-new
+        press, never a resumed one — so nothing draws again until BOTH
+        fingers have lifted and a genuinely fresh one goes down."""
+        from sidemark import _process_remote_touch
+        state = {"active": {}}
+
+        actions = _process_remote_touch(state, [
+            {"pid": "A", "ph": "down", "tool": "pen", "x": 0, "y": 0, "p": 0.5},
+        ])
+        self.assertEqual(actions[0][0], "draw_begin")
+
+        actions = _process_remote_touch(state, [
+            {"pid": "B", "ph": "down", "tool": "pen", "x": 5, "y": 5, "p": 0.5},
+        ])
+        self.assertEqual(actions, [("abort",)])
+
+        actions = _process_remote_touch(state, [
+            {"pid": "A", "ph": "move", "tool": "pen", "x": 1, "y": 1, "p": 0.5},
+            {"pid": "B", "ph": "move", "tool": "pen", "x": 6, "y": 6, "p": 0.5},
+        ])
+        self.assertEqual(actions, [])   # blocked: two fingers draw nothing
+
+        actions = _process_remote_touch(state, [
+            {"pid": "A", "ph": "up", "tool": "pen", "x": 1, "y": 1, "p": 0.0},
+        ])
+        self.assertEqual(actions, [])
+        self.assertTrue(state["blocked"])   # B survives but stays blocked
+
+        actions = _process_remote_touch(state, [
+            {"pid": "B", "ph": "move", "tool": "pen", "x": 7, "y": 7, "p": 0.5},
+        ])
+        self.assertEqual(actions, [])
+
+        actions = _process_remote_touch(state, [
+            {"pid": "B", "ph": "up", "tool": "pen", "x": 7, "y": 7, "p": 0.0},
+        ])
+        self.assertEqual(actions, [])
+        self.assertFalse(state["blocked"])   # every finger is up now
+
+        actions = _process_remote_touch(state, [
+            {"pid": "C", "ph": "down", "tool": "pen", "x": 9, "y": 9, "p": 0.5},
+        ])
+        self.assertEqual(actions, [("draw_begin", 9, 9, 0.5)])   # fresh stroke
+
+
+class TestRemoteDrawOnPDFCanvas(unittest.TestCase):
+    """The PDFCanvas half of "Draw from phone" (row 182): a gesture-free
+    parallel to a local pen drag, fed points already in document units."""
+
+    def setUp(self):
+        self.canvas = PDFCanvas()
+        self.canvas.scale = 1.0
+        self.canvas.offset_x = 0.0
+        self.canvas.offset_y = 0.0
+        self.canvas.current_page_idx = 0
+
+    def test_remote_stroke_commits_with_the_current_pen_regardless_of_tool(self):
+        self.canvas.pen_color = (0.1, 0.2, 0.3)
+        self.canvas.pen_width = 4.0
+        self.canvas.tool = "text"   # what the left button is bound to must
+                                    # not matter - a remote touch always draws
+        called = []
+        self.canvas.on_change = lambda: called.append("change")
+        self.canvas.on_user_action = lambda: called.append("action")
+
+        self.canvas.remote_stroke_begin(10.0, 10.0, 0.5)
+        self.canvas.remote_stroke_update(20.0, 15.0, 0.6)
+        self.canvas.remote_stroke_end()
+
+        self.assertEqual(len(self.canvas.strokes), 1)
+        stroke = self.canvas.strokes[0]
+        self.assertEqual(stroke["color"], (0.1, 0.2, 0.3))
+        self.assertEqual(stroke["width"], 4.0)
+        self.assertEqual(self.canvas.current_stroke, [])
+        self.assertEqual(self.canvas._undo_stack[-1][0], "draw")
+        self.assertEqual(called, ["change", "action"])
+
+    def test_remote_stroke_end_with_nothing_in_flight_is_a_no_op(self):
+        self.canvas.remote_stroke_end()
+        self.assertEqual(self.canvas.strokes, [])
+
+    def test_remote_erase_removes_a_hit_stroke_as_one_undo_group(self):
+        self.canvas.all_strokes[0] = [
+            {"pts": [(0.0, 0.0), (10.0, 0.0)], "color": (0, 0, 0),
+             "width": 2.0, "opacity": 1.0},
+        ]
+        acted = []
+        self.canvas.on_user_action = lambda: acted.append(True)
+        self.canvas.remote_erase_begin()
+        group = self.canvas._erase_group
+        self.canvas.remote_erase_at(5.0, 0.0)
+        self.canvas.remote_erase_end()
+        self.assertEqual(self.canvas.strokes, [])
+        self.assertEqual(acted, [True])
+        self.assertEqual(self.canvas._undo_stack[-1][4], group)
+
+    def test_remote_abort_drops_the_in_flight_stroke(self):
+        self.canvas.remote_stroke_begin(1.0, 1.0)
+        self.canvas.remote_stroke_update(2.0, 2.0)
+        self.canvas.remote_abort()
+        self.assertEqual(self.canvas.current_stroke, [])
+        self.canvas.remote_stroke_end()   # nothing left to commit
+        self.assertEqual(self.canvas.strokes, [])
+
+
+class TestRemoteDrawOnTextPage(unittest.TestCase):
+    """TextPageView's half of "Draw from phone" (row 182) — same contract as
+    PDFCanvas's, fed overlay-pixel points instead of document ones."""
+
+    def setUp(self):
+        import sidemark
+        self.tp = sidemark.TextPageView()
+        self.tp.view.get_buffer().set_text("alpha\nbeta\n")
+
+    def test_remote_stroke_commits_via_commit_stroke(self):
+        self.tp.remote_stroke_begin(5.0, 5.0, 0.5)
+        self.tp.remote_stroke_update(15.0, 8.0, 0.6)
+        self.tp.remote_stroke_end()
+        self.assertEqual(len(self.tp.strokes), 1)
+        self.assertEqual(self.tp.current_stroke, [])
+        self.assertEqual(self.tp._undo_ops[-1][0], "add")
+
+    def test_remote_erase_removes_a_hit_stroke(self):
+        self.tp.remote_stroke_begin(0.0, 0.0, 0.5)
+        self.tp.remote_stroke_update(10.0, 0.0, 0.5)
+        self.tp.remote_stroke_end()
+        self.assertEqual(len(self.tp.strokes), 1)
+
+        acted = []
+        self.tp.on_ink_action = lambda: acted.append(True)
+        self.tp.remote_erase_begin()
+        self.tp.remote_erase_at(5.0, 0.0)
+        self.tp.remote_erase_end()
+        self.assertEqual(self.tp.strokes, [])
+        self.assertEqual(acted, [True])
+        self.assertEqual(self.tp._undo_ops[-1][0], "erase")
+
+    def test_remote_abort_drops_state_without_committing(self):
+        self.tp.remote_stroke_begin(0.0, 0.0)
+        self.tp.remote_erase_begin()
+        self.tp._erased_now = [{"fake": "stroke"}]
+        self.tp.remote_abort()
+        self.assertEqual(self.tp.current_stroke, [])
+        self.assertEqual(self.tp._erased_now, [])
+        self.tp.remote_stroke_end()
+        self.assertEqual(self.tp.strokes, [])
+
+
+class TestApplyRemoteInkActions(unittest.TestCase):
+    """_apply_remote_ink_actions is plain dispatch with no window-tier
+    dependency of its own — mock stand-ins for the target surface are
+    enough, same reasoning as TestShareStopUX below uses duck-typed self."""
+
+    def test_dispatches_each_verb_to_the_matching_method(self):
+        import sidemark
+        target = mock.Mock()
+        sidemark.PDFEditorWindow._apply_remote_ink_actions(
+            None, target, None,
+            [("draw_begin", 1.0, 2.0, 0.5),
+             ("draw_update", 3.0, 4.0, 0.6),
+             ("draw_end", 0.0, 0.0, 0.0),
+             ("erase_begin", 0.0, 0.0, None),
+             ("erase_at", 5.0, 6.0, None),
+             ("erase_end", 0.0, 0.0, None),
+             ("abort",)])
+        target.remote_stroke_begin.assert_called_once_with(1.0, 2.0, 0.5)
+        target.remote_stroke_update.assert_called_once_with(3.0, 4.0, 0.6)
+        target.remote_stroke_end.assert_called_once_with()
+        target.remote_erase_begin.assert_called_once_with()
+        target.remote_erase_at.assert_called_once_with(5.0, 6.0)
+        target.remote_erase_end.assert_called_once_with()
+        target.remote_abort.assert_called_once_with()
+
+    def test_prefers_the_text_page_over_the_canvas_when_both_are_given(self):
+        """Whichever surface was bound at connect time — the closure that
+        builds `providers` captures exactly one of the two as non-None."""
+        import sidemark
+        canvas, tp = mock.Mock(), mock.Mock()
+        sidemark.PDFEditorWindow._apply_remote_ink_actions(
+            None, canvas, tp, [("draw_begin", 1.0, 1.0, None)])
+        tp.remote_stroke_begin.assert_called_once()
+        canvas.remote_stroke_begin.assert_not_called()
 
 
 class TestShareStopUX(unittest.TestCase):

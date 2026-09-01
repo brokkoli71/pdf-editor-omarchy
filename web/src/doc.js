@@ -42,13 +42,16 @@ export class Doc {
     this._thumbs = new Map();
   }
 
-  static async open(bytes, name) {
-    // Adopt any ink WE wrote and take it back out of the document before
-    // rendering. Without this the strokes are painted by pdf.js as annotation
-    // appearances while the model knows nothing about them — the file looks
-    // right and nothing on it can be erased, lassoed or undone. Stripping is
-    // what stops it then rendering twice, which is the desktop's image-layer
-    // trap in a different coat.
+  /** Adopt any ink and images WE wrote, and take them back OUT of the bytes
+   * before pdf.js sees them.
+   *
+   * Without the strip they are painted twice — once by pdf.js as annotation
+   * appearances and once by us as objects — and the copy pdf.js drew cannot
+   * be erased, lassoed or undone, which is the desktop's image-layer trap in
+   * a different coat. Shared with the lazy per-page path (LIVE mode) so a
+   * page fetched on its own cannot diverge from one that arrived with the
+   * document. */
+  static async _adopt(bytes) {
     let ink = new Map();
     try {
       const lib = await PDFDocument.load(bytes, { ignoreEncryption: true });
@@ -69,10 +72,23 @@ export class Doc {
       data: bytes.slice(0),      // pdf.js transfers the buffer; keep ours intact
       isEvalSupported: false,
     }).promise;
-    const doc = new Doc(pdf, bytes, name);
-    doc.ink = ink;
+    return { pdf, ink, bytes };
+  }
+
+  static async open(bytes, name) {
+    const got = await Doc._adopt(bytes);
+    const doc = new Doc(got.pdf, got.bytes, name);
+    doc.ink = got.ink;
     await doc._readOutline();
     return doc;
+  }
+
+  /** One page fetched on its own (LIVE mode). Returns the pdf.js page and the
+   * ink adopted off it, which the caller files under its REAL index — the
+   * fetched PDF is one page long, so everything in it says page 0. */
+  static async openLoosePage(bytes) {
+    const got = await Doc._adopt(bytes);
+    return { page: await got.pdf.getPage(1), ink: got.ink.get(0) || [] };
   }
 
   /** An empty document — the blank A4 sheet `blank_pdf_file()` makes. */
@@ -113,9 +129,42 @@ export class Doc {
 
   async page(index) {
     if (this._pageCache.has(index)) return this._pageCache.get(index);
-    const p = await this.pdf.getPage(index + 1);
+    // LIVE mode fetches pages one at a time (see attachLazyPages): `this.pdf`
+    // then holds ONE page, not the document, so asking it for page index+1
+    // would be a different page or none at all.
+    let p;
+    if (this._lazy && index !== this._lazy.have) {
+      const got = await this._lazy.fetch(index);
+      p = got.page;
+      // Ink adopted off a page fetched alone is filed under its REAL index.
+      // Tested for EMPTY, not for absence: `strokesFor` creates the key the
+      // moment anything asks for the page's strokes, and the renderer does
+      // that before this fetch resolves — so a `has()` guard here silently
+      // dropped every lazily fetched page's ink. Filled in place, because
+      // whoever created the key is already holding that array.
+      const cur = this.ink.get(index);
+      if (!cur) this.ink.set(index, got.ink);
+      else if (!cur.length) for (const o of got.ink) cur.push(o);
+    } else {
+      p = await this.pdf.getPage((this._lazy ? 0 : index) + 1);
+    }
     this._pageCache.set(index, p);
     return p;
+  }
+
+  /** Turn this into a lazily-paged document (LIVE mode only).
+   *
+   * The phone is handed the page it is looking at and nothing else — a first
+   * paint costs one page rather than a whole lecture — and pages arrive as it
+   * reaches them. Everything downstream (rendering, page sizes, thumbnails)
+   * already goes through `page()`, so this is the only place that has to know.
+   *
+   * `count` is the real page count, which the document itself can no longer
+   * say: it is a one-page PDF.
+   */
+  attachLazyPages(count, fetch) {
+    this._lazy = { have: this.pageIndexLoaded ?? 0, fetch };
+    this.pageCount = count;
   }
 
   /** The page's size in PDF points — which ARE the document units the ink

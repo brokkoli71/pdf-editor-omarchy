@@ -130,6 +130,28 @@ export class Surface {
     this.bindings = bindings;
     this.docMode = "pdf";       // routing NEVER reads bindings.mode
     this.onChange = opts.onChange || (() => {});
+    /** LIVE MODE only: raw stroke samples on their way to a desktop Sidemark.
+     * Called with a plain object per batch; see app.js's LIVE. The points are
+     * DOCUMENT coordinates, which is exactly what lets the phone hold a zoom
+     * of its own — a screen coordinate would only mean something against the
+     * desktop's view. The desktop runs its own pipeline over these, so what
+     * it commits is what THIS side commits: the same tuned code over the same
+     * raw samples, which is what the conformance vectors are for. */
+    this.onInkStream = opts.onInkStream || null;
+    this._streamSeq = 0;
+    // The gesture currently mirrored to the desktop, tracked HERE rather than
+    // on the gesture object — a gesture can be abandoned without ever
+    // reaching _onUp's branches (a circle-to-lasso conversion and a second
+    // finger both null `active` where they stand), and a stream left open
+    // wedges the desktop's one-finger rule for good.
+    this._streamOpen = null;
+    this._streamTool = "pen";
+    /** LIVE mode: the desktop's stroke while their pen is still down. */
+    this.remoteLive = null;
+    /** Called with each committed freehand stroke. Used by the write-and-
+     * advance aid, which needs to know WHERE a stroke finished, not merely
+     * that the document changed. */
+    this.onStrokeDone = opts.onStrokeDone || null;
     this.onPageChange = opts.onPageChange || (() => {});
     this.onNotesRestored = opts.onNotesRestored || (() => {});
     // called on every repaint, so a mirror can follow the live stroke
@@ -711,6 +733,7 @@ export class Surface {
 
     const coalesced = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
     const samples = coalesced.length ? coalesced : [e];
+    const streamed = this.onInkStream ? [] : null;
     for (const s of samples) {
       const [sx, sy] = this.toDoc(s.offsetX, s.offsetY);
       if (a.tool === "eraser") {
@@ -719,7 +742,11 @@ export class Surface {
         a.pts.push([sx, sy]);
         a.press.push(this._pressureOf(s));
       }
+      // the SAME samples the model just took, so the desktop's pipeline sees
+      // what this one saw — including everything getCoalescedEvents recovered
+      if (streamed) streamed.push([sx, sy, this._pressureOf(s)]);
     }
+    if (streamed) this._stream(a, streamed);
     a.lastView = [e.offsetX, e.offsetY];
 
     // A HOLD IS NOT A FREEZE. Both dwells stay alive while the pen is merely
@@ -917,7 +944,13 @@ export class Surface {
       if (left < 2) this._pinch = null;
       if (left === 0) this.requestDraw();
     }
-    if (!this.active || e.pointerId !== this.active.pointerId) return;
+    if (!this.active || e.pointerId !== this.active.pointerId) {
+      // The gesture was abandoned somewhere other than here — converted to a
+      // lasso, or dropped when a second finger started a pinch — so none of
+      // the branches below will run. Close the mirrored stroke anyway.
+      this._closeStream({ abort: true });
+      return;
+    }
     const a = this.active;
     this.active = null;
     this._cancelCircleLasso();
@@ -931,14 +964,19 @@ export class Surface {
     // with your hand down silently loses the stroke. Ink is revocable only for
     // the hand that drew it.
     if (cancelled || (a.device === "touch" && this.latch.multi)) {
+      // the desktop is mid-stroke and has to drop it too, or it is left with
+      // half a line and nothing coming to finish it
+      this._closeStream({ abort: true });
       this.requestDraw();
       return;
     }
 
     if (a.tool === "pen" || a.tool === "highlighter") {
+      this._closeStream({ end: true });
       this._commitStroke(a);
       this._clearSnap();
     } else if (a.tool === "eraser") {
+      this._closeStream({ end: true });
       if (a.erased.length) {
         this._pushUndo({ type: "erase", page: this.pageIndex, strokes: a.erased });
       }
@@ -1493,6 +1531,33 @@ export class Surface {
 
   // ── committing ─────────────────────────────────────────────────────────────
 
+  /** Mirror one batch of raw samples to a live desktop (LIVE mode only). */
+  _stream(a, batch) {
+    if (!this.onInkStream) return;
+    if (a.tool !== "pen" && a.tool !== "eraser") return;
+    if (this._streamOpen === null) {
+      // nothing is sent until there is something to draw, so a bare tap that
+      // never moves opens no gesture on the desktop either
+      if (!batch.length) return;
+      this._streamOpen = ++this._streamSeq;
+      this._streamTool = a.tool;
+    }
+    this.onInkStream({ t: "ink", id: this._streamOpen, tool: this._streamTool,
+                       page: this.pageIndex, pts: batch });
+  }
+
+  /** End the mirrored gesture, committing it on the desktop or dropping it.
+   *
+   * Must be reachable from EVERY way a gesture can end, including the ones
+   * that never run _onUp's tool branches. The desktop guards against a
+   * missing close as well, because this side cannot promise one. */
+  _closeStream(extra) {
+    if (this._streamOpen === null || !this.onInkStream) return;
+    this.onInkStream({ t: "ink", id: this._streamOpen, tool: this._streamTool,
+                       page: this.pageIndex, pts: [], ...extra });
+    this._streamOpen = null;
+  }
+
   _commitStroke(a) {
     const flat = a.tool === "highlighter";
     const press = this._hasPressureFor(a) ? a.press : [];
@@ -1527,6 +1592,7 @@ export class Surface {
     this._pushUndo({ type: "draw", page: this.pageIndex, stroke });
     this._appendToLayer(stroke);
     this.onChange();
+    if (this.onStrokeDone) this.onStrokeDone(stroke);
   }
 
   _hasPressureFor(a) { return a.device === "pen"; }
@@ -1844,7 +1910,24 @@ export class Surface {
     ctx.restore();
   }
 
+  /** The DESKTOP's in-progress stroke (LIVE mode), painted on top of the
+   * cached layer exactly as our own is — no layer invalidation, so mirroring
+   * somebody else's pen costs a repaint and not a re-render of the page. It
+   * is replaced by real ink the moment they lift, when the delta arrives. */
+  _drawRemoteLive(ctx) {
+    const r = this.remoteLive;
+    if (!r || !r.pts || r.pts.length < 1 || r.page !== this.pageIndex) return;
+    ctx.save();
+    ctx.translate(this.offX, this.offY);
+    ctx.scale(this.zoom, this.zoom);
+    ctx.fillStyle = rgbCss(r.color, r.opacity);
+    ctx.strokeStyle = rgbCss(r.color, r.opacity);
+    drawInkStroke(ctx, r.pts, r.width, null);
+    ctx.restore();
+  }
+
   _drawLive(ctx) {
+    this._drawRemoteLive(ctx);
     const a = this.active;
     if (!a || (a.tool !== "pen" && a.tool !== "highlighter")) return;
     const flat = a.tool === "highlighter";

@@ -38,6 +38,21 @@ package() {
     install -Dm755 sidemark.py \
         "$pkgdir/usr/share/sidemark/sidemark.py"
 
+    # The browser port, served to a phone by Share to phone — the QR lands on
+    # it, so without it a share falls back to the small image viewer that
+    # cannot zoom. test/ and package.json are development-only.
+    if [ -d web ]; then
+        install -dm755 "$pkgdir/usr/share/sidemark/web"
+        cp -r web/. "$pkgdir/usr/share/sidemark/web/"
+        rm -rf "$pkgdir/usr/share/sidemark/web/test" \
+               "$pkgdir/usr/share/sidemark/web/node_modules" \
+               "$pkgdir/usr/share/sidemark/web/dist" \
+               "$pkgdir/usr/share/sidemark/web/package.json" \
+               "$pkgdir/usr/share/sidemark/web/package-lock.json"
+        find "$pkgdir/usr/share/sidemark/web" -type f -exec chmod 644 {} +
+        find "$pkgdir/usr/share/sidemark/web" -type d -exec chmod 755 {} +
+    fi
+
     # Wrapper in PATH
     install -dm755 "$pkgdir/usr/bin"
     cat > "$pkgdir/usr/bin/sidemark" <<'EOF'

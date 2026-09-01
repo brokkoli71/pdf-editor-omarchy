@@ -1089,6 +1089,136 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   pen width or font size of the app you actually work in. Recent files
   (`recent.json`) stay shared on purpose — a copy is a different app, not a
   different person. Answer that question in one place or the two drift.
+- **Share to phone (☰ menu, `_share_btn`) covers both VIEWING and DRAWING
+  now (row 182), unified into one button/dialog/address-selection rather
+  than a second feature.** The dialog's Sharing/Writing toggle (a two-way
+  exclusive `Gtk.ToggleButton` pair, `_show_share_ready`) sets
+  `_ShareServer.drawing_allowed`; whichever address tier is in use — LAN,
+  Tailscale, or the PUBLIC link via Tailscale Funnel — carries write access
+  too whenever Writing is on. **This was a deliberate reversal, made
+  explicitly by the user, of an earlier safety-motivated design** (a
+  separate `_DrawServer` class that only ever offered LAN/Tailscale,
+  specifically so a document-mutating feature could never default to a
+  public link): one unified control was preferred over that split, with the
+  consequence — a leaked or overheard public link can draw on the document,
+  not just watch it, while Writing is picked — stated plainly and accepted
+  rather than designed around. There is no drawing-only address tier that
+  stays private while viewing goes public. Sharing (view-only) is the
+  default every session.
+  Live status is a CONTENT change on `_share_btn` itself
+  (`_update_share_indicator`) — it grows a pulsing "● Live" rather than the
+  button merely tinting colour (its earlier `.success`-class-only design),
+  asked for explicitly as something that reads as its own status. The dot's
+  opacity swing (`_pulse_share_dot`, 1.0/0.25) matches the phone page's own
+  `#dot` CSS keyframes, ported to a `GLib.timeout_add` since GTK's CSS gives
+  us no keyframes here.
+  Works in BOTH document modes (`PDFCanvas.remote_stroke_*`/
+  `remote_erase_*` and `TextPageView`'s twins, `_on_share_to_phone`'s guard
+  generalized off its old PDF-only `canvas.document is None` check) — this
+  app's "both modes, always" rule; a text-first page's phone mirror is
+  `TextPageView.render_snapshot_png` (a flat composited-overlay snapshot,
+  not `_write_text_pdf`'s vector-ink re-draw — plenty for a mobile preview,
+  not worth the print-quality cost here), a PDF's is the existing
+  `_render_share_page`, and both are gated by the SAME `_share_revision`
+  counter Share already bumps on any document change.
+  A touch always DRAWS (or erases, via the phone page's own Pen/Eraser
+  toggle) with the CURRENT pen, regardless of what tool the desktop's own
+  left button is bound to right now (which defaults to the CARET on the text
+  sheet) — `remote_stroke_end`/`_commit_stroke` read the canvas's/sheet's
+  ordinary pen-attribute accessors unchanged, so this is true for free rather
+  than needing a special case. `_process_remote_touch` is the one place the
+  "how many fingers, what do they mean" rule lives — pure and GTK-free by
+  design, so it needs no browser, server or window to test: one finger is a
+  stroke, a second joining ABORTS it (mirrors this app's own local-touch rule
+  that two fingers are reserved for navigation, never a second stroke), and
+  the whole episode stays blocked until every finger has lifted — a survivor
+  after a partial lift does not quietly resume drawing, the same reasoning
+  TouchLatch documents for local touch; touch coordinates map back through
+  `providers["map_point"]`, read live off `canvas.page_width` so a page-size
+  change can never desync the render and the mapping.
+  - **THE PHONE RUNS THE REAL BROWSER PORT, and the QR goes straight to it.**
+    `/<token>/` 302-redirects to `app/?live=1`; `_ShareServer` serves `web/`
+    itself under the token path (gzip + ETag, traversal-guarded, HTTP/1.1 so
+    31 requests are one connection). So the phone renders the page properly,
+    holds a **camera of its own**, and draws with the real pen pipeline.
+    `_SHARE_VIEWER_HTML` is now the FALLBACK, and both cases it covers are
+    real: a **text-first page** (the port has no text mode) and an installed
+    copy with no `web/`. `web/` is packaged by `install.sh` and both
+    PKGBUILDs — it never was, and this made it load-bearing.
+    - **Same origin is not a preference, it is the only thing that works.**
+      The hosted GitHub Pages copy cannot reach a desktop privately: mixed
+      content AND Chrome's Local Network Access block it, LNA counts the
+      tailnet as local, and **TLS does not lift LNA** (measured with a real
+      cert and permissive CORS). A LAN address can never satisfy mixed
+      content at all — no CA issues a cert for `192.168.x.x`. Only the public
+      Funnel tier could have worked, which would have made the public link
+      the *only* transport. Numbers in `notes/phone-web-port-sync-plan.md`;
+      don't re-derive them, and don't "just host it on Pages".
+    - **`live.pdf` is `save_copy`, NEVER the `pdf` provider.** That one is the
+      Download button's baked export with notes flattened onto the pages; the
+      port adopts real annotations into editable strokes, so the baked one
+      arrives as a picture of ink nothing can erase or undo.
+    - **Pages arrive ONE AT A TIME** (`page.pdf?n=N`, `Doc.attachLazyPages`),
+      sliced from the same per-revision copy. 60-page deck: 535.8 KB → 9.2 KB
+      to first paint. Trap met on the way: `strokesFor()` CREATES the page's
+      array on first access, so a "does this page have ink yet" test must ask
+      whether it is EMPTY, not whether the key exists.
+  - **The transport is a WebSocket (`_WSConn`), hand-rolled on the stdlib.**
+    Three details are load-bearing because each fails silently: client frames
+    are always MASKED, the payload length has THREE encodings (fine until a
+    stroke crosses 126 bytes), and a message may arrive fragmented.
+    **Each connection has its own SENDER THREAD with frame coalescing** — the
+    desktop's live stroke is pushed from the motion handler on the GTK main
+    thread, and a socket write to a phone out of wifi would freeze the app
+    under the hand that is drawing. Nothing user-facing touches the socket.
+  - **Both directions are live, and the wire carries DOCUMENT coordinates.**
+    The phone streams raw samples (it knows the real page geometry, so
+    `map_point` is identity) — which is what lets it draw under a zoom the
+    desktop knows nothing about, and is how row 182's deferred camera stopped
+    being a feature and became a consequence. The desktop mirrors its own
+    in-progress stroke back, painted on the phone on top of the cached layer.
+    On commit the desktop pushes **that page's strokes as JSON**, never the
+    whole PDF (re-serialising is ~500 ms plus a re-parse, per stroke). The
+    delta **REPLACES rather than merges** and needs no reconciliation: the
+    desktop's list is the whole truth for a page, ink the phone drew
+    included. A structural change is the exception, detected from the page
+    count and answered with a full reload. Every push **skips the connection
+    that caused it** (`ink_origin`), or drawing reloads the document under
+    the hand that drew.
+  - **A gesture that never closes wedges drawing FOR EVER, and it did.**
+    `_process_remote_touch`'s two-finger rule latches `blocked` while a
+    pointer id sits in `active`, and the port nulls `active` in several places
+    OUTSIDE `_onUp` (a circle becoming a lasso, a second finger starting a
+    pinch) — so the close never fired and phone→laptop ink died until reload.
+    Fixed on BOTH sides deliberately: the client closes from a catch-all in
+    `_onUp`, and the server treats a NEW gesture id as implicitly ending the
+    old one. A transport must not be one client bug away from wedging itself.
+  - **The phone reports its viewport** and the canvas draws it as a dashed
+    rectangle (`set_remote_view` / `_draw_remote_view`), suppressed when it
+    covers essentially the whole page — a rectangle around everything says
+    nothing. Cleared when the connection drops.
+  - **The mobile layout is a body class** (`MOBILE` = `pointer: coarse` and
+    `hover: none`, so a laptop with a touchscreen is not one): binding
+    stripes hidden (one finger, one answer, so the readout is a column of
+    identical colours), sidebar and notes collapsed, presenter and Download
+    in the ☰. Open/Save are hidden in a shared session on **any** device — a
+    laptop that scans the link is just as much a guest. In landscape the
+    toolbar becomes a **rail down the left** so the page keeps the height;
+    `--header-h` is overridden there, and everything floating under the
+    header (the ☰ popover, the rail itself) measures from it — the bug that
+    taught this was the menu opening 50px low, anchored to a two-row header
+    that no longer existed.
+  - **Write-and-advance** (☰ *Advance while writing*, row 186, off by
+    default): finish a stroke near the right edge, pause, and the view moves
+    along; at the page edge it wraps to the next line, spaced by the size of
+    what you have actually been writing. A new press cancels it — you had not
+    finished after all. Purely a camera move, so it cannot displace a stroke
+    or desync a session. Deliberately **no character segmentation**: "have
+    you run out of room?" is answered exactly by where a stroke ended, while
+    "was that a letter?" is not answered by a pen lift at all (row 184).
+  DEFERRED, tracked in ideas.csv row 182: multiple phones drawing at once, a
+  long-press tool picker beyond the plain Pen/Eraser toggle, and a
+  character-by-character "typewriter" input mode (row 184).
 
 ## Testing & verification
 

@@ -22,6 +22,7 @@ import datetime
 import base64
 import struct
 import zlib
+import gzip
 import uuid
 from typing import NamedTuple
 from collections import Counter
@@ -3568,6 +3569,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self.document = None
         self.n_pages = 0
         self.current_page_idx = 0
+        # where a connected phone is looking, {"page": n, "rect": (…)} in PDF
+        # units, or None when nothing is connected (row 182)
+        self.remote_view = None
         self.page = None
         self.page_width = 0
         self.page_height = 0
@@ -3680,6 +3684,12 @@ class PDFCanvas(Gtk.DrawingArea):
         # so the mirror redraws while the ink is still being laid down
         self.live_stroke_src = None
         self.on_live_draw = None
+        # Row 182: the in-progress stroke, mirrored to a connected phone so
+        # ink drawn HERE appears there while the pen is still down — the same
+        # liveness the phone→laptop direction already has. Deliberately its
+        # own hook rather than a second caller of on_live_draw, which the
+        # presenter window reassigns wholesale.
+        self.on_live_stream = None
 
         self.on_page_changed = None    # callback(current_idx, n_pages)
         # callback(start, delta) -> target page, so a relative flip can skip
@@ -4230,6 +4240,68 @@ class PDFCanvas(Gtk.DrawingArea):
             return self.hl_color, self.hl_width, self.hl_opacity
         return self.pen_color, self.pen_width, 1.0
 
+    # ── "Draw from phone" (row 182) ──────────────────────────────────────────
+    # A gesture-free parallel to _start_stroke/_on_drag_update/_drag_end's
+    # commit, fed points already in PDF/document units by the caller (a
+    # remote touch has no widget to convert FROM). Deliberately reuses
+    # _pen_attrs unchanged — a phone touch always draws with the CURRENT pen,
+    # never whatever tool the desktop's own left button happens to be bound
+    # to right now, which is the whole point of it being a graphics tablet
+    # rather than a simulated mouse.
+
+    def remote_stroke_begin(self, px, py, pressure=None):
+        self._recent_samples = []
+        self._capture_samples = []
+        self._capture_events = 0
+        self.current_stroke = [(px, py)]
+        self.current_press = [pressure] if pressure is not None else []
+
+    def remote_stroke_update(self, px, py, pressure=None):
+        if not self.current_stroke:
+            return
+        self.current_stroke.append((px, py))
+        if self.current_press:
+            self.current_press.append(pressure if pressure is not None else 1.0)
+        self.queue_draw()
+
+    def remote_stroke_end(self):
+        if not self.current_stroke:
+            return
+        pts, prof = self._finish_stroke(self.current_stroke, was_straight=False)
+        color, width, opacity = self._pen_attrs()
+        stroke = {"pts": pts, "color": color, "width": width, "opacity": opacity}
+        if prof:
+            stroke["press"] = prof
+        self.strokes.append(stroke)
+        self._undo_stack.append(("draw", self.current_page_idx, stroke))
+        self._redo_stack.clear()
+        self.current_stroke = []
+        if self.on_change:
+            self.on_change()
+        if self.on_user_action:
+            self.on_user_action()
+        self.queue_draw()
+
+    def remote_erase_begin(self):
+        self._erase_group += 1
+
+    def remote_erase_at(self, px, py):
+        self._erase_at(*self._pdf_to_screen(px, py))
+
+    def remote_erase_end(self):
+        if (self._undo_stack and self._undo_stack[-1][0] == "erase"
+                and self._undo_stack[-1][4] == self._erase_group
+                and self.on_user_action):
+            self.on_user_action()
+
+    def remote_abort(self):
+        """A second finger joined mid-gesture (_process_remote_touch) — drop
+        whatever was in flight rather than leaving a half-drawn stroke
+        lingering on screen with nothing left to redraw over it."""
+        self.current_stroke = []
+        self.current_press = []
+        self.queue_draw()
+
     # ── layout ───────────────────────────────────────────────────────────────
 
     # presentation stack look: the next page is drawn at STACK_NEXT_SCALE × the
@@ -4676,6 +4748,50 @@ class PDFCanvas(Gtk.DrawingArea):
             rw = abs(self._zoom_end[0] - self._zoom_start[0])
             rh = abs(self._zoom_end[1] - self._zoom_start[1])
             _draw_zoom_marquee(ctx, x1, y1, rw, rh, self.zoom_accent)
+
+        self._draw_remote_view(ctx)
+
+    def _draw_remote_view(self, ctx):
+        """Where the PHONE is looking, as a dashed rectangle (row 182).
+
+        The phone holds a camera of its own — that is the whole reason the
+        full editor exists rather than an image of this view — which means
+        the person at the laptop otherwise has no idea which corner of the
+        page the ink is about to appear in. Drawn in PDF units and scaled
+        here, so it survives zooming and panning on THIS side too.
+
+        Not drawn when it covers essentially the whole page: a rectangle
+        around everything says nothing, and it would sit on every share
+        where the phone never zoomed in."""
+        rv = self.remote_view
+        if not rv or rv.get("page") != self.current_page_idx:
+            return
+        x0, y0, x1, y1 = rv["rect"]
+        pw, ph = self.page_width, self.page_height
+        if (x1 - x0) >= pw * 0.92 and (y1 - y0) >= ph * 0.92:
+            return
+        sx0, sy0 = self._pdf_to_screen(x0, y0)
+        sx1, sy1 = self._pdf_to_screen(x1, y1)
+        ctx.save()
+        r, g, b = self.zoom_accent
+        # a soft wash first so the region reads at a glance, then the outline
+        ctx.set_source_rgba(r, g, b, 0.07)
+        ctx.rectangle(sx0, sy0, sx1 - sx0, sy1 - sy0)
+        ctx.fill()
+        ctx.set_source_rgba(r, g, b, 0.85)
+        ctx.set_line_width(2.0)
+        ctx.set_dash([8.0, 5.0])
+        ctx.rectangle(sx0, sy0, sx1 - sx0, sy1 - sy0)
+        ctx.stroke()
+        ctx.restore()
+        ctx.new_path()      # a shared painter must not leave a current point
+
+    def set_remote_view(self, view):
+        """Called from the main thread when the phone reports its camera."""
+        if view == self.remote_view:
+            return
+        self.remote_view = view
+        self.queue_draw()
 
     # ── pasted images ────────────────────────────────────────────────────────
     #
@@ -6301,6 +6417,8 @@ class PDFCanvas(Gtk.DrawingArea):
                     self._arm_straight_timer((cx, cy))
             if self.on_live_draw:
                 self.on_live_draw()   # mirror the in-progress ink live
+            if self.on_live_stream:
+                self.on_live_stream(self.current_stroke)
         self.queue_draw()
 
     def _on_drag_end(self, gesture, offset_x, offset_y):
@@ -6516,6 +6634,10 @@ class PDFCanvas(Gtk.DrawingArea):
             self._live_snap_at = None
             if self.on_live_draw:
                 self.on_live_draw()   # drop the live stroke from the mirror
+            if self.on_live_stream:
+                # the pen lifted: whatever was committed arrives as an ink
+                # delta, so the phone must drop the transient it was showing
+                self.on_live_stream(None)
         self._temp_highlighter = False
         self._apply_cursor()          # the pen lifted — give the pointer back
         self.queue_draw()
@@ -6577,6 +6699,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self.queue_draw()
         if self.on_live_draw:
             self.on_live_draw()
+        if self.on_live_stream:
+            # the dwell replaced the freehand with a clean shape, so the
+            # phone must see the shape and not the line it was drawn with
+            self.on_live_stream(self.current_stroke)
         return False   # one-shot
 
     def _draw_snap_label(self, ctx, sx, sy):
@@ -10439,18 +10565,84 @@ def _run_on_main(func, timeout=30):
     return box.get("r")
 
 
-# The phone-facing page: a current-page image that auto-refreshes (so the viewer
-# follows along live as you draw / flip pages) plus a Download button for the
-# full annotated PDF. An <img> renders on every mobile browser; an embedded PDF
-# does not (Android Chrome won't render PDFs inline in an iframe).
+def _process_remote_touch(touch_state, points):
+    """Turn one batch of phone touch points into ink actions. Fully GTK-free
+    and coordinate-system-agnostic (the caller has already mapped each point
+    into whatever units the target surface wants) so the one rule that
+    matters here — how many fingers, what do they mean — is unit-testable
+    without a browser, a server or a window.
+
+    `touch_state` is a plain dict the caller keeps across batches:
+    {"active": {pointer_id: tool}, "blocked": bool}. Each point in `points`
+    is a dict with x, y (already mapped), p (pressure, may be None), ph
+    ("down"/"move"/"up"/"cancel"), pid (the browser's pointerId) and tool
+    ("pen"/"eraser").
+
+    ONE finger drawing or erasing is a stroke; a SECOND finger joining
+    aborts it rather than starting a second one, the same rule this app's
+    own local touch handling already applies (a second finger reclaims the
+    gesture — see TouchLatch in CLAUDE.md) — so two accidental fingers can
+    never draw two tangled lines. Once a second finger has joined, the whole
+    episode stays blocked until EVERY finger has lifted; the finger left
+    behind after a lift does not quietly resume drawing (a survivor is
+    always a fresh press, never a continuation — same reasoning TouchLatch
+    documents for the local case), so the next stroke only starts on a new,
+    genuinely solo "down".
+
+    Returns a list of action tuples: ("draw_begin"|"draw_update"|"draw_end",
+    x, y, pressure) or ("erase_begin"|"erase_at"|"erase_end", x, y,
+    pressure) — erase actions carry pressure too, for a uniform shape, even
+    though nothing reads it."""
+    actions = []
+    active = touch_state.setdefault("active", {})
+    for pt in points:
+        pid, phase = pt["pid"], pt["ph"]
+        tool = pt.get("tool", "pen")
+        x, y, p = pt["x"], pt["y"], pt.get("p")
+        verb_prefix = "erase" if tool == "eraser" else "draw"
+
+        if phase == "down":
+            active[pid] = tool
+            if len(active) == 2:
+                touch_state["blocked"] = True
+                actions.append(("abort",))
+            elif len(active) == 1 and not touch_state.get("blocked"):
+                actions.append((f"{verb_prefix}_begin", x, y, p))
+            # a third-or-later finger changes nothing further — already blocked
+        elif phase == "move":
+            if (pid in active and len(active) == 1
+                    and not touch_state.get("blocked")):
+                actions.append((f"{verb_prefix}_at" if tool == "eraser"
+                                else "draw_update", x, y, p))
+        elif phase in ("up", "cancel"):
+            solo = (pid in active and len(active) == 1
+                   and not touch_state.get("blocked"))
+            active.pop(pid, None)
+            if solo and phase == "up":
+                actions.append((f"{verb_prefix}_end", x, y, p))
+            if not active:
+                touch_state["blocked"] = False
+    return actions
+
+
+# The FALLBACK phone page, no longer the normal one: a current-page image that
+# auto-refreshes plus a Download button for the full annotated PDF. Scanning
+# the QR now lands on the real browser port (see do_GET's "" branch), which
+# renders the page properly and can zoom; this is what is served when there is
+# no port to send you to, and both cases are real — a TEXT-FIRST page (the
+# port has no text mode yet) and an installed copy with no web/ beside it.
+# Delete it only once neither is true.
+#
+# An <img> renders on every mobile browser; an embedded PDF does not (Android
+# Chrome won't render PDFs inline in an iframe).
 _SHARE_VIEWER_HTML = """<!doctype html>
 <html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">
+<meta name=viewport content="width=device-width,initial-scale=1,user-scalable=no">
 <title>__TITLE__</title>
 <style>
  :root{color-scheme:dark}
  body{margin:0;background:#111;color:#eee;font-family:system-ui,sans-serif}
- header{position:sticky;top:0;z-index:1;display:flex;gap:.6rem;align-items:center;
+ header{position:sticky;top:0;z-index:2;display:flex;gap:.6rem;align-items:center;
    padding:.5rem .75rem;background:#1c1c1c;border-bottom:1px solid #333}
  header .t{flex:1;font-size:.9rem;overflow:hidden;text-overflow:ellipsis;
    white-space:nowrap}
@@ -10462,8 +10654,27 @@ _SHARE_VIEWER_HTML = """<!doctype html>
  #dot{width:.5rem;height:.5rem;border-radius:50%;background:#9ad29a;
    animation:pulse 1.6s infinite}
  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
- #img{display:block;max-width:100%;height:auto;margin:0 auto;background:#fff}
  #err{display:none;color:#e0a0a0;padding:.5rem .75rem;font-size:.8rem}
+ #tools{display:flex;gap:.5rem;padding:.4rem .75rem;background:#1c1c1c;
+   border-bottom:1px solid #333}
+ button.tool{background:#333;color:#eee;border:1px solid #444;border-radius:7px;
+   padding:.4rem .75rem;font-size:.85rem}
+ button.tool.on{background:#3584e4;border-color:#3584e4}
+ /* touch-action:none, and user-scalable=no above: TRIED allowing native
+    pinch-zoom here (touch-action:pinch-zoom) as a stand-in for the real,
+    still-deferred independent phone-side camera (ideas.csv row 182) and
+    REVERTED it — in the hand, the browser did not cleanly split "one
+    finger draws, two fingers zoom" the way the spec suggests. It treated
+    single-finger drags as pannable too, scrolling the whole page (the
+    toolbar included) out of view, and a gesture the browser decides to pan
+    is delivered to us as pointercancel rather than a clean pointerup —
+    which never commits (see up()'s comment: a cancelled touch has nothing
+    to send). So the stopgap didn't just fail to zoom, it silently broke
+    drawing itself. Zoom needs the real camera feature built deliberately,
+    not a touch-action guess. */
+ #stage{position:relative;touch-action:none}
+ #img{display:block;width:100%;height:auto;margin:0 auto;background:#fff}
+ #touch{position:absolute;inset:0;width:100%;height:100%}
 </style></head>
 <body>
 <header>
@@ -10471,11 +10682,50 @@ _SHARE_VIEWER_HTML = """<!doctype html>
  <span id=page></span>
  <a class=btn href="doc.pdf" download="__TITLE__">Download</a>
 </header>
+<div id=tools>
+ <button class="tool on" id=btnPen>Pen</button>
+ <button class="tool" id=btnEraser>Eraser</button>
+</div>
 <div id=live><span id=dot></span><span>Live — follows the presenter</span></div>
 <div id=err>Lost connection to the computer.</div>
-<img id=img alt="current page" src="page.png">
+<div id=stage>
+ <img id=img alt="current page" src="page.png">
+ <canvas id=touch></canvas>
+</div>
 <script>
- let cur=null, fails=0;
+ const img = document.getElementById('img');
+ const cvs = document.getElementById('touch');
+ const ctx = cvs.getContext('2d');
+ let tool = 'pen';
+ document.getElementById('btnPen').onclick = () => setTool('pen');
+ document.getElementById('btnEraser').onclick = () => setTool('eraser');
+ function setTool(t){
+   tool = t;
+   document.getElementById('btnPen').classList.toggle('on', t==='pen');
+   document.getElementById('btnEraser').classList.toggle('on', t==='eraser');
+ }
+ function sizeCanvas(){
+   const r = img.getBoundingClientRect();
+   cvs.width = r.width; cvs.height = r.height;
+ }
+ // The local preview (below) is cleared HERE, once the real committed image
+ // has actually finished loading — not the moment a finger lifts. Clearing
+ // eagerly on lift was the bug: it left a real gap (up to the poll period)
+ // where nothing was drawn at all, since the desktop hasn't rendered and
+ // sent back the committed stroke yet. Guarded on no finger currently down,
+ // so an unrelated poll tick (someone else's edit) can't erase a stroke
+ // that's still being drawn.
+ img.addEventListener('load', () => {
+   sizeCanvas();
+   if (last.size === 0) ctx.clearRect(0, 0, cvs.width, cvs.height);
+ });
+ addEventListener('resize', sizeCanvas);
+
+ let cur=null, fails=0, pollTimer=null;
+ function scheduleTick(delay){
+   if (pollTimer) clearTimeout(pollTimer);
+   pollTimer = setTimeout(tick, delay);
+ }
  async function tick(){
    try{
      const r=await fetch('state',{cache:'no-store'});
@@ -10485,13 +10735,300 @@ _SHARE_VIEWER_HTML = """<!doctype html>
      document.getElementById('page').textContent='Page '+(s.page+1)+' / '+s.pages;
      const key=s.rev+'-'+s.page;
      if(key!==cur){cur=key;
-       document.getElementById('img').src='page.png?v='+encodeURIComponent(key);}
+       img.src='page.png?v='+encodeURIComponent(key);}
    }catch(e){ if(++fails>3) document.getElementById('err').style.display='block'; }
-   setTimeout(tick, 1500);
+   scheduleTick(1500);
  }
  tick();
+
+ // Points are reported in the IMAGE's own natural pixel space, not the
+ // phone's viewport — the server turns that back into document/overlay
+ // coordinates (see _ShareServer's map_point provider). Whether a point
+ // actually draws anything is the DESKTOP's call (the Sharing/Writing
+ // toggle) — the phone always sends touches and always shows the Pen/
+ // Eraser toggle; a point landing while "Sharing" is picked is just
+ // silently ignored server-side, cheaply, with no extra state to sync here.
+ let buf=[];
+ const last=new Map();
+ function queue(clientX, clientY, p, phase, pid){
+   const r=img.getBoundingClientRect();
+   const nx=(clientX-r.left)*(img.naturalWidth/r.width);
+   const ny=(clientY-r.top)*(img.naturalHeight/r.height);
+   buf.push({x:nx,y:ny,p,ph:phase,pid,tool});
+ }
+ function flush(){
+   if(buf.length){
+     const body=JSON.stringify({points:buf});
+     buf=[];
+     fetch('ink',{method:'POST',body}).catch(()=>{});
+   }
+   requestAnimationFrame(flush);
+ }
+ requestAnimationFrame(flush);
+
+ // A local, throwaway preview stroke — immediate feedback while a finger is
+ // down, in plain client pixels. Cleared once every finger lifts; the next
+ // page.png poll then shows the real, committed ink if drawing was on.
+ cvs.addEventListener('pointerdown', e=>{
+   cvs.setPointerCapture(e.pointerId);
+   const r=cvs.getBoundingClientRect();
+   last.set(e.pointerId, {x:e.clientX-r.left, y:e.clientY-r.top});
+   queue(e.clientX, e.clientY, e.pressure||0.5, 'down', e.pointerId);
+ });
+ cvs.addEventListener('pointermove', e=>{
+   const p=last.get(e.pointerId);
+   if(!p) return;
+   const r=cvs.getBoundingClientRect();
+   const lx=e.clientX-r.left, ly=e.clientY-r.top;
+   queue(e.clientX, e.clientY, e.pressure||0.5, 'move', e.pointerId);
+   ctx.strokeStyle = tool==='eraser' ? 'rgba(224,64,64,.65)' : 'rgba(53,132,228,.9)';
+   ctx.lineWidth = tool==='eraser' ? 10 : 3;
+   ctx.lineCap = 'round';
+   ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(lx, ly); ctx.stroke();
+   last.set(e.pointerId, {x:lx, y:ly});
+ });
+ function up(e){
+   if(!last.has(e.pointerId)) return;
+   last.delete(e.pointerId);
+   queue(e.clientX, e.clientY, 0.0, 'up', e.pointerId);
+   // Don't clear the local preview here — a real stroke was just committed
+   // and is on its way back as a rendered image; wiping the preview before
+   // it arrives is exactly what made the ink flash and vanish. Poll again
+   // soon instead of waiting out the rest of the normal interval, so the
+   // real image replaces the preview (in the img 'load' handler above) as
+   // fast as the round trip allows.
+   if(last.size===0) scheduleTick(150);
+ }
+ cvs.addEventListener('pointerup', up);
+ cvs.addEventListener('pointercancel', e=>{
+   if(!last.has(e.pointerId)) return;
+   last.delete(e.pointerId);
+   queue(e.clientX, e.clientY, 0.0, 'cancel', e.pointerId);
+   // A cancelled gesture commits nothing server-side, so nothing is ever
+   // coming back to replace this preview — clear it immediately, unlike up().
+   if(last.size===0) ctx.clearRect(0, 0, cvs.width, cvs.height);
+ });
 </script>
 </body></html>"""
+
+
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_WS_MAX_FRAME = 4 << 20          # a stroke batch is bytes; this is a sanity cap
+
+
+def _ws_accept_key(key):
+    return base64.b64encode(
+        hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+
+
+class _WSConn:
+    """One WebSocket connection, hand-rolled on the stdlib.
+
+    By hand because the phone share is stdlib-only by design (row 182 took a
+    dependency-free prototype deliberately) and what is needed is a small
+    subset: text frames, ping/pong, close. Three details are load-bearing
+    precisely because getting them wrong looks like it works:
+
+    * a client frame is ALWAYS masked and must be unmasked — the browser
+      masks even on a LAN, and skipping it yields plausible-looking garbage
+      rather than an error;
+    * the payload length has THREE encodings, so reading only the 7-bit form
+      is correct until a stroke batch crosses 126 bytes, i.e. until someone
+      draws a real line rather than a test dot;
+    * a message may arrive FRAGMENTED across continuation frames, which the
+      browser is free to do at any size.
+
+    Sending is locked because the reads happen on this connection's own
+    request thread while pushes come from the GTK main thread."""
+
+    OP_CONT, OP_TEXT, OP_BIN, OP_CLOSE, OP_PING, OP_PONG = 0x0, 0x1, 0x2, 0x8, 0x9, 0xA
+
+    def __init__(self, rfile, wfile, cid):
+        self.rfile, self.wfile, self.cid = rfile, wfile, cid
+        self._lock = threading.Lock()
+        self.closed = False
+        # Sending happens on a thread of its OWN, and that is not tidiness:
+        # the live mirror of a desktop stroke is pushed from the motion
+        # handler, on the GTK main thread, while the pen is moving. A socket
+        # write to a phone that has wandered out of wifi blocks — and a main
+        # thread blocked mid-stroke is the app freezing under the hand that
+        # is drawing. Nothing user-facing may touch the socket directly.
+        self._out = []
+        self._live = None          # the latest coalescing frame, if any
+        self._cv = threading.Condition()
+        self._pump_thread = threading.Thread(target=self._pump, daemon=True)
+        self._pump_thread.start()
+
+    # ── writing ──────────────────────────────────────────────────────────
+    def queue(self, text, *, coalesce=False):
+        """Hand a frame to the sender thread. Never blocks.
+
+        `coalesce` is for a stream where only the newest frame matters — the
+        in-progress stroke is sent WHOLE each time, so a frame that has not
+        gone out yet is worthless the moment the next one is built. Without
+        this a phone that briefly cannot keep up accumulates a backlog and
+        then replays it, which looks like the stroke being drawn again in
+        slow motion."""
+        with self._cv:
+            if self.closed:
+                return False
+            if coalesce:
+                self._live = text
+            else:
+                self._out.append(text)
+            self._cv.notify()
+        return True
+
+    def _pump(self):
+        while True:
+            with self._cv:
+                while not self._out and self._live is None and not self.closed:
+                    self._cv.wait()
+                if self.closed:
+                    return
+                if self._out:
+                    blob = self._out.pop(0)
+                else:
+                    blob, self._live = self._live, None
+            self.send(blob)
+
+    def send(self, text):
+        data = text.encode("utf-8")
+        head = bytearray([0x80 | self.OP_TEXT])
+        n = len(data)
+        if n < 126:
+            head.append(n)
+        elif n < 65536:
+            head.append(126)
+            head += struct.pack(">H", n)
+        else:
+            head.append(127)
+            head += struct.pack(">Q", n)
+        return self._raw(bytes(head) + data)
+
+    def _control(self, opcode, payload=b""):
+        payload = payload[:125]          # a control frame's payload is capped
+        self._raw(bytes([0x80 | opcode, len(payload)]) + payload)
+
+    def _raw(self, blob):
+        with self._lock:
+            if self.closed:
+                return False
+            try:
+                self.wfile.write(blob)
+                self.wfile.flush()
+                return True
+            except OSError:
+                # the phone walked out of range / locked its screen
+                self.closed = True
+                return False
+
+    def close(self):
+        self._control(self.OP_CLOSE)
+        with self._cv:
+            self.closed = True
+            self._cv.notify_all()      # let the sender thread retire
+
+    # ── reading ──────────────────────────────────────────────────────────
+    def _exact(self, n):
+        chunks, got = [], 0
+        while got < n:
+            b = self.rfile.read(n - got)
+            if not b:
+                raise ConnectionError("peer closed")
+            chunks.append(b)
+            got += len(b)
+        return b"".join(chunks)
+
+    def recv(self):
+        """The next complete text message, or None when the peer closes."""
+        parts = []
+        while True:
+            b1, b2 = self._exact(2)
+            fin, opcode = b1 & 0x80, b1 & 0x0F
+            masked, n = b2 & 0x80, b2 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._exact(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._exact(8))[0]
+            if n > _WS_MAX_FRAME:
+                raise ConnectionError("frame too large")
+            mask = self._exact(4) if masked else b""
+            payload = self._exact(n) if n else b""
+            if masked:
+                payload = bytes(c ^ mask[i & 3] for i, c in enumerate(payload))
+            if opcode == self.OP_CLOSE:
+                return None
+            if opcode == self.OP_PING:
+                self._control(self.OP_PONG, payload)
+                continue
+            if opcode == self.OP_PONG:
+                continue
+            if opcode in (self.OP_TEXT, self.OP_BIN):
+                parts = [payload]
+            elif opcode == self.OP_CONT:
+                parts.append(payload)
+            if fin and parts:
+                return b"".join(parts).decode("utf-8", "replace")
+
+
+def _web_app_dir():
+    """The browser port's own directory (`web/`) beside this script, or None.
+
+    The port is a CHECKOUT-ONLY asset — install.sh and both PKGBUILDs ship
+    sidemark.py and extras/, never web/ — so an installed copy legitimately
+    has none. Returning None rather than raising is the whole point: the
+    full editor is an ADDITION to share-to-phone, and its absence must cost
+    the existing viewer nothing."""
+    try:
+        here = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+    except NameError:                        # exec'd without a __file__
+        return None
+    d = os.path.join(here, "web")
+    return d if os.path.isfile(os.path.join(d, "index.html")) else None
+
+
+# A module script served under the WRONG content type is refused by the
+# browser with nothing drawn and only a console line to say why, and Python's
+# mimetypes does not know .mjs at all — which is pdf.js's worker. So the port's
+# types are stated here rather than guessed.
+_WEB_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json",
+    ".map": "application/json",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
+    ".wasm": "application/wasm",
+}
+
+# Worth compressing: the port is ~4 MB raw and ~1.2 MB gzipped, and the phone
+# is on wifi. PDFs and PNGs are already-compressed streams and only get slower.
+_WEB_COMPRESSIBLE = ("text/", "application/json", "image/svg+xml",
+                     "application/wasm")
+
+
+def _stroke_to_wire(st):
+    """One stroke in the shape the browser port already uses.
+
+    The two models agree field for field (both carry RGB in 0..1 and a
+    per-point width factor), so this is a rename and a rounding, not a
+    translation: `press` is the port's `profile`. Coordinates are rounded to
+    2dp because they are PDF points — a hundredth of a point is far below
+    anything that can be drawn, and it roughly halves the payload."""
+    out = {"pts": [[round(x, 2), round(y, 2)] for x, y in st["pts"]],
+           "w": st.get("width", 1.0),
+           "c": list(st.get("color") or (0, 0, 0)),
+           "o": st.get("opacity", 1.0)}
+    press = st.get("press")
+    if press:
+        out["p"] = [round(v, 3) for v in press]
+    return out
 
 
 class _ShareServer:
@@ -10500,9 +11037,23 @@ class _ShareServer:
     * static  — serves a single file (legacy; `_ShareServer(path)`).
     * live    — serves a phone viewer that follows the document as it changes:
                 `_ShareServer(providers=...)`, where providers is a dict with
-                'title' (str), 'state' ()->(rev,page,pages), 'render'(path) and
-                'pdf'(path). render/pdf are expected to already marshal to the
-                main thread; state is read straight (cheap int reads)."""
+                'title' (str), 'state' ()->(rev,page,pages), 'render'(path),
+                'pdf'(path), 'map_point'(img_x,img_y)->(target_x,target_y)
+                and 'ink_actions'(actions)->None. render/pdf/ink_actions are
+                expected to already marshal to the main thread; state and
+                map_point are read straight (cheap reads, no GTK object
+                touched off-thread).
+
+    Row 182: viewing and drawing are ONE server/dialog/address-selection —
+    the phone can both watch the page live AND, once the desktop flips the
+    Sharing/Writing toggle (`drawing_allowed`), draw on it — because they are
+    the same underlying live-viewer connection, not two features. This is a
+    deliberate choice (made explicitly by the user, who preferred one
+    unified control over a safety-motivated split) with a real consequence
+    worth stating plainly: whichever address tier is in use — including the
+    PUBLIC Tailscale Funnel link, which needs no app and no shared network at
+    all — also carries write access whenever Writing is on. There is no
+    drawing-only address tier that stays private while viewing goes public."""
 
     def __init__(self, file_path=None, *, providers=None):
         import secrets
@@ -10511,6 +11062,7 @@ class _ShareServer:
         self.port = 0
         self.served = False
         self.funnel_port = None    # set by _share_prepare when Funnel is live
+        self.drawing_allowed = False   # the Sharing/Writing toggle
         self._httpd = None
         self.providers = providers
         self.file_path = file_path
@@ -10519,6 +11071,25 @@ class _ShareServer:
         self._lock = threading.Lock()
         self._img_cache = {"key": None, "data": None}
         self._pdf_cache = {"rev": None, "data": None}
+        self._doc_cache = {"rev": None, "data": None}
+        # one page at a time, keyed by (rev, page) — the phone's first paint
+        self._page_cache = {"key": None, "data": None}
+        # live connections (the full editor). The small viewer polls and needs
+        # none of this; a WebSocket is what makes drawing feel immediate
+        # instead of arriving a poll interval late.
+        self._ws = set()
+        self._ws_lock = threading.Lock()
+        self._ws_seq = 0
+        # Set on the main thread for the duration of one connection's ink, and
+        # read by the push that its own edit triggers — so a phone does not
+        # reload the document because of the stroke it just drew. Both halves
+        # run on the main thread inside one idle callback, so this needs no
+        # lock and cannot interleave.
+        self.ink_origin = None
+        # resolved once: the answer cannot change while we run, and every
+        # request would otherwise stat the disk
+        self.app_dir = _web_app_dir()
+        self._touch_state = {"active": {}}
         self._tmp = (tempfile.mkdtemp(prefix="sidemark-live-")
                      if providers is not None else None)
 
@@ -10544,6 +11115,250 @@ class _ShareServer:
                     self._pdf_cache = {"rev": rev, "data": f.read()}
             return self._pdf_cache["data"]
 
+    @property
+    def editor_available(self):
+        """Whether this share can offer the full browser port as well as the
+        small viewer. Two conditions, and both are real: the port has to be
+        on disk (a checkout, see `_web_app_dir`), and the surface has to be
+        able to hand over a document the port can open — which a text-first
+        page cannot, because text-first mode is not in the port yet."""
+        return bool(self.app_dir and self.providers
+                    and self.providers.get("live_doc"))
+
+    # ── live connections ─────────────────────────────────────────────────
+    def state_payload(self, **extra):
+        rev, page, pages = self.providers["state"]()
+        body = {"t": "state", "rev": rev, "page": page, "pages": pages,
+                "title": self.filename, "editor": self.editor_available,
+                "writing": self.drawing_allowed}
+        body.update(extra)
+        return body
+
+    def ws_register(self):
+        with self._ws_lock:
+            self._ws_seq += 1
+            return self._ws_seq
+
+    def broadcast(self, payload, *, skip=None, coalesce=False):
+        """Push to every live editor. `skip` is a connection id to leave out —
+        the one whose own edit caused this, which must not be told to reload
+        the stroke it is already showing."""
+        body = json.dumps(payload)
+        with self._ws_lock:
+            conns = list(self._ws)
+        for c in conns:
+            if c.cid == skip or c.closed:
+                continue
+            c.queue(body, coalesce=coalesce)
+
+    def notify_live_stroke(self, page, pts, attrs):
+        """The desktop's own in-progress stroke, mirrored while the pen is
+        still down — the same liveness the phone→laptop direction has.
+
+        Sent as the WHOLE stroke so far rather than a delta of new points: a
+        stroke is redrawn from scratch on the phone each time anyway, the
+        pipeline re-shapes its tail on every sample (so an append-only delta
+        would be wrong, not merely bigger), and a dropped frame then costs
+        nothing because the next one carries everything. `pts` of None means
+        the pen lifted: drop the transient, the committed ink is arriving as
+        an ordinary delta right behind it.
+
+        Skips the phone that is drawing, like every other push — it is
+        already showing its own stroke, at its own frame rate."""
+        if not self._ws or self.providers is None:
+            return
+        try:
+            if pts is None:
+                # the CLEAR is not coalescable: dropping it leaves a ghost
+                # stroke on the phone with nothing coming to replace it
+                self.broadcast({"t": "live", "page": page, "pts": None},
+                               skip=self.ink_origin)
+                return
+            self.broadcast({"t": "live", "page": page,
+                            "pts": [[round(x, 2), round(y, 2)] for x, y in pts],
+                            "w": attrs[1], "c": list(attrs[0]), "o": attrs[2]},
+                           skip=self.ink_origin, coalesce=True)
+        except Exception:                          # noqa: BLE001
+            logger.exception("share: failed to mirror the live stroke")
+
+    def notify_change(self):
+        """The document changed on the desktop. Pushed, not polled — and the
+        page's INK rides along, which is what makes it quick.
+
+        The first version told the phone only that something had changed, and
+        the phone answered by re-fetching the whole PDF: `save_copy` writes
+        every annotation on the desktop (~half a second on a long document,
+        row 170's measurement) and pdf.js re-parses the lot on the phone, so
+        a single stroke drawn on the laptop cost a full document round trip
+        and arrived visibly late.
+
+        The strokes of ONE page are a few KB of JSON, and there is nothing to
+        reconcile: the desktop's list is the whole truth for that page —
+        ink the phone drew is in it too, because it was committed there —
+        so the phone REPLACES rather than merging. That is what makes a
+        delta safe here where it usually is not.
+
+        A structural change is the exception the phone detects for itself:
+        `pages` is carried so a page added, deleted or reordered still forces
+        a full reload, where a per-page stroke list would silently describe
+        the wrong page."""
+        if not self._ws or self.providers is None:
+            return
+        try:
+            payload = self.state_payload()
+            ink = self.providers.get("page_ink")
+            if ink is not None:
+                page, strokes = ink()
+                payload["ink"] = {"page": page, "strokes": strokes}
+            self.broadcast(payload, skip=self.ink_origin)
+        except Exception:                          # noqa: BLE001
+            logger.exception("share: failed to push state")
+
+    def ws_serve(self, conn):
+        """One connection's read loop, on its own request thread.
+
+        Each connection keeps its OWN touch state, so the small viewer's HTTP
+        ink and an editor cannot interleave into one another's gesture. Two
+        editors drawing at once is still out of scope (row 182), but they now
+        fail by drawing two strokes rather than by corrupting one."""
+        touch = {"active": {}}
+        try:
+            while True:
+                try:
+                    msg = conn.recv()
+                except (OSError, ConnectionError, struct.error):
+                    return
+                if msg is None:
+                    return
+                try:
+                    self._ws_message(conn, json.loads(msg), touch)
+                except Exception:                  # noqa: BLE001
+                    # one bad message must not drop a live drawing session
+                    logger.exception("share: bad message from the phone")
+        finally:
+            # a phone that has gone is not looking anywhere, and a rectangle
+            # left behind would claim it still is
+            setter = self.providers.get("set_view")
+            if setter is not None:
+                try:
+                    setter(None)
+                except Exception:                  # noqa: BLE001
+                    pass
+
+    def _ws_message(self, conn, m, touch):
+        kind = m.get("t")
+        if kind == "hello":
+            conn.queue(json.dumps(self.state_payload()))
+            return
+        if kind == "view":
+            # Where the phone is looking, for the dashed rectangle on the
+            # desktop page. Cheap and lossy on purpose: it is a hint about
+            # attention, so a dropped update costs nothing and it must never
+            # compete with ink for the connection.
+            setter = self.providers.get("set_view")
+            if setter is not None:
+                rect = m.get("rect")
+                setter({"page": m.get("page"), "rect": tuple(rect)}
+                       if rect and len(rect) == 4 else None)
+            return
+        if kind != "ink":
+            return
+        if not self.drawing_allowed:
+            # Sharing is picked, not Writing — the same cheap refusal the HTTP
+            # route makes, and for the same reason: this arrives every frame.
+            return
+        pid = m.get("id")
+        tool = "eraser" if m.get("tool") == "eraser" else "pen"
+        # The editor sends DOCUMENT coordinates, so there is no map_point here
+        # and there must not be: it holds the real page geometry, which is
+        # exactly what lets it draw under a zoom the desktop knows nothing
+        # about. The small viewer sends image pixels and is mapped instead.
+        pts, first = m.get("pts") or [], pid not in touch["active"]
+        if first and touch["active"]:
+            # A NEW gesture means the previous one is over, whatever the phone
+            # managed to tell us — and it cannot always tell us. The port
+            # abandons a gesture in several places without going through
+            # pointerup (converting a circle to a lasso, a second finger
+            # starting a pinch), and a pointer id left behind here latches
+            # _process_remote_touch's two-finger block FOR EVER: drawing then
+            # stops working until the page is reloaded, with nothing on
+            # either side saying why. The phone closes its streams properly
+            # now; this is here because a transport must not be one client
+            # bug away from wedging itself.
+            touch["active"].clear()
+            touch["blocked"] = False
+            self.providers["ink_actions"]([("abort",)], m.get("page"),
+                                          conn.cid)
+        points = []
+        for i, pt in enumerate(pts):
+            points.append({"x": pt[0], "y": pt[1],
+                           "p": pt[2] if len(pt) > 2 else None,
+                           "ph": "down" if (i == 0 and first) else "move",
+                           "pid": pid, "tool": tool})
+        if m.get("abort"):
+            points.append({"x": 0, "y": 0, "p": None, "ph": "cancel",
+                           "pid": pid, "tool": tool})
+        elif m.get("end"):
+            # coordinates are unread for a lift (remote_stroke_end takes none),
+            # so an end with no points left is still a clean commit
+            points.append({"x": 0, "y": 0, "p": None, "ph": "up",
+                           "pid": pid, "tool": tool})
+        actions = _process_remote_touch(touch, points)
+        if actions:
+            self.providers["ink_actions"](actions, m.get("page"), conn.cid)
+
+    def _live_page(self, n):
+        """ONE page of the document, as its own small PDF.
+
+        The phone does not need 40 MB of lecture to draw on slide 3. It takes
+        the page it is looking at and fetches others as it reaches them, which
+        is what turns "wait for the whole deck" into a first paint.
+
+        Sliced out of the SAME per-revision copy `_live_doc` caches, so a
+        document is serialised at most once per change however many pages are
+        asked for — and annotations come with it (`annots=True`), so a page
+        arrives with the ink already on it rather than blank until the first
+        delta lands."""
+        key = (self.providers["state"]()[0], n)
+        with self._lock:
+            if self._page_cache.get("key") == key:
+                return self._page_cache["data"]
+        data = self._live_doc()
+        src = fitz.open(stream=data, filetype="pdf")
+        try:
+            if n < 0 or n >= src.page_count:
+                raise IndexError(n)
+            out = fitz.open()
+            try:
+                out.insert_pdf(src, from_page=n, to_page=n, annots=True)
+                blob = out.tobytes()
+            finally:
+                out.close()
+        finally:
+            src.close()
+        with self._lock:
+            self._page_cache = {"key": key, "data": blob}
+        return blob
+
+    def _live_doc(self):
+        """The document as the EDITOR must see it, and deliberately NOT the
+        `pdf` provider behind the Download button.
+
+        That one is the baked export — notes, anchors and callouts flattened
+        onto the pages — which is right for a human downloading a copy and
+        wrong here: the port adopts our ink back out of the PDF's annotations
+        (`readInk`) into editable strokes, and a flattened export arrives as a
+        picture of ink that nothing can erase, lasso or undo. `save_copy`
+        writes the real document with the annotations still annotations."""
+        rev, _, _ = self.providers["state"]()
+        with self._lock:
+            if self._doc_cache["rev"] != rev or self._doc_cache["data"] is None:
+                p = os.path.join(self._tmp, "live.pdf")
+                self.providers["live_doc"](p)
+                with open(p, "rb") as f:
+                    self._doc_cache = {"rev": rev, "data": f.read()}
+            return self._doc_cache["data"]
+
     def start(self):
         import http.server
         import json as _json
@@ -10552,15 +11367,78 @@ class _ShareServer:
         token, fname = self.token, self.filename
 
         class _Handler(http.server.BaseHTTPRequestHandler):
-            def _send(self, data, ctype, disposition=None):
+            # Keep-alive: the browser port is 31 requests, and HTTP/1.0 closes
+            # the connection after every one of them — a TCP handshake per
+            # asset, and per touch batch on the ink route. It is also what
+            # lets the 101 upgrade below be a legal response at all.
+            protocol_version = "HTTP/1.1"
+            # ...which means an idle connection would otherwise hold its
+            # thread for ever.
+            timeout = 60
+
+            def _send(self, data, ctype, disposition=None, *,
+                      cache="no-store", etag=None):
+                # gzip is not a nicety here: the browser port is ~4 MB of
+                # vendored libraries and the client is a phone. The stdlib
+                # handler does none of this for us.
+                enc = None
+                if (len(data) > 1400
+                        and ctype.startswith(_WEB_COMPRESSIBLE)
+                        and "gzip" in self.headers.get("Accept-Encoding", "")):
+                    data, enc = gzip.compress(data, 6), "gzip"
                 self.send_response(200)
                 self.send_header("Content-Type", ctype)
                 if disposition:
                     self.send_header("Content-Disposition", disposition)
+                if enc:
+                    self.send_header("Content-Encoding", enc)
+                    self.send_header("Vary", "Accept-Encoding")
+                if etag:
+                    self.send_header("ETag", etag)
                 self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-store")
+                self.send_header("Cache-Control", cache)
                 self.end_headers()
                 self.wfile.write(data)
+
+            def _send_app_file(self, rel):
+                """Serve one file of the browser port, under the same token
+                path as everything else.
+
+                The containment check is against the REAL path on both sides:
+                the port is served straight off the disk of whoever is
+                sharing, and this route is reachable from a public Funnel
+                link, so `..` must not walk out of `web/` into their home
+                directory."""
+                root = server.app_dir
+                if not root:
+                    self.send_error(404)
+                    return
+                full = os.path.realpath(os.path.join(root, rel or "index.html"))
+                if not (full == root or full.startswith(root + os.sep)) \
+                        or not os.path.isfile(full):
+                    self.send_error(404)
+                    return
+                ext = os.path.splitext(full)[1].lower()
+                try:
+                    st = os.stat(full)
+                    tag = f'"{int(st.st_mtime)}-{st.st_size}"'
+                    # A second load of a 1.2 MB app should cost nothing. The
+                    # short max-age keeps a checkout you are editing honest,
+                    # and the ETag makes the revalidation after it a 304.
+                    if self.headers.get("If-None-Match") == tag:
+                        self.send_response(304)
+                        self.send_header("ETag", tag)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    with open(full, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    self.send_error(404)
+                    return
+                self._send(data,
+                           _WEB_TYPES.get(ext, "application/octet-stream"),
+                           cache="max-age=60", etag=tag)
 
             def do_GET(self):
                 path = unquote(self.path.split("?", 1)[0])
@@ -10587,14 +11465,41 @@ class _ShareServer:
 
                 try:
                     if sub in ("", "index.html"):
+                        if server.editor_available:
+                            # The QR goes straight to the real editor. There
+                            # is no landing page any more: an extra tap
+                            # between scanning a code and drawing bought
+                            # nothing, and the thing it used to offer — a
+                            # picture of the desktop's view — is strictly
+                            # worse than the page itself.
+                            #
+                            # A REDIRECT rather than serving the app here,
+                            # because the port is a tree of relative URLs: at
+                            # /<token>/ its own `../live.pdf` would resolve
+                            # outside the token path and 404.
+                            self.send_response(302)
+                            self.send_header("Location", "app/?live=1")
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                            return
+                        # ...unless there is no editor to send them to: a
+                        # text-first page (the browser port has no text mode
+                        # yet) or an installed copy with no web/ beside it.
+                        # Those keep the small viewer, which is the whole
+                        # reason it still exists.
                         html = _SHARE_VIEWER_HTML.replace(
                             "__TITLE__", _html_escape(fname))
                         self._send(html.encode("utf-8"),
                                    "text/html; charset=utf-8")
                     elif sub == "state":
                         rev, page, pages = server.providers["state"]()
+                        # `title` and `editor` are additive: the small viewer
+                        # reads neither, the full editor names its document
+                        # and knows whether it is even on offer.
                         body = _json.dumps(
-                            {"rev": rev, "page": page, "pages": pages})
+                            {"rev": rev, "page": page, "pages": pages,
+                             "title": fname,
+                             "editor": server.editor_available})
                         self._send(body.encode("utf-8"), "application/json")
                     elif sub == "page.png":
                         self._send(server._live_image(), "image/png")
@@ -10602,10 +11507,106 @@ class _ShareServer:
                         self._send(server._live_pdf(), "application/pdf",
                                    f'attachment; filename="{fname}"')
                         server.served = True
+                    elif sub == "page.pdf":
+                        if not server.editor_available:
+                            self.send_error(404)
+                            return
+                        from urllib.parse import parse_qs
+                        q = parse_qs(self.path.split("?", 1)[1]
+                                     if "?" in self.path else "")
+                        try:
+                            n = int((q.get("n") or ["0"])[0])
+                        except ValueError:
+                            self.send_error(400)
+                            return
+                        self._send(server._live_page(n), "application/pdf")
+                    elif sub == "live.pdf":
+                        # the editor's source — see _ShareServer._live_doc
+                        if not server.editor_available:
+                            self.send_error(404)
+                            return
+                        self._send(server._live_doc(), "application/pdf")
+                    elif sub == "app":
+                        # without the trailing slash every relative URL in the
+                        # port would resolve one level too high
+                        self.send_response(301)
+                        self.send_header("Location", "app/")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                    elif sub.startswith("app/"):
+                        self._send_app_file(sub[4:])
+                    elif sub == "ws":
+                        self._serve_websocket()
                     else:
                         self.send_error(404)
                 except Exception:                      # noqa: BLE001
                     self.send_error(503)
+
+            def _serve_websocket(self):
+                """Upgrade this request into a live connection.
+
+                Same origin as everything else, which is the whole reason this
+                works at all: a page loaded from the desktop may open a socket
+                back to it, while the hosted copy on GitHub Pages may not —
+                mixed content and Chrome's Local Network Access both refuse,
+                and TLS does not lift the second (measured; see
+                notes/phone-web-port-sync-plan.md)."""
+                key = self.headers.get("Sec-WebSocket-Key")
+                upgrade = (self.headers.get("Upgrade") or "").lower()
+                if not key or "websocket" not in upgrade:
+                    self.send_error(400)
+                    return
+                self.send_response(101)
+                self.send_header("Upgrade", "websocket")
+                self.send_header("Connection", "Upgrade")
+                self.send_header("Sec-WebSocket-Accept", _ws_accept_key(key))
+                self.end_headers()
+                self.wfile.flush()
+                # no read timeout once upgraded: a phone that is being looked
+                # at rather than drawn on is legitimately silent for minutes
+                try:
+                    self.connection.settimeout(None)
+                except OSError:
+                    pass
+                conn = _WSConn(self.rfile, self.wfile, server.ws_register())
+                with server._ws_lock:
+                    server._ws.add(conn)
+                try:
+                    server.ws_serve(conn)
+                finally:
+                    with server._ws_lock:
+                        server._ws.discard(conn)
+                    conn.closed = True
+                self.close_connection = True
+
+            def do_POST(self):
+                # Ink only exists in live mode, on the one /ink route.
+                if server.providers is None or self.path != f"/{token}/ink":
+                    self.send_error(404)
+                    return
+                if not server.drawing_allowed:
+                    # Sharing is picked, not Writing: the cheapest possible
+                    # reject, no main-thread hop at all — a touch batch fires
+                    # every animation frame, so this must cost nothing.
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                length = int(self.headers.get("Content-Length", 0))
+                try:
+                    payload = _json.loads(self.rfile.read(length))
+                    points = []
+                    for pt in payload.get("points", []):
+                        mx, my = server.providers["map_point"](pt["x"], pt["y"])
+                        points.append({**pt, "x": mx, "y": my})
+                    actions = _process_remote_touch(server._touch_state, points)
+                    if actions:
+                        server.providers["ink_actions"](actions)
+                except Exception:                      # noqa: BLE001
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                self.send_response(204)
+                self.end_headers()
 
             def log_message(self, *_a):
                 pass   # don't spam stderr
@@ -10631,6 +11632,13 @@ class _ShareServer:
         return self.url_for(self.ip)
 
     def stop(self):
+        with self._ws_lock:
+            conns, self._ws = list(self._ws), set()
+        for c in conns:
+            try:
+                c.close()
+            except Exception:                      # noqa: BLE001
+                pass
         if self.funnel_port:
             _tailscale_funnel_stop(self.funnel_port)
             self.funnel_port = None
@@ -15373,6 +16381,61 @@ class TextPageView(Gtk.Overlay):
         if self.on_ink_changed:
             self.on_ink_changed()
 
+    # ── "Draw from phone" (row 182) ──────────────────────────────────────────
+    # PDFCanvas's twin — see it for the contract. Points here are overlay
+    # pixels (the caller has already mapped a phone touch onto the sheet's
+    # current visible viewport), which is exactly what current_stroke holds
+    # during a local drag too, so _finish_stroke/_commit_stroke need no
+    # remote-specific branch at all.
+
+    def remote_stroke_begin(self, ox, oy, pressure=None):
+        self._recent_samples = []
+        self._capture_samples = []
+        self._capture_events = 0
+        self.current_stroke = [(ox, oy)]
+        self.current_press = [pressure] if pressure is not None else []
+
+    def remote_stroke_update(self, ox, oy, pressure=None):
+        if not self.current_stroke:
+            return
+        self.current_stroke.append((ox, oy))
+        if self.current_press:
+            self.current_press.append(pressure if pressure is not None else 1.0)
+        self.ink.queue_draw()
+
+    def remote_stroke_end(self):
+        if not self.current_stroke:
+            return
+        pts, prof = self._finish_stroke(self.current_stroke, was_straight=False)
+        self._commit_stroke(pts, prof)
+        self.current_stroke = []
+        self.ink.queue_draw()
+
+    def remote_erase_begin(self):
+        self._erased_now = []
+
+    def remote_erase_at(self, ox, oy):
+        self._erase_at(ox, oy)
+
+    def remote_erase_end(self):
+        if self._erased_now:
+            self._undo_ops.append(("erase", self._erased_now))
+            self._redo_ops.clear()
+            self._erased_now = []
+            if self.on_ink_action:
+                self.on_ink_action()
+        self.ink.queue_draw()
+
+    def remote_abort(self):
+        """PDFCanvas's twin — see it for the contract. Also drops any
+        erase-in-progress: _erased_now is about to be reset by the next
+        remote_erase_begin regardless, but clearing it here means the
+        stray removal preview can't outlive the gesture it belonged to."""
+        self.current_stroke = []
+        self.current_press = []
+        self._erased_now = []
+        self.ink.queue_draw()
+
     # ── circle to lasso (row 126) ───────────────────────────────────────────
     # PDFCanvas._arm_circle_lasso's twin — see it for the contract and for why
     # the pen lift, not the shape, is what keeps this clear of the dwell snap.
@@ -15433,6 +16496,30 @@ class TextPageView(Gtk.Overlay):
         actually see, at every zoom."""
         f = self.font_px / max(st["font_px"], 1)
         return erase_radius(st["width"] * f)
+
+    def render_snapshot_png(self, path):
+        """One flat PNG of exactly what's on screen right now — text AND ink
+        composited, since `self` (a Gtk.Overlay) parents both `self.view` and
+        `self.ink`, and a WidgetPaintable snapshots a widget as GTK would
+        paint it, overlay children included. This is the text-sheet's answer
+        to `_render_share_page`, for the "Draw from phone" phone mirror
+        (row 182) — unlike `_write_text_pdf`'s vector-ink re-draw (built for
+        PRINT quality), a raster of the live viewport is plenty for a mobile
+        preview, and at native size (no pagination, no upscale) the pixel
+        dimensions here are exactly what map_point's inverse needs: none,
+        since phone-image pixels and overlay pixels are then the same units."""
+        w, h = self.get_width(), self.get_height()
+        if w < 1 or h < 1:
+            raise OSError("the page has no layout yet")
+        paintable = Gtk.WidgetPaintable.new(self)
+        snapshot = Gtk.Snapshot()
+        paintable.snapshot(snapshot, w, h)
+        node = snapshot.to_node()
+        if node is None:
+            raise OSError("nothing to render")
+        renderer = self.get_native().get_renderer()
+        texture = renderer.render_texture(node, Graphene.Rect().init(0, 0, w, h))
+        texture.save_to_png(path)
 
     def _erase_at(self, x, y):
         # Hit-test every SEGMENT, not just the stored vertices, reusing the PDF
@@ -16815,6 +17902,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                                 # its own (unpublished) server back down
                                 # instead of reviving a share you already
                                 # walked away from
+        self._share_pulse_id = None   # GLib.timeout_add id for the header
+                                       # button's "● Live" pulse (row 182),
+                                       # or None while it's off
         self._notes_link_updating = False   # guards the row-129 checkbox
         self._bookmark_updating = False     # the same guard for the bookmark toggle
         self._bookmark_lists = []           # every live copy of the list widget
@@ -17195,6 +18285,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         menu_box.append(cm_row)
         _menu_item("Save", lambda: (menu_pop.popdown(), self._on_save()),
                    "Save the document and its notes (Ctrl+S)")
+        # Mode-neutral (both PDF and text-first pages) — this app's "both
+        # modes, always" rule, so it sits outside the two mode-gated groups
+        # below rather than needing to appear in both of them. Row 182:
+        # viewing AND drawing from a phone are the one unified feature now,
+        # so there is one entry point, not two.
+        _menu_item("Share to phone…",
+                   lambda: (menu_pop.popdown(), self._on_share_to_phone()),
+                   "Show a QR code to view — or, with the Writing toggle, "
+                   "draw on — this document from a phone")
         # PDF-only actions — hidden while a text-first page is active
         # (see _update_header_for_mode)
         self._pdf_menu_items = (
@@ -17204,9 +18303,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             _menu_item("Add text layer (OCR)",
                        lambda: (menu_pop.popdown(), self._ocr_current()),
                        "Run OCR so a scanned document's text becomes selectable and searchable"),
-            _menu_item("Share to phone…",
-                       lambda: (menu_pop.popdown(), self._on_share_to_phone()),
-                       "Show a QR code to open this PDF on a phone on the same Wi-Fi"),
             _menu_item("Notes file…",
                        lambda: (menu_pop.popdown(), self._choose_notes_file()),
                        "Choose which Markdown file this document's notes are saved to"),
@@ -17826,11 +18922,29 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "Presenter view — mirror the page on a second screen (F5)")
         self._present_btn.connect("toggled", self._on_present_toggled)
 
-        # Sibling of the presenter button: mirror the page to a phone instead of
-        # a second screen — a live view the audience can follow, QR to connect.
-        self._share_btn = Gtk.Button()
-        self._share_btn.set_icon_name(
+        # Sibling of the presenter button: mirror the page to a phone instead
+        # of a second screen — a live view the audience can follow, QR to
+        # connect, and (row 182) a Sharing/Writing toggle inside the panel
+        # that also lets that same phone draw on the page. ONE button for
+        # both, not a trigger-in-the-☰-menu plus a separate status widget —
+        # click always opens/reopens the panel (never a second meaning for
+        # the click), and while a session is live its content grows a
+        # pulsing "● Live" — a state CONTENT change, not a colour tint (a QR
+        # icon merely turning green was explicitly asked to be told apart
+        # from here). The dot's opacity is toggled by a GLib timeout on the
+        # same 1.0/0.25 swing as the phone page's own #dot keyframes
+        # (_SHARE_VIEWER_HTML) — ported from a CSS animation since GTK's own
+        # CSS gives us no @keyframes to lean on for this.
+        self._share_icon = Gtk.Image.new_from_icon_name(
             _themed_icon("qr-code-symbolic", "phone-symbolic"))
+        self._share_dot = Gtk.Label(label="●")
+        self._share_dot.add_css_class("success")
+        self._share_live_label = Gtk.Label(label="Live")
+        self._share_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                                      spacing=4)
+        self._share_content.append(self._share_icon)
+        self._share_btn = Gtk.Button()
+        self._share_btn.set_child(self._share_content)
         self._share_btn.set_tooltip_text(
             "Share to phone — live view + QR code")
         self._share_btn.connect("clicked", lambda _: self._on_share_to_phone())
@@ -19598,6 +20712,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 self._pdf_dirty = True
         # bump the revision so any live phone-share view knows to refresh
         self._share_revision += 1
+        # ...and TELL it, rather than leaving it to notice on its next poll.
+        # A pushed change is the difference between a phone that feels live
+        # and one that is up to a poll interval behind.
+        srv = getattr(self, "_share_server", None)
+        if srv is not None:
+            srv.notify_change()
         if self._presenter is not None:
             self._presenter.refresh()
 
@@ -19914,6 +21034,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         SWITCHING TABS changes the page in front without any page changing, so
         it fires nothing at all. That is the one that read "155 / 800" over a
         different document until you happened to turn a page."""
+        # A page turn is not a document change, so it never reaches
+        # _mark_dirty — and a phone following along has to hear about it.
+        srv = getattr(self, "_share_server", None)
+        if srv is not None:
+            srv.notify_change()
         text_mode = self._text_mode
         doc = self.canvas.document if self.canvas is not None else None
         if doc is None or text_mode:
@@ -22688,7 +23813,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         "_toc_btn":      ("pdf",),
         "_nav_box":      ("pdf",),
         "_pages_box":    ("pdf",),
-        "_share_btn":    ("pdf",),
+        # row 182: Share to phone now covers a text-first page too (viewing
+        # AND drawing), since it's no longer PDF-only infrastructure
+        "_share_btn":    ("pdf", "text"),
         # a text page is one endless sheet with no page structure to bookmark —
         # the same reason linked page notes are PDF-only (row 129)
         "_bookmark_btn": ("pdf",),
@@ -24649,9 +25776,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     # ── share to phone (LAN HTTP + QR, #62) ─────────────────────────────────────
     def _on_share_to_phone(self):
-        if self.canvas.document is None:
-            self._toast("Open a PDF first to share it.")
-            return
+        # Row 182: a text-first page shares/draws too now — the same reason
+        # this app never leaves a text page out of a PDF-shaped feature
+        # without a stated reason (there is none here).
+        if self._text_mode:
+            tp = self._ensure_text_page(self._active_session)
+            canvas = None
+        else:
+            if self.canvas.document is None:
+                self._toast("Open a document first to share it.")
+                return
+            canvas = self.canvas
+            tp = None
         self._commit_note()
         # Sharing OUTLIVES the window now (closing it is not stopping it —
         # see _stop_sharing), so a second Share click can land in three
@@ -24667,7 +25803,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # Show the dialog *immediately* with a spinner; the slow parts
         # (baking the PDF, starting the server, rendering QR codes) run in a
         # worker thread so the button feels responsive.
-        self._show_share_dialog()
+        self._show_share_dialog(canvas, tp)
 
     @staticmethod
     def _share_prepare(out_dir, server, name):
@@ -24724,19 +25860,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 funnel_url = server.url_for(funnel_host, scheme="https",
                                             port=None)
                 funnel_qr = os.path.join(out_dir, "qr-funnel.png")
-                funnel_entry = {"caption": "Anyone with the link (public)",
+                funnel_entry = {"caption": "Public",
                                 "url": funnel_url,
                                 "qr": funnel_qr
                                     if _make_qr_png(funnel_url, funnel_qr)
                                     else None}
             else:
-                funnel_entry = {"caption": "Anyone with the link (public)",
+                funnel_entry = {"caption": "Public",
                                 "hint": funnel_hint or
                                 ("Enable Funnel for this tailnet in the "
                                  "Tailscale admin console to get a public "
                                  "link that needs no app on the phone.")}
         else:
-            funnel_entry = {"caption": "Anyone with the link (public)",
+            funnel_entry = {"caption": "Public",
                             "hint": ("Connect this computer to Tailscale to "
                                      "turn on a public link (Funnel) that "
                                      "needs no app on the phone.")}
@@ -24760,7 +25896,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             if entry.get("qr"):
                 pic = Gtk.Picture.new_for_filename(entry["qr"])
                 pic.set_can_shrink(False)
-                pic.set_size_request(160, 160)
+                pic.set_size_request(220, 220)
                 col.append(pic)
             else:
                 hint = Gtk.Label(label="Install ‘qrencode’ for a scannable code.")
@@ -24776,7 +25912,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             col.append(link)
         else:
             spacer = Gtk.Box()
-            spacer.set_size_request(160, 160)
+            spacer.set_size_request(220, 220)
             icon = Gtk.Image.new_from_icon_name("network-vpn-symbolic")
             icon.set_pixel_size(48)
             icon.set_vexpand(True)
@@ -24814,21 +25950,44 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _update_share_indicator(self, active):
         """The Share button IS the "currently sharing" indicator (#180) — no
-        separate banner row. `.success` is Adwaita's own green-tint class, so
-        this needs no new widget or header layout change (which would have
-        broken the test walking _header_end's direct children); the button's
-        CLICK BEHAVIOUR never changes — it always opens/reopens the panel,
-        active or not — so lighting up is purely a look, never a second
-        meaning for the same click, which is what made a plain toggle
-        ambiguous here (does clicking an active toggle stop it, or view it?).
-        Stop sharing lives inside the panel this always opens."""
+        separate banner row. The button's CLICK BEHAVIOUR never changes — it
+        always opens/reopens the panel, active or not — so this is purely a
+        look, never a second meaning for the same click, which is what made
+        a plain toggle ambiguous here (does clicking an active toggle stop
+        it, or view it?). Stop sharing lives inside the panel this always
+        opens.
+
+        Row 182: a pulsing "● Live" grown onto the button's own content,
+        replacing the earlier plain `.success` colour tint — asked for
+        explicitly as something that reads as its own status rather than a
+        QR icon merely turning green, once viewing and drawing were unified
+        onto this one button."""
         self._share_btn.set_tooltip_text(
             "Sharing to phone — click to view or stop" if active
             else "Share to phone — live view + QR code")
         if active:
-            self._share_btn.add_css_class("success")
+            if self._share_dot.get_parent() is None:
+                self._share_content.append(self._share_dot)
+                self._share_content.append(self._share_live_label)
+            if self._share_pulse_id is None:
+                self._share_pulse_id = GLib.timeout_add(
+                    700, self._pulse_share_dot)
         else:
-            self._share_btn.remove_css_class("success")
+            if self._share_dot.get_parent() is not None:
+                self._share_content.remove(self._share_dot)
+                self._share_content.remove(self._share_live_label)
+            if self._share_pulse_id is not None:
+                GLib.source_remove(self._share_pulse_id)
+                self._share_pulse_id = None
+                self._share_dot.set_opacity(1.0)
+
+    def _pulse_share_dot(self):
+        # Same 1.0/0.25 opacity swing as the phone page's own #dot keyframes
+        # (_SHARE_VIEWER_HTML) — ported to a timeout since GTK's CSS gives us
+        # no @keyframes to lean on for this.
+        self._share_dot.set_opacity(
+            0.25 if self._share_dot.get_opacity() > 0.6 else 1.0)
+        return True   # keep going until _update_share_indicator(False) stops us
 
     def _on_share_window_close(self, win):
         """Closing the QR window is NOT stopping the share (that changed —
@@ -24860,6 +26019,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._share_gen += 1
         server, out_dir = self._share_server, self._share_out_dir
         self._share_server = None
+        # stop mirroring into a server that is going away, and take the
+        # phone's viewport rectangle off the page with it
+        for sess in getattr(self, "_sessions", ()) or ():
+            cv = getattr(sess, "canvas", None)
+            if cv is not None:
+                cv.on_live_stream = None
+                if getattr(cv, "remote_view", None) is not None:
+                    cv.set_remote_view(None)
         self._share_out_dir = None
         self._share_entries = None
         if server is not None:
@@ -24891,11 +26058,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # The window's own close button (X) dismisses without stopping —
         # _on_share_window_close is what makes that true, not a widget here.
         # Stop sharing is the one button that actually ends it, so it's the
-        # only one worth adding explicitly.
+        # only one worth adding explicitly. Deliberately NOT styled
+        # destructive-action: nothing is lost by stopping (unlike a delete),
+        # so a bold red button fighting the X for attention overstated what
+        # the action actually does — reworked along with the rest of the
+        # dialog's visual weight (row 182).
         stop_btn = Gtk.Button(label="Stop sharing")
         stop_btn.set_tooltip_text("Stop the phone from being able to reach "
                                   "this document")
-        stop_btn.add_css_class("destructive-action")
         stop_btn.set_sensitive(False)   # nothing to stop until it's ready
         stop_btn.connect("clicked", lambda _b: self._stop_sharing())
         header.pack_end(stop_btn)
@@ -24932,49 +26102,94 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         box.append(msg)
         body.append(box)
 
-    def _show_share_ready(self, body, entries):
-        """Fill body with the intro + mode switcher + live indicator for a
-        (server, entries) pair that's already live — shared by a fresh
-        share's worker callback and by reopening the window on one that's
-        still running, so reopening never re-runs tailscale/funnel/QR work."""
+    def _show_share_ready(self, body, server, entries):
+        """Fill body for a (server, entries) pair that's already live —
+        shared by a fresh share's worker callback and by reopening the
+        window on one that's still running, so reopening never re-runs
+        tailscale/funnel/QR work.
+
+        Reworked (row 182, on request): the QR is the one thing here that
+        can't be smaller, so it gets the visual weight; everything else is
+        ranked by how often it's actually touched. Sharing/Writing is a real
+        decision made most sessions — prominent. Which network address is in
+        use is usually not a decision at all (it already auto-picks the
+        best option) — demoted from an always-visible 3-way switcher to a
+        compact dropdown that only expands when you go looking for it. The
+        instruction paragraph shrank to one line — Download/Stop/etc. are
+        discovered by using them once, not read every time the dialog opens."""
         self._clear_box(body)
-        intro = Gtk.Label(
-            label="Scan to open a <b>live view</b> on your phone — it follows "
-                  "along as you draw and flip pages. Tap <b>Download</b> there "
-                  "for the full annotated PDF. Sharing keeps running when "
-                  "you close this window — use <b>Stop sharing</b> to end it.")
-        intro.set_use_markup(True)
-        intro.set_wrap(True)
-        intro.set_xalign(0)
+        intro = Gtk.Label(label="Scan with your phone's camera.")
+        intro.add_css_class("dim-label")
+        intro.set_xalign(0.5)
+        intro.set_halign(Gtk.Align.CENTER)
         body.append(intro)
 
-        # A switcher instead of 3 side-by-side columns, defaulting to the
-        # best reachable option — "anyone with the link" beats a tailnet
-        # link beats plain LAN, in the order _share_prepare already returns
-        # them in, so the first entry with a live "url" wins.
-        stack = Gtk.Stack()
-        stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
-        stack.set_vexpand(True)
-        switcher = Gtk.StackSwitcher()
-        switcher.set_stack(stack)
-        switcher.set_halign(Gtk.Align.CENTER)
-        switcher.set_margin_top(6)
-        body.append(switcher)
-        body.append(stack)
+        # Row 182: Sharing (view-only) vs Writing (the phone can also draw/
+        # erase, with the current pen, on whichever address is in use beside
+        # it — including the public link, if that's the one picked). A
+        # two-way exclusive toggle rather than an additive "allow drawing"
+        # checkbox, since the user framed it as one of two modes to be in,
+        # not a permission layered on top of viewing. This is the one
+        # control here that's a real decision most sessions, so it stays
+        # prominent — sharing the same row as the network dropdown puts both
+        # of this dialog's controls at one glance, with the toggle still
+        # given the visual lead by being the linked/grouped one.
+        top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        top_row.set_halign(Gtk.Align.CENTER)
+        top_row.set_margin_top(6)
 
-        default_name = None
-        for i, entry in enumerate(entries):
-            page_name = f"e{i}"
-            stack.add_titled(self._share_entry(entry, show_caption=False),
-                             page_name, entry["caption"])
-            if default_name is None and "url" in entry:
-                default_name = page_name
-        stack.set_visible_child_name(default_name or f"e{len(entries) - 1}")
+        mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        mode_row.add_css_class("linked")
+        share_toggle = Gtk.ToggleButton(label="Sharing")
+        write_toggle = Gtk.ToggleButton(label="Writing")
+        write_toggle.set_group(share_toggle)
+        share_toggle.set_active(not server.drawing_allowed)
+        write_toggle.set_active(server.drawing_allowed)
+        share_toggle.set_tooltip_text(
+            "View-only — the phone follows along but can't change anything")
+        write_toggle.set_tooltip_text(
+            "The phone can draw on this page with the current pen, or erase")
+        share_toggle.connect(
+            "toggled",
+            lambda b: b.get_active() and setattr(server, "drawing_allowed", False))
+        write_toggle.connect(
+            "toggled",
+            lambda b: b.get_active() and setattr(server, "drawing_allowed", True))
+        mode_row.append(share_toggle)
+        mode_row.append(write_toggle)
+        top_row.append(mode_row)
+
+        # Which network address is in use — a DropDown instead of the old
+        # always-visible 3-way switcher, defaulting to the best reachable
+        # option ("anyone with the link" beats a tailnet link beats plain
+        # LAN, in the order _share_prepare already returns them in, so the
+        # first entry with a live "url" wins). Compact by construction: it
+        # only grows into a list when you actually click it.
+        dropdown = Gtk.DropDown.new_from_strings([e["caption"] for e in entries])
+        dropdown.add_css_class("flat")
+        dropdown.set_tooltip_text("Which network the phone connects over")
+        default_idx = next((i for i, e in enumerate(entries) if "url" in e),
+                           len(entries) - 1)
+        dropdown.set_selected(default_idx)
+        top_row.append(dropdown)
+
+        body.append(top_row)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content.set_margin_top(10)
+        body.append(content)
+
+        def show_entry(*_a):
+            self._clear_box(content)
+            content.append(self._share_entry(entries[dropdown.get_selected()],
+                                             show_caption=False))
+        dropdown.connect("notify::selected", show_entry)
+        show_entry()
 
         live = Gtk.Label(label="●  Live — your phone mirrors this document")
         live.add_css_class("dim-label")
         live.add_css_class("caption")
-        live.set_margin_top(4)
+        live.set_margin_top(10)
         body.append(live)
 
     def _show_share_failed(self, body, message):
@@ -24991,31 +26206,45 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         new _ShareServer, no re-running tailscale/funnel."""
         win, body, stop_btn = self._build_share_window_shell()
         stop_btn.set_sensitive(True)
-        self._show_share_ready(body, self._share_entries)
+        self._show_share_ready(body, self._share_server, self._share_entries)
         win.present()
 
-    def _show_share_dialog(self):
+    def _show_share_dialog(self, canvas, tp):
         """Start a share from scratch: a spinner first, then the worker
         thread fills in the picker once _share_prepare returns. Only called
         when nothing is live yet — _on_share_to_phone routes an already-live
         share to _reopen_share_window instead. The window and the share it
         shows are two different lifetimes now — see _on_share_window_close /
-        _stop_sharing."""
+        _stop_sharing.
+
+        `canvas, tp` are bound to whichever surface is active *now* (exactly
+        one of them is non-None) — the same "bind at connect time" contract
+        as before, generalized from PDF-only to row 182's "both modes,
+        always": a text-first page shares/draws through `tp` exactly as a
+        PDF does through `canvas`, and switching tabs afterwards doesn't
+        retarget an already-live session."""
         out_dir = tempfile.mkdtemp(prefix="sidemark-share-")
-        # Bind to the document that's active *now*, so the live view keeps
-        # following it even if the user switches tabs while sharing.
-        canvas = self.canvas
-        save_copy = canvas.save_copy
         notes_model = self.notes_model
-        accent = canvas.zoom_accent
-        name = (os.path.basename(self._path)
-                if (self._path and not self._is_untitled) else "document.pdf")
-        if not name.lower().endswith(".pdf"):
-            name += ".pdf"
+        accent = self.canvas.zoom_accent
+
+        if tp is not None:
+            base = (os.path.basename(self._notes_path)
+                    if self._notes_path else "notes")
+            name = os.path.splitext(base)[0] + ".pdf"
+        else:
+            save_copy = canvas.save_copy
+            name = (os.path.basename(self._path)
+                    if (self._path and not self._is_untitled) else "document.pdf")
+            if not name.lower().endswith(".pdf"):
+                name += ".pdf"
 
         def bake(out_path):
-            # The full annotated export (ink + grouped notes/anchors/callouts/
-            # text boxes) served behind the Download button.
+            # The full annotated export served behind the Download button —
+            # ink + grouped notes/anchors/callouts/text boxes for a PDF, the
+            # sheet's own A4 render for a text page.
+            if tp is not None:
+                self._write_text_pdf(out_path)
+                return
             ink = out_path + ".ink.pdf"
             save_copy(ink)
             try:
@@ -25028,15 +26257,55 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 except OSError:
                     pass
 
+        def render(path):
+            if tp is not None:
+                tp.render_snapshot_png(path)
+            else:
+                self._render_share_page(canvas, notes_model, accent, path)
+
+        def map_point(ix, iy):
+            if tp is not None:
+                # the phone image is the sheet's own live viewport at native
+                # resolution — image pixels ARE overlay pixels, no scale
+                return ix, iy
+            # the PDF mirror is rendered at the same "~1500px is crisp on
+            # phones" fit _render_share_page already uses — invert it here,
+            # read live so a page whose size changes stays correct
+            zoom = 1500.0 / max(canvas.page_width, 1)
+            return ix / zoom, iy / zoom
+
         providers = {
             "title": name,
-            # cheap int reads — safe to call straight from the server thread
+            # cheap reads — safe to call straight from the server thread
             "state": lambda: (self._share_revision,
-                              canvas.current_page_idx, canvas.n_pages),
-            # these touch the document, so hop to the main thread and block
-            "render": lambda p: _run_on_main(
-                lambda: self._render_share_page(canvas, notes_model, accent, p)),
+                              canvas.current_page_idx if canvas else 0,
+                              canvas.n_pages if canvas else 1),
+            "map_point": map_point,
+            # these touch the document/GTK, so hop to the main thread and block
+            "render": lambda p: _run_on_main(lambda: render(p)),
             "pdf": lambda p: _run_on_main(lambda: bake(p)),
+            "ink_actions": lambda actions, page=None, origin=None: _run_on_main(
+                lambda: self._apply_remote_ink_actions(canvas, tp, actions,
+                                                       page, origin)),
+            # The full editor's source. PDF ONLY, and stated loudly rather
+            # than left to fail: text-first mode is not in the browser port
+            # yet, so a text sheet offers no editor at all and keeps the
+            # small viewer, which serves it perfectly well (row 182's "both
+            # modes, always" is deferred here on purpose, not overlooked —
+            # see notes/phone-web-port-sync-plan.md).
+            "live_doc": (None if tp is not None else
+                         lambda p: _run_on_main(lambda: save_copy(p))),
+            # The current page's ink, for the push. Read straight rather than
+            # through _run_on_main: notify_change is only ever called FROM the
+            # main thread (a document change or a page turn), and hopping to
+            # the thread you are already on would deadlock.
+            "page_ink": (None if tp is not None else
+                         lambda: (canvas.current_page_idx,
+                                  [_stroke_to_wire(x) for x in canvas.strokes])),
+            # arrives on the server thread, so it hops like everything else
+            # that touches a widget
+            "set_view": (None if tp is not None else
+                         lambda v: GLib.idle_add(canvas.set_remote_view, v)),
         }
         server = _ShareServer(providers=providers)
         my_gen = self._share_gen   # see _on_share_window_close / _stop_sharing
@@ -25054,11 +26323,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 shutil.rmtree(out_dir, ignore_errors=True)
                 return False
             self._share_server = srv
+            # Mirror the desktop's OWN in-progress stroke to the phone, so
+            # ink drawn here appears there while the pen is down rather than
+            # on lift. PDF only, for the same reason the editor is.
+            if canvas is not None and tp is None:
+                canvas.on_live_stream = lambda pts, _c=canvas, _s=srv: (
+                    _s.notify_live_stroke(_c.current_page_idx, pts,
+                                          _c._pen_attrs()))
             self._share_out_dir = out_dir
             self._share_entries = entries
             self._update_share_indicator(True)
             stop_btn.set_sensitive(True)
-            self._show_share_ready(body, entries)
+            self._show_share_ready(body, srv, entries)
             # safety net: stop sharing after 10 minutes even if left running
             GLib.timeout_add_seconds(
                 600, lambda: (self._stop_sharing(), False)[1])
@@ -25079,6 +26355,56 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             GLib.idle_add(_ready, srv, entries)
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_remote_ink_actions(self, canvas, tp, actions,
+                                  page=None, origin=None):
+        """The single _run_on_main-wrapped entry point for one phone touch
+        batch. Dispatches straight to the bare remote_* primitives on
+        whichever surface is bound — never through the button-bindings/tool
+        resolution machinery, since a phone touch always means "draw" or
+        "erase" by its own on-screen toggle, regardless of what tool the
+        desktop's own left button is bound to right now.
+
+        `page` is the page the PHONE was looking at. The full editor has a
+        camera of its own, so it can be on a page the desktop is not, and ink
+        must land where it was drawn — so the desktop TURNS to it rather than
+        applying the stroke to whatever happens to be in front. Silently
+        dropping it would lose writing; applying it here would put it on the
+        wrong page, which is worse than losing it because nobody notices.
+
+        `origin` is the connection that sent this. It is parked on the server
+        for the duration of the call so the change this causes can be pushed
+        to every OTHER phone and not back to the one already showing it."""
+        target = tp if tp is not None else canvas
+        if (page is not None and canvas is not None and tp is None
+                and canvas.document and page != canvas.current_page_idx):
+            canvas.go_to_page(page)
+        srv = self._share_server
+        if srv is not None:
+            srv.ink_origin = origin
+        try:
+            self._dispatch_remote_ink(target, actions)
+        finally:
+            if srv is not None:
+                srv.ink_origin = None
+
+    @staticmethod
+    def _dispatch_remote_ink(target, actions):
+        for verb, *rest in actions:
+            if verb == "draw_begin":
+                target.remote_stroke_begin(*rest)
+            elif verb == "draw_update":
+                target.remote_stroke_update(*rest)
+            elif verb == "draw_end":
+                target.remote_stroke_end()
+            elif verb == "erase_begin":
+                target.remote_erase_begin()
+            elif verb == "erase_at":
+                target.remote_erase_at(rest[0], rest[1])
+            elif verb == "erase_end":
+                target.remote_erase_end()
+            elif verb == "abort":
+                target.remote_abort()
 
     def _current_dir_gfile(self):
         """The folder of the currently open file, so file dialogs start there."""
