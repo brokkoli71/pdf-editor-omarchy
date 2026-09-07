@@ -70,8 +70,11 @@ for (const file of readdirSync(src).filter((f) => f.endsWith(".js"))) {
     ...[...code.matchAll(/(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/g)].map((m) => m[1]),
     ...[...code.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g)].map((m) => m[1]),
     ...[...code.matchAll(/class\s+([A-Za-z_$][\w$]*)/g)].map((m) => m[1]),
-    // parameters and destructured names, coarsely
-    ...[...code.matchAll(/[({,]\s*([A-Za-z_$][\w$]*)\s*(?=[,)=])/g)].map((m) => m[1]),
+    // parameters and destructured names, coarsely. `}` closes the set as well
+    // as `,` and `)`, or the LAST name of a destructured parameter list —
+    // `function f({ a, b, onError })` — reads as undefined and every call to it
+    // is reported.
+    ...[...code.matchAll(/[({,]\s*([A-Za-z_$][\w$]*)\s*(?=[,)=}])/g)].map((m) => m[1]),
     // class methods and getters, which are definitions and not calls
     ...[...code.matchAll(/^\s*(?:static\s+|async\s+|get\s+|set\s+|\*\s*)*([A-Za-z_$][\w$]*)\s*\([^()]*\)\s*\{/gm)]
       .map((m) => m[1]),

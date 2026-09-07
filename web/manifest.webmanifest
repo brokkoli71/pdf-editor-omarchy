@@ -1,0 +1,37 @@
+{
+  "name": "Sidemark",
+  "short_name": "Sidemark",
+  "description": "A PDF annotator with a live Markdown notes panel.",
+  "id": "sidemark",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "icons": [
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-180.png", "sizes": "180x180", "type": "image/png", "purpose": "any" },
+    { "src": "icon-32.png", "sizes": "32x32", "type": "image/png", "purpose": "any" }
+  ],
+  "share_target": {
+    "action": "./share-target",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "files": [
+        { "name": "files", "accept": ["application/pdf", ".pdf", "text/markdown", ".md"] }
+      ]
+    }
+  },
+  "file_handlers": [
+    {
+      "action": "./",
+      "accept": {
+        "application/pdf": [".pdf"],
+        "text/markdown": [".md"]
+      }
+    }
+  ],
+  "launch_handler": { "client_mode": "focus-existing" }
+}

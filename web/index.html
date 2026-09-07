@@ -12,6 +12,12 @@
 <title>Sidemark — browser prototype</title>
 <link rel="icon" type="image/png" sizes="32x32" href="icon-32.png">
 <link rel="apple-touch-icon" sizes="180x180" href="icon-180.png">
+<!-- Installed as an app: the manifest carries the icon, the standalone window,
+     Android's share sheet ("share a PDF to Sidemark") and "open with". None of
+     it changes what the page may REACH — an installed copy has the same origin
+     and the same network rules as this tab. -->
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#ffffff">
 <link rel="stylesheet" href="src/style.css">
 </head>
 <body>
@@ -113,6 +119,19 @@
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.2l1.8 3.7 4 .6-2.9 2.8.7 4L8 11.4l-3.6 1.9.7-4L2.2 6.5l4-.6z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
       Bookmark this page
       <span class="menu-key">Ctrl+B</span>
+    </button>
+    <!-- The phone's list of computers to attach to. It stores ADDRESSES and
+         navigates to them — see src/desktops.js for why it cannot be a client
+         itself. -->
+    <button class="flat menu-item" id="desktops-btn" aria-haspopup="dialog">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5.5 13.5h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      My desktops…
+    </button>
+    <!-- Hidden until Chrome says the app is installable, and gone again once
+         it is installed: an entry that cannot do anything is worse than none. -->
+    <button class="flat menu-item" id="install-btn" hidden>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v7M5 7l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 12.5h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      Install Sidemark
     </button>
     <a class="flat menu-item" href="demo.html" id="tour-link">
       <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 7.2v4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="4.9" r=".85" fill="currentColor"/></svg>
@@ -259,6 +278,31 @@
       <button class="flat small" id="recent-clear">Clear</button>
     </div>
     <div id="recent-list"></div>
+  </div>
+</div>
+
+<div class="popover desktops-popover" id="desktops-popover" role="dialog" aria-label="My desktops" hidden>
+  <div class="popover-body">
+    <div class="row">
+      <span class="dim grow">My desktops</span>
+      <button class="flat small" id="desktops-scan">Scan a code</button>
+    </div>
+    <p class="hint" id="desktops-hint">Start “Share to phone” on your computer, then scan its QR code.</p>
+    <div id="desktops-list"></div>
+    <div class="row">
+      <input type="text" id="desktops-paste" placeholder="…or paste the share link" autocomplete="off" spellcheck="false">
+      <button class="small suggested" id="desktops-add">Add</button>
+    </div>
+  </div>
+</div>
+
+<!-- Full-screen because a viewfinder you have to aim through a 200px box is a
+     viewfinder nobody can aim. -->
+<div class="scanner" id="scanner" hidden>
+  <video id="scanner-video" playsinline muted></video>
+  <div class="scanner-bar">
+    <span class="grow" id="scanner-status">Point the camera at the code on your computer</span>
+    <button class="flat small" id="scanner-close">Cancel</button>
   </div>
 </div>
 

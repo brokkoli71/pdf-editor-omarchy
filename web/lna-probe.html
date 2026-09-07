@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sidemark — can this page reach your desktop?</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 0; padding: 18px;
+         max-width: 40rem; }
+  h1 { font-size: 19px; margin: 0 0 4px; }
+  p.lede { color: #666; margin-top: 0; }
+  label { display: block; margin: 14px 0 4px; font-weight: 600; }
+  input { font: inherit; width: 100%; box-sizing: border-box; padding: 8px 10px;
+          border: 1px solid #999; border-radius: 6px; }
+  button { font: inherit; margin-top: 12px; padding: 9px 16px; border-radius: 6px;
+           border: 1px solid #999; background: #eee; }
+  .row { border: 1px solid #ccc; border-radius: 8px; padding: 10px 12px;
+         margin-top: 12px; }
+  .row h2 { font-size: 14px; margin: 0 0 4px; }
+  .verdict { font-weight: 700; }
+  .ok { color: #1a7f37; } .bad { color: #b42318; } .wait { color: #8a6d00; }
+  code { background: rgba(127,127,127,.18); padding: 1px 4px; border-radius: 4px; }
+  footer { margin-top: 22px; color: #666; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>Can this page reach your desktop?</h1>
+<p class="lede">
+  Open this <strong>from the hosted copy</strong>
+  (<code>brokkoli71.github.io</code>) on your phone, with Sidemark sharing on
+  your computer. It answers one question: whether a public-origin page is
+  allowed to talk to your machine, and whether the browser offers to ask you.
+</p>
+
+<label for="addr">Your desktop's share address</label>
+<input id="addr" type="url" autocomplete="off" spellcheck="false"
+       placeholder="https://thinkpad.tailnet.ts.net:8443/TOKEN/">
+<button id="run">Test it</button>
+
+<div id="out"></div>
+
+<footer>
+  <p><strong>What the answers mean.</strong> Each test fetches
+  <code>state</code> under the address in <code>no-cors</code> mode, so a
+  refusal is the <em>network</em> refusing, not CORS.</p>
+  <ul>
+    <li><strong>Reached it</strong> — the request went through. If that happens
+      for the <code>https://</code> tailnet address, Local Network Access is no
+      longer an absolute block, and the hosted app could speak to the desktop
+      directly.</li>
+    <li><strong>Blocked</strong> — the request never left. Expected today for
+      both, and expected <em>for ever</em> for a plain <code>http://</code>
+      address, which fails mixed content before anything else is consulted.</li>
+    <li><strong>A permission prompt appeared</strong> — say so. That is the
+      whole reason this page exists: a prompt that can be granted is a
+      different finding from a silent refusal.</li>
+  </ul>
+</footer>
+
+<script>
+const out = document.getElementById("out");
+
+function card(title, note) {
+  const el = document.createElement("div");
+  el.className = "row";
+  el.innerHTML = `<h2></h2><div class="verdict wait">testing…</div>
+                  <div class="detail"></div>`;
+  el.querySelector("h2").textContent = title;
+  el.querySelector(".detail").textContent = note || "";
+  out.appendChild(el);
+  return el;
+}
+
+async function probe(el, url) {
+  const started = performance.now();
+  try {
+    // `no-cors` on purpose: an opaque response still means the request was
+    // ALLOWED onto the network, which is the only thing being measured. With
+    // cors, a missing Access-Control-Allow-Origin would look identical to a
+    // network-level block, and those are the two answers we need to tell apart.
+    await fetch(url, { mode: "no-cors", cache: "no-store" });
+    const ms = Math.round(performance.now() - started);
+    el.querySelector(".verdict").textContent = `Reached it (${ms} ms)`;
+    el.querySelector(".verdict").className = "verdict ok";
+  } catch (err) {
+    const ms = Math.round(performance.now() - started);
+    el.querySelector(".verdict").textContent = `Blocked (${ms} ms)`;
+    el.querySelector(".verdict").className = "verdict bad";
+    el.querySelector(".detail").textContent =
+      `${err.name}: ${err.message} — check the browser console for the reason ` +
+      `the engine gives (mixed content, or a local network refusal).`;
+  }
+}
+
+document.getElementById("run").addEventListener("click", async () => {
+  out.replaceChildren();
+  let base;
+  try {
+    base = new URL(document.getElementById("addr").value.trim());
+  } catch {
+    card("That is not an address", "It should look like https://host:8443/token/");
+    return;
+  }
+  if (!base.pathname.endsWith("/")) base.pathname += "/";
+
+  card("This page's own origin", `${location.origin} — ${location.protocol === "https:"
+      ? "secure, so it is a public origin as far as the checks below are concerned"
+      : "NOT https, so this test says nothing about the hosted copy"}`)
+    .querySelector(".verdict").remove();
+
+  const secure = card(`Reach ${base.host}`,
+    base.protocol === "https:"
+      ? "The Local Network Access gate. This is the one that could change."
+      : "A plain http:// address — mixed content, which never changes.");
+  await probe(secure, new URL("state", base).toString());
+
+  // The contrast case, so the report says which gate did the refusing.
+  if (base.protocol === "https:") {
+    const plain = new URL(base);
+    plain.protocol = "http:";
+    const insecure = card(`Reach ${plain.host} over plain http`,
+      "Mixed content. Expected to fail permanently — no CA issues a "
+      + "certificate for a LAN address, so there is no secure version to ask for.");
+    await probe(insecure, new URL("state", plain).toString());
+  }
+});
+</script>
+</body>
+</html>

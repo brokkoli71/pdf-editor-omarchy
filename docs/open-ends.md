@@ -31,7 +31,7 @@ them is unverified rather than finished.
    along — it was chosen on a 1.5× display, so it is a starting point, not a
    result.
 
-## The share thread (rows 182/186/187/189) — what is left
+## The share thread (rows 182/186/187/189/190) — what is left
 
 The behaviour is in `docs/share.md` and the reasoning in `ideas.csv`. Only
 these are still open.
@@ -55,6 +55,34 @@ these are still open.
     funnel is up**, while Google and Quad9 both resolve it — and Brave's Secure
     DNS commonly defaults to Cloudflare. One line on the dialog's public entry
     would save the next person an hour. Small, and free to pick up.
+- **The installed app (row 190) is UNVERIFIED ON A REAL PHONE.** What WAS
+  verified, in headless Chromium: the worker registers and precaches 43 entries
+  with no live-session data among them, a real multipart share-target POST
+  lands both files and the app collects and empties them, and the desktops list
+  saves, labels and refuses a `javascript:` link. What needs a hand and an
+  Android device, in this order:
+  1. Install the Pages copy (☰ → Install Sidemark, or Chrome's own offer), then
+     open it with the phone in flight mode — it should start and draw.
+  2. Share a PDF into it from another app's share sheet; then a PDF *and* its
+     `.md` together, which should arrive paired.
+  3. "Open with Sidemark" on a `.pdf` from the file manager, then Ctrl+S — it
+     should write back in place rather than dropping a copy in Downloads.
+  4. ☰ → My desktops → Scan a code, against a live share QR. The camera should
+     open and the first code should go straight to the session.
+  5. The new "Install on phone" share tier: scan it, then install from THAT
+     address. The icon should be named for the machine, and opening it should
+     land in the live session rather than a blank page.
+- **The ONE measurement that would redesign row 190**, and it is ten minutes:
+  `web/lna-probe.html`, opened from the Pages copy on a phone against a desktop
+  running the new "Install on phone" tier. Chrome has been moving Local Network
+  Access toward a user *permission prompt*. Row 182's record says a tailnet
+  HTTPS fetch from a public origin was blocked; it does not say whether a
+  prompt appeared and was refused or never appeared at all — different
+  findings, and only one of them durable. If a prompt appears and can be
+  granted, the hosted app can speak to a desktop directly, "My desktops" stops
+  being a launcher and becomes a client, and the browser-tab seam goes away.
+  **Record the answer on row 190 either way** — a second person re-deriving
+  this is the whole cost of not writing it down.
 - **Deferred by decision, tracked on row 182**: several phones drawing at once
   (a canvas has one `current_stroke`, which is the obstacle; the viewport boxes
   are already per phone), and a long-press tool picker on the phone beyond the

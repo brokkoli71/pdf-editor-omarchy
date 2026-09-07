@@ -83,6 +83,7 @@ npm test                                              # all the runners
 | `inkpdf.mjs` | — | annots, appearance, profile, regeneration, foreign ink |
 | `crossing.mjs` | 27 | where the caret and its selection land crossing the divider |
 | `paging.mjs` | 885 | insert/delete/reorder re-key notes, runs, bookmarks, hidden, outline |
+| `pwa.mjs` | 124 | the precache list vs the directory, the manifest, the share-target handoff, what a scanned code may be |
 | `wiring.mjs` | — | callbacks supplied, bare calls resolve, DOM ids exist |
 
 The ink vectors are **real captured strokes** from `notes/*.jsonl` — the same
@@ -222,6 +223,93 @@ is over the whole sidecar and typing must not pay for it per character.
 `setModel` resets the panel to one page, and the divider's state outlives a
 document change — so every path that swaps the model calls `syncFullNotes()` to
 re-enter the sheet. Without it the panel is full width, showing one page.
+
+## INSTALLED AS AN APP (row 190)
+
+`manifest.webmanifest` + `sw.js` make the hosted copy a real PWA: its own icon,
+a standalone window, and a precached shell so it opens with no network.
+
+**Installing is not a permission grant, and this is the fact the whole design
+turns on.** An installed page has the same origin and the same per-request
+network checks as a tab, so the hosted copy still cannot speak to a desktop's
+share server — mixed content on a LAN address, Local Network Access on a
+tailnet one (both measured, see LIVE MODE). Packaging changes nothing about
+that, and neither does serving JSON instead of HTML: the block is on the
+request, not the payload.
+
+- **The service worker has TWO FLAVOURS, one file**, chosen by a flag in the
+  script URL (`sw.js?live=1`), and the difference is the strategy, never the
+  rules:
+  - **Hosted** — precache the whole app, then cache-first. Instant, works
+    offline, a deploy arrives one launch later.
+  - **Live** — network-first, no precache. The desktop serves `web/` straight
+    off a checkout somebody may be editing (its short `max-age` exists for
+    exactly that), so a cache-first worker there would hand the phone
+    yesterday's app and make an edit look like it never landed. The hop is a
+    LAN or tailnet away and the server sends an ETag, so asking costs a 304.
+  - Neither can reach a live session's data: `../state`, `../live.pdf`,
+    `../page.pdf` and `../ws` sit one level ABOVE the app directory the worker
+    is scoped to. Unreachable by construction, not by a rule someone maintains.
+  - **No `skipWaiting()`.** pdf.js's worker is fetched lazily, so a worker
+    swapped in under a running page could answer that fetch from a different
+    deploy than the page came from.
+- **Registration gates on `isSecureContext`**, never on a protocol test — a
+  hand-rolled hostname check leaves 127.0.0.1 and ::1 out, which is how the
+  first browser run showed no worker at all. Plain-http share tiers therefore
+  get no worker and cannot be installed, which is why the desktop grew a
+  `tailscale serve` HTTPS tier (`docs/share.md`).
+- **The precache list is EXPLICIT and checked against the directory both
+  ways** (`test/pwa.mjs`). A worker cannot read a directory, and the way this
+  breaks is a new module landing in `src/` that nobody adds here — which fails
+  only offline, the one place nobody tests.
+- **Share target**: Android's share sheet gains "Sidemark". The worker takes
+  the multipart POST, parks the files in a **Cache** and 303s to `./?shared=1`,
+  which the app collects and empties. The Cache rather than IndexedDB on
+  purpose: `db.js` owns the one database and its one version number, and a
+  worker opening it on its own schedule is exactly the mismatch that file
+  exists to prevent. A share-sheet launch OUTRANKS the saved session.
+- **File handlers**: "open with Sidemark" arrives carrying **handles**, so a
+  document opened that way saves back in place with no second gesture.
+- **`beforeinstallprompt` fires once and cannot be replayed**, so it is stashed
+  and the ☰ entry is its visibility.
+
+## MY DESKTOPS — the phone's list of computers (row 190)
+
+`src/desktops.js`. It holds **addresses and navigates to them**; it is not and
+cannot be a client (above). Tapping one leaves for that desktop's origin, where
+the live session runs exactly as it always has. In a standalone window that
+opens as a browser tab — the visible seam of the design, and not worth hiding.
+
+- **No probe before navigating.** "Is it sharing right now?" is the
+  cross-origin request to a local address this page may not make, so the answer
+  comes from arriving: a desktop that is not sharing says so in its own words,
+  which beats this page guessing on its behalf.
+- **The QR scanner earns its place on the PUBLIC tier specifically.** That
+  token is fresh every session and never saved (row 189), so it is the one
+  address that cannot be a bookmark. `BarcodeDetector` is native on Android
+  Chrome and absent elsewhere — one capability check and a paste box otherwise,
+  the same shape as File System Access. A vendored decoder would be 40 kB
+  carried by every visitor for a button most never press.
+- **`parseDesktopLink` is strict** — http/https only, trailing slash added,
+  fragment dropped. The list is tapped later from a menu with no address bar to
+  read, so anything else would be navigating somewhere you cannot see.
+- **Hidden in LIVE mode**: the list lives in the ORIGIN's storage, and there
+  the origin is the desktop that served the page — so it is empty whatever the
+  phone has saved, and an empty one reads as having lost it.
+
+## The open question this design is waiting on
+
+**`lna-probe.html`.** Chrome has been moving Local Network Access toward a user
+*permission prompt*. The measurement on record says a tailnet HTTPS fetch from
+a public origin was blocked; it does not say whether a prompt was offered and
+refused, or never appeared — different findings, and only one of them durable.
+The probe settles it from the phone in minutes: `no-cors` on purpose, so a
+refusal is the network refusing and not CORS, with the plain-http address
+alongside as the contrast that can never change.
+
+If a prompt appears and can be granted, the hosted app can talk to a desktop
+directly, "My desktops" stops being a launcher and becomes a client, and the
+seam above disappears. Until then, don't design as though it will.
 
 ## LIVE MODE — this port as a phone attached to a desktop Sidemark
 
@@ -382,3 +470,7 @@ the job copies files and nothing else; `test/` and `package.json` are
 development-only and are left out. Over HTTPS the File System Access API works,
 which is what gives save-in-place — the one thing a `file://` copy or a plain
 http server cannot offer.
+
+HTTPS is also what makes this the **installable** copy, so the job must copy
+`manifest.webmanifest` and `sw.js` too, and `sw.js` must land at the site
+ROOT — a worker's scope cannot reach above the path it is served from.

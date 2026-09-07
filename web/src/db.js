@@ -1,17 +1,21 @@
 // The one place that owns the IndexedDB schema.
 //
-// Two modules keep state here — the session and the recents list — and they
-// must not each open the database with their own version number: whichever
+// Three modules keep state here — the session, the recents list and the saved
+// desktops — and they must not each open the database with their own version number: whichever
 // opens second with a LOWER version fails outright, and a browser will not tell
 // you why. One opener, one version, every store created together.
 
 const DB_NAME = "sidemark";
-const VERSION = 3;
+const VERSION = 4;
 // `handoff` carries dragged PAGES between two Sidemark windows. A drag's
 // payload has to be readable by the window that receives it, and neither an
 // object URL nor module state crosses one — but IndexedDB is per ORIGIN, so
 // both windows already share it. The drag then carries only a key.
-export const STORES = { session: {}, recent: { keyPath: "id" }, handoff: {} };
+// `desktops` is the phone's list of computers it can attach to (desktops.js).
+// It holds ADDRESSES, never a document — the live session runs on the desktop's
+// own origin, and nothing of it is persisted here.
+export const STORES = { session: {}, recent: { keyPath: "id" }, handoff: {},
+                        desktops: { keyPath: "id" } };
 
 export function openDb() {
   return new Promise((resolve, reject) => {

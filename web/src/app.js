@@ -22,6 +22,10 @@ import { listRecent, rememberRecent, forgetRecent, clearRecent,
 import { Search } from "./search.js";
 import { Presenter, Timer } from "./presenter.js";
 import { putHandoff, takeHandoff } from "./db.js";
+import { registerServiceWorker, isSharedLaunch, takeSharedFiles,
+         consumeLaunchFiles, watchInstallPrompt, promptInstall } from "./pwa.js";
+import { listDesktops, rememberDesktop, forgetDesktop, parseDesktopLink,
+         canScan, startScanner } from "./desktops.js";
 
 // ── settings (the settings.json analogue) ────────────────────────────────────
 
@@ -282,6 +286,8 @@ wireSearch();
 wireBookmarks();
 wireRecent();
 wireMoreMenu();
+wireDesktops();
+wireInstall();
 wirePaste();
 wirePresenter();
 wireNotesPanel();
@@ -326,7 +332,11 @@ function applyMobileLayout() {
   // legitimate. Not gated on MOBILE: a laptop that scans the link is just as
   // much a guest.
   if (LIVE) {
-    for (const id of ["open-btn", "save-btn"]) {
+    // "My desktops" goes too: this list lives in the ORIGIN's storage, and in
+    // a shared session the origin is the desktop that served the page — so the
+    // list is empty here whatever the phone has saved, and offering an empty
+    // one reads as having lost it.
+    for (const id of ["open-btn", "save-btn", "desktops-btn"]) {
       const el = document.getElementById(id);
       if (el) el.hidden = true;
     }
@@ -597,7 +607,17 @@ surface.requestDraw();
 // to the blank page rather than stopping here.
 watchForStalledStart();
 noteSavingSupport();
-(LIVE ? openLiveDocument() : restoreSession())
+// The offline shell, and the two ways the OS can hand us a document. Both are
+// no-ops where the platform does not have them, and neither changes what this
+// page may reach over the network — see src/pwa.js.
+registerServiceWorker({ live: LIVE, sandbox: SANDBOX });
+consumeLaunchFiles(openLaunchedFiles);
+// A share-sheet launch OUTRANKS the saved session: someone picked a file and
+// sent it here, and restoring last night's document over it would look like
+// the share had failed.
+(LIVE ? openLiveDocument()
+      : isSharedLaunch() ? openSharedFiles()
+      : restoreSession())
   .catch(async (err) => {
     // A session that cannot be restored would fail again on every load, so it
     // is thrown away rather than kept. A stale document is not worth an app
@@ -1220,6 +1240,35 @@ async function openFiles(files) {
   return openPaired(await readFiles(files));
 }
 
+/** Files handed to us by Android's share sheet.
+ *
+ * They arrive as a POST the service worker answered while this page did not
+ * exist, so they are collected from it rather than from an event here. Emptied
+ * as they are read — a reload must not re-open what was shared minutes ago.
+ *
+ * Returns whether anything was opened, because the startup chain uses that to
+ * decide whether it still owes the user a blank page. */
+async function openSharedFiles() {
+  const files = await takeSharedFiles();
+  if (!files.length) return null;
+  await openFiles(files);
+  return true;
+}
+
+/** "Open with Sidemark" from the file manager.
+ *
+ * The launch carries HANDLES, which is the whole prize: opened this way a
+ * document saves back in place, exactly like one chosen through the picker,
+ * with no second gesture to ask for the file again. */
+async function openLaunchedFiles(items) {
+  const sources = [];
+  for (const { file, handle } of items) {
+    sources.push({ name: file.name, type: file.type,
+                   bytes: new Uint8Array(await file.arrayBuffer()), handle });
+  }
+  return openPaired(pairSources(sources));
+}
+
 /** What `pairSources` produced: a PDF (or several to merge), or a lone sidecar
  * for the document already open. Both ways in — the drop and the picker — land
  * here, so neither can grow its own idea of what opening a `.md` means. */
@@ -1743,6 +1792,152 @@ function wireMoreMenu() {
       pop.hidden = true;
     }
   }, true);
+}
+
+// ── my desktops, and the code scanner ────────────────────────────────────────
+//
+// The list holds ADDRESSES and navigating to one is the whole of "connect" —
+// `src/desktops.js` says why an installed copy of this page cannot be the
+// client itself, and it is a measured constraint, not a missing feature.
+
+async function buildDesktopList() {
+  const host = document.getElementById("desktops-list");
+  const entries = await listDesktops();
+  host.replaceChildren();
+  if (!entries.length) {
+    const p = document.createElement("p");
+    p.className = "desktops-empty";
+    p.textContent = "No computers yet.";
+    host.appendChild(p);
+    return;
+  }
+  for (const entry of entries) {
+    const row = document.createElement("div");
+    row.className = "desktop-row";
+
+    const open = document.createElement("button");
+    open.className = "open";
+    open.innerHTML = `<span class="name"></span><span class="addr"></span>`;
+    open.querySelector(".name").textContent = entry.label;
+    open.querySelector(".addr").textContent = entry.url;
+    open.addEventListener("click", () => openDesktop(entry));
+    row.appendChild(open);
+
+    const drop = document.createElement("button");
+    drop.className = "drop";
+    drop.textContent = "×";
+    drop.title = "Forget this computer";
+    drop.addEventListener("click", async () => {
+      await forgetDesktop(entry.id);
+      buildDesktopList();
+    });
+    row.appendChild(drop);
+    host.appendChild(row);
+  }
+}
+
+/** Go to the desktop. A plain navigation, deliberately.
+ *
+ * There is no probe first — "is it sharing right now?" is a cross-origin
+ * request to a local address, which is the exact thing this page may not make.
+ * So the answer comes from arriving: a desktop that is not sharing says so in
+ * its own words, which is better than this page guessing on its behalf. */
+async function openDesktop(entry) {
+  await rememberDesktop(entry);          // most recently used, first next time
+  document.getElementById("desktops-popover").hidden = true;
+  location.href = entry.url;
+}
+
+async function addDesktopFromText(text) {
+  const parsed = parseDesktopLink(text);
+  if (!parsed) {
+    toast("That is not a share link — it should start with http:// or https://");
+    return null;
+  }
+  await rememberDesktop(parsed);
+  await buildDesktopList();
+  toast(`Saved ${parsed.label}`);
+  return parsed;
+}
+
+let stopScanner = null;
+
+/** Open the viewfinder, and go straight to the desktop on the first code.
+ *
+ * A scan is an aiming gesture that has already said what it wants, so it opens
+ * the session rather than dropping a row into a list and asking again. The row
+ * is saved on the way. */
+function openScanner() {
+  const panel = document.getElementById("scanner");
+  const video = document.getElementById("scanner-video");
+  const status = document.getElementById("scanner-status");
+  if (!canScan()) {
+    toast("This browser has no code scanner — paste the link instead");
+    document.getElementById("desktops-paste").focus();
+    return;
+  }
+  document.getElementById("desktops-popover").hidden = true;
+  status.textContent = "Point the camera at the code on your computer";
+  panel.hidden = false;
+  stopScanner = startScanner({
+    video,
+    onFound: async (entry) => {
+      closeScanner();
+      await openDesktop(entry);
+    },
+    onError: (err) => {
+      closeScanner();
+      toast(err && err.name === "NotAllowedError"
+        ? "The camera was not allowed — paste the link instead"
+        : `Could not start the camera: ${err ? err.message : "unknown"}`);
+    },
+  });
+}
+
+function closeScanner() {
+  if (stopScanner) stopScanner();
+  stopScanner = null;
+  document.getElementById("scanner").hidden = true;
+}
+
+function wireDesktops() {
+  const pop = document.getElementById("desktops-popover");
+  const btn = document.getElementById("desktops-btn");
+  btn.addEventListener("click", async () => {
+    pop.hidden = !pop.hidden;
+    if (!pop.hidden) {
+      document.getElementById("desktops-hint").textContent = canScan()
+        ? "Start “Share to phone” on your computer, then scan its QR code."
+        : "Start “Share to phone” on your computer and paste the link below.";
+      await buildDesktopList();
+    }
+  });
+  document.addEventListener("pointerdown", (e) => {
+    if (!pop.hidden && !pop.contains(e.target) && !btn.contains(e.target)) {
+      pop.hidden = true;
+    }
+  }, true);
+  document.getElementById("desktops-scan").addEventListener("click", openScanner);
+  document.getElementById("scanner-close").addEventListener("click", closeScanner);
+  const paste = document.getElementById("desktops-paste");
+  const add = async () => {
+    const entry = await addDesktopFromText(paste.value);
+    if (entry) paste.value = "";
+  };
+  document.getElementById("desktops-add").addEventListener("click", add);
+  paste.addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
+}
+
+/** The install entry appears only while Chrome has an offer to make.
+ *
+ * `beforeinstallprompt` fires once, cannot be replayed, and needs a real
+ * gesture — so the event is kept and the menu row is its visibility. */
+function wireInstall() {
+  const btn = document.getElementById("install-btn");
+  watchInstallPrompt((available) => { btn.hidden = !available; });
+  btn.addEventListener("click", async () => {
+    if (await promptInstall()) toast("Sidemark installed");
+  });
 }
 
 // ── bookmarks and linked notes ───────────────────────────────────────────────

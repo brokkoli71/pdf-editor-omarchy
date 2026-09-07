@@ -8,6 +8,16 @@ it with a stylus or a mouse, write live-Markdown notes beside it, and save the
 whole thing back as a normal `.pdf` with real ink annotations plus a `.md`
 sidecar.
 
+**On a phone, install it.** Open the demo in Chrome and use *Install Sidemark*
+(in the ☰ menu, or Chrome's own offer). You get an app icon, a window without
+browser chrome, and a copy that starts with no connection at all. Installed, it
+also appears in Android's share sheet — send a PDF to Sidemark from any app and
+it opens here — and in *Open with* for `.pdf` and `.md` files.
+
+**☰ → My desktops** keeps the computers you attach to. Scan the QR from *Share
+to phone* on a desktop once and it is remembered, so the next session is one
+tap. Scanning goes straight to that computer's live session.
+
 New here? **[Take the six-step tour](https://brokkoli71.github.io/sidemark/demo.html)**
 — it walks you through the parts you would never find on your own, driving a
 real Sidemark beside it. It writes nothing to your settings.

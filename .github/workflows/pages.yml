@@ -4,6 +4,12 @@
 # nothing else. Over HTTPS the File System Access API works, which is what gives
 # save-in-place; that is the one thing a `file://` copy or a plain http server
 # cannot offer.
+#
+# HTTPS is also what makes this copy INSTALLABLE: `manifest.webmanifest` and
+# `sw.js` need a secure context, so the Pages copy is the one that can be an app
+# on a phone. `sw.js` must be copied to the ROOT of the site, not into a
+# subdirectory — a worker's scope cannot reach above the path it is served from,
+# and `web/test/` and `package.json` stay out as development-only.
 name: pages
 
 on:
@@ -33,6 +39,8 @@ jobs:
         run: |
           mkdir -p _site
           cp -r web/index.html web/demo.html web/input-probe.html \
+                web/lna-probe.html \
+                web/manifest.webmanifest web/sw.js \
                 web/icon-32.png web/icon-180.png \
                 web/icon-512.png web/src web/vendor web/demo _site/
           # test/ and package.json are development-only and would just be

@@ -10848,6 +10848,91 @@ def _tailscale_funnel_stop(port):
     _live_funnels.discard(port)
 
 
+# ── Tailscale serve: the same server, over HTTPS, PRIVATELY ─────────────────
+#
+# The tailnet tier is plain HTTP on our own port, which is reachable and fine
+# for a browser tab — but a browser will only INSTALL an app, and only run a
+# service worker, on a secure origin. `tailscale serve` fronts us with a real
+# Let's Encrypt certificate on the node's own `*.ts.net` name without exposing
+# anything publicly, which is the one private address on this machine that a
+# phone can install Sidemark from.
+#
+# PORT 8443, NOT 443, and that is the whole reason this can coexist with the
+# public link. Funnel's mapping IS a serve mapping with ingress turned on, and
+# it lives on `--https=443`; a second consumer of that same front would make
+# `_tailscale_funnel_stop`'s node-wide `--https=443 off` tear down both, and
+# turning the public link on would silently publish this one. Tailscale accepts
+# 443, 8443 and 10000 for HTTPS, so the two never touch.
+TAILSCALE_SERVE_PORT = 8443
+
+
+def _tailscale_serve_start(port, timeout=25):
+    """Front the share server with tailnet-only HTTPS. Returns (host, hint).
+
+    `host` is the bare `*.ts.net` name the CLI printed — never the full URL,
+    for the same reason as the funnel: serve fronts the node's ROOT, so the
+    caller still has to put our own `/<token>/` path onto it.
+
+    Certificate provisioning is what makes this slow the first time on a node
+    (Let's Encrypt, seconds), which is why it is provisioned in the BACKGROUND
+    exactly like the funnel — never on the path that renders the first QR."""
+    if not shutil.which("tailscale"):
+        return None, None
+    try:
+        out = subprocess.run(
+            ["tailscale", "serve", "--bg", f"--https={TAILSCALE_SERVE_PORT}",
+             f"http://127.0.0.1:{port}"],
+            capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return None, (f"tailscale serve --https={TAILSCALE_SERVE_PORT} timed "
+                      "out — try it in a terminal to see what it's waiting on.")
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    text = out.stdout + out.stderr
+    m = re.search(r"https://([A-Za-z0-9._-]+)", text)
+    if out.returncode == 0 and m:
+        host = m.group(1).split("/")[0].split(":")[0]
+        if host:
+            _live_serves.add(port)
+            return host, None
+    return None, text.strip() or None
+
+
+# Same reasoning as _live_funnels: the mapping lives in tailscaled, so an exit
+# that never reaches _stop_sharing would leave a tailnet address pointing at a
+# dead port. Private rather than public, so the consequence is smaller — but a
+# link that resolves and never answers is still the worst kind.
+_live_serves = set()
+
+
+def _tailscale_serve_stop(port):
+    """Undo _tailscale_serve_start. Scoped to OUR front port, so it cannot
+    disturb a funnel or any serve mapping somebody else set up."""
+    if not shutil.which("tailscale"):
+        _live_serves.discard(port)
+        return
+    logger.info("share: turning the private HTTPS address off (port %s)", port)
+    try:
+        subprocess.run(["tailscale", "serve",
+                        f"--https={TAILSCALE_SERVE_PORT}", "off"],
+                       capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    _live_serves.discard(port)
+
+
+def _drop_live_serves():
+    for port in list(_live_serves):
+        try:
+            _tailscale_serve_stop(port)
+        except Exception:                                  # noqa: BLE001
+            pass
+
+
+atexit.register(_drop_live_serves)
+
+
 def _make_qr_png(url, out_path):
     """Render a QR PNG for url via the optional 'qrencode' tool. Returns True on
     success, False if qrencode isn't installed or fails (caller shows the URL)."""
@@ -11561,6 +11646,7 @@ class _ShareServer:
         self.port = 0
         self.served = False
         self.funnel_port = None    # set by _share_prepare when Funnel is live
+        self.serve_port = None     # set when the private HTTPS front is live
         # The Read only / Writing toggle. WRITING by default (the user's call,
         # 2026-09-01): the phone is overwhelmingly used here as a tablet for
         # your own document, so making every session start read-only meant
@@ -12141,6 +12227,10 @@ class _ShareServer:
                         self.send_header("Location", "app/")
                         self.send_header("Content-Length", "0")
                         self.end_headers()
+                    elif sub == "app/manifest.webmanifest":
+                        # GENERATED, not the file on disk: see app_manifest.
+                        self._send(server.app_manifest(),
+                                   "application/manifest+json")
                     elif sub.startswith("app/"):
                         self._send_app_file(sub[4:])
                     elif sub == "ws":
@@ -12300,6 +12390,46 @@ class _ShareServer:
             return f"{scheme}://{hostport}/{tok}/"
         return f"{scheme}://{hostport}/{self.token}/{quote(self.filename)}"
 
+    def app_manifest(self):
+        """The installed-app manifest for THIS computer, built from the port's
+        own file rather than replacing it.
+
+        Three things have to differ from the hosted copy, and each of them is
+        a bug if it does not:
+
+        * `start_url` is `./?live=1`. Without the flag the icon opens the app
+          in its ordinary mode ON THE DESKTOP'S ORIGIN, where there is no
+          session to restore and no file to open — a blank page that looks
+          like the share is broken.
+        * The NAME carries this machine's hostname. A phone that has installed
+          two computers has two icons, and "Sidemark" twice is two icons you
+          cannot tell apart. `id` carries the token for the same reason: it is
+          what makes them separate installs rather than one being replaced.
+        * `share_target` and `file_handlers` are dropped. They offer to open a
+          file the phone chose, and this copy is a window onto somebody else's
+          open document — the same reasoning that hides Open and Save here.
+
+        Everything else — the icons, the display mode, the colours — comes
+        from `web/manifest.webmanifest`, so the two cannot drift."""
+        data = {}
+        if self.app_dir:
+            try:
+                with open(os.path.join(self.app_dir, "manifest.webmanifest"),
+                          "rb") as f:
+                    data = json.loads(f.read().decode("utf-8"))
+            except (OSError, ValueError):
+                data = {}
+        import socket
+        host = socket.gethostname().split(".")[0] or "this computer"
+        data["name"] = f"Sidemark — {host}"
+        data["short_name"] = host[:12]
+        data["id"] = f"sidemark-{self.token}"
+        data["start_url"] = "./?live=1"
+        data["scope"] = "./"
+        data.pop("share_target", None)
+        data.pop("file_handlers", None)
+        return json.dumps(data).encode("utf-8")
+
     @property
     def url(self):
         return self.url_for(self.ip)
@@ -12315,6 +12445,9 @@ class _ShareServer:
         if self.funnel_port:
             _tailscale_funnel_stop(self.funnel_port)
             self.funnel_port = None
+        if self.serve_port:
+            _tailscale_serve_stop(self.serve_port)
+            self.serve_port = None
         if self._httpd is not None:
             httpd, self._httpd = self._httpd, None
             # OFF THE MAIN THREAD. `shutdown()` waits for the serve_forever
@@ -26634,7 +26767,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         lan_url = server.url_for(server.ip)
         lan_qr = os.path.join(out_dir, "qr-lan.png")
-        wifi_entry = {"caption": "Same Wi-Fi", "url": lan_url,
+        wifi_entry = {"kind": "lan", "caption": "Same Wi-Fi", "url": lan_url,
                       "qr": lan_qr if _make_qr_png(lan_url, lan_qr) else None,
                       "note": _firewall_note(server.port)}
 
@@ -26642,7 +26775,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if ts and ts != server.ip:
             ts_url = server.url_for(ts)
             ts_qr = os.path.join(out_dir, "qr-ts.png")
-            ts_entry = {"caption": "Over Tailscale", "url": ts_url,
+            ts_entry = {"kind": "tailnet", "caption": "Over Tailscale",
+                        "url": ts_url,
                         "qr": ts_qr if _make_qr_png(ts_url, ts_qr) else None}
         else:
             if shutil.which("tailscale"):
@@ -26653,7 +26787,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 hint = ("Set up Tailscale on both devices to share securely "
                         "from anywhere — even when the Wi-Fi blocks the direct "
                         "link (repeaters, guest networks, AP isolation).")
-            ts_entry = {"caption": "Over Tailscale", "hint": hint}
+            ts_entry = {"kind": "tailnet", "caption": "Over Tailscale",
+                        "hint": hint}
 
         # PROTOTYPE (#180): a public link via Tailscale Funnel — the phone
         # needs no Tailscale app at all, unlike the tailnet link above. Only
@@ -26670,14 +26805,38 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # link most sessions never open. It is filled in by
         # _share_finish_funnel once the dialog is already on screen.
         if ts:
-            funnel_entry = {"caption": "Public link", "pending": True,
+            funnel_entry = {"kind": "funnel", "caption": "Public link",
+                            "pending": True,
                             "hint": "Setting up the public link…"}
         else:
-            funnel_entry = {"caption": "Public link",
+            funnel_entry = {"kind": "funnel", "caption": "Public link",
                             "hint": ("Connect this computer to Tailscale to "
                                      "turn on a public link (Funnel) that "
                                      "needs no app on the phone.")}
-        return server, [funnel_entry, ts_entry, wifi_entry]
+
+        # The INSTALLABLE address (row 190). Every tier above is plain HTTP,
+        # and a browser will only install an app — or run a service worker —
+        # on a secure origin, so none of them can be more than a bookmark on
+        # a phone. `tailscale serve` puts a real certificate on the node's own
+        # name without publishing anything, which is the only private HTTPS
+        # address this machine has.
+        #
+        # LAST in the list on purpose: the order here IS the dialog's default
+        # tab, and this one is provisioned in the background like the funnel.
+        # A tier that arrives late must never take the tab you are already
+        # scanning — with Writing on that would also widen who can draw.
+        if ts:
+            serve_entry = {"kind": "serve", "caption": "Install on phone",
+                           "pending": True,
+                           "hint": "Setting up the private HTTPS address…"}
+        else:
+            serve_entry = {"kind": "serve", "caption": "Install on phone",
+                           "hint": ("Connect this computer to Tailscale to get "
+                                    "a private HTTPS address. A phone can "
+                                    "install Sidemark from that address as an "
+                                    "app of its own, which a plain http:// "
+                                    "address can never be.")}
+        return server, [funnel_entry, ts_entry, wifi_entry, serve_entry]
 
     def _share_entry(self, entry, show_caption=True):
         """One page of the share dialog's mode switcher: a QR (if available)
@@ -27015,8 +27174,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             default_idx = next((i for i, e in enumerate(entries)
                                 if e["caption"] == select_caption), 0)
         else:
-            default_idx = next((i for i, e in enumerate(entries) if "url" in e),
-                               len(entries) - 1)
+            # The fallback is the LAN entry BY KIND, not the last one: Wi-Fi
+            # is the tier that always has a url, and the list no longer ends
+            # with it — "Install on phone" is last precisely because it must
+            # never be picked for you.
+            default_idx = next(
+                (i for i, e in enumerate(entries) if "url" in e),
+                next((i for i, e in enumerate(entries)
+                      if e.get("kind") == "lan"), 0))
         dropdown.set_selected(default_idx)
         top_row.append(dropdown)
 
@@ -27439,9 +27604,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._update_share_indicator(True)
             stop_btn.set_sensitive(True)
             self._show_share_ready(body, srv, entries)
-            # ...and only now go and get the public link, with the QR already
-            # on screen and scannable
+            # ...and only now go and get the two slow addresses, with the QR
+            # already on screen and scannable. Both provision in their own
+            # thread and neither may move the tab you are looking at.
             self._share_finish_funnel(srv, out_dir, my_gen)
+            self._share_finish_serve(srv, out_dir, my_gen)
             # safety net: stop sharing after 10 minutes even if left running
             GLib.timeout_add_seconds(
                 600, lambda: (self._stop_sharing(), False)[1])
@@ -27473,8 +27640,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         Everything here is best-effort. A share whose public link never
         arrives is a working share with two addresses, so a failure leaves the
         entry's hint in place and says nothing else."""
+        # BY KIND, not by "the pending one": there are two slow tiers now, and
+        # whichever finished first would otherwise be filled in with the
+        # other's address.
         entry = next((e for e in (self._share_entries or [])
-                      if e.get("pending")), None)
+                      if e.get("kind") == "funnel" and e.get("pending")), None)
         if entry is None:
             return
 
@@ -27548,6 +27718,70 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 logger.info("share: funnel provisioned at %s", host)
             else:
                 logger.warning("share: NO public link — %s",
+                               hint or "tailscale gave no reason")
+            GLib.idle_add(_done, host, hint)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _share_finish_serve(self, server, out_dir, gen):
+        """Provision the private HTTPS address in the background and slot it in.
+
+        The funnel's twin, and deliberately a separate method rather than a
+        parameter on it: the two differ in the part that matters, which is the
+        teardown. `tailscale serve --https=8443 off` addresses OUR OWN front
+        port, so a late teardown from an abandoned share cannot take down a
+        newer one — the whole hazard the funnel's `_done` has to reason about
+        does not exist here, and folding them together would hide that."""
+        entry = next((e for e in (self._share_entries or [])
+                      if e.get("kind") == "serve" and e.get("pending")), None)
+        if entry is None:
+            return
+
+        def _done(host, hint):
+            if gen != self._share_gen or self._share_server is not server:
+                if host:
+                    _tailscale_serve_stop(server.port)
+                return False
+            entry.pop("pending", None)
+            if host:
+                logger.info("share: private HTTPS address LIVE at %s", host)
+                server.serve_port = server.port      # stop() tears it down
+                # The PERMANENT token, not the funnel's session one: this
+                # address is the one a phone is meant to keep, and an
+                # installed app whose start_url expired on the next share
+                # would be an icon that opens a 404. It never leaves the
+                # tailnet, which is exactly why it may carry the saved secret.
+                url = server.url_for(host, scheme="https",
+                                     port=TAILSCALE_SERVE_PORT)
+                qr = os.path.join(out_dir, "qr-serve.png")
+                entry["url"] = url
+                entry["qr"] = qr if _make_qr_png(url, qr) else None
+                entry["note"] = ("Open this on the phone, then use the "
+                                 "browser's “Install app”. The icon stays "
+                                 "pointed at this computer.")
+                entry.pop("hint", None)
+            else:
+                entry["hint"] = hint or (
+                    "Tailscale could not provide a certificate for this "
+                    "machine. Enable HTTPS for the tailnet in the Tailscale "
+                    "admin console.")
+            if self._share_window is not None and self._share_body is not None:
+                self._show_share_ready(
+                    self._share_body, server, self._share_entries,
+                    select_caption=(self._share_selected
+                                    if self._share_user_picked else None))
+            return False
+
+        def _worker():
+            logger.info("share: starting the private HTTPS address "
+                        "(serve :%d -> :%d)…", TAILSCALE_SERVE_PORT,
+                        server.port)
+            try:
+                host, hint = _tailscale_serve_start(server.port)
+            except Exception as e:                          # noqa: BLE001
+                host, hint = None, str(e)
+            if not host:
+                logger.warning("share: NO private HTTPS address — %s",
                                hint or "tailscale gave no reason")
             GLib.idle_add(_done, host, hint)
 

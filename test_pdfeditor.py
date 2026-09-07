@@ -6854,6 +6854,18 @@ class TestShareToPhone(unittest.TestCase):
         server = sidemark._ShareServer(providers=providers)
         return sidemark.PDFEditorWindow._share_prepare(d, server, "doc.pdf")
 
+    @staticmethod
+    def _entry(entries, kind):
+        """One address tier BY IDENTITY.
+
+        Never by index: the list's order is the dialog's tab order and its
+        default-tab preference, which is a thing that is allowed to change —
+        a test that pins it fires when somebody deliberately reorders the
+        tabs and says nothing about whether the tier works."""
+        found = [e for e in entries if e.get("kind") == kind]
+        assert len(found) == 1, f"{kind}: {[e.get('kind') for e in entries]}"
+        return found[0]
+
     def test_prepare_always_offers_tailscale_with_hint_when_off(self):
         """Entries come back in PRIORITY order — public link, tailnet,
         Wi-Fi — not the order they're computed in, so Wi-Fi (always live) is
@@ -6863,10 +6875,16 @@ class TestShareToPhone(unittest.TestCase):
             with tempfile.TemporaryDirectory() as d:
                 server, entries = self._prepare(d)
                 try:
-                    self.assertEqual(entries[-1]["caption"], "Same Wi-Fi")
-                    self.assertIn("url", entries[-1])
+                    wifi = self._entry(entries, "lan")
+                    self.assertEqual(wifi["caption"], "Same Wi-Fi")
+                    self.assertIn("url", wifi)
+                    # Wi-Fi is the only tier with a url here, and it is still
+                    # not first: the order is the PREFERENCE, not what was
+                    # ready soonest.
+                    self.assertLess(entries.index(self._entry(entries, "funnel")),
+                                    entries.index(wifi))
                     # the Tailscale column is always present...
-                    ts = entries[1]
+                    ts = self._entry(entries, "tailnet")
                     self.assertEqual(ts["caption"], "Over Tailscale")
                     # ...but as an explanatory hint, not a live link, when off
                     self.assertNotIn("url", ts)
@@ -6883,7 +6901,7 @@ class TestShareToPhone(unittest.TestCase):
             with tempfile.TemporaryDirectory() as d:
                 server, entries = self._prepare(d)
                 try:
-                    ts = entries[1]
+                    ts = self._entry(entries, "tailnet")
                     self.assertEqual(ts["caption"], "Over Tailscale")
                     self.assertIn("100.70.12.127", ts["url"])
                 finally:
@@ -6906,13 +6924,13 @@ class TestShareToPhone(unittest.TestCase):
                 server, entries = self._prepare(d)
                 try:
                     start.assert_not_called()
-                    funnel = entries[0]
+                    funnel = self._entry(entries, "funnel")
                     self.assertEqual(funnel["caption"], "Public link")
                     self.assertTrue(funnel["pending"])
                     self.assertNotIn("url", funnel)
-                    # the private tiers are live immediately
-                    self.assertIn("url", entries[1])
-                    self.assertIn("url", entries[2])
+                    # the tiers that need no provisioning are live immediately
+                    self.assertIn("url", self._entry(entries, "tailnet"))
+                    self.assertIn("url", self._entry(entries, "lan"))
                 finally:
                     server.stop()
 
@@ -6934,7 +6952,7 @@ class TestShareToPhone(unittest.TestCase):
             with tempfile.TemporaryDirectory() as d:
                 server, entries = self._prepare(d)
                 try:
-                    funnel = entries[0]
+                    funnel = self._entry(entries, "funnel")
                     self.assertTrue(funnel["pending"])   # not yet
                     # what _share_finish_funnel's worker + idle callback do
                     host, hint = sidemark._tailscale_funnel_start(server.port)
@@ -6963,7 +6981,7 @@ class TestShareToPhone(unittest.TestCase):
             with tempfile.TemporaryDirectory() as d:
                 server, entries = self._prepare(d)
                 try:
-                    funnel = entries[0]
+                    funnel = self._entry(entries, "funnel")
                     # what _share_finish_funnel does when the CLI refuses
                     host, hint = sidemark._tailscale_funnel_start(server.port)
                     self.assertIsNone(host)
@@ -6985,13 +7003,160 @@ class TestShareToPhone(unittest.TestCase):
             with tempfile.TemporaryDirectory() as d:
                 server, entries = self._prepare(d)
                 try:
-                    funnel = entries[0]
+                    funnel = self._entry(entries, "funnel")
                     self.assertEqual(funnel["caption"], "Public link")
                     self.assertIn("Tailscale", funnel["hint"])
                     self.assertNotIn("pending", funnel)   # nothing to wait for
                     start.assert_not_called()
                 finally:
                     server.stop()
+
+    # ── the installable address: `tailscale serve` (row 190) ────────────────
+
+    def test_prepare_does_not_wait_for_the_private_https_address(self):
+        """Deferred for the same reason the funnel is: provisioning a
+        certificate takes seconds, and the QR most sessions scan is ready in
+        milliseconds. A tier that arrives late must also never be able to take
+        the tab under a scan, which starting `pending` is what guarantees."""
+        import sidemark
+        with mock.patch.object(sidemark, "_tailscale_ip",
+                               return_value="100.70.12.127"), \
+             mock.patch.object(sidemark, "_tailscale_serve_start") as start:
+            with tempfile.TemporaryDirectory() as d:
+                server, entries = self._prepare(d)
+                try:
+                    start.assert_not_called()
+                    serve = self._entry(entries, "serve")
+                    self.assertTrue(serve["pending"])
+                    self.assertNotIn("url", serve)
+                finally:
+                    server.stop()
+
+    def test_prepare_explains_the_installable_address_when_tailscale_is_off(self):
+        import sidemark
+        with mock.patch.object(sidemark, "_tailscale_ip", return_value=None), \
+             mock.patch.object(sidemark, "_tailscale_serve_start") as start:
+            with tempfile.TemporaryDirectory() as d:
+                server, entries = self._prepare(d)
+                try:
+                    serve = self._entry(entries, "serve")
+                    self.assertNotIn("pending", serve)   # nothing to wait for
+                    self.assertIn("Tailscale", serve["hint"])
+                    start.assert_not_called()
+                finally:
+                    server.stop()
+
+    def test_the_private_https_front_does_not_share_the_funnel_s_port(self):
+        """443 IS the funnel's front, and `_tailscale_funnel_stop` turns it off
+        NODE-WIDE (`--https=443 off` is the only spelling the current CLI
+        takes). Put this mapping there too and a share ending would silently
+        drop the other one, with nothing to tell the two apart. Tailscale
+        accepts 443, 8443 and 10000 for HTTPS; this asks for one of the other
+        two."""
+        import sidemark
+        self.assertNotEqual(sidemark.TAILSCALE_SERVE_PORT, 443)
+        with mock.patch.object(sidemark.subprocess, "run") as run, \
+             mock.patch.object(sidemark.shutil, "which", return_value="/x/ts"):
+            run.return_value = mock.Mock(
+                returncode=0, stdout="https://box.tailnet.ts.net:8443/\n",
+                stderr="")
+            host, hint = sidemark._tailscale_serve_start(8756)
+        argv = run.call_args[0][0]
+        self.assertEqual(host, "box.tailnet.ts.net")
+        self.assertIn(f"--https={sidemark.TAILSCALE_SERVE_PORT}", argv)
+        self.assertNotIn("--https=443", argv)
+        # and it points at OUR port, not at itself
+        self.assertIn("http://127.0.0.1:8756", argv)
+        sidemark._live_serves.discard(8756)
+
+    def test_stop_turns_the_private_https_front_off_only_when_started(self):
+        import sidemark
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "doc.pdf"); make_pdf(p)
+            srv = sidemark._ShareServer(p)
+            with mock.patch.object(sidemark, "_tailscale_serve_stop") as stop:
+                srv.stop()                     # never started it
+                stop.assert_not_called()
+                srv.serve_port = 4321
+                srv.stop()
+                stop.assert_called_once_with(4321)
+                self.assertIsNone(srv.serve_port)
+
+    def test_the_installable_url_carries_the_permanent_token_over_https(self):
+        """The saved token, deliberately — unlike the public link. An installed
+        icon whose start_url expired at the end of the session is an icon that
+        opens a 404, and this address never leaves the tailnet, which is the
+        reason it may carry the bookmarkable secret at all."""
+        import sidemark
+        srv = sidemark._ShareServer(providers={
+            "title": "d.pdf", "state": lambda: (0, 0, 1),
+            "render": lambda p: None, "pdf": lambda p: None})
+        url = srv.url_for("box.tailnet.ts.net", scheme="https",
+                          port=sidemark.TAILSCALE_SERVE_PORT)
+        self.assertTrue(url.startswith("https://box.tailnet.ts.net:"))
+        self.assertIn(f"/{srv.token}/", url)
+        self.assertNotIn(srv.public_token, url)
+
+    # ── the per-machine installed-app manifest ──────────────────────────────
+
+    def _manifest(self, srv):
+        import json
+        return json.loads(srv.app_manifest().decode("utf-8"))
+
+    def test_the_desktop_s_manifest_starts_the_app_in_live_mode(self):
+        """Without the flag the icon opens the app in its ORDINARY mode on the
+        desktop's origin — no session to restore and no file to open, which is
+        a blank page that reads as a broken share."""
+        import sidemark
+        srv = sidemark._ShareServer(providers={
+            "title": "d.pdf", "state": lambda: (0, 0, 1),
+            "render": lambda p: None, "pdf": lambda p: None})
+        m = self._manifest(srv)
+        self.assertEqual(m["start_url"], "./?live=1")
+        self.assertEqual(m["scope"], "./")
+
+    def test_the_desktop_s_manifest_names_the_machine(self):
+        """Two computers installed on one phone are two icons, and "Sidemark"
+        twice is two icons nobody can tell apart. `id` separates the installs
+        so the second does not replace the first."""
+        import sidemark
+        srv = sidemark._ShareServer(providers={
+            "title": "d.pdf", "state": lambda: (0, 0, 1),
+            "render": lambda p: None, "pdf": lambda p: None})
+        with mock.patch("socket.gethostname", return_value="thinkpad.local"):
+            m = self._manifest(srv)
+        self.assertIn("thinkpad", m["name"])
+        self.assertIn("thinkpad", m["short_name"])
+        self.assertIn(srv.token, m["id"])
+
+    def test_the_desktop_s_manifest_drops_the_file_taking_entries(self):
+        """They offer to open a file the PHONE chose, and this copy is a window
+        onto somebody else's open document — the same reasoning that hides Open
+        and Save in a live session."""
+        import sidemark
+        srv = sidemark._ShareServer(providers={
+            "title": "d.pdf", "state": lambda: (0, 0, 1),
+            "render": lambda p: None, "pdf": lambda p: None})
+        srv.app_dir = os.path.join(os.path.dirname(sidemark.__file__), "web")
+        m = self._manifest(srv)
+        self.assertNotIn("share_target", m)
+        self.assertNotIn("file_handlers", m)
+        # ...while everything that is NOT per-machine comes from the port's own
+        # file, so the two cannot drift
+        self.assertTrue(m.get("icons"))
+        self.assertEqual(m.get("display"), "standalone")
+
+    def test_the_desktop_s_manifest_survives_an_install_with_no_web_dir(self):
+        """`app_dir` is None for a text-first page or an installed copy with no
+        web/ beside it. A manifest that raised there would take the whole
+        request down."""
+        import sidemark
+        srv = sidemark._ShareServer(providers={
+            "title": "d.pdf", "state": lambda: (0, 0, 1),
+            "render": lambda p: None, "pdf": lambda p: None})
+        srv.app_dir = None
+        m = self._manifest(srv)
+        self.assertEqual(m["start_url"], "./?live=1")
 
     def test_stop_turns_funnel_off_only_when_it_was_started(self):
         import sidemark

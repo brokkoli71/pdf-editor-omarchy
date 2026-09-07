@@ -80,6 +80,13 @@
       Funnel tier could have worked, which would have made the public link
       the *only* transport. Numbers in `notes/phone-web-port-sync-plan.md`;
       don't re-derive them, and don't "just host it on Pages".
+      **Installing the hosted copy does not change this** — an installed page
+      has the same origin and the same per-request checks as a tab, and neither
+      does serving structured JSON instead of HTML, since the block is on the
+      request and not on the payload. The ONE thing that could change is
+      whether Chrome now offers a *permission prompt* for local network access;
+      `web/lna-probe.html` settles that from the phone, and until it does, the
+      hosted app is a launcher (`web/CLAUDE.md`), never a client.
     - **`live.pdf` is `save_copy`, NEVER the `pdf` provider.** That one is the
       Download button's baked export with notes flattened onto the pages; the
       port adopts real annotations into editable strokes, so the baked one
@@ -190,6 +197,40 @@
     fresh each session and never saved. A stale link says so instead of a bare
     404 — for a NAVIGATION only, since a stray HTML body in place of a script
     is worse than an honest error.
+  - **The INSTALLABLE address is a fourth tier, `tailscale serve` on :8443**
+    (row 190). Every other tier is plain HTTP, and a browser will only install
+    an app — or run a service worker — on a secure origin, so none of them can
+    be more than a bookmark on a phone. `tailscale serve --bg --https=8443`
+    puts a real Let's Encrypt certificate on the node's own `*.ts.net` name
+    with **nothing published**, which is the only private HTTPS address this
+    machine has.
+    - **8443 AND NOT 443, and this is the load-bearing part.** 443 is Funnel's
+      front, and `_tailscale_funnel_stop` is NODE-WIDE (`--https=443 off` is
+      the only spelling the current CLI takes). Sharing the port would mean a
+      share ending silently drops the other mapping, with nothing to tell the
+      two apart — the failure the funnel's own teardown already has to reason
+      about. Tailscale accepts 443, 8443 and 10000 for HTTPS; taking one of the
+      others means the two never touch, and `_tailscale_serve_stop` can be the
+      simple thing the funnel's stop cannot be.
+    - **Provisioned in the background and starting `pending`**, exactly like
+      the funnel and for the same reason: a certificate takes seconds, and a
+      tier that arrives late must never take the tab under a scan. It is LAST
+      in `_share_prepare`'s list, which is the dialog's preference order.
+    - **It carries the PERMANENT token, deliberately unlike the public link.**
+      An installed icon whose `start_url` expired at the end of the session is
+      an icon that opens a 404. This address never leaves the tailnet, which is
+      exactly why it may carry the bookmarkable secret.
+    - **The manifest under the token path is GENERATED** (`app_manifest`), not
+      the port's own file: `start_url` is `./?live=1` (without the flag the
+      icon opens the app in its ORDINARY mode on this origin — no session to
+      restore and no file to open, a blank page that reads as a broken share),
+      the name carries this machine's hostname so two computers are two icons
+      you can tell apart, `id` carries the token so the second install does not
+      replace the first, and `share_target`/`file_handlers` are dropped for the
+      same reason Open and Save are hidden here. Everything else comes from
+      `web/manifest.webmanifest`, so the two cannot drift.
+    - The phone's own list of computers, and why it navigates rather than
+      connecting, is `web/CLAUDE.md`.
   - **A random port is unfirewallable BY CONSTRUCTION**, and that was the real
     cause of "the phone never loads": ufw with a DROP default has nothing to
     allow when the port changes every session. Hence the stable port, and the
