@@ -10735,6 +10735,89 @@ def _tailscale_ip():
     return None
 
 
+# ONE tailscale config write at a time, from this process.
+#
+# `tailscale serve` and `tailscale funnel` both write the SAME serve config in
+# tailscaled, and that write is etag-guarded: a second writer arriving mid-flight
+# is rejected with "Another client is changing the serve config" /
+# "Preconditions failed: etag mismatch". Two share tiers provisioning in
+# parallel is exactly that collision, and the loser's QR simply never appears.
+#
+# The lock covers this process; the RETRY covers everyone else — another
+# Sidemark, a `tailscale` in a terminal, the admin console. Nothing can make
+# the operation atomic across processes, so losing once and trying again is
+# the whole of the answer.
+_TAILSCALE_CONFIG_LOCK = threading.Lock()
+
+_TAILSCALE_BUSY = ("etag mismatch", "another client is changing")
+
+
+def _tailscale_config_run(argv, timeout, retries=2, pause=0.6):
+    """Run one `tailscale serve/funnel` config write, serialized and retried.
+
+    Returns the CompletedProcess, or None if the binary is unusable. A caller
+    reads returncode and output exactly as it would from subprocess.run."""
+    with _TAILSCALE_CONFIG_LOCK:
+        out = None
+        for attempt in range(retries + 1):
+            try:
+                out = subprocess.run(argv, capture_output=True, text=True,
+                                     timeout=timeout, stdin=subprocess.DEVNULL)
+            except subprocess.TimeoutExpired:
+                raise
+            except (OSError, subprocess.SubprocessError):
+                return None
+            text = ((out.stdout or "") + (out.stderr or "")).lower()
+            if out.returncode == 0 or not any(m in text for m in _TAILSCALE_BUSY):
+                return out
+            if attempt < retries:
+                logger.info("share: tailscale config was busy, retrying (%d)",
+                            attempt + 1)
+                time.sleep(pause)
+        return out
+
+
+def _tailscale_hint(text, tier):
+    """Turn what the CLI said into something a person can act on.
+
+    Returns (sentence, detail). The raw text is kept as `detail` rather than
+    thrown away — it is what a bug report needs — but it never leads, because
+    every one of these failures has a plain cause and the CLI names none of
+    them in words the person holding the phone can use.
+
+    `tier` is "serve" (the installable private HTTPS address) or "funnel" (the
+    public link); the two fail for different reasons and the advice differs."""
+    raw = (text or "").strip()
+    low = raw.lower()
+    if any(m in low for m in _TAILSCALE_BUSY):
+        return ("Tailscale was busy applying another change and would not take "
+                "this one. Stop sharing and start again — it usually works the "
+                "second time.", raw)
+    if "logged out" in low or "not logged in" in low or "NeedsLogin" in raw:
+        return ("This computer is not signed in to Tailscale. Run "
+                "“tailscale up” here, then share again.", raw)
+    if ("certificate" in low or "cert " in low
+            or ("https" in low and "enable" in low)):
+        return ("Tailscale has no HTTPS certificate for this computer. Turn on "
+                "HTTPS in the Tailscale admin console (DNS → HTTPS "
+                "Certificates), then share again.", raw)
+    if tier == "funnel" and ("funnel" in low or "not permitted" in low
+                             or "denied" in low):
+        return ("Funnel is not enabled for this tailnet. Turn it on in the "
+                "Tailscale admin console (Access controls → nodeAttrs → "
+                "funnel), then share again.", raw)
+    if "timed out" in low:
+        return ("Tailscale did not answer in time. Stop sharing and start "
+                "again; if it keeps happening, run the command in a terminal "
+                "to see what it is waiting on.", raw)
+    if tier == "serve":
+        return ("Tailscale could not set up the private HTTPS address. The "
+                "other options above still work — this one is only needed to "
+                "install Sidemark as an app.", raw)
+    return ("Tailscale could not set up the public link. The private options "
+            "above still work.", raw)
+
+
 def _tailscale_funnel_start(port, timeout=25):
     """PROTOTYPE (#180): point Tailscale Funnel at our local share server, so
     the phone needs no Tailscale app at all — a public HTTPS link, reachable
@@ -10762,14 +10845,12 @@ def _tailscale_funnel_start(port, timeout=25):
     if not shutil.which("tailscale"):
         return None, None
     try:
-        out = subprocess.run(
-            ["tailscale", "funnel", "--bg", "--yes", str(port)],
-            capture_output=True, text=True, timeout=timeout,
-            stdin=subprocess.DEVNULL)
+        out = _tailscale_config_run(
+            ["tailscale", "funnel", "--bg", "--yes", str(port)], timeout)
     except subprocess.TimeoutExpired:
         return None, (f"tailscale funnel --bg {port} timed out — try it in a "
                        "terminal to see what it's waiting on.")
-    except (OSError, subprocess.SubprocessError):
+    if out is None:
         return None, None
     text = out.stdout + out.stderr
     m = re.search(r"https://\S+", text)
@@ -10835,8 +10916,10 @@ def _tailscale_funnel_stop(port):
     for argv in (["tailscale", "funnel", "--https=443", "off"],
                  ["tailscale", "funnel", str(port), "off"]):
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
-        except (OSError, subprocess.SubprocessError):
+            r = _tailscale_config_run(argv, 5)
+        except subprocess.TimeoutExpired:
+            break
+        if r is None:
             break
         # exit status alone is not the answer here: the rejected old form
         # exits 0 and complains on stderr, which is exactly how this went
@@ -10879,15 +10962,13 @@ def _tailscale_serve_start(port, timeout=25):
     if not shutil.which("tailscale"):
         return None, None
     try:
-        out = subprocess.run(
+        out = _tailscale_config_run(
             ["tailscale", "serve", "--bg", f"--https={TAILSCALE_SERVE_PORT}",
-             f"http://127.0.0.1:{port}"],
-            capture_output=True, text=True, timeout=timeout,
-            stdin=subprocess.DEVNULL)
+             f"http://127.0.0.1:{port}"], timeout)
     except subprocess.TimeoutExpired:
         return None, (f"tailscale serve --https={TAILSCALE_SERVE_PORT} timed "
                       "out — try it in a terminal to see what it's waiting on.")
-    except (OSError, subprocess.SubprocessError):
+    if out is None:
         return None, None
     text = out.stdout + out.stderr
     m = re.search(r"https://([A-Za-z0-9._-]+)", text)
@@ -10914,10 +10995,9 @@ def _tailscale_serve_stop(port):
         return
     logger.info("share: turning the private HTTPS address off (port %s)", port)
     try:
-        subprocess.run(["tailscale", "serve",
-                        f"--https={TAILSCALE_SERVE_PORT}", "off"],
-                       capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
+        _tailscale_config_run(["tailscale", "serve",
+                               f"--https={TAILSCALE_SERVE_PORT}", "off"], 5)
+    except subprocess.TimeoutExpired:
         pass
     _live_serves.discard(port)
 
@@ -26896,6 +26976,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             hint.set_max_width_chars(28)
             hint.set_justify(Gtk.Justification.CENTER)
             col.append(hint)
+            # What the tool actually said, kept but demoted: it is the thing a
+            # bug report needs and the thing nobody can act on, so it goes
+            # behind an expander rather than in front of the explanation.
+            if entry.get("detail"):
+                more = Gtk.Expander(label="What Tailscale said")
+                more.add_css_class("caption")
+                detail = Gtk.Label(label=entry["detail"])
+                detail.add_css_class("dim-label")
+                detail.add_css_class("caption")
+                detail.add_css_class("monospace")
+                detail.set_wrap(True)
+                detail.set_max_width_chars(34)
+                detail.set_selectable(True)
+                detail.set_margin_top(4)
+                more.set_child(detail)
+                more.set_margin_top(4)
+                col.append(more)
         return col
 
     def _render_share_page(self, canvas, notes_model, accent, path):
@@ -27605,10 +27702,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             stop_btn.set_sensitive(True)
             self._show_share_ready(body, srv, entries)
             # ...and only now go and get the two slow addresses, with the QR
-            # already on screen and scannable. Both provision in their own
-            # thread and neither may move the tab you are looking at.
-            self._share_finish_funnel(srv, out_dir, my_gen)
-            self._share_finish_serve(srv, out_dir, my_gen)
+            # already on screen and scannable. They share one thread and
+            # neither may move the tab you are looking at.
+            self._share_finish_addresses(srv, out_dir, my_gen)
             # safety net: stop sharing after 10 minutes even if left running
             GLib.timeout_add_seconds(
                 600, lambda: (self._stop_sharing(), False)[1])
@@ -27631,7 +27727,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _share_finish_funnel(self, server, out_dir, gen):
-        """Provision the public link in the background and slot it in.
+        """The public link's provisioning step. Returns a callable to run on a
+        background thread, or None if there is nothing to provision.
+
+        NOT started here: both slow tiers write the SAME serve config in
+        tailscaled, and that write is etag-guarded — run in parallel, one of
+        them loses with "Another client is changing the serve config" and its
+        QR never appears. `_share_finish_addresses` runs them in order.
 
         Separate from _share_prepare because it is the only slow step: the
         rest of the dialog is ~15 ms and this is seconds, so the QR you
@@ -27683,11 +27785,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 entry["url"] = url
                 entry["qr"] = qr if _make_qr_png(url, qr) else None
                 entry.pop("hint", None)
+                entry.pop("detail", None)
+            elif hint:
+                entry["hint"], entry["detail"] = _tailscale_hint(hint, "funnel")
             else:
-                entry["hint"] = hint or (
+                entry["hint"] = (
                     "Enable Funnel for this tailnet in the Tailscale admin "
                     "console to get a public link that needs no app on the "
                     "phone.")
+                entry.pop("detail", None)
             # Re-render only if the window is still open, and WITHOUT moving
             # the dropdown: the address you are looking at must not change
             # under you because a slower option finished.
@@ -27721,10 +27827,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                                hint or "tailscale gave no reason")
             GLib.idle_add(_done, host, hint)
 
-        threading.Thread(target=_worker, daemon=True).start()
+        return _worker
 
     def _share_finish_serve(self, server, out_dir, gen):
-        """Provision the private HTTPS address in the background and slot it in.
+        """The private HTTPS address's provisioning step. Returns a callable to
+        run on a background thread, or None if there is nothing to provision.
 
         The funnel's twin, and deliberately a separate method rather than a
         parameter on it: the two differ in the part that matters, which is the
@@ -27760,11 +27867,20 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                                  "browser's “Install app”. The icon stays "
                                  "pointed at this computer.")
                 entry.pop("hint", None)
+                entry.pop("detail", None)
+            elif hint:
+                # What tailscale said, TRANSLATED. Its own wording names an
+                # internal precondition ("Preconditions failed: etag
+                # mismatch") and nothing a person holding a phone can do — so
+                # the sentence leads and the raw text stays underneath it for
+                # a bug report.
+                entry["hint"], entry["detail"] = _tailscale_hint(hint, "serve")
             else:
-                entry["hint"] = hint or (
-                    "Tailscale could not provide a certificate for this "
-                    "machine. Enable HTTPS for the tailnet in the Tailscale "
-                    "admin console.")
+                entry["hint"] = (
+                    "Tailscale could not set up the private HTTPS address. "
+                    "The other options above still work — this one is only "
+                    "needed to install Sidemark as an app on the phone.")
+                entry.pop("detail", None)
             if self._share_window is not None and self._share_body is not None:
                 self._show_share_ready(
                     self._share_body, server, self._share_entries,
@@ -27784,6 +27900,35 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 logger.warning("share: NO private HTTPS address — %s",
                                hint or "tailscale gave no reason")
             GLib.idle_add(_done, host, hint)
+
+        return _worker
+
+    def _share_finish_addresses(self, server, out_dir, gen):
+        """Provision both slow tiers, ON ONE THREAD, in this order.
+
+        SEQUENCED, not parallel, and the order is not arbitrary:
+
+        * They write the same etag-guarded serve config in tailscaled, so two
+          at once means one is rejected outright ("Another client is changing
+          the serve config") and its QR simply never appears. That is a lock's
+          job in principle — and there is one, for writers this process does
+          not own — but sequencing is what makes it impossible rather than
+          merely retried.
+        * SERVE FIRST, because the funnel can sit for its full 25 s ceiling
+          when a tailnet has Funnel switched off, and a person waiting to
+          install the app should not be behind a link they may never open.
+        """
+        steps = [self._share_finish_serve(server, out_dir, gen),
+                 self._share_finish_funnel(server, out_dir, gen)]
+
+        def _worker():
+            for step in steps:
+                if step is None:
+                    continue
+                try:
+                    step()
+                except Exception:                           # noqa: BLE001
+                    logger.exception("share: an address failed to provision")
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -27822,10 +27967,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # getattr for the same reason _share_server above uses it: this is
         # reached from a worker hop and must not require a built window.
         if getattr(self, "_share_modifiers", False) and canvas is not None:
-            held = canvas.get_held_mods() if canvas.get_held_mods else (0, 0, 0)
-            tool = self.bindings.tool_for(BTN_FINGER, bool(held[0]),
-                                          bool(held[1]), bool(held[2]),
-                                          mode="pdf")
+            # `_finger_tool_now`, and NOT a modifier read off the canvas.
+            # `get_held_mods` is a TextPageView callback — a PDFCanvas has
+            # never had one — so reaching through the canvas raised
+            # AttributeError here and every phone stroke on a PDF was dropped
+            # for as long as the toggle was on. The window is where the held
+            # modifiers are actually tracked (`_held_mods`).
+            #
+            # It is also the function `_push_share_tool` sends to the phone,
+            # which is the point: the tool the phone DISPLAYS and the tool the
+            # desktop APPLIES are then one answer rather than two computations
+            # that can disagree — the same rule that keeps the binding table
+            # off the phone in the first place.
+            tool = self._finger_tool_now()
             actions = apply_modifier_tool(actions, tool)
             # the highlighter is the pen with other attributes, and
             # _temp_highlighter is exactly the transient flag _pen_attrs reads

@@ -216,6 +216,23 @@
       the funnel and for the same reason: a certificate takes seconds, and a
       tier that arrives late must never take the tab under a scan. It is LAST
       in `_share_prepare`'s list, which is the dialog's preference order.
+    - **The two slow tiers SHARE ONE THREAD, serve first**
+      (`_share_finish_addresses`). `serve` and `funnel` write the SAME
+      etag-guarded serve config in tailscaled, so run in parallel one is
+      rejected outright — "Another client is changing the serve config" /
+      "Preconditions failed: etag mismatch" — and its QR never appears at all.
+      Sequencing makes that impossible; `_TAILSCALE_CONFIG_LOCK` plus a retry
+      in `_tailscale_config_run` covers writers this process does not own (a
+      second Sidemark, a terminal, the admin console). Serve goes first
+      because the funnel can sit for its full 25 s ceiling on a tailnet with
+      Funnel off, and somebody waiting to install the app should not queue
+      behind a link they may never open.
+    - **What tailscale says is TRANSLATED before it is shown**
+      (`_tailscale_hint`). Its own wording names internal preconditions and
+      nothing a person holding a phone can act on, so the entry gets a plain
+      sentence with a cause and a next step, and the raw text goes behind a
+      "What Tailscale said" expander — kept, because it is what a bug report
+      needs, and demoted, because it is not what a reader needs.
     - **It carries the PERMANENT token, deliberately unlike the public link.**
       An installed icon whose `start_url` expired at the end of the session is
       an icon that opens a 404. This address never leaves the tailnet, which is
@@ -256,6 +273,14 @@
       phone.** Resolved on the DESKTOP, because a copy of the table on the
       phone is the second mapping row 132 forbids; the phone is sent the
       answer, never the table.
+      **The held modifiers come from the WINDOW (`_finger_tool_now`), never
+      from the canvas.** `get_held_mods` is a `TextPageView` callback and a
+      `PDFCanvas` has never had one, so reading it in
+      `_apply_remote_ink_actions` raised before a single verb was dispatched
+      and every phone stroke on a PDF was silently dropped for as long as the
+      toggle was on. It is also the function `_push_share_tool` sends, which
+      is the point: what the phone DISPLAYS and what the desktop APPLIES are
+      one answer, not two that can disagree.
     - The push carries `tool` (what a touch does right now, modifiers
       included) and `base` (the finger's own binding). The phone STORES the
       base and only displays `tool`, so releasing a key needs no message.

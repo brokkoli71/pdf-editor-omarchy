@@ -6549,9 +6549,13 @@ class TestShareToPhone(unittest.TestCase):
             # while this silently did nothing and every share leaked a live
             # public hostname. Funnel fronts on 443, so that is what is
             # turned off; the local port is only the target behind it.
-            run.assert_called_once_with(
-                ["tailscale", "funnel", "--https=443", "off"],
-                capture_output=True, text=True, timeout=5)
+            # The ARGV, not the whole call: every tailscale config write now
+            # goes through one runner that also closes stdin and retries a
+            # busy config, and pinning its keyword arguments here would fire
+            # for a change to the runner rather than to this decision.
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args[0][0],
+                             ["tailscale", "funnel", "--https=443", "off"])
 
     def test_funnel_stop_falls_back_to_the_old_spelling(self):
         """An older Tailscale still wants `funnel <port> off`. The rejected
@@ -7068,6 +7072,131 @@ class TestShareToPhone(unittest.TestCase):
         # and it points at OUR port, not at itself
         self.assertIn("http://127.0.0.1:8756", argv)
         sidemark._live_serves.discard(8756)
+
+    def test_both_slow_tiers_run_on_one_thread_serve_first(self):
+        """They write the SAME etag-guarded serve config in tailscaled, so in
+        parallel one is rejected outright ("Another client is changing the
+        serve config") and its QR never appears — which is exactly what was
+        reported. Sequencing makes it impossible rather than merely retried,
+        and serve goes first because the funnel can sit for its full 25 s
+        ceiling on a tailnet with Funnel switched off."""
+        import sidemark
+        win = sidemark.PDFEditorWindow.__new__(sidemark.PDFEditorWindow)
+        order = []
+        win._share_finish_serve = lambda *a: (lambda: order.append("serve"))
+        win._share_finish_funnel = lambda *a: (lambda: order.append("funnel"))
+        started = []
+
+        class _Thread:
+            def __init__(self, target=None, daemon=None):
+                self.target = target
+
+            def start(self):
+                started.append(self)
+                self.target()
+
+        with mock.patch.object(sidemark.threading, "Thread", _Thread):
+            sidemark.PDFEditorWindow._share_finish_addresses(win, None, "d", 1)
+        self.assertEqual(len(started), 1, "one thread, not one each")
+        self.assertEqual(order, ["serve", "funnel"])
+
+    def test_one_tier_failing_does_not_strand_the_other(self):
+        import sidemark
+        win = sidemark.PDFEditorWindow.__new__(sidemark.PDFEditorWindow)
+        ran = []
+
+        def _boom():
+            raise RuntimeError("tailscale fell over")
+
+        win._share_finish_serve = lambda *a: _boom
+        win._share_finish_funnel = lambda *a: (lambda: ran.append("funnel"))
+
+        class _Thread:
+            def __init__(self, target=None, daemon=None):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with mock.patch.object(sidemark.threading, "Thread", _Thread):
+            sidemark.PDFEditorWindow._share_finish_addresses(win, None, "d", 1)
+        self.assertEqual(ran, ["funnel"])
+
+    def test_a_busy_tailscale_config_is_retried_not_surfaced(self):
+        """The rejection is transient by nature — the lock covers this
+        process, and another Sidemark or a `tailscale` in a terminal is what
+        the retry is for."""
+        import sidemark
+        calls = []
+
+        def _run(argv, **kw):
+            calls.append(argv)
+            if len(calls) == 1:
+                return mock.Mock(returncode=1, stdout="",
+                                 stderr="Another client is changing the serve "
+                                        "config; please try again.\n"
+                                        "Preconditions failed: etag mismatch")
+            return mock.Mock(returncode=0, stdout="https://box.ts.net/", stderr="")
+
+        with mock.patch.object(sidemark.subprocess, "run", side_effect=_run):
+            out = sidemark._tailscale_config_run(["tailscale", "serve"], 5,
+                                                 pause=0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(out.returncode, 0)
+
+    def test_the_retry_gives_up_rather_than_spinning(self):
+        import sidemark
+        busy = mock.Mock(returncode=1, stdout="",
+                         stderr="Preconditions failed: etag mismatch")
+        with mock.patch.object(sidemark.subprocess, "run", return_value=busy) as r:
+            out = sidemark._tailscale_config_run(["tailscale", "serve"], 5,
+                                                 retries=2, pause=0)
+        self.assertEqual(r.call_count, 3)          # the first plus two retries
+        self.assertEqual(out.returncode, 1)
+
+    def test_tailscale_failures_are_translated_before_they_are_shown(self):
+        """The CLI names an internal precondition and nothing anybody can do
+        about it. Each of these has a plain cause; the raw text is kept as the
+        detail, never as the message."""
+        import sidemark
+        cases = [
+            ("Another client is changing the serve config; please try again.\n"
+             "Preconditions failed: etag mismatch", "serve", "again"),
+            ("Logged out.", "serve", "tailscale up"),
+            ("no certificate issued for this node", "serve", "admin console"),
+            ("Funnel is not permitted for this tailnet", "funnel", "Funnel"),
+            ("tailscale serve --https=8443 timed out", "serve", "again"),
+        ]
+        for raw, tier, expect in cases:
+            sentence, detail = sidemark._tailscale_hint(raw, tier)
+            self.assertIn(expect, sentence, raw)
+            # the sentence is prose, not the tool's own vocabulary
+            self.assertNotIn("etag", sentence.lower())
+            self.assertNotIn("precondition", sentence.lower())
+            # ...and the raw text survives for a bug report
+            self.assertEqual(detail, raw.strip())
+
+    def test_a_translated_failure_reaches_the_entry_with_its_detail(self):
+        """End to end through _share_finish_serve's callback: what the dialog
+        renders is the sentence, with the raw text behind it."""
+        import sidemark
+        with mock.patch.object(sidemark, "_tailscale_ip",
+                               return_value="100.70.12.127"), \
+             mock.patch.object(sidemark, "_tailscale_serve_start",
+                               return_value=(None, "Preconditions failed: "
+                                                   "etag mismatch")):
+            with tempfile.TemporaryDirectory() as d:
+                server, entries = self._prepare(d)
+                try:
+                    serve = self._entry(entries, "serve")
+                    host, raw = sidemark._tailscale_serve_start(server.port)
+                    self.assertIsNone(host)
+                    serve["hint"], serve["detail"] = \
+                        sidemark._tailscale_hint(raw, "serve")
+                    self.assertNotIn("etag", serve["hint"])
+                    self.assertIn("etag", serve["detail"])
+                finally:
+                    server.stop()
 
     def test_stop_turns_the_private_https_front_off_only_when_started(self):
         import sidemark
@@ -8295,6 +8424,92 @@ class TestApplyRemoteInkActions(unittest.TestCase):
         target.remote_erase_at.assert_called_once_with(5.0, 6.0)
         target.remote_erase_end.assert_called_once_with()
         target.remote_abort.assert_called_once_with()
+
+    # ── the tool link must not eat the stroke ───────────────────────────────
+    #
+    # These use a REAL PDFCanvas, and that is the whole point. The tests above
+    # pass `self=None`, so `_share_modifiers` reads False and the modifier
+    # branch never runs; a `mock.Mock()` canvas would not help either, because
+    # a Mock grows whatever attribute you ask it for. The branch was therefore
+    # dead code to this suite while being live in the app, and it raised
+    # AttributeError on every phone stroke — drawing from the phone simply
+    # stopped arriving for anyone with the toggle on.
+
+    @staticmethod
+    def _window_with_link_on(bindings=None):
+        """A duck-typed window with the tool link ON — the same stand-in style
+        TestShareStopUX uses, plus the three things _finger_tool_now reads."""
+        import types
+        return types.SimpleNamespace(
+            _share_modifiers=True,
+            _share_server=None,
+            _held_mods=(False, False, False),
+            _active_session=None,          # → "pdf", the mode a canvas implies
+            bindings=bindings or sidemark.Bindings(),
+            _finger_tool_now=None,         # filled in below
+        )
+
+    def _linked_window(self, bindings=None):
+        win = self._window_with_link_on(bindings)
+        win._finger_tool_now = lambda: sidemark.PDFEditorWindow._finger_tool_now(win)
+        return win
+
+    def test_a_phone_stroke_still_arrives_with_the_tool_link_on(self):
+        """The regression: a real PDFCanvas has no `get_held_mods`, so the
+        modifier branch used to raise before dispatching anything."""
+        canvas = PDFCanvas()
+        win = self._linked_window()
+        sidemark.PDFEditorWindow._apply_remote_ink_actions(
+            win, canvas, None,
+            [("draw_begin", 10.0, 10.0, 0.5),
+             ("draw_update", 20.0, 20.0, 0.5),
+             ("draw_end", 0.0, 0.0, 0.0)])
+        self.assertEqual(len(canvas.strokes), 1,
+                         "the phone's stroke never reached the canvas")
+
+    def test_a_held_modifier_repoints_the_finger_on_a_pdf(self):
+        """The feature the branch exists for, exercised through the real
+        method rather than through `apply_modifier_tool` on its own — which is
+        what let the wiring break while the pure function stayed green."""
+        b = sidemark.Bindings()
+        b.bind("ctrl+finger", "eraser")
+        canvas = PDFCanvas()
+        canvas.remote_stroke_begin(10.0, 10.0, 0.5)
+        canvas.remote_stroke_update(60.0, 10.0, 0.5)
+        canvas.remote_stroke_end()
+        self.assertEqual(len(canvas.strokes), 1)
+
+        win = self._linked_window(b)
+        win._held_mods = (True, False, False)          # ctrl down here
+        sidemark.PDFEditorWindow._apply_remote_ink_actions(
+            win, canvas, None,
+            [("draw_begin", 10.0, 10.0, 0.5),
+             ("draw_update", 60.0, 10.0, 0.5),
+             ("draw_end", 0.0, 0.0, 0.0)])
+        # ctrl+finger is the eraser, so the touch ERASED the stroke that was
+        # there instead of adding a second one
+        self.assertEqual(canvas.strokes, [])
+
+    def test_the_tool_the_phone_is_told_is_the_tool_that_is_applied(self):
+        """One answer, not two. `_push_share_tool` sends `_finger_tool_now()`;
+        so does the dispatch. A second computation here is exactly how the
+        phone comes to show one tool and draw with another."""
+        b = sidemark.Bindings()
+        b.bind("shift+finger", "highlighter")
+        win = self._linked_window(b)
+        win._held_mods = (False, True, False)
+        self.assertEqual(win._finger_tool_now(), "highlighter")
+
+        canvas = PDFCanvas()
+        sidemark.PDFEditorWindow._apply_remote_ink_actions(
+            win, canvas, None,
+            [("draw_begin", 10.0, 10.0, 0.5),
+             ("draw_update", 20.0, 20.0, 0.5),
+             ("draw_end", 0.0, 0.0, 0.0)])
+        self.assertEqual(len(canvas.strokes), 1)
+        # the highlighter is the pen with other attributes, and the transient
+        # flag is cleared again whatever happened
+        self.assertFalse(getattr(canvas, "_temp_highlighter", False))
 
     def test_prefers_the_text_page_over_the_canvas_when_both_are_given(self):
         """Whichever surface was bound at connect time — the closure that
