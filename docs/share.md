@@ -297,7 +297,9 @@
     spelling the current CLI takes), so a late teardown from an abandoned
     share used to kill a newer share's funnel — same port, nothing to tell
     them apart. It only stops when nothing has replaced it, and every stop
-    logs its caller. *ceiling: Tailscale's public ingress currently accepts
+    logs its caller as a ONE-LINE breadcrumb (`_caller_trail`) — it was a
+    `format_stack()` block, which is shaped exactly like a crash and was read
+    as one in a log where nothing had gone wrong. *ceiling: Tailscale's public ingress currently accepts
     the TCP connection and closes during TLS, with nothing reaching
     tailscaled, while the tailnet path works — verified against all three
     ingress IPs with the funnel confirmed on. That is theirs, not ours (row

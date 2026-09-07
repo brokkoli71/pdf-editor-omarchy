@@ -7050,6 +7050,42 @@ class TestShareToPhone(unittest.TestCase):
                 finally:
                     server.stop()
 
+    def test_a_teardown_names_its_caller_without_looking_like_a_crash(self):
+        """This log line was reported as an error during an entirely ordinary
+        shutdown, because `format_stack()` renders the same shape a traceback
+        does. The caller still has to be recorded — the stop is node-wide and
+        a public link dying for no visible reason is this feature's hardest
+        failure — so it is a one-line breadcrumb instead."""
+        import sidemark
+
+        def outer():
+            return inner()
+
+        def inner():
+            return sidemark._caller_trail()
+
+        trail = outer()
+        self.assertNotIn("\n", trail, "a multi-line trail reads as a crash")
+        self.assertNotIn("Traceback", trail)
+        self.assertNotIn("File \"", trail)
+        # it names the callers, innermost last, and NOT the helper itself
+        self.assertIn("outer:", trail)
+        self.assertNotIn("_caller_trail", trail)
+        self.assertLess(trail.index("outer:"), len(trail))
+
+    def test_the_teardown_log_carries_the_trail_and_stays_one_line(self):
+        import sidemark
+        with mock.patch.object(sidemark.shutil, "which", return_value="/x/ts"), \
+             mock.patch.object(sidemark, "_tailscale_config_run",
+                               return_value=mock.Mock(returncode=0, stderr="")), \
+             mock.patch.object(sidemark.logger, "info") as info:
+            sidemark._tailscale_funnel_stop(8756)
+        msg, args = info.call_args[0][0], info.call_args[0][1:]
+        rendered = msg % args
+        self.assertNotIn("\n", rendered)
+        self.assertIn("8756", rendered)
+        self.assertIn("asked by", rendered)
+
     def test_the_private_https_front_does_not_share_the_funnel_s_port(self):
         """443 IS the funnel's front, and `_tailscale_funnel_stop` turns it off
         NODE-WIDE (`--https=443 off` is the only spelling the current CLI

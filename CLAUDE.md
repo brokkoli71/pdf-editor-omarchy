@@ -174,11 +174,17 @@ published to <https://brokkoli71.github.io/sidemark/> on every push to master.
 It is also what a phone gets when you Share to phone. **`web/CLAUDE.md` is its
 reference — read that before touching anything under `web/`.**
 
-The one rule that belongs here: the ported pipeline is checked against
-`sidemark.py` by exported VECTORS (`extras/export_*_vectors.py`), so a change
-to the ink pipeline, the maths grammar, the sidecar format, the lasso geometry
-or the shape recogniser on this side may break `web/test/`. Regenerate with
+Two rules belong here. The ported pipeline is checked against `sidemark.py`
+by exported VECTORS (`extras/export_*_vectors.py`), so a change to the ink
+pipeline, the maths grammar, the sidecar format, the lasso geometry or the
+shape recogniser on this side may break `web/test/`. Regenerate with
 `npm run vectors` in `web/` and re-run `npm test`.
+
+And the Pages copy is an **installable app** (row 190): `manifest.webmanifest`
+and `sw.js` are load-bearing, `sw.js` must be deployed at the SITE ROOT (a
+service worker cannot claim a scope above its own path), and its precache list
+is checked against `src/` and `vendor/` both ways — add a module there and
+`web/test/pwa.mjs` will tell you.
 
 ## The deck branch (parked — not a concern)
 

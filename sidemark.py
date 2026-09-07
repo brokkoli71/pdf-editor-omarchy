@@ -10735,6 +10735,26 @@ def _tailscale_ip():
     return None
 
 
+def _caller_trail(limit=6, skip=2):
+    """Who asked for this, on ONE line.
+
+    `traceback.format_stack()` renders the same information as a Python
+    TRACEBACK, and a traceback in a log at INFO reads as a crash — this one was
+    reported as an error during an entirely ordinary shutdown. A breadcrumb
+    says the same thing and cannot be mistaken for one:
+
+        on_response:21956 → _destroy_all:21976 → stop:12526
+
+    Innermost LAST, so it reads in the direction the call went. `skip` drops
+    this helper and the function asking on its own behalf.
+    """
+    try:
+        frames = traceback.extract_stack(limit=limit + skip)[:-skip]
+    except Exception:                                      # noqa: BLE001
+        return "?"
+    return " → ".join(f"{f.name}:{f.lineno}" for f in frames) or "?"
+
+
 # ONE tailscale config write at a time, from this process.
 #
 # `tailscale serve` and `tailscale funnel` both write the SAME serve config in
@@ -10906,13 +10926,17 @@ def _tailscale_funnel_stop(port):
     if not shutil.which("tailscale"):
         _live_funnels.discard(port)
         return
-    # LOGGED, with a stack, because this is node-wide: `--https=443 off` turns
-    # off whatever funnel is running, not merely the one this port started.
-    # A public link that dies for no visible reason is the hardest failure
-    # this feature has, and the start already says why it succeeds — the stop
-    # has to say who asked.
-    logger.info("share: turning the public link off (port %s), asked by:\n%s",
-                port, "".join(traceback.format_stack(limit=6)[:-1]).rstrip())
+    # LOGGED WITH ITS CALLER, because this is node-wide: `--https=443 off`
+    # turns off whatever funnel is running, not merely the one this port
+    # started. A public link that dies for no visible reason is the hardest
+    # failure this feature has, and the start already says why it succeeds —
+    # the stop has to say who asked.
+    #
+    # A BREADCRUMB, not a stack dump. This was a `format_stack()` block, which
+    # is shaped exactly like a crash and was duly read as one in a log where
+    # nothing had gone wrong. See _caller_trail.
+    logger.info("share: turning the public link off (port %s) — asked by %s",
+                port, _caller_trail())
     for argv in (["tailscale", "funnel", "--https=443", "off"],
                  ["tailscale", "funnel", str(port), "off"]):
         try:
@@ -10993,7 +11017,8 @@ def _tailscale_serve_stop(port):
     if not shutil.which("tailscale"):
         _live_serves.discard(port)
         return
-    logger.info("share: turning the private HTTPS address off (port %s)", port)
+    logger.info("share: turning the private HTTPS address off (port %s) — "
+                "asked by %s", port, _caller_trail())
     try:
         _tailscale_config_run(["tailscale", "serve",
                                f"--https={TAILSCALE_SERVE_PORT}", "off"], 5)
