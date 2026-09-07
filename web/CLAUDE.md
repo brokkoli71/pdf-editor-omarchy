@@ -84,6 +84,7 @@ npm test                                              # all the runners
 | `crossing.mjs` | 27 | where the caret and its selection land crossing the divider |
 | `paging.mjs` | 885 | insert/delete/reorder re-key notes, runs, bookmarks, hidden, outline |
 | `pwa.mjs` | 124 | the precache list vs the directory, the manifest, the share-target handoff, what a scanned code may be |
+| `render.mjs` | 38 | fit against a container with no size, render scale, the preview pass, two renders racing, prefetch |
 | `wiring.mjs` | — | callbacks supplied, bare calls resolve, DOM ids exist |
 
 The ink vectors are **real captured strokes** from `notes/*.jsonl` — the same
@@ -363,6 +364,12 @@ Numbers in `../notes/phone-web-port-sync-plan.md`.
 - **Fullscreen is Android-only.** Safari implements `requestFullscreen` for
   video and nothing else, so the entry is offered only where the API exists;
   Add to Home Screen (the `*-web-app-capable` meta) is the iOS route.
+- **The next page is PREFETCHED on every turn** (`Doc.prefetchPage`). A turn
+  costs a round trip to the desktop before a pixel can be rasterised, and that
+  round trip — not the rendering — is the beat you can see. It restores
+  `_lastPage` synchronously, because that is what `_evictLazyPages` treats as
+  "here": a prefetch that moved it would evict the neighbours of a page nobody
+  is looking at.
 - **Lazily fetched pages are EVICTED** to a window of 8. Each is a whole
   pdf.js document whose memory lives in the WORKER, so holding them all is
   invisible in `performance.memory` and ends as a killed tab on a phone.
@@ -371,6 +378,37 @@ Numbers in `../notes/phone-web-port-sync-plan.md`.
   `if (!sendBeacon(...))` fallback never fires and the record vanishes
   silently — which is exactly how a browser crash was investigated twice with
   nothing to show for it.
+
+## Painting a page: what happens before it is ready
+
+Three traps, and every one of them is silent — the page is simply white, or
+soft, or a beat late, with nothing in the console.
+
+- **`fit()` refuses a container with no size**, and this is the important one.
+  `(0 - 48) / 595` is a perfectly good NEGATIVE number, so a fit against a box
+  that has not been laid out yet gave a negative zoom, `_renderScale` asked
+  pdf.js for a negative viewport, `doc.render` clamped it to a 1px canvas
+  rather than throwing, and `draw` refuses to blit anything that narrow. White
+  page — and the dud was CACHED under `_pageKey`, so nothing re-rendered until
+  a gesture happened to change the scale. On a phone that reads as "blank until
+  I pinch". It leaves `_fitPending` set instead, clamps the margin to the box
+  (a narrow column is a small page, not an inverted one) and floors the zoom at
+  `MIN_ZOOM`.
+- **The owed re-fit is paid OUTSIDE `draw`'s canvas-resize branch.** It used to
+  be inside it, so a fit owed while the canvas already had the right size was
+  never paid at all. `fit` re-sets the flag when there is still no box, so this
+  cannot spin.
+- **Each render gets its own canvas** and is swapped in only if it still wins
+  (`_renderAt`). `doc.render` sets the size and paints, so two renders sharing
+  one buffer means a slower earlier one can finish last and overwrite the
+  bitmap `_pageKey` claims is on screen. A degenerate result is never cached.
+- **A blurry page beats a white one.** With nothing on screen for this page, a
+  `PREVIEW_SIDE` bitmap goes up first and the full-scale one replaces it when
+  it lands, so a page sharpens instead of appearing. Deliberately skipped in
+  two cases: when this page is ALREADY showing, where the bitmap in hand is the
+  better placeholder and a soft one is a visible step backwards; and when the
+  full render is already small enough that the preview would be the same work
+  twice.
 
 ## Browser differences (measured, not assumed)
 

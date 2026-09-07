@@ -45,6 +45,21 @@ export const PAGE_W = 595.0, PAGE_H = 842.0;   // A4 in document units, the size
 // about landing on whole device pixels, not about making more of them.
 export const MAX_RENDER_SIDE = 8192;
 
+/** The zoom range a view may hold. The FLOOR is what stops a container with
+ * no size producing a negative scale — `(0 - 48) / 595` is a perfectly good
+ * number and a completely broken view. */
+export const MIN_ZOOM = 0.05, MAX_ZOOM = 16;
+
+/** A first, blurry pass while the real one rasterises.
+ *
+ * A page arrives as a white rectangle otherwise — pdf.js takes long enough at
+ * full device resolution to be seen, and on a phone a page turn is a white
+ * flash. A bitmap this size comes back in a fraction of the time and is
+ * replaced the moment the sharp one lands, so the page FADES IN rather than
+ * appearing. Only worth doing when the real bitmap is meaningfully bigger;
+ * below that the preview is the same work twice. */
+export const PREVIEW_SIDE = 700;
+
 export const STRAIGHT_HOLD_MS = 500;   // hold still this long mid-stroke to snap
 // The same hold time, so there is only one to learn. What separates the two is
 // the pen LIFT, not the shape: hold WITHOUT lifting and the stroke snaps; hold
@@ -263,6 +278,14 @@ export class Surface {
     await this._renderPage();
     this.onPageChange(index);
     this.requestDraw();
+    // The page after this one, before it is asked for. A no-op unless the
+    // document is fetching pages one at a time (LIVE mode), where the round
+    // trip — not the rasterising — is what makes a page turn wait. Forward
+    // first because that is the direction reading goes.
+    if (this.doc.prefetchPage) {
+      this.doc.prefetchPage(index + 1);
+      this.doc.prefetchPage(index - 1);
+    }
   }
 
   /** Only RELATIVE navigation is a "flip" — and only relative navigation SKIPS
@@ -317,18 +340,62 @@ export class Surface {
     this.offY = Math.round(this.offY * dpr) / dpr;
   }
 
+  /** Rasterise one page at one scale, into a canvas of its own.
+   *
+   * A PRIVATE canvas per render, never the shared one: `doc.render` sets the
+   * size and paints, so two renders sharing a buffer means a slower earlier
+   * one can finish last and overwrite the bitmap the key says is on screen.
+   * Returns null if it failed, lost, or came back degenerate — a page that
+   * will not render must not wedge, and must not be cached either. */
+  async _renderAt(page, scale, token) {
+    if (!(scale > 0)) return null;
+    const target = document.createElement("canvas");
+    try {
+      await this.doc.render(page, scale, target);
+    } catch {
+      return null;
+    }
+    if (token !== this._renderToken) return null;
+    // `doc.render` clamps a nonsense viewport to 1px rather than throwing, and
+    // `draw` refuses to blit that — so caching it under a key is how a page
+    // stays blank until something else changes the scale.
+    if (target.width <= 1 || target.height <= 1) return null;
+    return target;
+  }
+
+  /** True while the bitmap on screen belongs to `page`, at any scale. */
+  _showingPage(page) {
+    return !!this._pageKey && this._pageKey.startsWith(`${page}@`);
+  }
+
   async _renderPage() {
     if (!this.doc) return;
     const scale = this._renderScale();
-    const key = `${this.pageIndex}@${scale.toFixed(3)}`;
+    if (!(scale > 0)) return;                  // no view to render into yet
+    const page = this.pageIndex;
+    const key = `${page}@${scale.toFixed(3)}`;
     if (this._pageKey === key) return;
     const token = ++this._renderToken;
-    try {
-      await this.doc.render(this.pageIndex, scale, this._pageCanvas);
-    } catch {
-      return;                    // a page that will not render must not wedge
+
+    // A BLURRY PAGE BEATS A WHITE ONE. With nothing on screen for this page,
+    // a small bitmap goes up first and the full-scale one replaces it when it
+    // lands, so the page sharpens instead of appearing. Skipped when this page
+    // is ALREADY showing — there the bitmap in hand is the better placeholder,
+    // and dropping to a soft one would be a visible step backwards.
+    const preview = Math.min(scale, PREVIEW_SIDE / Math.max(this.pageW, this.pageH));
+    if (!this._showingPage(page) && preview < scale * 0.9) {
+      const quick = await this._renderAt(page, preview, token);
+      if (token !== this._renderToken) return;
+      if (quick) {
+        this._pageCanvas = quick;
+        this._pageKey = `${page}@preview`;
+        this.requestDraw();
+      }
     }
-    if (token !== this._renderToken) return;   // a newer render won
+
+    const full = await this._renderAt(page, scale, token);
+    if (token !== this._renderToken || !full) return;
+    this._pageCanvas = full;
     this._pageKey = key;
     this.requestDraw();
   }
@@ -339,9 +406,19 @@ export class Surface {
   get cssH() { return this.el.clientHeight; }
 
   fit() {
-    const m = 24;
-    this.zoom = Math.min((this.cssW - m * 2) / this.pageW,
-                         (this.cssH - m * 2) / this.pageH);
+    // A CONTAINER WITH NO SIZE HAS NO FIT, and computing one anyway is how the
+    // page came up blank on a phone: `(0 - 48) / 595` is a NEGATIVE zoom, which
+    // renders a 1px bitmap that `draw` then refuses to blit — and caches it
+    // under a key, so nothing re-rendered until a gesture happened to change
+    // the scale. Wait for a box instead; `draw` re-fits as soon as there is one.
+    const w = this.cssW, h = this.cssH;
+    if (!(w >= 1) || !(h >= 1)) { this._fitPending = true; return; }
+    // The margin cannot be bigger than the box it is inset from — a narrow
+    // column is a small page, not an inverted one.
+    const m = Math.min(24, w / 10, h / 10);
+    this.zoom = Math.max(MIN_ZOOM,
+                         Math.min((w - m * 2) / this.pageW,
+                                  (h - m * 2) / this.pageH));
     this.offX = (this.cssW - this.pageW * this.zoom) / 2;
     this.offY = (this.cssH - this.pageH * this.zoom) / 2;
     this._snapView();
@@ -405,7 +482,7 @@ export class Surface {
   zoomAt(factor, cx, cy) {
     const [dx, dy] = this.toDoc(cx, cy);
     this._fitted = false;        // a scale the hand chose; a resize keeps it
-    this.zoom = Math.max(0.05, Math.min(16, this.zoom * factor));
+    this.zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, this.zoom * factor));
     this.offX = cx - dx * this.zoom;
     this.offY = cy - dy * this.zoom;
     this._snapView();
@@ -1831,8 +1908,14 @@ export class Surface {
       this.el.style.width = `${devW / dpr}px`;
       this.el.style.height = `${devH / dpr}px`;
       this.invalidateLayer();
-      if (this._fitPending) { this._fitPending = false; this.fit(); }
     }
+    // AFTER the resize above, because `fit` measures the CANVAS and it still
+    // carried the old size a moment ago — but OUTSIDE it, because a fit can be
+    // owed while the canvas is already the right size, and there it was never
+    // paid: the flag stayed set and the view kept whatever `fit` had made of a
+    // container that did not exist yet. `fit` sets the flag again if there is
+    // still no box, so this cannot spin.
+    if (this._fitPending) { this._fitPending = false; this.fit(); }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, this.cssW, this.cssH);
 

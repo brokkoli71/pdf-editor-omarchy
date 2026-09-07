@@ -183,6 +183,32 @@ export class Doc {
     this.pageCount = count;
   }
 
+  /** Warm the page we are about to need, WITHOUT moving "here".
+   *
+   * A page turn in LIVE mode costs a round trip to the desktop before a single
+   * pixel can be rasterised, and that round trip is the "split second" — the
+   * rendering is fast once the bytes are local. Reading is overwhelmingly
+   * sequential, so the next page is worth having before it is asked for.
+   *
+   * `_lastPage` is restored immediately, and that matters: it is what
+   * `_evictLazyPages` treats as where you are, so a prefetch that moved it
+   * would evict the neighbours of a page nobody is looking at. `page()` sets
+   * it synchronously at the top, before its first await, so putting it back
+   * right after the call is enough.
+   *
+   * A no-op outside live mode: there the whole document is already here. */
+  prefetchPage(index) {
+    if (!this._lazy) return;
+    if (!(index >= 0 && index < this.pageCount)) return;
+    if (this._pageCache.has(index)) return;
+    const here = this._lastPage;
+    const p = this.page(index);
+    this._lastPage = here;
+    // Failure is not interesting — this page was never asked for, and the
+    // real request will report its own error if it ever comes.
+    if (p && typeof p.catch === "function") p.catch(() => {});
+  }
+
   /** Keep only a window of fetched pages alive.
    *
    * Every lazily fetched page is its own pdf.js DOCUMENT, and pdf.js keeps
